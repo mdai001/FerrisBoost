@@ -43,7 +43,7 @@ fn readable(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     }
 }
 
-fn infer(path: &Path, has_header: bool) -> anyhow::Result<SchemaRef> {
+pub(crate) fn infer_schema(path: &Path, has_header: bool) -> anyhow::Result<SchemaRef> {
     let mut file = readable(path)?;
     let format = Format::default().with_header(has_header);
     let (schema, _) = format
@@ -61,15 +61,26 @@ pub fn peek_n_features(
     label: &str,
     has_header: bool,
 ) -> anyhow::Result<usize> {
-    let schema = infer(path.as_ref(), has_header)?;
-    columns(&schema, label).map(|(features, _, _)| features.len())
+    let schema = infer_schema(path.as_ref(), has_header)?;
+    n_features_from_schema(&schema, label)
+}
+
+pub(crate) fn n_features_from_schema(schema: &Schema, label: &str) -> anyhow::Result<usize> {
+    columns(schema, label).map(|(features, _, _)| features.len())
 }
 
 /// Resolve a positional label against the inferred CSV schema.  Arrow assigns
 /// stable synthetic field names to headerless columns; the name is only an
 /// internal handle used by the existing projection machinery.
 pub fn positional_label_name(path: impl AsRef<Path>, label_index: usize) -> anyhow::Result<String> {
-    let schema = infer(path.as_ref(), false)?;
+    let schema = infer_schema(path.as_ref(), false)?;
+    positional_label_name_from_schema(&schema, label_index)
+}
+
+pub(crate) fn positional_label_name_from_schema(
+    schema: &Schema,
+    label_index: usize,
+) -> anyhow::Result<String> {
     let n_columns = schema.fields().len();
     anyhow::ensure!(
         label_index < n_columns,
@@ -201,15 +212,67 @@ pub fn open_many_with_header_and_nthread(
     has_header: bool,
     nthread: usize,
 ) -> anyhow::Result<Dataset> {
+    open_many_impl(
+        paths,
+        label,
+        cuts,
+        max_bins,
+        cols_per_block,
+        has_header,
+        nthread,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_many_with_header_and_nthread_prepared(
+    paths: &[PathBuf],
+    label: &str,
+    cuts: Option<BinCuts>,
+    max_bins: u32,
+    cols_per_block: usize,
+    has_header: bool,
+    nthread: usize,
+    first_schema: SchemaRef,
+) -> anyhow::Result<Dataset> {
+    open_many_impl(
+        paths,
+        label,
+        cuts,
+        max_bins,
+        cols_per_block,
+        has_header,
+        nthread,
+        Some(first_schema),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_many_impl(
+    paths: &[PathBuf],
+    label: &str,
+    cuts: Option<BinCuts>,
+    max_bins: u32,
+    cols_per_block: usize,
+    has_header: bool,
+    nthread: usize,
+    first_schema: Option<SchemaRef>,
+) -> anyhow::Result<Dataset> {
     anyhow::ensure!(!paths.is_empty(), "没有输入文件");
     let schema_pool = crate::threading::build_pool(nthread)
         .map_err(|e| anyhow::anyhow!("CSV schema ingest 线程池创建失败:{e}"))?;
+    let schema_profile = crate::source::openprof::start("schema");
     let schemas = schema_pool.install(|| {
         paths
             .par_iter()
-            .map(|path| infer(path, has_header))
+            .enumerate()
+            .map(|(index, path)| match (index, first_schema.as_ref()) {
+                (0, Some(schema)) => Ok(Arc::clone(schema)),
+                _ => infer_schema(path, has_header),
+            })
             .collect::<anyhow::Result<Vec<_>>>()
     })?;
+    drop(schema_profile);
     let mut feat_proj = Vec::with_capacity(paths.len());
     let mut label_proj = Vec::with_capacity(paths.len());
     let mut feature_names: Option<Vec<String>> = None;
@@ -259,7 +322,7 @@ pub fn open_many_with_header_and_nthread(
     let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
     let owned = paths.to_vec();
     let (sc, fp) = (schemas.clone(), feat_proj.clone());
-    let feats = || {
+    let feats = || -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
         Ok(dataset_reader(
             owned.clone(),
             sc.clone(),
@@ -268,17 +331,61 @@ pub fn open_many_with_header_and_nthread(
             reader_threads,
         ))
     };
-    let source = match cuts {
-        Some(c) => ArrowSource::with_cuts_and_nthread(feats, c, cols_per_block, transform_threads)?,
-        None => ArrowSource::new_with_nthread(feats, max_bins, cols_per_block, transform_threads)?,
+    let (cuts, known_rows) = match cuts {
+        Some(cuts) => (cuts, None),
+        None => {
+            let _profile = crate::source::openprof::start("cuts");
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_with_nthread(
+                feats()?,
+                max_bins as usize,
+                transform_threads,
+            )?;
+            (cuts, Some(n_rows))
+        }
     };
 
+    // CSV must scan complete records even for a one-column projection. Read
+    // the label beside features during the quantization pass, then expose a
+    // cheap feature-only RecordBatch view to ArrowSource. This removes the
+    // former third full-file scan without changing canonical feature order.
+    let combined_proj = feat_proj
+        .into_iter()
+        .zip(label_proj)
+        .map(|(mut features, label)| {
+            features.push(label);
+            features
+        })
+        .collect::<Vec<_>>();
     let mut labels = Vec::new();
-    let lp: Vec<Vec<usize>> = label_proj.iter().map(|c| vec![*c]).collect();
-    for batch in dataset_reader(paths.to_vec(), schemas, lp, has_header, nthread) {
-        let batch = batch?;
-        labels.extend(crate::source::arrow_source::column_as_f32(&batch, 0)?);
-    }
+    let batches = FeatureLabelBatches::new(
+        dataset_reader(
+            paths.to_vec(),
+            schemas,
+            combined_proj,
+            has_header,
+            reader_threads,
+        ),
+        feature_names.len(),
+        &mut labels,
+    );
+    let source = {
+        let _profile = crate::source::openprof::start("quantize+label");
+        match known_rows {
+            Some(n_rows) => ArrowSource::from_batches_with_cuts_and_nthread_known_rows(
+                batches,
+                cuts,
+                cols_per_block,
+                n_rows,
+                transform_threads,
+            )?,
+            None => ArrowSource::from_batches_with_cuts_and_nthread(
+                batches,
+                cuts,
+                cols_per_block,
+                transform_threads,
+            )?,
+        }
+    };
     Dataset::assemble(
         source,
         labels,
@@ -329,6 +436,58 @@ fn dataset_reader(
             })))
         },
     ))
+}
+
+/// Combined CSV feature+label batches are reordered to canonical features
+/// followed by the label. Keep the label values and return a zero-copy Arrow
+/// view containing only feature arrays for quantization.
+struct FeatureLabelBatches<'a> {
+    batches: crate::source::parallel_reader::BatchIter,
+    n_features: usize,
+    feature_projection: Vec<usize>,
+    labels: &'a mut Vec<f32>,
+}
+
+impl<'a> FeatureLabelBatches<'a> {
+    fn new(
+        batches: crate::source::parallel_reader::BatchIter,
+        n_features: usize,
+        labels: &'a mut Vec<f32>,
+    ) -> Self {
+        Self {
+            batches,
+            n_features,
+            feature_projection: (0..n_features).collect(),
+            labels,
+        }
+    }
+}
+
+impl Iterator for FeatureLabelBatches<'_> {
+    type Item = anyhow::Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.batches.next()? {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
+        };
+        if batch.num_columns() != self.n_features + 1 {
+            return Some(Err(anyhow::anyhow!(
+                "CSV combined batch 有 {} 列,预期 {} 个特征 + 1 个标签",
+                batch.num_columns(),
+                self.n_features,
+            )));
+        }
+        self.labels.reserve(batch.num_rows());
+        if let Err(error) =
+            crate::source::arrow_source::for_each_column_f32(&batch, self.n_features, |value| {
+                self.labels.push(value)
+            })
+        {
+            return Some(Err(error));
+        }
+        Some(batch.project(&self.feature_projection).map_err(Into::into))
+    }
 }
 
 pub(crate) const CSV_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -536,7 +695,7 @@ pub fn schema_and_names(
     path: impl AsRef<Path>,
     has_header: bool,
 ) -> anyhow::Result<(SchemaRef, Vec<String>)> {
-    let schema = infer(path.as_ref(), has_header)?;
+    let schema = infer_schema(path.as_ref(), has_header)?;
     let names = schema.fields().iter().map(|f| f.name().clone()).collect();
     Ok((schema, names))
 }
@@ -723,6 +882,41 @@ mod tests {
         assert_eq!(ds.labels, vec![0.0, 1.0, 0.0, 1.0]);
         assert!(ds.feature_names.is_empty(), "无表头模型必须是位置模式");
         assert!(positional_label_name(&path, 4).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn prepared_schema_matches_regular_open() {
+        let path = write("prepared_schema", BODY);
+        let schema = infer_schema(&path, true).unwrap();
+        let prepared = open_many_with_header_and_nthread_prepared(
+            std::slice::from_ref(&path),
+            "target",
+            None,
+            16,
+            2,
+            true,
+            4,
+            schema,
+        )
+        .unwrap();
+        let regular = open(&path, "target", 16, 2).unwrap();
+
+        assert_eq!(prepared.labels, regular.labels);
+        assert_eq!(prepared.feature_names, regular.feature_names);
+        assert_eq!(prepared.source.n_rows(), regular.source.n_rows());
+        for feature in 0..prepared.source.n_features() as u32 {
+            assert_eq!(
+                prepared.source.cuts().cuts_for(feature),
+                regular.source.cuts().cuts_for(feature)
+            );
+            for row in 0..prepared.source.n_rows() {
+                assert_eq!(
+                    prepared.source.bin_at(row, feature),
+                    regular.source.bin_at(row, feature)
+                );
+            }
+        }
         std::fs::remove_file(&path).ok();
     }
 }

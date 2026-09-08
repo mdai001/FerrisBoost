@@ -1820,6 +1820,15 @@ fn train_file(
     let fmt = resolved.format.label();
     let path_disp = paths[0].display().to_string();
     let path = path_disp.as_str();
+    // CSV schema inference samples text rows, so keep the result used for
+    // blocking and pass it into open instead of rescanning the first file.
+    let csv_preflight = match fmt {
+        "csv" => Some(
+            csv_source::infer_schema(&paths[0], header)
+                .map_err(|e| PyValueError::new_err(format!("读 {path} 的 schema 失败:{e}")))?,
+        ),
+        _ => None,
+    };
     let label_owned = match (fmt, header) {
         ("parquet", false) => {
             return Err(PyValueError::new_err("header=False 只适用于 CSV"));
@@ -1836,8 +1845,11 @@ fn train_file(
                     "label 列下标不能是负数,给的是 {index}"
                 )));
             }
-            csv_source::positional_label_name(path, index as usize)
-                .map_err(|e| PyValueError::new_err(format!("{e}")))?
+            csv_source::positional_label_name_from_schema(
+                csv_preflight.as_deref().expect("CSV preflight exists"),
+                index as usize,
+            )
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?
         }
         _ => unreachable!(),
     };
@@ -1848,7 +1860,10 @@ fn train_file(
     // 不必把 `nthread` 传进底层的 `partition_features`。
     let n_features = match fmt {
         "parquet" => parquet_source::peek_n_features(path, label),
-        "csv" => csv_source::peek_n_features(path, label, header),
+        "csv" => csv_source::n_features_from_schema(
+            csv_preflight.as_deref().expect("CSV preflight exists"),
+            label,
+        ),
         other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
     }
     .map_err(|e| PyValueError::new_err(format!("读 {path} 的 schema 失败:{e}")))?;
@@ -1910,7 +1925,8 @@ fn train_file(
     // 单文件只是 `len() == 1` 的退化情况,不需要第二条代码路径。
     let max_bin = cfg.params.max_bin;
     let open_paths = |ps: &[std::path::PathBuf],
-                      cuts: Option<crate::columns::BinCuts>|
+                      cuts: Option<crate::columns::BinCuts>,
+                      first_csv_schema: Option<arrow::datatypes::SchemaRef>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         match fmt {
             "parquet" => parquet_source::open_many_with_nthread(
@@ -1921,15 +1937,27 @@ fn train_file(
                 cols_per_block,
                 ingest_threads,
             ),
-            "csv" => csv_source::open_many_with_header_and_nthread(
-                ps,
-                label,
-                cuts,
-                max_bin,
-                cols_per_block,
-                header,
-                ingest_threads,
-            ),
+            "csv" => match first_csv_schema {
+                Some(schema) => csv_source::open_many_with_header_and_nthread_prepared(
+                    ps,
+                    label,
+                    cuts,
+                    max_bin,
+                    cols_per_block,
+                    header,
+                    ingest_threads,
+                    schema,
+                ),
+                None => csv_source::open_many_with_header_and_nthread(
+                    ps,
+                    label,
+                    cuts,
+                    max_bin,
+                    cols_per_block,
+                    header,
+                    ingest_threads,
+                ),
+            },
             other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
         }
     };
@@ -1944,7 +1972,7 @@ fn train_file(
             r.format.label(),
             resolved.format.label()
         );
-        open_paths(&r.paths, cuts)
+        open_paths(&r.paths, cuts, None)
     };
 
     let (mut cbs, handle) = build_callbacks(early_stopping_rounds, verbose_eval, callbacks)?;
@@ -2061,7 +2089,7 @@ fn train_file(
         ));
     }
 
-    let ds = open_paths(&paths, None).map_err(to_py_err)?;
+    let ds = open_paths(&paths, None, csv_preflight.clone()).map_err(to_py_err)?;
     ingest_reporter.complete(ds.source.n_rows());
     // A deferred source only learns its aggregate row count during open.
     // Complete the GPU plan now, preserving the requested block width while
