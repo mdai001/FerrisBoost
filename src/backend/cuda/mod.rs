@@ -12,7 +12,9 @@ use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
 
 use crate::types::{Bin, GradPairFixed, RowId, MISSING_BIN};
 
+mod inference;
 mod train_ctx;
+pub use inference::GpuInferenceModel;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
     GpuSegmentTiming, GpuTrainCtx,

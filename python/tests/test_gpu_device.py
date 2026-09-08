@@ -51,6 +51,58 @@ def test_cpu_and_gpu_smoke():
 
 
 @cuda
+def test_gpu_prediction_is_bit_identical_and_cache_reusable(tmp_path):
+    """Inference backend is independent of the backend that trained the model."""
+    rng = np.random.default_rng(20260908)
+    train_x = rng.normal(size=(4000, 16)).astype(np.float32)
+    train_y = (
+        train_x[:, 0]
+        + train_x[:, 1] * train_x[:, 2]
+        - 0.5 * train_x[:, 5]
+        + 0.25 * train_x[:, 9]
+        > 0
+    ).astype(np.float32)
+    model = fb.train(
+        {"max_depth": 6, "eta": 0.2, "max_bin": 64, "nthread": 1},
+        train_x,
+        train_y,
+        num_boost_round=30,
+    )
+    predict_x = np.tile(train_x, (25, 1))
+    predict_x[::97, 0] = np.nan
+    predict_x[::131, 7] = np.nan
+
+    cpu_margin = model.predict(predict_x, output_margin=True, predict_threads=1)
+    gpu_margin_first = model.predict(predict_x, output_margin=True, use_gpu=True)
+    gpu_margin_reuse = model.predict(predict_x, output_margin=True, use_gpu=True)
+    assert cpu_margin.tobytes() == gpu_margin_first.tobytes()
+    assert cpu_margin.tobytes() == gpu_margin_reuse.tobytes()
+    assert model.predict(predict_x, predict_threads=1).tobytes() == model.predict(
+        predict_x, use_gpu=True
+    ).tobytes()
+    assert cpu_margin.tobytes() == model.predict(
+        np.asfortranarray(predict_x), output_margin=True, use_gpu=True
+    ).tobytes()
+    strided_storage = np.empty((len(predict_x), predict_x.shape[1] * 2), dtype=np.float32)
+    strided_storage[:, ::2] = predict_x
+    strided_storage[:, 1::2] = -1.0
+    assert cpu_margin.tobytes() == model.predict(
+        strided_storage[:, ::2], output_margin=True, use_gpu=True
+    ).tobytes()
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    file_path = tmp_path / "predict.parquet"
+    pq.write_table(
+        pa.table({f"f{i}": predict_x[:, i] for i in range(predict_x.shape[1])}),
+        file_path,
+    )
+    file_cpu = model.predict(file_path, output_margin=True, predict_threads=1)
+    file_gpu = model.predict(file_path, output_margin=True, use_gpu=True)
+    assert file_cpu.tobytes() == file_gpu.tobytes()
+
+
+@cuda
 def test_gpu_is_byte_identical_to_cpu_in_exact_mode():
     """exact 模式(默认)下,换后端**不允许**改变模型。
 

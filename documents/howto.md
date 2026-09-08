@@ -418,7 +418,17 @@ FerrisBoost's memory planner automatically trades GPU memory for training speed 
 
 ## Prediction
 
-`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is always a one-dimensional `numpy.ndarray` of `float32`.
+`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is always a one-dimensional `numpy.ndarray` of `float32`. Prediction has its own CPU thread control and does not inherit training `nthread`:
+
+```python
+prediction = model.predict(data, predict_threads=0)  # process-aware auto
+reference = model.predict(data, predict_threads=1)   # explicit serial path
+gpu_allowed = model.predict(data, use_gpu=True)      # CUDA build; GPU 0 when worthwhile
+```
+
+`predict_threads=0` uses available physical CPU parallelism and keeps small workloads serial; a positive value is an explicit override. Workers own disjoint row slices and each row traverses trees in model order, so output is bit-identical across serial, explicit multi-thread, and auto CPU execution. NumPy scoring releases the Python GIL.
+
+`use_gpu=False` is the default and never initializes CUDA. With `use_gpu=True`, a CUDA-enabled build lazily creates a compact prediction-only SoA model on GPU 0 and reuses it on later calls. It transfers only tree-used features, while the selector also accounts for host projection and launch costs and can keep a batch on CPU. The inference backend is independent of whether the model was trained by FerrisBoost CPU, FerrisBoost GPU, or XGBoost, and independent of training `gpu_math`.
 
 ### File prediction
 
@@ -426,7 +436,7 @@ Passing file paths streams records directly through Rust readers without materia
 
 ```python
 # Single file (.parquet, .pq, .csv, or .csv.gz):
-prediction = model.predict("test.parquet")
+prediction = model.predict("test.parquet", predict_threads=0)
 
 # Multi-file or partitioned dataset (list of files, directory path, or glob):
 prediction = model.predict(["test_part_0.parquet", "test_part_1.parquet"])
@@ -438,6 +448,10 @@ prediction = model.predict("test.csv", header=False)
 ```
 
 In named mode (Parquet or CSV with headers), FerrisBoost binds columns by the feature names recorded during training. Surplus columns—including leftover label columns—are ignored automatically. In positional mode (`header=False`), the file must have exactly `model.n_features` columns.
+
+File readers validate the full canonical schema before projecting batches to the sorted set of features actually used by the ensemble. This reduces Parquet decode/materialization and GPU H2D width without weakening missing-feature checks. The canonical training/serialized model is immutable; feature remapping exists only in a lazy inference copy, so save/load and XGBoost interchange retain original feature IDs.
+
+Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
 
 ### In-memory array prediction
 
@@ -453,7 +467,7 @@ first_20_trees = model.predict(X_test, n_trees=20)
 
 C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays, pandas `DataFrame`s, or PyArrow `Table`s must be converted explicitly with `np.asarray(..., dtype=np.float32)`.
 
-In the current release, FerrisBoost model prediction executes single-threaded on the CPU. If inference throughput or latency is a primary concern, models can be loaded directly into XGBoost for multi-threaded CPU or GPU serving.
+For GPU prediction, the first eligible call includes CUDA context initialization and one model upload; subsequent calls reuse the cached model. Staging memory remains per-call and bounded to available VRAM. GPU 0 is the only inference target in this version; multi-GPU prediction is intentionally not enabled.
 
 The model exposes these properties:
 

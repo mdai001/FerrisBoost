@@ -22,6 +22,9 @@ class Model:
         output_margin: bool = False,
         n_trees: int | None = None,
         header: bool = True,
+        *,
+        predict_threads: int = 0,
+        use_gpu: bool = False,
     ) -> NDArray[np.float32]:
         """从二维数组或文件路径预测；无表头 CSV 传 header=False。"""
         ...

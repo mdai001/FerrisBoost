@@ -8,10 +8,14 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, ToPyArray};
+#[cfg(not(feature = "cuda"))]
+use pyo3::exceptions::PyNotImplementedError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use rayon::prelude::*;
 
 use crate::callback::{Callback, EarlyStopping, RecordHistory, RoundMetrics, VerboseEval};
 use crate::columns::BinningStrategy;
@@ -672,11 +676,7 @@ fn parallel_model_write(
             handles.push(scope.spawn(move || -> std::io::Result<()> {
                 let base = index * chunk_size;
                 for (part_index, part) in chunk.chunks(MODEL_IO_CHUNK).enumerate() {
-                    write_all_at(
-                        &output,
-                        part,
-                        (base + part_index * MODEL_IO_CHUNK) as u64,
-                    )?;
+                    write_all_at(&output, part, (base + part_index * MODEL_IO_CHUNK) as u64)?;
                     progress.fetch_add(part.len() as u64, Ordering::Relaxed);
                 }
                 Ok(())
@@ -713,11 +713,7 @@ fn parallel_model_read(path: &str, requested: usize, quiet: bool) -> anyhow::Res
             handles.push(scope.spawn(move || -> std::io::Result<()> {
                 let base = index * chunk_size;
                 for (part_index, part) in chunk.chunks_mut(MODEL_IO_CHUNK).enumerate() {
-                    read_exact_at(
-                        &input,
-                        part,
-                        (base + part_index * MODEL_IO_CHUNK) as u64,
-                    )?;
+                    read_exact_at(&input, part, (base + part_index * MODEL_IO_CHUNK) as u64)?;
                     progress.fetch_add(part.len() as u64, Ordering::Relaxed);
                 }
                 Ok(())
@@ -739,6 +735,202 @@ fn parallel_model_read(path: &str, requested: usize, quiet: bool) -> anyhow::Res
 /// 两处如果各算各的,块宽就会按一个和实际线程数不同的值来切。
 use crate::threading::effective_threads as effective_nthread;
 
+/// Auto prediction stays serial below this conservative work estimate. The
+/// estimate uses the maximum traversed path in each selected tree; the exact
+/// crossover is benchmarked independently.
+const AUTO_PREDICT_MIN_WORK: usize = 256 * 1024;
+
+fn prediction_work_per_row(model: &Model, n_trees: usize) -> usize {
+    fn tree_path_upper_bound(tree: &crate::tree::Tree) -> usize {
+        if tree.nodes.is_empty() {
+            return 0;
+        }
+        let mut longest = 1usize;
+        let mut stack = vec![(0usize, 1usize)];
+        while let Some((node_id, depth)) = stack.pop() {
+            longest = longest.max(depth);
+            let node = &tree.nodes[node_id];
+            if !node.is_leaf {
+                stack.push((node.left as usize, depth + 1));
+                stack.push((node.right as usize, depth + 1));
+            }
+        }
+        longest
+    }
+
+    model.trees[..n_trees.min(model.trees.len())]
+        .iter()
+        .map(tree_path_upper_bound)
+        .sum::<usize>()
+        .max(1)
+}
+
+fn resolved_predict_workers(
+    requested: usize,
+    worker_cap: usize,
+    n_rows: usize,
+    work_per_row: usize,
+) -> usize {
+    let resolved = effective_nthread(requested)
+        .min(worker_cap.max(1))
+        .min(n_rows.max(1));
+    if requested == 0 && n_rows.saturating_mul(work_per_row) < AUTO_PREDICT_MIN_WORK {
+        1
+    } else {
+        resolved.max(1)
+    }
+}
+
+/// Score independent row indices into deterministic, disjoint output chunks.
+/// Every row still traverses trees serially and in model order, so scheduling
+/// cannot change floating-point accumulation order.
+fn score_rows<F>(
+    n_rows: usize,
+    workers: usize,
+    pool: &mut Option<rayon::ThreadPool>,
+    score_row: F,
+) -> anyhow::Result<Vec<f32>>
+where
+    F: Fn(usize) -> f32 + Sync,
+{
+    let mut out = vec![0.0f32; n_rows];
+    if n_rows == 0 {
+        return Ok(out);
+    }
+    if workers <= 1 {
+        for (row, value) in out.iter_mut().enumerate() {
+            *value = score_row(row);
+        }
+        return Ok(out);
+    }
+    if pool.is_none() {
+        *pool = Some(crate::threading::build_pool(workers)?);
+    }
+    let chunks = workers.saturating_mul(4).max(1);
+    let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
+    pool.as_ref()
+        .expect("prediction pool just initialized")
+        .install(|| {
+            out.par_chunks_mut(rows_per_chunk)
+                .enumerate()
+                .for_each(|(chunk, values)| {
+                    let first = chunk * rows_per_chunk;
+                    for (offset, value) in values.iter_mut().enumerate() {
+                        *value = score_row(first + offset);
+                    }
+                });
+        });
+    Ok(out)
+}
+
+fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool) -> f32 {
+    let margin = model.predict_margin_upto(row, n_trees);
+    if output_margin {
+        margin
+    } else {
+        match model.objective {
+            Objective::SquaredError => margin,
+            Objective::Logistic => 1.0 / (1.0 + (-margin).exp()),
+        }
+    }
+}
+
+fn project_canonical_rows(
+    row_major: &[f32],
+    n_rows: usize,
+    canonical_width: usize,
+    projected_features: &[usize],
+) -> anyhow::Result<Vec<f32>> {
+    let expected = n_rows
+        .checked_mul(canonical_width)
+        .context("prediction canonical input size 溢出")?;
+    if row_major.len() != expected {
+        anyhow::bail!(
+            "prediction canonical input 有 {} 个值,预期 {expected}",
+            row_major.len()
+        );
+    }
+    let output_len = n_rows
+        .checked_mul(projected_features.len())
+        .context("prediction compact input size 溢出")?;
+    let mut projected = Vec::with_capacity(output_len);
+    for row in row_major.chunks_exact(canonical_width) {
+        for &feature in projected_features {
+            projected.push(row[feature]);
+        }
+    }
+    Ok(projected)
+}
+
+/// File ingest and prediction are independently configurable, but auto values
+/// share one process-visible CPU budget. Explicit values are never rewritten.
+fn prediction_pipeline_workers(
+    ingest_requested: usize,
+    predict_requested: usize,
+    resolved_ingest: usize,
+) -> (usize, usize, bool) {
+    let budget = effective_nthread(0).max(1);
+    let (ingest, predict) = match (ingest_requested, predict_requested) {
+        (0, 0) if budget > 1 => {
+            let ingest = resolved_ingest.min((budget / 2).max(1));
+            (ingest, budget.saturating_sub(ingest).max(1))
+        }
+        (0, 0) => (1, 1),
+        (0, explicit_predict) => {
+            let predict = effective_nthread(explicit_predict);
+            (
+                resolved_ingest.min(budget.saturating_sub(predict).max(1)),
+                predict,
+            )
+        }
+        (_, 0) => (
+            resolved_ingest,
+            budget.saturating_sub(resolved_ingest).max(1),
+        ),
+        (_, explicit_predict) => (resolved_ingest, effective_nthread(explicit_predict)),
+    };
+    let explicit_oversubscription =
+        ingest_requested > 0 && predict_requested > 0 && ingest + predict > budget;
+    (ingest.max(1), predict.max(1), explicit_oversubscription)
+}
+
+const AUTO_GPU_PREDICT_MIN_WORK: usize = 8 * 1024 * 1024;
+
+fn ensure_gpu_prediction_available(use_gpu: bool) -> PyResult<()> {
+    #[cfg(not(feature = "cuda"))]
+    if use_gpu {
+        return Err(PyNotImplementedError::new_err(
+            "这个 FerrisBoost build 没有 CUDA prediction 支持;请使用 use_gpu=False 或安装 CUDA wheel。",
+        ));
+    }
+    let _ = use_gpu;
+    Ok(())
+}
+
+fn gpu_prediction_selected(
+    use_gpu: bool,
+    n_rows: usize,
+    n_features: usize,
+    work_per_row: usize,
+) -> bool {
+    // Full-row H2D competes with traversal work that touches only split
+    // features. Wide/shallow inputs can therefore favor CPU even at a large
+    // row count (confirmed by Epsilon 20k x 2000); require at least one unit
+    // of traversal work per transferred feature in addition to total work.
+    use_gpu
+        && work_per_row >= n_features
+        && n_rows.saturating_mul(work_per_row) >= AUTO_GPU_PREDICT_MIN_WORK
+}
+
+#[cfg(feature = "cuda")]
+fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin: bool) {
+    if !output_margin && model.objective == Objective::Logistic {
+        for value in values {
+            *value = 1.0 / (1.0 + (-*value).exp());
+        }
+    }
+}
+
 #[pyclass(name = "Model", module = "ferrisboost._core")]
 pub struct PyModel {
     inner: Model,
@@ -746,6 +938,46 @@ pub struct PyModel {
     quiet: bool,
     model_io_threads: usize,
     ingest_threads: usize,
+    inference_model: Mutex<Option<Arc<crate::inference::CompactInferenceModel>>>,
+    #[cfg(feature = "cuda")]
+    gpu_predictors:
+        Mutex<std::collections::HashMap<usize, Arc<crate::backend::cuda::GpuInferenceModel>>>,
+}
+
+impl PyModel {
+    fn inference_model(&self) -> anyhow::Result<Arc<crate::inference::CompactInferenceModel>> {
+        let mut cache = self
+            .inference_model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compact inference model cache poisoned"))?;
+        if let Some(model) = cache.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(crate::inference::CompactInferenceModel::new(&self.inner)?);
+        *cache = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn gpu_predictor(
+        &self,
+        device_ordinal: usize,
+    ) -> anyhow::Result<Arc<crate::backend::cuda::GpuInferenceModel>> {
+        let mut cache = self
+            .gpu_predictors
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU prediction model cache poisoned"))?;
+        if let Some(predictor) = cache.get(&device_ordinal) {
+            return Ok(Arc::clone(predictor));
+        }
+        let inference = self.inference_model()?;
+        let predictor = Arc::new(crate::backend::cuda::GpuInferenceModel::from_compact(
+            &inference,
+            device_ordinal,
+        )?);
+        cache.insert(device_ordinal, Arc::clone(&predictor));
+        Ok(predictor)
+    }
 }
 
 #[pymethods]
@@ -754,7 +986,8 @@ impl PyModel {
     ///
     /// 和 XGBoost 的 `Booster.predict()` 一样,**默认用全部树**,
     /// 即使早停记了 best_iteration。要截断传 `n_trees`。
-    #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true))]
+    #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
+                        predict_threads=0, use_gpu=false))]
     /// 预测。`data` 可以是:
     ///
     /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
@@ -769,28 +1002,43 @@ impl PyModel {
         output_margin: bool,
         n_trees: Option<usize>,
         header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        ensure_gpu_prediction_available(use_gpu)?;
         // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
         if let Some(specs) = path_specs_of(data)? {
-            return self.predict_files(py, specs, output_margin, n_trees, header);
+            return self.predict_files(
+                py,
+                specs,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+            );
         }
         let x: PyReadonlyArray2<'py, f32> = data.extract().map_err(|_| {
             PyValueError::new_err(
                 "predict 只接受文件路径(单个 / 列表 / 目录 / glob)或二维 f32 numpy 数组",
             )
         })?;
-        self.predict_array(py, x, output_margin, n_trees)
+        self.predict_array(py, x, output_margin, n_trees, predict_threads, use_gpu)
     }
 
-    #[pyo3(signature = (x, output_margin=false, n_trees=None))]
+    #[pyo3(signature = (x, output_margin=false, n_trees=None, *,
+                        predict_threads=0, use_gpu=false))]
     fn predict_array<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f32>,
         output_margin: bool,
         n_trees: Option<usize>,
+        predict_threads: usize,
+        use_gpu: bool,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
+            ensure_gpu_prediction_available(use_gpu)?;
             let shape = x.shape();
             let (n_rows, n_features) = (shape[0], shape[1]);
             if n_features != self.inner.n_features {
@@ -800,39 +1048,86 @@ impl PyModel {
                 )));
             }
             let upto = n_trees.unwrap_or(self.inner.trees.len());
-            let predict_row = |row: &[f32]| {
-                let margin = self.inner.predict_margin_upto(row, upto);
-                if output_margin {
-                    margin
-                } else {
-                    match self.inner.objective {
-                        Objective::SquaredError => margin,
-                        Objective::Logistic => 1.0 / (1.0 + (-margin).exp()),
-                    }
-                }
+            let work_per_row = prediction_work_per_row(&self.inner, upto);
+            let inference = if use_gpu {
+                Some(self.inference_model().map_err(to_py_err)?)
+            } else {
+                None
             };
+            let transfer_width = inference
+                .as_ref()
+                .map_or(n_features, |model| model.n_features());
+            if gpu_prediction_selected(use_gpu, n_rows, transfer_width, work_per_row) {
+                #[cfg(feature = "cuda")]
+                {
+                    let inference = inference.expect("CUDA selection built compact model");
+                    let predictor = self.gpu_predictor(0).map_err(to_py_err)?;
+                    let mut out = if x.is_c_contiguous() {
+                        let data = x.as_slice()?;
+                        if inference.is_identity(n_features) {
+                            py.detach(|| predictor.predict_margins(data, n_rows, upto))
+                        } else {
+                            py.detach(|| {
+                                let projected = project_canonical_rows(
+                                    data,
+                                    n_rows,
+                                    n_features,
+                                    inference.canonical_features(),
+                                )?;
+                                predictor.predict_margins(&projected, n_rows, upto)
+                            })
+                        }
+                    } else {
+                        let view = x.as_array();
+                        py.detach(|| {
+                            let mut projected = Vec::with_capacity(n_rows * inference.n_features());
+                            for row in 0..n_rows {
+                                for &feature in inference.canonical_features() {
+                                    projected.push(view[(row, feature)]);
+                                }
+                            }
+                            predictor.predict_margins(&projected, n_rows, upto)
+                        })
+                    }
+                    .map_err(to_py_err)?;
+                    transform_prediction_margins(&self.inner, &mut out, output_margin);
+                    return Ok(out.to_pyarray(py));
+                }
+            }
+            let worker_cap = effective_nthread(predict_threads);
+            let workers =
+                resolved_predict_workers(predict_threads, worker_cap, n_rows, work_per_row);
+            let mut pool = None;
 
             // `as_slice` alone is insufficient: NumPy can return a linear slice
             // for an F-contiguous array too, whose physical order is column-major.
             // Only C-contiguous input may use the zero-copy row-major fast path.
             // Other layouts are enumerated logically, so storage order is never
             // interpreted as row-major.
-            let out: Vec<f32> = if x.is_c_contiguous() {
+            let out = if x.is_c_contiguous() {
                 let data = x.as_slice()?;
-                (0..n_rows)
-                    .map(|r| predict_row(&data[r * n_features..(r + 1) * n_features]))
-                    .collect()
-            } else {
-                x.as_array()
-                    .outer_iter()
-                    .map(|row| {
-                        // Tree prediction takes &[f32].  Materialize only this
-                        // logical row for non-C layouts, never the whole matrix.
-                        let row = row.iter().copied().collect::<Vec<_>>();
-                        predict_row(&row)
+                py.detach(|| {
+                    score_rows(n_rows, workers, &mut pool, |row| {
+                        let first = row * n_features;
+                        predict_value(
+                            &self.inner,
+                            &data[first..first + n_features],
+                            upto,
+                            output_margin,
+                        )
                     })
-                    .collect()
-            };
+                })
+            } else {
+                let view = x.as_array();
+                py.detach(|| {
+                    score_rows(n_rows, workers, &mut pool, |row| {
+                        // Materialize only this logical row, never the whole matrix.
+                        let values = view.row(row).iter().copied().collect::<Vec<_>>();
+                        predict_value(&self.inner, &values, upto, output_margin)
+                    })
+                })
+            }
+            .map_err(to_py_err)?;
             Ok(out.to_pyarray(py))
         })
     }
@@ -846,7 +1141,8 @@ impl PyModel {
     ///
     /// ⚠️ **不需要标签列。** 标签是训练期元信息;文件里带着也不影响,
     /// 因为选列是按模型的特征名单来的,不是"除某列外全要"。
-    #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true))]
+    #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true, *,
+                        predict_threads=0, use_gpu=false))]
     fn predict_files<'py>(
         &self,
         py: Python<'py>,
@@ -854,8 +1150,11 @@ impl PyModel {
         output_margin: bool,
         n_trees: Option<usize>,
         header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         use crate::tree::SchemaMode;
+        ensure_gpu_prediction_available(use_gpu)?;
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -892,9 +1191,12 @@ impl PyModel {
         }
 
         let names = self.inner.feature_names.clone();
-        let n_features = self.inner.n_features;
+        let canonical_n_features = self.inner.n_features;
+        let inference = self.inference_model().map_err(to_py_err)?;
+        let projected_features = inference.canonical_features().to_vec();
+        let n_features = inference.n_features();
         let upto = n_trees.unwrap_or(self.inner.trees.len());
-        let inner = &self.inner;
+        let inner = inference.model();
         let mut out: Vec<f32> = Vec::new();
         let rows_total = if resolved.format == crate::source::input::InputFormat::Parquet {
             resolved
@@ -907,13 +1209,36 @@ impl PyModel {
         } else {
             None
         };
-        let ingest_workers = resolved_ingest_workers(
+        let initially_resolved_ingest = resolved_ingest_workers(
             self.ingest_threads,
             resolved.format.label(),
             &resolved.paths,
             n_features,
             n_features.max(1),
         );
+        let work_per_row = prediction_work_per_row(inner, upto);
+        let known_gpu_selection = rows_total
+            .and_then(|rows| usize::try_from(rows).ok())
+            .map(|rows| gpu_prediction_selected(use_gpu, rows, n_features, work_per_row));
+        let (ingest_workers, predict_worker_cap, oversubscribed) =
+            if known_gpu_selection == Some(true) {
+                (initially_resolved_ingest, 1, false)
+            } else {
+                prediction_pipeline_workers(
+                    self.ingest_threads,
+                    predict_threads,
+                    initially_resolved_ingest,
+                )
+            };
+        if oversubscribed && !self.quiet {
+            eprintln!(
+                "PREDICT warning=explicit_cpu_oversubscription ingest_workers={} \
+                 predict_workers={} available={}",
+                ingest_workers,
+                predict_worker_cap,
+                effective_nthread(0),
+            );
+        }
         let reporter = IngestReporter::start(
             self.quiet,
             resolved.format.label(),
@@ -922,28 +1247,55 @@ impl PyModel {
             ingest_workers,
             rows_total,
         );
+        let mut predict_pool = None;
         let rows = py
             .detach(|| {
-                crate::source::predict_input::for_each_batch(
+                #[cfg(feature = "cuda")]
+                let mut gpu_predictor = None;
+                crate::source::predict_input::for_each_projected_batch(
                     &resolved,
                     &names,
-                    n_features,
+                    canonical_n_features,
+                    &projected_features,
                     header,
                     ingest_workers,
                     |rows| {
-                        for row in rows {
-                            let margin = inner.predict_margin_upto(row, upto);
-                            // 和 numpy 那条路用**同一个**变换,免得两条预测路径
-                            // 对同一个模型给出不同的数。
-                            out.push(if output_margin {
-                                margin
-                            } else {
-                                match inner.objective {
-                                    Objective::SquaredError => margin,
-                                    Objective::Logistic => 1.0 / (1.0 + (-margin).exp()),
+                        let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
+                            gpu_prediction_selected(use_gpu, rows.len(), n_features, work_per_row)
+                        });
+                        #[cfg(feature = "cuda")]
+                        if gpu_batch {
+                            let predictor = match &gpu_predictor {
+                                Some(predictor) => Arc::clone(predictor),
+                                None => {
+                                    let predictor = self.gpu_predictor(0)?;
+                                    gpu_predictor = Some(Arc::clone(&predictor));
+                                    predictor
                                 }
-                            });
+                            };
+                            let mut data = Vec::with_capacity(rows.len() * n_features);
+                            for row in rows {
+                                data.extend_from_slice(row);
+                            }
+                            let mut batch = predictor.predict_margins(&data, rows.len(), upto)?;
+                            transform_prediction_margins(inner, &mut batch, output_margin);
+                            out.extend(batch);
+                            return Ok(());
                         }
+                        let _ = gpu_batch;
+                        let workers = resolved_predict_workers(
+                            predict_threads,
+                            predict_worker_cap,
+                            rows.len(),
+                            work_per_row,
+                        );
+                        let batch = score_rows(rows.len(), workers, &mut predict_pool, |row| {
+                            predict_value(inner, &rows[row], upto, output_margin)
+                        })?;
+                        // Batch completion order is irrelevant: the reader yields
+                        // batches in canonical file/row order and this callback
+                        // commits each complete batch synchronously.
+                        out.extend(batch);
                         Ok(())
                     },
                 )
@@ -1001,6 +1353,9 @@ impl PyModel {
                 quiet,
                 model_io_threads,
                 ingest_threads,
+                #[cfg(feature = "cuda")]
+                gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+                inference_model: Mutex::new(None),
             })
         })
     }
@@ -1279,6 +1634,9 @@ fn finish(
         quiet,
         model_io_threads,
         ingest_threads,
+        inference_model: Mutex::new(None),
+        #[cfg(feature = "cuda")]
+        gpu_predictors: Mutex::new(std::collections::HashMap::new()),
     }
 }
 

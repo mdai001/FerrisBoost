@@ -1,4 +1,4 @@
-// FerrisBoost source FNV-1a64: e25fd6307c392628
+// FerrisBoost source FNV-1a64: 91071cbeac5ee211
 
 .version 9.3
 .target sm_75
@@ -7638,6 +7638,165 @@ $L__BB17_2:
 
 $L__BB18_2:
 	.loc	1 1341 1
+	ret;
+
+}
+	// .globl	predict_margin_soa
+.visible .entry predict_margin_soa(
+	.param .u64 predict_margin_soa_param_0,
+	.param .u32 predict_margin_soa_param_1,
+	.param .u32 predict_margin_soa_param_2,
+	.param .u64 predict_margin_soa_param_3,
+	.param .u32 predict_margin_soa_param_4,
+	.param .u64 predict_margin_soa_param_5,
+	.param .u64 predict_margin_soa_param_6,
+	.param .u64 predict_margin_soa_param_7,
+	.param .u64 predict_margin_soa_param_8,
+	.param .u64 predict_margin_soa_param_9,
+	.param .u64 predict_margin_soa_param_10,
+	.param .f32 predict_margin_soa_param_11,
+	.param .u64 predict_margin_soa_param_12
+)
+{
+	.reg .pred 	%p<17>;
+	.reg .b16 	%rs<11>;
+	.reg .f32 	%f<12>;
+	.reg .b32 	%r<18>;
+	.reg .b64 	%rd<46>;
+	.loc	1 1347 0
+
+
+	ld.param.u64 	%rd13, [predict_margin_soa_param_0];
+	ld.param.u32 	%r9, [predict_margin_soa_param_1];
+	ld.param.u32 	%r7, [predict_margin_soa_param_2];
+	ld.param.u64 	%rd20, [predict_margin_soa_param_3];
+	ld.param.u32 	%r8, [predict_margin_soa_param_4];
+	ld.param.u64 	%rd14, [predict_margin_soa_param_5];
+	ld.param.u64 	%rd15, [predict_margin_soa_param_6];
+	ld.param.u64 	%rd16, [predict_margin_soa_param_7];
+	ld.param.u64 	%rd17, [predict_margin_soa_param_8];
+	ld.param.u64 	%rd21, [predict_margin_soa_param_9];
+	ld.param.u64 	%rd18, [predict_margin_soa_param_10];
+	ld.param.f32 	%f10, [predict_margin_soa_param_11];
+	ld.param.u64 	%rd19, [predict_margin_soa_param_12];
+	.loc	1 1361 5
+	cvta.to.global.u64 	%rd1, %rd21;
+	cvta.to.global.u64 	%rd2, %rd20;
+	mov.u32 	%r10, %ntid.x;
+	mov.u32 	%r11, %ctaid.x;
+	mov.u32 	%r12, %tid.x;
+	mad.lo.s32 	%r1, %r11, %r10, %r12;
+	.loc	1 1362 5
+	setp.ge.u32 	%p4, %r1, %r9;
+	@%p4 bra 	$L__BB19_12;
+
+	.loc	1 1364 5
+	cvt.u64.u32 	%rd3, %r1;
+	.loc	1 1366 5
+	setp.eq.s32 	%p5, %r8, 0;
+	@%p5 bra 	$L__BB19_11;
+
+	.loc	1 1367 9
+	ld.global.nc.u32 	%r16, [%rd2];
+	.loc	1 1361 5
+	cvta.to.global.u64 	%rd4, %rd15;
+	cvta.to.global.u64 	%rd5, %rd13;
+	cvta.to.global.u64 	%rd6, %rd14;
+	cvta.to.global.u64 	%rd7, %rd18;
+	.loc	1 1364 5
+	cvt.u64.u32 	%rd22, %r7;
+	mul.lo.s64 	%rd8, %rd22, %rd3;
+	mov.u32 	%r17, 0;
+
+$L__BB19_3:
+	.loc	1 1368 9
+	add.s32 	%r17, %r17, 1;
+	mul.wide.u32 	%rd23, %r17, 4;
+	add.s64 	%rd24, %rd2, %rd23;
+	ld.global.nc.u32 	%r6, [%rd24];
+	setp.eq.s32 	%p6, %r16, %r6;
+	@%p6 bra 	$L__BB19_10;
+
+	.loc	1 1369 9
+	cvt.u64.u32 	%rd45, %r16;
+	add.s64 	%rd25, %rd1, %rd45;
+	ld.global.nc.u8 	%rs4, [%rd25];
+	cvt.u16.u8 	%rs10, %rs4;
+	and.b16  	%rs5, %rs10, 1;
+	setp.eq.b16 	%p7, %rs5, 1;
+	mov.pred 	%p8, 0;
+	xor.pred  	%p9, %p7, %p8;
+	@%p9 bra 	$L__BB19_9;
+
+$L__BB19_5:
+	.loc	1 1370 13
+	shl.b64 	%rd26, %rd45, 2;
+	add.s64 	%rd27, %rd6, %rd26;
+	ld.global.nc.u32 	%r14, [%rd27];
+	cvt.u64.u32 	%rd28, %r14;
+	add.s64 	%rd29, %rd8, %rd28;
+	shl.b64 	%rd30, %rd29, 2;
+	add.s64 	%rd31, %rd5, %rd30;
+	ld.global.nc.f32 	%f2, [%rd31];
+	.loc	1 1371 13
+	setp.nan.f32 	%p10, %f2, %f2;
+	@%p10 bra 	$L__BB19_7;
+
+	.loc	1 1373 19
+	add.s64 	%rd33, %rd4, %rd26;
+	ld.global.nc.f32 	%f7, [%rd33];
+	setp.lt.f32 	%p16, %f2, %f7;
+	bra.uni 	$L__BB19_8;
+
+$L__BB19_7:
+	.loc	1 1372 20
+	shr.u16 	%rs6, %rs10, 1;
+	and.b16  	%rs7, %rs6, 1;
+	setp.eq.b16 	%p16, %rs7, 1;
+
+$L__BB19_8:
+	.loc	1 1374 13
+	selp.b64 	%rd34, %rd16, %rd17, %p16;
+	.loc	1 1361 5
+	cvta.to.global.u64 	%rd35, %rd34;
+	.loc	1 1374 13
+	add.s64 	%rd37, %rd35, %rd26;
+	ld.global.nc.u32 	%r15, [%rd37];
+	cvt.u64.u32 	%rd45, %r15;
+	.loc	1 1369 9
+	add.s64 	%rd38, %rd1, %rd45;
+	ld.global.nc.u8 	%rs8, [%rd38];
+	cvt.u16.u8 	%rs10, %rs8;
+	and.b16  	%rs9, %rs10, 1;
+	setp.eq.b16 	%p11, %rs9, 1;
+	mov.pred 	%p12, 0;
+	xor.pred  	%p13, %p11, %p12;
+	not.pred 	%p14, %p13;
+	@%p14 bra 	$L__BB19_5;
+
+$L__BB19_9:
+	.loc	1 1376 9
+	shl.b64 	%rd39, %rd45, 2;
+	add.s64 	%rd40, %rd7, %rd39;
+	ld.global.nc.f32 	%f8, [%rd40];
+	add.f32 	%f10, %f10, %f8;
+
+$L__BB19_10:
+	.loc	1 1366 5
+	setp.lt.u32 	%p15, %r17, %r8;
+	mov.u32 	%r16, %r6;
+	@%p15 bra 	$L__BB19_3;
+
+$L__BB19_11:
+	.loc	1 1361 5
+	cvta.to.global.u64 	%rd41, %rd19;
+	.loc	1 1378 5
+	shl.b64 	%rd42, %rd3, 2;
+	add.s64 	%rd43, %rd41, %rd42;
+	st.global.f32 	[%rd43], %f10;
+
+$L__BB19_12:
+	.loc	1 1379 1
 	ret;
 
 }

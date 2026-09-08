@@ -1339,3 +1339,41 @@ extern "C" __global__ void init_tree_rows(
         prediction_delta[idx] = 0.0f;
     }
 }
+
+// Prediction-only compact SoA traversal. One thread owns one row and walks
+// trees in model order, matching Model::predict_margin_upto's accumulation
+// order exactly. The host applies the objective link after D2H so CUDA expf
+// cannot change prediction semantics.
+extern "C" __global__ void predict_margin_soa(
+    const float* __restrict__ rows,
+    uint32_t n_rows,
+    uint32_t n_features,
+    const uint32_t* __restrict__ tree_offsets,
+    uint32_t n_trees,
+    const uint32_t* __restrict__ features,
+    const float* __restrict__ split_conditions,
+    const uint32_t* __restrict__ left_children,
+    const uint32_t* __restrict__ right_children,
+    const uint8_t* __restrict__ flags,
+    const float* __restrict__ leaf_values,
+    float base_margin,
+    float* __restrict__ output) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const float* values = rows + (uint64_t)row * n_features;
+    float margin = base_margin;
+    for (uint32_t tree = 0; tree < n_trees; ++tree) {
+        uint32_t node = tree_offsets[tree];
+        if (node == tree_offsets[tree + 1]) continue;
+        while ((flags[node] & 1u) == 0u) {
+            const float value = values[features[node]];
+            const bool go_left = value != value
+                ? ((flags[node] & 2u) != 0u)
+                : value < split_conditions[node];
+            node = go_left ? left_children[node] : right_children[node];
+        }
+        margin += leaf_values[node];
+    }
+    output[row] = margin;
+}

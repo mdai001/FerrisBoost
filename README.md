@@ -132,7 +132,7 @@ model = fb.train(
 )
 
 # Predict returns a 1-D NumPy float32 array:
-prediction = model.predict("test.parquet")
+prediction = model.predict("test.parquet", predict_threads=0)
 model.save_model("model.json")
 ```
 
@@ -157,6 +157,8 @@ model = fb.train(
 - **`colsample_bytree`**: Selects a deterministic feature subset per tree. Column-major GPU execution uses that subset as the logical histogram execution/output width while preserving the physical resident-block layout and model compatibility.
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
 - **`nthread`**: `0` selects available physical CPU parallelism.
+- **Prediction CPU threads**: `model.predict(..., predict_threads=0)` uses process-aware automatic CPU parallelism independently of training `nthread`; a positive value overrides it.
+- **GPU prediction**: `model.predict(..., use_gpu=True)` opts into single-GPU inference. The compact tree model is uploaded lazily and cached for reuse; small or transfer-heavy batches automatically remain on CPU.
 
 Multi-file and partitioned datasets (list of files, directory, or glob pattern):
 
@@ -232,16 +234,15 @@ Because FerrisBoost models are serialized to standard XGBoost-compatible JSON:
 
 - Similarly, FerrisBoost can load models originally trained by XGBoost (`fb.Model.load_model("xgb_model.json")`) and predict using FerrisBoost's CPU engine.
 
-In the current release, FerrisBoost model prediction runs single-threaded on the CPU. If inference throughput or latency is a primary concern, models can be loaded directly into XGBoost for multi-threaded CPU or GPU serving.
+FerrisBoost prediction is independent of the training backend. CPU prediction parallelizes deterministic row ranges with `predict_threads=0` by default. CUDA-enabled builds can opt into single-GPU prediction with `use_gpu=True`; repeated calls reuse a lazy compact device model. File prediction validates the complete model schema, then materializes only features used by the trees. The canonical model feature IDs are never rewritten: compact IDs exist only in the cached inference representation, preserving save/load and XGBoost compatibility. A transfer-aware selector keeps small or transfer-heavy batches on CPU. CPU single-thread, CPU multi-thread, and GPU outputs preserve the same row order and prediction bits for the same model.
 
 ### Known limitations
 
-* **CPU prediction:** tree scoring is currently single-threaded. Large-batch inference may be faster through XGBoost model interchange.
 * **Row-sampling efficiency:** `subsample` currently preserves full-row routing so every row receives every learned tree. Column sampling is physically selective on the column-major GPU path; the row-major path skips unselected accumulation but retains full-width histogram buffers.
-* **GPU inference:** post-training prediction currently runs on CPU, including models trained on GPU.
-* **Multi-GPU:** training currently uses one selected GPU per job; multi-GPU execution is not yet implemented.
+* **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
+* **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
-These are performance and feature limitations, not correctness failures. Future work includes parallel CPU prediction, more selective row-sampling execution, and multi-GPU support.
+These are performance and feature limitations, not correctness failures. Future work includes more selective row-sampling execution, GPU inference pipeline overlap, and multi-GPU support.
 
 ## Learn more
 

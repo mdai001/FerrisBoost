@@ -17,6 +17,7 @@ pub mod callback;
 pub mod train;
 pub mod source;
 pub mod backend;
+mod inference;
 mod threading;
 
 #[cfg(feature = "python")]

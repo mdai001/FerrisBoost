@@ -28,36 +28,83 @@ pub fn for_each_batch<F>(
     n_features: usize,
     csv_has_header: bool,
     ingest_threads: usize,
+    on_rows: F,
+) -> Result<usize>
+where
+    F: FnMut(&[Vec<f32>]) -> Result<()>,
+{
+    let projected_features = (0..n_features).collect::<Vec<_>>();
+    for_each_projected_batch(
+        resolved,
+        feature_names,
+        n_features,
+        &projected_features,
+        csv_has_header,
+        ingest_threads,
+        on_rows,
+    )
+}
+
+/// Validate the complete canonical schema, then materialize only the feature
+/// ids used by the private inference representation. Canonical ids remain the
+/// file/model contract; `projected_features` only defines callback row layout.
+pub fn for_each_projected_batch<F>(
+    resolved: &ResolvedInput,
+    canonical_feature_names: &[String],
+    canonical_n_features: usize,
+    projected_features: &[usize],
+    csv_has_header: bool,
+    ingest_threads: usize,
     mut on_rows: F,
 ) -> Result<usize>
 where
     F: FnMut(&[Vec<f32>]) -> Result<()>,
 {
+    if projected_features.is_empty() {
+        bail!("prediction feature projection 不能为空");
+    }
+    if projected_features.windows(2).any(|pair| pair[0] >= pair[1])
+        || projected_features
+            .iter()
+            .any(|&feature| feature >= canonical_n_features)
+    {
+        bail!("prediction feature projection 必须是有序、去重且不越界的 canonical id");
+    }
     let mut total = 0usize;
     let batches: super::parallel_reader::BatchIter = if resolved.paths.len() == 1 {
         open_projected(
             &resolved.paths[0],
             resolved.format,
-            feature_names,
-            n_features,
+            canonical_feature_names,
+            canonical_n_features,
+            projected_features,
             csv_has_header,
             ingest_threads,
         )?
     } else {
         let paths = Arc::new(resolved.paths.clone());
-        let names = Arc::new(feature_names.to_vec());
+        let names = Arc::new(canonical_feature_names.to_vec());
+        let projected = Arc::new(projected_features.to_vec());
         let format = resolved.format;
         Box::new(super::parallel_reader::ordered_parallel_batches(
             paths.len(),
             ingest_threads,
             move |index| {
-                open_projected(&paths[index], format, &names, n_features, csv_has_header, 1)
+                open_projected(
+                    &paths[index],
+                    format,
+                    &names,
+                    canonical_n_features,
+                    &projected,
+                    csv_has_header,
+                    1,
+                )
             },
         ))
     };
     for batch in batches {
         let batch = batch?;
-        let rows = batch_to_rows(&batch, n_features)?;
+        let rows = batch_to_rows(&batch, projected_features.len())?;
         total += rows.len();
         on_rows(&rows)?;
     }
@@ -68,15 +115,20 @@ where
 fn open_projected(
     path: &Path,
     format: InputFormat,
-    feature_names: &[String],
-    n_features: usize,
+    canonical_feature_names: &[String],
+    canonical_n_features: usize,
+    projected_features: &[usize],
     csv_has_header: bool,
     ingest_threads: usize,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + 'static>> {
     match format {
         InputFormat::Parquet => {
             let names = super::parquet_source::all_column_names(path)?;
-            let proj = bind(&names, feature_names, n_features, path)?;
+            let canonical = bind(&names, canonical_feature_names, canonical_n_features, path)?;
+            let proj = projected_features
+                .iter()
+                .map(|&feature| canonical[feature])
+                .collect::<Vec<_>>();
             let (mask, order) = projection_and_order(&proj);
             Ok(Box::new(
                 super::parquet_source::raw_batches_with_nthread(path, &mask, ingest_threads)?
@@ -85,7 +137,11 @@ fn open_projected(
         }
         InputFormat::Csv => {
             let (schema, names) = super::csv_source::schema_and_names(path, csv_has_header)?;
-            let proj = bind(&names, feature_names, n_features, path)?;
+            let canonical = bind(&names, canonical_feature_names, canonical_n_features, path)?;
+            let proj = projected_features
+                .iter()
+                .map(|&feature| canonical[feature])
+                .collect::<Vec<_>>();
             let (mask, order) = projection_and_order(&proj);
             Ok(Box::new(
                 super::csv_source::raw_batches_with_nthread(

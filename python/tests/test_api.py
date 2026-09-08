@@ -321,8 +321,54 @@ def test_ingest_threads_preserve_models_and_row_order(tmp_path, fmt, multi):
         model.save_model(str(path), quiet=True)
         saved.append(path.read_bytes())
     assert saved[0] == saved[1] == saved[2]
-    predictions = [model.predict(data).tobytes() for model in models]
-    assert predictions[0] == predictions[1] == predictions[2]
+    reference = models[0].predict(data, predict_threads=1).tobytes()
+    predictions = [
+        model.predict(data, predict_threads=threads).tobytes()
+        for model in models
+        for threads in (0, 1, 2, 4)
+    ]
+    assert all(prediction == reference for prediction in predictions)
+
+
+def test_file_prediction_compacts_used_features_but_validates_full_schema(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    rng = np.random.default_rng(20260908)
+    x = np.zeros((1200, 8), dtype=np.float32)
+    x[:, 0] = rng.normal(size=len(x))
+    y = (x[:, 0] > 0).astype(np.float32)
+    names = [f"f{i}" for i in range(x.shape[1])]
+    train_path = tmp_path / "compact-train.parquet"
+    pq.write_table(
+        pa.table({**{name: x[:, i] for i, name in enumerate(names)}, "target": y}),
+        train_path,
+    )
+    model = fb.train(
+        {**BASE, "max_depth": 3, "nthread": 1},
+        train_path,
+        label="target",
+        num_boost_round=8,
+        quiet=True,
+    )
+
+    before = tmp_path / "canonical-before.json"
+    model.save_model(str(before), quiet=True)
+    want = model.predict(x, output_margin=True, predict_threads=1)
+    got = model.predict(train_path, output_margin=True, predict_threads=4)
+    assert got.tobytes() == want.tobytes()
+    after = tmp_path / "canonical-after.json"
+    model.save_model(str(after), quiet=True)
+    assert before.read_bytes() == after.read_bytes()
+
+    # f7 is constant and cannot participate in a split, but it remains part of
+    # the canonical model schema. Compaction must never weaken schema checks.
+    missing_unused = tmp_path / "missing-unused.parquet"
+    pq.write_table(
+        pa.table({name: x[:, i] for i, name in enumerate(names[:-1])}),
+        missing_unused,
+    )
+    with pytest.raises(ValueError, match="f7"):
+        model.predict(missing_unused)
 
 
 def test_io_thread_auto_and_negative_validation():
@@ -452,10 +498,17 @@ def test_predict_accepts_all_numpy_2d_layouts(objective):
     assert fortran.flags["F_CONTIGUOUS"] and not fortran.flags["C_CONTIGUOUS"]
     assert not strided.flags["C_CONTIGUOUS"]
 
-    want = model.predict(x, output_margin=True).tobytes()
-    assert model.predict(fortran, output_margin=True).tobytes() == want
-    assert model.predict(strided, output_margin=True).tobytes() == want
-
+    want = model.predict(x, output_margin=True, predict_threads=1).tobytes()
+    for threads in (0, 1, 2, 4):
+        assert model.predict(
+            x, output_margin=True, predict_threads=threads
+        ).tobytes() == want
+        assert model.predict(
+            fortran, output_margin=True, predict_threads=threads
+        ).tobytes() == want
+        assert model.predict(
+            strided, output_margin=True, predict_threads=threads
+        ).tobytes() == want
 
 def test_gil_is_released_during_training():
     """训练时要放掉 GIL,否则调用方的其它线程会被卡住。"""
@@ -477,6 +530,37 @@ def test_gil_is_released_during_training():
     stop.set()
     t.join()
     assert len(ticks) > 5, f"训练期间别的线程只跑了 {len(ticks)} 次,GIL 大概没放开"
+
+
+def test_gil_is_released_during_numpy_prediction():
+    """NumPy scoring can be long-running and must not retain the Python GIL."""
+    import threading
+    import time
+
+    x, y = toy(n=4000, m=20, seed=91)
+    model = fb.train(
+        {**BASE, "max_depth": 6, "nthread": 1},
+        x,
+        label=y,
+        num_boost_round=30,
+    )
+    predict_x = np.tile(x, (20, 1))
+    ticks = []
+    stop = threading.Event()
+
+    def ticker():
+        while not stop.is_set():
+            ticks.append(time.perf_counter())
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=ticker)
+    thread.start()
+    model.predict(predict_x, predict_threads=1)
+    stop.set()
+    thread.join()
+    assert len(ticks) > 5, (
+        f"prediction 期间别的线程只跑了 {len(ticks)} 次,GIL 大概没放开"
+    )
 
 
 # ---------------------------------------------------------------- 量化缓存
