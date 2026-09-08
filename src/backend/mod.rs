@@ -106,6 +106,7 @@ pub mod cuda {
         pub fn timing_enabled(&self) -> bool { match self.0 {} }
         pub fn hist_stream_count(&self) -> usize { match self.0 {} }
         pub fn resident_block_count(&self) -> usize { match self.0 {} }
+        pub fn supports_compact_column_histogram(&self) -> bool { match self.0 {} }
         pub fn device_mem_used(&self) -> Result<(usize, usize)> { match self.0 {} }
         pub fn upload_gpair(&self, _gpair: &[GradPairFixed]) -> Result<f32> { match self.0 {} }
         pub fn device_quantize_enabled(&self) -> bool { match self.0 {} }
@@ -130,6 +131,7 @@ pub mod cuda {
         }
         pub fn block_session(
             &self, _block: usize, _data: &[Bin], _rows: usize, _feats: usize, _offsets: &[u32],
+            _selected_local: Option<&[usize]>,
         ) -> Result<GpuBlockSession<'_>> { match self.0 {} }
         pub fn partition_session(&self, _col: &[Bin]) -> Result<GpuPartitionSession<'_>> {
             match self.0 {}
@@ -157,7 +159,6 @@ pub mod cuda {
         ) -> Result<()> { match self.0 {} }
         pub fn histogram_device_batch(
             &mut self, _spans: &[GpuRowSpan], _outs: &mut [&mut Vec<GradPairFixed>],
-            _feat_mask: u32,
         ) -> Result<()> { match self.0 {} }
         pub fn hist_nodes_batch_capacity(&self) -> usize { match self.0 {} }
         pub fn requires_batched_hist(&self) -> bool { match self.0 {} }

@@ -1521,8 +1521,11 @@ fn build_tree(
         /// ⚠️ 曾经把它和 `sampled_global` 合成一个字段,结果不支持部分读的
         /// source 交回整块、而 offsets 按子集算,直接对不上 —— 断言抓到了。
         handed_feats: Vec<FeatId>,
-        /// 直方图 offsets,按**实际交给 histogram 的那个块**算。
-        offsets: Vec<u32>,
+        /// 直方图的逻辑特征。column-major GPU 可只含采样列,即使
+        /// resident `handed_feats` 仍保持完整物理块。
+        hist_feats: Vec<FeatId>,
+        /// 与 `hist_feats` 一一对应的紧凑 histogram offsets。
+        hist_offsets: Vec<u32>,
         /// 是否物化成压实块(只读选中列)。resident 块恒为 false。
         compact: bool,
     }
@@ -1540,6 +1543,7 @@ fn build_tree(
     // GPU resident 的块保持原样(整块常驻,采样只影响 compute);
     // 其余块允许按采样列压实,从而在 source 侧就少读。
     let resident_upto = gpu.map_or(0, |c| c.resident_block_count());
+    let compact_gpu_hist = gpu.is_some_and(|c| c.supports_compact_column_histogram());
     let supports_cols = source.supports_column_selection();
     let plans: Vec<BlockPlan> = match sampled {
         Some(sel) => crate::colsample::required_blocks(sel, &all_block_feats)
@@ -1559,13 +1563,19 @@ fn build_tree(
                 } else {
                     all_block_feats[physical].clone()
                 };
-                let offsets = cuts.block_hist_offsets(&handed_feats);
+                let hist_feats = if compact_gpu_hist {
+                    sampled_global.clone()
+                } else {
+                    handed_feats.clone()
+                };
+                let hist_offsets = cuts.block_hist_offsets(&hist_feats);
                 BlockPlan {
                     physical,
                     sampled_global,
                     orig_local,
                     handed_feats,
-                    offsets,
+                    hist_feats,
+                    hist_offsets,
                     compact,
                 }
             })
@@ -1576,7 +1586,8 @@ fn build_tree(
                 sampled_global: all_block_feats[physical].clone(),
                 orig_local: (0..all_block_feats[physical].len()).collect(),
                 handed_feats: all_block_feats[physical].clone(),
-                offsets: cuts.block_hist_offsets(&all_block_feats[physical]),
+                hist_feats: all_block_feats[physical].clone(),
+                hist_offsets: cuts.block_hist_offsets(&all_block_feats[physical]),
                 compact: false,
             })
             .collect(),
@@ -1653,7 +1664,7 @@ fn build_tree(
                         block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
                         "列块 {b} 数据长度与行数 × 特征数不一致"
                     );
-                    let width = *plan.offsets.last().unwrap() as usize;
+                    let width = *plan.hist_offsets.last().unwrap() as usize;
                     // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
                     // 原来这里给每个槽位都分配 + 清零一个完整直方图,相减节点
                     // 那一半分配完立刻被扔掉。
@@ -1686,26 +1697,12 @@ fn build_tree(
                     hist_data,
                             hist_rows,
                             block.n_feats(),
-                            &plan.offsets,
+                            &plan.hist_offsets,
+                            match sampled {
+                                Some(_) if !plan.compact => Some(plan.orig_local.as_slice()),
+                                _ => None,
+                            },
                         )?;
-                        // 交给 kernel 的位图,按**这个块实际交回来的特征**算。
-                        //
-                        // - 压实块:每一列都是选中的 → 全 1;
-                        // - resident 整块:采样只影响 compute,这里才真正
-                        //   起到跳过未选中特征的作用。
-                        let feat_mask: u32 = match sampled {
-                            Some(_) if plan.compact => !0u32,
-                            Some(sel) => {
-                                let mut m = 0u32;
-                                for (l, f) in block.feat_ids.iter().enumerate() {
-                                    if l < 32 && sel.binary_search(f).is_ok() {
-                                        m |= 1u32 << l;
-                                    }
-                                }
-                                m
-                            }
-                            None => !0u32,
-                        };
                         // 整层的 Accumulate 节点按容量分批合并 launch。
                         // 容量 1 就是原来的逐节点路径,一个字都没变。
                         let cap = session.hist_nodes_batch_capacity();
@@ -1745,7 +1742,7 @@ fn build_tree(
                                     rest = tail;
                                     taken = i + 1;
                                 }
-                                session.histogram_device_batch(&spans, &mut outs, feat_mask)?;
+                                session.histogram_device_batch(&spans, &mut outs)?;
                             }
                         }
                         let timing = session.timing();
@@ -1774,7 +1771,7 @@ fn build_tree(
                                     &block.data,
                                     block.n_rows,
                                     block.n_feats(),
-                                    &plan.offsets,
+                                    &plan.hist_offsets,
                                     gpair,
                                     rows,
                                     &mut per_node[i].bins,
@@ -1816,8 +1813,8 @@ fn build_tree(
                         .map(|(i, ln)| {
                             split::best_split_in_block(
                                 &per_node[i],
-                                &block.feat_ids,
-                                &plan.offsets,
+                                &plan.hist_feats,
+                                &plan.hist_offsets,
                                 ln.sum,
                                 q,
                                 p,

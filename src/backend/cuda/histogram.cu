@@ -803,7 +803,9 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
     const uint32_t* node_off,
     const uint32_t* node_len,
     uint32_t n_nodes,
-    uint32_t hist_stride) {
+    uint32_t hist_stride,
+    const uint32_t* feature_select,
+    uint32_t selection_active) {
     extern __shared__ unsigned int fused_hist_b[];
     __shared__ uint32_t s_node;
 
@@ -876,13 +878,15 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
         __syncthreads();
 
         for (uint32_t feat = f0; feat < f1; ++feat) {
+            const uint32_t physical_feat =
+                selection_active != 0 ? feature_select[feat] : feat;
             const uint32_t off = feat_offsets[feat] - hist_begin;
 #pragma unroll
             for (int r = 0; r < ROWS_PER_THREAD; ++r) {
                 if (!ok[r]) {
                     continue;
                 }
-                const uint8_t bin = bins[(uint64_t)feat * n_rows + rows_v[r]];
+                const uint8_t bin = bins[(uint64_t)physical_feat * n_rows + rows_v[r]];
                 if (bin == UINT8_MAX) {
                     continue;
                 }

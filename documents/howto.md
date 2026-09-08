@@ -534,8 +534,8 @@ empty `evals_result()`.
 | `lambda` | `1.0` | Alias: `reg_lambda` |
 | `gamma` | `0.0` | Minimum split loss |
 | `min_child_weight` | `1.0` | Minimum child Hessian |
-| `subsample` | `1.0` | Other values are not implemented by the trainer |
-| `colsample_bytree` | `1.0` | Other values are not implemented by the trainer |
+| `subsample` | `1.0` | Deterministic per-tree row sampling in `(0, 1]`; all rows still receive the learned tree |
+| `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `cols_per_block` | automatic | Positive integer; normally leave unset |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |

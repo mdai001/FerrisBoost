@@ -87,6 +87,8 @@ pub struct GpuMemoryBudget {
     /// 行主序原型的转置暂存区(一块,不随 resident 块数增长)。关闭时为 0。
     pub rm_stage_bytes: usize,
     pub offsets_bytes: usize,
+    /// 每个 histogram slot 的 colsample 选择表,O(max block features)。
+    pub hist_feature_select_bytes: usize,
     /// 每棵树的叶子预测增量；写完一次 D2H，供下一轮算梯度。
     pub prediction_bytes: usize,
     /// device-side quantization 的 f32 gpair 与两个归约 buffer。关闭时为 0。
@@ -142,6 +144,7 @@ impl GpuMemoryBudget {
             + self.hist_nodes_batch_idx_bytes
             + self.fast_math_bytes
             + self.rm_stage_bytes
+            + self.hist_feature_select_bytes
     }
 
     /// 只随行数走、列分块压不掉的那部分。
@@ -161,7 +164,7 @@ impl GpuMemoryBudget {
         format!(
             "预分配显存 {:.1} MB({} 条 histogram stream) = gpair {:.1} + row_idx {:.1} + partition 输出 {:.1} \
              + partition 临时 {:.1} + partition 取列 {:.1} + 列块 buffer {:.1} \
-             + 直方图 {:.1} + offsets {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
+             + 直方图 {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -172,6 +175,7 @@ impl GpuMemoryBudget {
             mb(self.block_bins_bytes),
             mb(self.hist_bytes),
             mb(self.offsets_bytes),
+            mb(self.hist_feature_select_bytes),
             mb(self.prediction_bytes),
             mb(self.gpair_f32_bytes),
             mb(self.hist_nodes_batch_idx_bytes),
@@ -351,6 +355,8 @@ struct GpuHistBuffers {
     stream: Arc<CudaStream>,
     bins: CudaSlice<u8>,
     offsets: CudaSlice<u32>,
+    /// Column-major colsample index scratch, one u32 per local feature.
+    feature_select: CudaSlice<u32>,
     hist_out: CudaSlice<i64>,
     /// Multi-node batching 的 block -> node 映射,布局是
     /// `[blk_ptr(batch+1) | node_off(batch) | node_len(batch)]`。
@@ -671,7 +677,7 @@ impl GpuTrainCtx {
         } else {
             (None, None, None)
         };
-        let hist_batched_fn = if hist_fused_fn.is_some() && hist_nodes_per_batch > 1 {
+        let hist_batched_fn = if hist_fused_fn.is_some() {
             Some(
                 state
                     .module
@@ -756,7 +762,7 @@ impl GpuTrainCtx {
         // ⚠️ 行主序**只有 batched 一个入口**,所以哪怕
         // `hist_nodes_per_batch == 1` 也要按批分配 —— 否则批里那一个节点
         // 要写 4 个 u32 到一个长度为 1 的 buffer 上,cudarc 直接 panic。
-        let batch_capable = hist_nodes_per_batch > 1 || row_major;
+        let batch_capable = hist_fused_fn.is_some() || row_major;
         let batch_idx_len = if batch_capable { hist_nodes_per_batch.max(1) * 3 + 1 } else { 1 };
 
         // 默认双流；同一 binary 可用 1 做严格 A/B。只开放 1/2，避免把
@@ -1017,6 +1023,9 @@ impl GpuTrainCtx {
             let offsets = hist_stream
                 .alloc_zeros::<u32>(offsets_len)
                 .with_context(|| format!("histogram slot {slot} offsets buffer 分配"))?;
+            let feature_select = hist_stream
+                .alloc_zeros::<u32>(max_block_feats.max(1))
+                .with_context(|| format!("histogram slot {slot} colsample buffer 分配"))?;
             let hist_out = hist_stream
                 .alloc_zeros::<i64>((hist_words * hist_nodes_per_batch).max(1))
                 .with_context(|| format!("histogram slot {slot} 输出 buffer 分配"))?;
@@ -1047,6 +1056,7 @@ impl GpuTrainCtx {
                 stream: hist_stream,
                 bins,
                 offsets,
+                feature_select,
                 hist_out,
                 batch_idx,
                 hist_host: Vec::new(),
@@ -1065,6 +1075,8 @@ impl GpuTrainCtx {
                 .with_context(|| format!("resident block {cache_slot} buffer 分配"))?;
             let offsets = hist_stream.alloc_zeros::<u32>(offsets_len)
                 .with_context(|| format!("resident block {cache_slot} offsets 分配"))?;
+            let feature_select = hist_stream.alloc_zeros::<u32>(max_block_feats.max(1))
+                .with_context(|| format!("resident block {cache_slot} colsample buffer 分配"))?;
             let hist_out = hist_stream.alloc_zeros::<i64>((hist_words * hist_nodes_per_batch).max(1))
                 .with_context(|| format!("resident block {cache_slot} histogram 分配"))?;
             let batch_idx = hist_stream.alloc_zeros::<u32>(batch_idx_len)
@@ -1086,7 +1098,7 @@ impl GpuTrainCtx {
                 None
             };
             hist_slots.push(Mutex::new(GpuHistBuffers {
-                stream: hist_stream, bins, offsets, hist_out, batch_idx,
+                stream: hist_stream, bins, offsets, feature_select, hist_out, batch_idx,
                 hist_host: Vec::new(),
                 bins_host, rm_stage, start_event, end_event,
                 resident_feats: 0, resident_block: None,
@@ -1130,6 +1142,8 @@ impl GpuTrainCtx {
                 0
             },
             offsets_bytes: offsets_len * 4 * (hist_stream_count + resident_block_count),
+            hist_feature_select_bytes: max_block_feats.max(1) * 4
+                * (hist_stream_count + resident_block_count),
             prediction_bytes: n_rows * 4,
         };
         // ⚠️ **预算必须report实际分配的东西,不能按公式猜。**
@@ -1330,6 +1344,12 @@ impl GpuTrainCtx {
     /// 采样集变化,而 slot 是按物理块号缓存的)。
     pub fn resident_block_count(&self) -> usize {
         self.resident_block_count
+    }
+
+    /// Compact selected-feature histograms are available only on the normal
+    /// batched column-major path. Bucket profiling keeps the legacy kernels.
+    pub fn supports_compact_column_histogram(&self) -> bool {
+        self.rm_hist_fn.is_none() && self.hist_batched_fn.is_some()
     }
 
     pub fn hist_stream_count(&self) -> usize {
@@ -1840,6 +1860,7 @@ impl GpuTrainCtx {
         block_n_rows: usize,
         n_feats: usize,
         feat_offsets: &[u32],
+        selected_local: Option<&[usize]>,
     ) -> Result<GpuBlockSession<'_>> {
         // selected-row packing 之后,交给 histogram 的块**行数会更少**
         // (只含采样行),所以这里不能再要求等于训练行数。
@@ -1857,13 +1878,33 @@ impl GpuTrainCtx {
         if block_data.len() != n_feats.saturating_mul(block_n_rows) {
             bail!("bins 长度与 n_feats × n_rows 不符");
         }
-        if feat_offsets.len() != n_feats + 1 || feat_offsets.first() != Some(&0) {
-            bail!("feat_offsets 必须从 0 开始且长度为 n_feats + 1");
+        if feat_offsets.is_empty() || feat_offsets.first() != Some(&0) {
+            bail!("feat_offsets 必须从 0 开始且非空");
         }
+        let hist_n_feats = feat_offsets.len() - 1;
         if feat_offsets.windows(2).any(|pair| pair[0] > pair[1]) {
             bail!("feat_offsets 必须单调不减");
         }
-        let n_hist = feat_offsets[n_feats] as usize;
+        if let Some(selected) = selected_local {
+            if selected.windows(2).any(|pair| pair[0] >= pair[1])
+                || selected.iter().any(|&feat| feat >= n_feats)
+            {
+                bail!("colsample 局部特征必须严格递增且小于物理 n_feats");
+            }
+        }
+        let column_major = self.rm_transpose_fn.is_none();
+        if column_major {
+            if let Some(selected) = selected_local {
+                if selected.len() != hist_n_feats {
+                    bail!("column-major selected_local 必须与紧凑 histogram 特征数相等");
+                }
+            } else if hist_n_feats != n_feats {
+                bail!("无 selected_local 时 histogram 特征数必须等于物理 n_feats");
+            }
+        } else if hist_n_feats != n_feats {
+            bail!("row-major histogram offsets 必须保持物理全宽");
+        }
+        let n_hist = feat_offsets[hist_n_feats] as usize;
         // 独立入口每次调用都全量扫一遍 bin 范围;那是 O(行数 × 特征数),
         // 和 kernel 本身一个量级,接进训练循环就不能每块都付。
         //
@@ -1871,9 +1912,14 @@ impl GpuTrainCtx {
         // 产生,要么 < n_bins 要么是 MISSING_BIN。debug 构建仍然验一遍,
         // 因为越界的后果是 shared memory 越界写,不是一个错数字。
         debug_assert!(
-            (0..n_feats).all(|feat| {
-                let n_bins = feat_offsets[feat + 1] - feat_offsets[feat];
-                block_data[feat * block_n_rows..(feat + 1) * block_n_rows]
+            (0..hist_n_feats).all(|hist_feat| {
+                let physical_feat = if column_major {
+                    selected_local.map_or(hist_feat, |selected| selected[hist_feat])
+                } else {
+                    hist_feat
+                };
+                let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
+                block_data[physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows]
                     .iter()
                     .all(|&bin| bin == crate::types::MISSING_BIN || u32::from(bin) < n_bins)
             }),
@@ -1901,6 +1947,18 @@ impl GpuTrainCtx {
         }
 
         let cache_hit = slot.resident_block == Some(block_index);
+        let selection_active = selected_local.is_some_and(|selected| selected.len() < n_feats);
+        let row_major_feat_mask = if selection_active {
+            let mut mask = 0u32;
+            for &feat in selected_local.expect("selection_active 蕴含 selected_local") {
+                if feat < 32 {
+                    mask |= 1u32 << feat;
+                }
+            }
+            mask
+        } else {
+            !0u32
+        };
         // 这里是唯一一次量化数据的 H2D。块本身在调用方的 `with_block`
         // 闭包结束时就还回去了,device 上留下的只是 slot 的可覆写 buffer。
         // 行主序的 pinned 落地在下面的分块循环里做(`RmStaging.host`),
@@ -1923,7 +1981,6 @@ impl GpuTrainCtx {
             let GpuHistBuffers {
                 bins,
                 bins_host,
-                offsets,
                 rm_stage,
                 ..
             } = &mut *slot;
@@ -2032,10 +2089,6 @@ impl GpuTrainCtx {
                     }
                 }
             }
-            let mut offsets_view = offsets.slice_mut(..feat_offsets.len());
-            hist_stream
-                .memcpy_htod(feat_offsets, &mut offsets_view)
-                .context("feat_offsets H2D")?;
         }
         if block_index < self.resident_block_count {
             // 宽度和块号**必须一起写** —— 只写块号就等于让下游去反推宽度,
@@ -2043,6 +2096,23 @@ impl GpuTrainCtx {
             slot.resident_feats = n_feats;
             slot.resident_block = Some(block_index);
         }
+        }
+        {
+            let mut offsets_view = slot.offsets.slice_mut(..feat_offsets.len());
+            hist_stream
+                .memcpy_htod(feat_offsets, &mut offsets_view)
+                .context("feat_offsets H2D")?;
+        }
+        if selection_active {
+            let selected = selected_local.expect("selection_active 蕴含 selected_local");
+            let selected_u32: Vec<u32> = selected
+                .iter()
+                .map(|&feat| u32::try_from(feat).context("局部特征下标超过 u32"))
+                .collect::<Result<_>>()?;
+            let mut feature_select_view = slot.feature_select.slice_mut(..selected_u32.len());
+            hist_stream
+                .memcpy_htod(&selected_u32, &mut feature_select_view)
+                .context("colsample feature indices H2D")?;
         }
         self.sync_hist_if_timing(&hist_stream)?;
         let block_h2d_ms = if self.timing {
@@ -2053,17 +2123,24 @@ impl GpuTrainCtx {
 
         let timing = GpuSegmentTiming {
             block_h2d_ms,
-            block_h2d_calls: u64::from(!cache_hit) * 2,
-            block_h2d_bytes: u64::from(!cache_hit) * (block_data.len() + std::mem::size_of_val(feat_offsets)) as u64,
+            block_h2d_calls: u64::from(!cache_hit) + 1 + u64::from(selection_active),
+            block_h2d_bytes: u64::from(!cache_hit) * block_data.len() as u64
+                + std::mem::size_of_val(feat_offsets) as u64
+                + selected_local.map_or(0, |selected| {
+                    (selected.len() * std::mem::size_of::<u32>()) as u64
+                }),
             ..Default::default()
         };
         Ok(GpuBlockSession {
             ctx: self,
             slot: Some(slot),
             lease,
-            n_feats,
+            physical_n_feats: n_feats,
+            n_feats: hist_n_feats,
             n_hist,
             feat_offsets: feat_offsets.to_vec(),
+            selection_active,
+            row_major_feat_mask,
             timing,
             feature_tiles: 0,
         })
@@ -2218,9 +2295,14 @@ pub struct GpuBlockSession<'a> {
     // Option 只为 Drop 时先释放 mutex guard、再把 slot 号还给 pool。
     slot: Option<MutexGuard<'a, GpuHistBuffers>>,
     lease: Option<HistSlotLease<'a>>,
+    /// Number of columns in the resident/streamed bins allocation.
+    physical_n_feats: usize,
+    /// Number of logical columns represented in the histogram output.
     n_feats: usize,
     n_hist: usize,
     feat_offsets: Vec<u32>,
+    selection_active: bool,
+    row_major_feat_mask: u32,
     timing: GpuSegmentTiming,
     feature_tiles: usize,
 }
@@ -2641,17 +2723,12 @@ impl GpuBlockSession<'_> {
     /// 是 memcpy。
     ///
     /// 调用方保证 `spans.len() == outs.len()`,且不超过 `hist_nodes_per_batch`。
-    /// `feat_mask`:本列块里被选中的局部特征位图(`colsample_bytree`)。
-    /// `!0` = 全选。行主序一块最多 32 个特征,所以一个 u32 够用。
-    ///
-    /// ⚠️ 只有行主序 kernel 会用它。列主序参照臂仍然对全部特征建直方图
-    /// —— 结果**仍然正确**(枚举侧已经跳过未选中的特征),只是不省计算。
-    /// 参照臂的存在是为了 A/B,不是生产路径,所以不为它加这条支路。
+    /// Column-major consumes a compact logical feature list; row-major keeps
+    /// its scalar mask ABI while retaining the full output shape.
     pub fn histogram_device_batch(
         &mut self,
         spans: &[GpuRowSpan],
         outs: &mut [&mut Vec<GradPairFixed>],
-        feat_mask: u32,
     ) -> Result<()> {
         if spans.len() != outs.len() {
             bail!("histogram batch:spans {} 与 outs {} 不等长", spans.len(), outs.len());
@@ -2782,10 +2859,18 @@ impl GpuBlockSession<'_> {
                 .memcpy_htod(&idx_host, &mut idx_view)
                 .context("批 block->node 索引 H2D")?;
 
-            let GpuHistBuffers { bins, offsets, hist_out, batch_idx, .. } = &mut **slot;
+            let GpuHistBuffers {
+                bins,
+                offsets,
+                feature_select,
+                hist_out,
+                batch_idx,
+                ..
+            } = &mut **slot;
             let GpuBuffers { gpair, rows, .. } = &*core;
-            let bins_view = bins.slice(0..self.n_feats * self.ctx.n_rows);
+            let bins_view = bins.slice(0..self.physical_n_feats * self.ctx.n_rows);
             let offsets_view = offsets.slice(0..=self.n_feats);
+            let feature_select_view = feature_select.slice(0..self.n_feats.max(1));
             let blk_ptr_view = batch_idx.slice(0..n_nodes + 1);
             let node_off_view = batch_idx.slice(n_nodes + 1..n_nodes * 2 + 1);
             let node_len_view = batch_idx.slice(n_nodes * 2 + 1..n_nodes * 3 + 1);
@@ -2797,6 +2882,7 @@ impl GpuBlockSession<'_> {
                 block_dim: (threads_per_block, 1, 1),
                 shared_mem_bytes,
             };
+            let selection_active_u32 = u32::from(self.selection_active);
             let mut launch = stream.launch_builder(batched_fn);
             launch
                 .arg(&bins_view)
@@ -2813,7 +2899,9 @@ impl GpuBlockSession<'_> {
                 .arg(&n_nodes_u32)
                 .arg(&hist_stride_u32);
             if row_major {
-                launch.arg(&feat_mask);
+                launch.arg(&self.row_major_feat_mask);
+            } else {
+                launch.arg(&feature_select_view).arg(&selection_active_u32);
             }
             unsafe { launch.launch(cfg) }.context("launch batched histogram")?;
             self.timing.kernel_calls += 1;
@@ -2879,7 +2967,7 @@ impl GpuBlockSession<'_> {
     /// 这个 bug 被 `gpu_multi_node_batching_crosses_the_batch_boundary`
     /// 抓到过一次。
     pub fn requires_batched_hist(&self) -> bool {
-        self.ctx.rm_hist_fn.is_some()
+        self.ctx.rm_hist_fn.is_some() || self.selection_active
     }
 
     pub fn timing(&self) -> GpuSegmentTiming {

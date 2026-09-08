@@ -12,6 +12,7 @@ In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not b
 
 - **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–8× faster** while slashing peak host RAM by **2–4×** (`0.24–0.48× XGBoost`).
 - **Adaptive VRAM Management**: Instead of requiring manual external-memory configurations when datasets exceed physical VRAM, FerrisBoost features an adaptive GPU memory planner that automatically manages residency—seamlessly transitioning between full VRAM residency, hybrid CPU/GPU caching, and streaming execution under memory pressure.
+- **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
 - **Deterministic Parity & Flexible Math Modes**: FerrisBoost provides deterministic training semantics. Use `gpu_math="exact"` (default) for byte-identical CPU/GPU models, or `gpu_math="fast"` for maximum GPU throughput; `fast` is deterministic but does not guarantee byte-identical CPU/GPU models.
@@ -117,6 +118,7 @@ model = fb.train(
 
 - **`device`**: Single GPU today (`device="cuda"` or `device="cuda:N"`); multi-GPU scaling is in progress (WIP).
 - **Adaptive VRAM**: Automatically manages GPU memory, dynamically adapting between full residency and streaming execution based on dataset size and available VRAM.
+- **`colsample_bytree`**: Selects a deterministic feature subset per tree. Column-major GPU execution uses that subset as the logical histogram execution/output width while preserving the physical resident-block layout and model compatibility.
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
 - **`nthread`**: `0` selects available physical CPU parallelism.
 
@@ -199,11 +201,11 @@ In the current release, FerrisBoost model prediction runs single-threaded on the
 ### Known limitations
 
 * **CPU prediction:** tree scoring is currently single-threaded. Large-batch inference may be faster through XGBoost model interchange.
-* **Sampling efficiency:** subsampling currently preserves full row traversal. On the full-resident column-major GPU path, colsample reduces split enumeration but does not yet skip histogram construction for unselected features.
+* **Row-sampling efficiency:** `subsample` currently preserves full-row routing so every row receives every learned tree. Column sampling is physically selective on the column-major GPU path; the row-major path skips unselected accumulation but retains full-width histogram buffers.
 * **GPU inference:** post-training prediction currently runs on CPU, including models trained on GPU.
 * **Multi-GPU:** training currently uses one selected GPU per job; multi-GPU execution is not yet implemented.
 
-These are performance and feature limitations, not correctness failures. Future work includes parallel CPU prediction, more selective histogram execution, and multi-GPU support.
+These are performance and feature limitations, not correctness failures. Future work includes parallel CPU prediction, more selective row-sampling execution, and multi-GPU support.
 
 ## Learn more
 
