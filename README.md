@@ -32,6 +32,39 @@ On the tested workloads, FerrisBoost GPU fast used **0.89–1.34×** XGBoost tra
 - **GPU VRAM**: Adaptive; full residency when memory is available, hybrid or streaming under tighter budgets
 - **CPU training**: 1.59–2.42× XGBoost time (reference implementation; not yet optimized)
 
+### v0.0.1-post1 column-sampling validation
+
+`v0.0.1-post1` resolves the column-major resident-path issue where
+`colsample_bytree` reduced split enumeration but left histogram construction
+and device-to-host output effectively full-width. Selected features now define
+the compact histogram initialization, accumulation, sibling subtraction, host
+transfer, and enumeration width while resident feature blocks remain unchanged.
+
+A clean-installed generic wheel was tested on HIGGS Parquet and Epsilon CSV
+with 100 rounds, depth 6, `eta=0.2`, `subsample=0.6`, and
+`colsample_bytree=0.6`. Values are medians of two fresh-process
+forward/reverse runs after full input-cache and per-backend warm-ups:
+
+| Dataset | Backend | Setup | Train | Seconds/round | End-to-end | Peak RAM | Active VRAM |
+|---|---|---:|---:|---:|---:|---:|---:|
+| HIGGS 10.5M × 28 Parquet | CPU | 5.205 s | 67.723 s | 0.6772 | 72.927 s | 816 MiB | 0 |
+| HIGGS 10.5M × 28 Parquet | GPU exact | 6.259 s | 15.475 s | 0.1548 | 21.734 s | 676 MiB | 1,092 MiB |
+| HIGGS 10.5M × 28 Parquet | GPU fast | 6.296 s | 6.176 s | 0.0618 | 12.472 s | 521 MiB | 1,135 MiB |
+| Epsilon 380K × 2,000 CSV | CPU | 52.643 s | 117.610 s | 1.1761 | 170.253 s | 3,468 MiB | 0 |
+| Epsilon 380K × 2,000 CSV | GPU exact | 55.399 s | 15.466 s | 0.1547 | 70.865 s | 3,671 MiB | 1,136 MiB |
+| Epsilon 380K × 2,000 CSV | GPU fast | 54.397 s | 14.744 s | 0.1474 | 69.141 s | 3,417 MiB | 1,070 MiB |
+
+CPU and GPU-exact models and validation predictions were byte-identical on
+both datasets. GPU fast was deterministic; its maximum probability difference
+from exact was `1.1920929e-7`. Validation accuracy/AUC were
+`0.737168/0.818614` on HIGGS and `0.853400/0.930840` on Epsilon for all three
+backends at the shown precision. Prediction/scoring was performed after and
+excluded from timing and memory accounting. Active VRAM is sampled above the
+pre-arm idle baseline and may miss sub-sampling-interval spikes.
+
+This post-fix table is FerrisBoost-only; the cross-implementation ranges above
+come from the broader v0.0.1 release matrix.
+
 ## Install
 
 FerrisBoost is available on [PyPI](https://pypi.org/project/ferrisboost/):
@@ -39,6 +72,9 @@ FerrisBoost is available on [PyPI](https://pypi.org/project/ferrisboost/):
 ```bash
 pip install ferrisboost
 ```
+
+The release tag is `v0.0.1-post1`; Python package metadata uses the normalized
+PEP 440 version `0.0.1.post1`.
 
 One wheel, CPU and NVIDIA GPU support. GPU acceleration is optional; CPU training and inference work without NVIDIA hardware or drivers.
 
