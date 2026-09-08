@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ferrisboost"
+# Kept in step with the Cargo description and the README, which are English.
+description = "Column-blocked gradient boosted trees that train directly from Arrow / Parquet / CSV"
+requires-python = ">=3.9"
+# PEP 639 SPDX form. The legacy `{ text = ... }` table is deprecated and
+# publishes as a bare License field instead of a License-Expression.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# Without this the built METADATA carries no description at all and the
+# project page renders empty.
+readme = "README.md"
+keywords = ["gbdt", "boosting", "xgboost", "arrow", "parquet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://pypi.org/project/ferrisboost/"
+
+[tool.maturin]
+# ⚠️ `pyo3` 在 Cargo.toml 里是 optional(`python` feature 才开),所以显式
+# 写死绑定类型,不依赖自动探测。
+#
+# ⚠️⚠️ **构建时 `--features` 会覆盖下面那行 `features`,不是追加。**
+# 只写 `maturin build --features cuda` 会把 `python` 关掉 —— 产物里没有
+# pyo3,于是 maturin 回退去生成 cffi 声明、用系统 python 失败,吐出一个
+# **22 字节的坏 wheel**。正确写法是把三个都列上:
+#     maturin build --release --features "cuda,python,pyo3/extension-module"
+# 症状(缺 cffi 模块)离原因(feature 被覆盖)很远,所以写在这里。
+bindings = "pyo3"
+# Rust 只做数值内核,参数解析和 dtype 归一化放 Python 那层
+python-source = "python"
+module-name = "ferrisboost._core"
+# extension-module 只在打包时开:开在依赖里的话 cargo test --features python
+# 会因为 Python 符号缺失链接不过
+features = ["python", "pyo3/extension-module"]

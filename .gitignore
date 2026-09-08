@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+*.so
+__pycache__/
+.venv/
+/internal-docs/
+/CLAUDE.md
