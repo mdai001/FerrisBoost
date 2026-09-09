@@ -216,7 +216,9 @@ These are performance and feature limitations, not correctness failures. Future 
 
 ## Learn more
 
-Project homepage and source: [github.com/mdai001/FerrisBoost](https://github.com/mdai001/FerrisBoost).
+Project homepage: [mdai001.github.io/FerrisBoost](https://mdai001.github.io/FerrisBoost/).
+
+Source code: [github.com/mdai001/FerrisBoost](https://github.com/mdai001/FerrisBoost).
 
 See the [Python API How-To](documents/howto.md) for installation details,
 Parquet/CSV input formats, validation, early stopping, model persistence,
