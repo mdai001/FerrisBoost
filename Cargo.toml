@@ -10,9 +10,17 @@ documentation = "https://github.com/mdai001/FerrisBoost"
 readme = "README.md"
 keywords = ["gbdt", "boosting", "xgboost", "arrow", "parquet"]
 categories = ["science", "algorithms"]
-# uv.lock and .gitignore are local development artefacts; they describe this
-# checkout rather than the crate, so they stay out of the published package.
-exclude = ["uv.lock", ".gitignore"]
+# Keep crates.io focused on the Rust library. Python packages, wheel tooling,
+# internal docs, and local development artifacts belong to separate release
+# paths and must not enter the crate archive.
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/src/**",
+    "/tests/**",
+]
 
 [dependencies]
 arrow = "53"
