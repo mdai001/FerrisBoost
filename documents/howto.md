@@ -46,22 +46,26 @@ training; GPU selection does not require users to redesign the loading plan.
 Install the prebuilt wheel from [PyPI](https://pypi.org/project/ferrisboost/):
 
 ```bash
-pip install ferrisboost
+uv venv .venv
+source .venv/bin/activate
+uv pip install ferrisboost
 ```
 
 ### Install from the source tree
 
 FerrisBoost requires Python 3.9 or newer and a Rust toolchain. For development,
-create or activate a virtual environment and install Maturin:
+create a UV-managed virtual environment and install Maturin into it:
 
 ```bash
-python -m pip install --upgrade pip maturin
+uv venv .venv
+source .venv/bin/activate
+uv pip install "maturin>=1.7,<2"
 
 # CPU-only build:
-maturin develop --release
+uv run --no-sync maturin develop --release
 
 # CUDA GPU-enabled build (Turing+ / sm_75+; precompiled PTX bundled):
-maturin develop --release --features "cuda,python,pyo3/extension-module"
+uv run --no-sync maturin develop --release --features "cuda,python,pyo3/extension-module"
 ```
 
 Use a release build for training or benchmarking. A debug build is
@@ -70,12 +74,12 @@ substantially slower.
 To build a wheel instead:
 
 ```bash
-# CPU wheel:
-maturin build --release
-
-# CUDA GPU wheel:
-maturin build --release --features "cuda,python,pyo3/extension-module"
-python -m pip install target/wheels/ferrisboost-*.whl
+# Release wheel. This applies the required feature set, path remapping,
+# stripping, wheel sanitization, and RECORD regeneration.
+WHEEL_PATH=$(MATURIN=.venv/bin/maturin FB_PY=.venv/bin/python \
+  bash scripts/build_wheel.sh | tail -1)
+# Install exactly the newly built artifact, never a stale wildcard match.
+uv pip install "$WHEEL_PATH"
 ```
 
 If a release bundle provides both `generic/` and `x86-64-v3/`, install the
@@ -639,7 +643,7 @@ ValueError: 这个构建没有 CUDA 支持:请用 --features cuda 重新构建,�
 ```
 Rebuild with:
 ```bash
-maturin develop --release --features "cuda,python,pyo3/extension-module"
+uv run --no-sync maturin develop --release --features "cuda,python,pyo3/extension-module"
 ```
 
 ### Header and label specification mismatch

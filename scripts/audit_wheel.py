@@ -12,6 +12,14 @@ z = zipfile.ZipFile(wheel)
 home, user, host = os.path.expanduser("~"), getpass.getuser(), socket.gethostname()
 cwd = os.getcwd()
 
+# The canonical public project URL intentionally contains the maintainer's
+# account name. Remove only these exact, approved identifiers for the username
+# check; a bare username anywhere else remains a finding.
+APPROVED_PUBLIC_IDENTIFIERS = [
+    b"https://github.com/mdai001/FerrisBoost",
+    b"github.com/mdai001/FerrisBoost",
+]
+
 CHECKS = [
     ("home directory",        [home.encode()]),
     ("username",              [user.encode()]),
@@ -48,8 +56,12 @@ findings = 0
 for label, pats in CHECKS:
     hits = []
     for fn, data in blob.items():
+        scan_data = data
+        if label == "username":
+            for approved in APPROVED_PUBLIC_IDENTIFIERS:
+                scan_data = scan_data.replace(approved, b"")
         for pat in pats:
-            if pat and pat in data:
+            if pat and pat in scan_data:
                 hits.append(f"{fn}({pat.decode(errors='replace')[:24]})")
                 break
     if hits:
