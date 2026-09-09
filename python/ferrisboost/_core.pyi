@@ -28,6 +28,17 @@ class Model:
     ) -> NDArray[np.float32]:
         """从二维数组或文件路径预测；无表头 CSV 传 header=False。"""
         ...
+    def predict_to_parquet(
+        self,
+        data: str | PathLike[str] | Sequence[str | PathLike[str]],
+        output_path: str,
+        output_margin: bool = False,
+        n_trees: int | None = None,
+        header: bool = True,
+        *,
+        predict_threads: int = 0,
+        prediction_column: str = "prediction",
+    ) -> int: ...
     def save_model(
         self, path: str, quiet: bool | None = None, model_io_threads: int | None = None
     ) -> None: ...
