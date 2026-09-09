@@ -27,7 +27,8 @@ dynamic = ["version"]
 dependencies = ["numpy>=1.21"]
 
 [project.urls]
-Homepage = "https://pypi.org/project/ferrisboost/"
+Homepage = "https://github.com/mdai001/FerrisBoost"
+Repository = "https://github.com/mdai001/FerrisBoost"
 
 [tool.maturin]
 # ⚠️ `pyo3` 在 Cargo.toml 里是 optional(`python` feature 才开),所以显式
