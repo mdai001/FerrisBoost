@@ -16,7 +16,7 @@ In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not b
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
 - **Deterministic Parity & Flexible Math Modes**: FerrisBoost provides deterministic training semantics. Use `gpu_math="exact"` (default) for byte-identical CPU/GPU models, or `gpu_math="fast"` for maximum GPU throughput; `fast` is deterministic but does not guarantee byte-identical CPU/GPU models.
-- **File-First Rust Data Pipeline**: Train directly from Parquet, CSV, or CSV.gz (single or partitioned files), PyArrow tables, or NumPy arrays without constructing an intermediate `DMatrix`, `QuantileDMatrix`, or custom iterator. Passing file paths lets Rust inspect schemas and stream-quantize required columns directly.
+- **File-First Rust Data Pipeline**: Train directly from Parquet, CSV, or CSV.gz (single or partitioned files), PyArrow tables, or NumPy arrays without constructing an intermediate `DMatrix`, `QuantileDMatrix`, or custom iterator. The Rust CSV path reuses schema preflight, computes cuts and the exact row count on its first pass, then extracts labels and quantizes directly into final column-major buffers on its second pass. File prediction can stream deterministic CPU results directly into one Parquet output without materializing a full NumPy result.
 
 ## Performance vs XGBoost
 
@@ -32,39 +32,6 @@ On the tested workloads, FerrisBoost GPU fast used **0.89–1.34×** XGBoost tra
 - **GPU VRAM**: Adaptive; full residency when memory is available, hybrid or streaming under tighter budgets
 - **CPU training**: 1.59–2.42× XGBoost time (reference implementation; not yet optimized)
 
-### v0.0.1-post1 column-sampling validation
-
-`v0.0.1-post1` resolves the column-major resident-path issue where
-`colsample_bytree` reduced split enumeration but left histogram construction
-and device-to-host output effectively full-width. Selected features now define
-the compact histogram initialization, accumulation, sibling subtraction, host
-transfer, and enumeration width while resident feature blocks remain unchanged.
-
-A clean-installed generic wheel was tested on HIGGS Parquet and Epsilon CSV
-with 100 rounds, depth 6, `eta=0.2`, `subsample=0.6`, and
-`colsample_bytree=0.6`. Values are medians of two fresh-process
-forward/reverse runs after full input-cache and per-backend warm-ups:
-
-| Dataset | Backend | Setup | Train | Seconds/round | End-to-end | Peak RAM | Active VRAM |
-|---|---|---:|---:|---:|---:|---:|---:|
-| HIGGS 10.5M × 28 Parquet | CPU | 5.205 s | 67.723 s | 0.6772 | 72.927 s | 816 MiB | 0 |
-| HIGGS 10.5M × 28 Parquet | GPU exact | 6.259 s | 15.475 s | 0.1548 | 21.734 s | 676 MiB | 1,092 MiB |
-| HIGGS 10.5M × 28 Parquet | GPU fast | 6.296 s | 6.176 s | 0.0618 | 12.472 s | 521 MiB | 1,135 MiB |
-| Epsilon 380K × 2,000 CSV | CPU | 52.643 s | 117.610 s | 1.1761 | 170.253 s | 3,468 MiB | 0 |
-| Epsilon 380K × 2,000 CSV | GPU exact | 55.399 s | 15.466 s | 0.1547 | 70.865 s | 3,671 MiB | 1,136 MiB |
-| Epsilon 380K × 2,000 CSV | GPU fast | 54.397 s | 14.744 s | 0.1474 | 69.141 s | 3,417 MiB | 1,070 MiB |
-
-CPU and GPU-exact models and validation predictions were byte-identical on
-both datasets. GPU fast was deterministic; its maximum probability difference
-from exact was `1.1920929e-7`. Validation accuracy/AUC were
-`0.737168/0.818614` on HIGGS and `0.853400/0.930840` on Epsilon for all three
-backends at the shown precision. Prediction/scoring was performed after and
-excluded from timing and memory accounting. Active VRAM is sampled above the
-pre-arm idle baseline and may miss sub-sampling-interval spikes.
-
-This post-fix table is FerrisBoost-only; the cross-implementation ranges above
-come from the broader v0.0.1 release matrix.
-
 ## Install
 
 FerrisBoost is available on [PyPI](https://pypi.org/project/ferrisboost/):
@@ -72,9 +39,6 @@ FerrisBoost is available on [PyPI](https://pypi.org/project/ferrisboost/):
 ```bash
 pip install ferrisboost
 ```
-
-The release tag is `v0.0.1-post1`; Python package metadata uses the normalized
-PEP 440 version `0.0.1.post1`.
 
 One wheel, CPU and NVIDIA GPU support. GPU acceleration is optional; CPU training and inference work without NVIDIA hardware or drivers.
 
@@ -236,13 +200,14 @@ Because FerrisBoost models are serialized to standard XGBoost-compatible JSON:
 
 FerrisBoost prediction is independent of the training backend. CPU prediction parallelizes deterministic row ranges with `predict_threads=0` by default. CUDA-enabled builds can opt into single-GPU prediction with `use_gpu=True`; repeated calls reuse a lazy compact device model. File prediction validates the complete model schema, then materializes only features used by the trees. The canonical model feature IDs are never rewritten: compact IDs exist only in the cached inference representation, preserving save/load and XGBoost compatibility. A transfer-aware selector keeps small or transfer-heavy batches on CPU. CPU single-thread, CPU multi-thread, and GPU outputs preserve the same row order and prediction bits for the same model.
 
+File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes one `float32` prediction column without collecting the complete result in Python memory.
+
 ### Known limitations
 
-* **Row-sampling efficiency:** `subsample` currently preserves full-row routing so every row receives every learned tree. Column sampling is physically selective on the column-major GPU path; the row-major path skips unselected accumulation but retains full-width histogram buffers.
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
-These are performance and feature limitations, not correctness failures. Future work includes more selective row-sampling execution, GPU inference pipeline overlap, and multi-GPU support.
+These are performance and feature limitations, not correctness failures. Future work includes GPU inference pipeline overlap and multi-GPU support.
 
 ## Learn more
 

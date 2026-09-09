@@ -141,13 +141,18 @@ def test_normal_runtime_summary_and_quiet_mode(capfd):
 def test_save_load_round_trip(tmp_path):
     x, y = toy()
     model = fb.train(BASE, x, label=y, num_boost_round=5)
-    path = tmp_path / "m.json"
-    model.save_model(str(path))
+    serial_path = tmp_path / "serial.json"
+    parallel_path = tmp_path / "parallel.json"
+    model.save_model(str(serial_path), model_io_threads=1)
+    model.save_model(str(parallel_path), model_io_threads=4)
+    assert parallel_path.read_bytes() == serial_path.read_bytes()
 
-    back = fb.Model.load_model(str(path))
-    assert back.num_trees == model.num_trees
-    assert back.predict(x, output_margin=True).tobytes() == \
-        model.predict(x, output_margin=True).tobytes()
+    serial = fb.Model.load_model(str(serial_path), model_io_threads=1)
+    parallel = fb.Model.load_model(str(serial_path), model_io_threads=4)
+    expected = model.predict(x, output_margin=True).tobytes()
+    assert serial.num_trees == parallel.num_trees == model.num_trees
+    assert serial.predict(x, output_margin=True).tobytes() == expected
+    assert parallel.predict(x, output_margin=True).tobytes() == expected
 
 
 def test_model_io_progress_and_quiet(tmp_path, capfd):
@@ -369,6 +374,150 @@ def test_file_prediction_compacts_used_features_but_validates_full_schema(tmp_pa
     )
     with pytest.raises(ValueError, match="f7"):
         model.predict(missing_unused)
+
+
+def test_predict_to_parquet_matches_file_prediction_and_order(tmp_path, capfd):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = toy(n=900, m=8, seed=37)
+    names = [f"f{i}" for i in range(x.shape[1])]
+
+    train_path = tmp_path / "train.parquet"
+    pq.write_table(
+        pa.table({**{name: x[:, i] for i, name in enumerate(names)}, "target": y}),
+        train_path,
+    )
+    model = fb.train(
+        {**BASE, "max_depth": 4, "nthread": 1, "ingest_threads": 0},
+        train_path,
+        label="target",
+        num_boost_round=12,
+    )
+
+    input_dir = tmp_path / "predict-parts"
+    input_dir.mkdir()
+    for part, (start, stop) in enumerate(((0, 317), (317, len(x)))):
+        # Physical column order differs from the canonical model schema.
+        columns = {
+            names[i]: x[start:stop, i]
+            for i in reversed(range(x.shape[1]))
+        }
+        columns["target"] = y[start:stop]
+        pq.write_table(
+            pa.table(columns),
+            input_dir / f"part-{part:02d}.parquet",
+            row_group_size=73,
+        )
+
+    capfd.readouterr()
+    expected = model.predict(
+        input_dir,
+        output_margin=True,
+        predict_threads=1,
+    )
+    capfd.readouterr()
+    for threads in (0, 4):
+        output = tmp_path / f"predictions-{threads}.parquet"
+        rows = model.predict_to_parquet(
+            input_dir,
+            str(output),
+            output_margin=True,
+            predict_threads=threads,
+            prediction_column="score",
+        )
+        log = capfd.readouterr().err
+        assert rows == len(x)
+        assert "PREDICT_OUTPUT start" in log
+        assert "PREDICT_OUTPUT complete" in log
+        assert "writer_workers=1" in log
+        table = pq.read_table(output)
+        assert table.schema.names == ["score"]
+        assert table.schema.field("score").type == pa.float32()
+        values = table.column("score").combine_chunks().to_numpy()
+        assert values.dtype == np.float32
+        assert values.tobytes() == expected.tobytes()
+
+
+def test_predict_to_parquet_accepts_headless_csv(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = toy(n=240, m=5, seed=41)
+    training = np.column_stack((x[:, :2], y, x[:, 2:]))
+    train_path = tmp_path / "headless-train.csv"
+    np.savetxt(train_path, training, delimiter=",")
+    model = fb.train(
+        BASE,
+        train_path,
+        label=2,
+        header=False,
+        num_boost_round=5,
+        quiet=True,
+    )
+
+    predict_path = tmp_path / "headless-predict.csv"
+    np.savetxt(predict_path, x, delimiter=",")
+    expected = model.predict(
+        predict_path,
+        output_margin=True,
+        header=False,
+        predict_threads=1,
+    )
+    output = tmp_path / "headless-output.parquet"
+    rows = model.predict_to_parquet(
+        predict_path,
+        str(output),
+        output_margin=True,
+        header=False,
+        predict_threads=0,
+    )
+    values = pq.read_table(output).column("prediction").combine_chunks().to_numpy()
+    assert rows == len(x)
+    assert values.tobytes() == expected.tobytes()
+
+
+def test_predict_to_parquet_rejects_overwrite_and_removes_failed_output(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = toy(n=180, m=5, seed=43)
+    names = [f"f{i}" for i in range(x.shape[1])]
+    valid = tmp_path / "valid.parquet"
+    pq.write_table(
+        pa.table({**{name: x[:, i] for i, name in enumerate(names)}, "target": y}),
+        valid,
+    )
+    model = fb.train(
+        BASE,
+        valid,
+        label="target",
+        num_boost_round=4,
+        quiet=True,
+    )
+
+    missing = tmp_path / "missing.parquet"
+    pq.write_table(
+        pa.table({name: x[:, i] for i, name in enumerate(names[:-1])}),
+        missing,
+    )
+    incomplete = tmp_path / "must-be-removed.parquet"
+    with pytest.raises(ValueError, match="f4"):
+        model.predict_to_parquet(missing, str(incomplete))
+    assert not incomplete.exists()
+
+    existing = tmp_path / "existing.parquet"
+    existing.write_bytes(b"keep")
+    with pytest.raises(FileExistsError, match="不会覆盖"):
+        model.predict_to_parquet(valid, str(existing))
+    assert existing.read_bytes() == b"keep"
+
+    with pytest.raises(ValueError, match=r"\.parquet|\.pq"):
+        model.predict_to_parquet(valid, str(tmp_path / "bad.csv"))
+    with pytest.raises(ValueError, match="prediction_column"):
+        model.predict_to_parquet(
+            valid,
+            str(tmp_path / "empty-column.parquet"),
+            prediction_column="   ",
+        )
+    with pytest.raises(ValueError, match="只接受文件路径"):
+        model.predict_to_parquet(x, str(tmp_path / "numpy.parquet"))
 
 
 def test_io_thread_auto_and_negative_validation():

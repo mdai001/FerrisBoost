@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use rayon::prelude::*;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,30 @@ const NO_CHILD: i32 = -1;
 
 /// XGBoost 用它表示根节点没有父亲(uint32 的 -1 落到 int32 上)。
 const NO_PARENT: i32 = 2147483647;
+
+/// Small models stay serial: constructing a private Rayon pool would cost more
+/// than converting their compact tree arrays. An explicit worker override is
+/// still honored so tests and callers can force either execution path.
+const MODEL_TREE_PARALLEL_MIN_NODES: usize = 4096;
+const MODEL_TREE_WORKER_MEMORY: usize = 1024 * 1024;
+
+fn model_tree_conversion_workers(
+    requested: usize,
+    tree_count: usize,
+    total_nodes: usize,
+) -> usize {
+    if tree_count <= 1 || (requested == 0 && total_nodes < MODEL_TREE_PARALLEL_MIN_NODES) {
+        return 1;
+    }
+    crate::threading::bounded_io_workers(requested, tree_count, MODEL_TREE_WORKER_MEMORY)
+}
+
+fn model_tree_pool(workers: usize) -> Result<rayon::ThreadPool, serde_json::Error> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .map_err(|e| unsupported(format_args!("model tree conversion thread pool failed: {e}")))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
@@ -239,12 +264,36 @@ impl Model {
 
     /// 导出成 XGBoost 兼容的 JSON。
     pub fn to_xgboost_json(&self) -> Result<String, serde_json::Error> {
-        let trees: Vec<xgb::Tree> = self
-            .trees
-            .iter()
-            .enumerate()
-            .map(|(id, t)| xgb::Tree::from_tree(id as i32, t, self.n_features))
-            .collect();
+        self.to_xgboost_json_with_threads(0)
+    }
+
+    /// XGBoost-style model export: convert independent trees in parallel, then
+    /// serialize the single JSON document in its canonical fixed order.
+    pub(crate) fn to_xgboost_json_with_threads(
+        &self,
+        requested: usize,
+    ) -> Result<String, serde_json::Error> {
+        let workers = model_tree_conversion_workers(
+            requested,
+            self.trees.len(),
+            self.trees.iter().map(Tree::len).sum(),
+        );
+        let convert = || {
+            self.trees
+                .par_iter()
+                .enumerate()
+                .map(|(id, t)| xgb::Tree::from_tree(id as i32, t, self.n_features))
+                .collect::<Vec<_>>()
+        };
+        let trees = if workers == 1 {
+            self.trees
+                .iter()
+                .enumerate()
+                .map(|(id, t)| xgb::Tree::from_tree(id as i32, t, self.n_features))
+                .collect()
+        } else {
+            model_tree_pool(workers)?.install(convert)
+        };
 
         let file = xgb::File {
             version: XGB_VERSION,
@@ -303,6 +352,16 @@ impl Model {
     /// 加载 XGBoost 训好的模型。主要用途是预测对拍:同一个模型两边
     /// 各跑一遍,预测值必须逐个对得上。
     pub fn from_xgboost_json(s: &str) -> Result<Self, serde_json::Error> {
+        Self::from_xgboost_json_with_threads(s, 0)
+    }
+
+    /// Parse the JSON document serially, then convert and validate each tree in
+    /// parallel. Indexed collection preserves model order; collecting errors in
+    /// a second serial pass deterministically returns the first invalid tree.
+    pub(crate) fn from_xgboost_json_with_threads(
+        s: &str,
+        requested: usize,
+    ) -> Result<Self, serde_json::Error> {
         let file: xgb::File = serde_json::from_str(s)?;
         let learner = file.learner;
         let booster = learner.gradient_booster;
@@ -338,12 +397,23 @@ impl Model {
         let n_features = parse_param::<usize>("num_feature", &mp.num_feature)?;
         let base_score = parse_base_score(&mp.base_score)?;
 
-        let trees = booster
-            .model
-            .trees
-            .iter()
-            .map(|t| t.to_tree())
-            .collect::<Result<Vec<_>, _>>()?;
+        let source_trees = &booster.model.trees;
+        let workers = model_tree_conversion_workers(
+            requested,
+            source_trees.len(),
+            source_trees.iter().map(|t| t.left_children.len()).sum(),
+        );
+        let converted = if workers == 1 {
+            source_trees.iter().map(xgb::Tree::to_tree).collect()
+        } else {
+            model_tree_pool(workers)?.install(|| {
+                source_trees
+                    .par_iter()
+                    .map(xgb::Tree::to_tree)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let trees = converted.into_iter().collect::<Result<Vec<_>, _>>()?;
 
         // 闭包没法泛型,两个字段的目标类型不同,分开写
         let attrs = &learner.attributes;
@@ -762,6 +832,24 @@ mod tests {
         }
     }
 
+    fn many_tree_model(n_trees: usize) -> Model {
+        let mut model = fixture_model();
+        model.trees = (0..n_trees)
+            .map(|tree_id| {
+                let mut tree = fixture_tree();
+                let node_count = tree.nodes.len();
+                for (node_id, node) in tree.nodes.iter_mut().enumerate() {
+                    if node.is_leaf {
+                        node.leaf_value +=
+                            (tree_id * node_count + node_id) as f32 / 1024.0;
+                    }
+                }
+                tree
+            })
+            .collect();
+        model
+    }
+
     #[test]
     fn descends_by_strict_less_than() {
         let t = fixture_tree();
@@ -835,6 +923,61 @@ mod tests {
         for row in [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [f32::NAN, 0.5]] {
             assert_eq!(back.predict(&row), m.predict(&row), "行 {row:?}");
         }
+    }
+
+    #[test]
+    fn parallel_tree_conversion_is_byte_and_prediction_identical() {
+        let model = many_tree_model(257);
+        let serial_json = model.to_xgboost_json_with_threads(1).unwrap();
+        let parallel_json = model.to_xgboost_json_with_threads(4).unwrap();
+        assert_eq!(
+            parallel_json.as_bytes(),
+            serial_json.as_bytes(),
+            "parallel save conversion changed JSON bytes or tree order"
+        );
+
+        let serial = Model::from_xgboost_json_with_threads(&serial_json, 1).unwrap();
+        let parallel = Model::from_xgboost_json_with_threads(&serial_json, 4).unwrap();
+        assert_eq!(
+            parallel.to_xgboost_json_with_threads(1).unwrap(),
+            serial.to_xgboost_json_with_threads(1).unwrap(),
+            "parallel load conversion changed the canonical model or tree order"
+        );
+
+        for row in [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [f32::NAN, 0.5]] {
+            for upto in [0, 1, 17, 128, 257] {
+                assert_eq!(
+                    parallel.predict_margin_upto(&row, upto).to_bits(),
+                    serial.predict_margin_upto(&row, upto).to_bits(),
+                    "row {row:?}, first {upto} trees"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_tree_conversion_reports_the_same_first_error() {
+        let mut json: serde_json::Value = serde_json::from_str(
+            &many_tree_model(64)
+                .to_xgboost_json_with_threads(1)
+                .unwrap(),
+        )
+        .unwrap();
+        let trees = json["learner"]["gradient_booster"]["model"]["trees"]
+            .as_array_mut()
+            .unwrap();
+        trees[3]["split_indices"][0] = serde_json::json!(99);
+        trees[41]["split_indices"][0] = serde_json::json!(100);
+        let json = serde_json::to_string(&json).unwrap();
+
+        let serial = Model::from_xgboost_json_with_threads(&json, 1)
+            .unwrap_err()
+            .to_string();
+        let parallel = Model::from_xgboost_json_with_threads(&json, 4)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(parallel, serial);
+        assert!(serial.contains("树 3"), "must report the first invalid tree: {serial}");
     }
 
     #[test]

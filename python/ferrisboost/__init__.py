@@ -48,7 +48,8 @@ _DEFAULTS: dict[str, Any] = {
     "nthread": 0,
     # 0 = system-adaptive auto; independent of training nthread.
     "ingest_threads": 0,
-    # 0 = auto for bounded positional model file I/O; independent of ingest/training.
+    # 0 = auto for ordered tree conversion and positional model I/O;
+    # independent of ingest/training. Single-document JSON serde stays serial.
     "model_io_threads": 0,
     # None = 用默认值 1。第二条 stream 要多一整套列块 buffer
     # (resident 280 MB / streaming 305 MB),而实测 resident 上单流反而更快、

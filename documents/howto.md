@@ -447,11 +447,27 @@ prediction = model.predict("data/test_*.parquet")
 prediction = model.predict("test.csv", header=False)
 ```
 
+```python
+# Stream file prediction directly to one Parquet output:
+rows_written = model.predict_to_parquet(
+    "data/test_partitions/",
+    "predictions.parquet",
+    output_margin=False,
+    n_trees=None,
+    predict_threads=0,
+    prediction_column="prediction",
+)
+```
+
 In named mode (Parquet or CSV with headers), FerrisBoost binds columns by the feature names recorded during training. Surplus columns—including leftover label columns—are ignored automatically. In positional mode (`header=False`), the file must have exactly `model.n_features` columns.
 
 File readers validate the full canonical schema before projecting batches to the sorted set of features actually used by the ensemble. This reduces Parquet decode/materialization and GPU H2D width without weakening missing-feature checks. The canonical training/serialized model is immutable; feature remapping exists only in a lazy inference copy, so save/load and XGBoost interchange retain original feature IDs.
 
 Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
+
+`predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
+
+The direct-output path keeps a bounded two-batch channel between scoring and one ordered Parquet writer thread. The writer can overlap encoding/output with the next input batch while preserving file order and row order. Auto mode shares one process-visible CPU budget across ingest, scoring, and the writer; explicit ingest or prediction thread counts are preserved and produce an oversubscription warning when their total plus the writer exceeds that budget.
 
 ### In-memory array prediction
 
@@ -490,10 +506,11 @@ restored = fb.Model.load_model("model.json")
 prediction = restored.predict(X.astype(np.float32))
 ```
 
-Model files use bounded positional I/O. `model_io_threads=0` selects a
-system-adaptive worker count and is independent of file ingest and training
-threads. Small models automatically use one worker; override per operation when
-needed:
+Model save/load converts independent trees in parallel with fixed-index ordering,
+keeps single-document JSON serialization/parsing sequential, and uses bounded
+positional file I/O. `model_io_threads=0` selects system-adaptive workers and is
+independent of file ingest and training threads. Small models automatically use
+one conversion worker; override per operation when needed:
 
 ```python
 model.save_model("model.json", model_io_threads=2)
@@ -502,8 +519,10 @@ restored = fb.Model.load_model("model.json", model_io_threads=2)
 
 Save/load and file ingest emit concise progress on stderr every few seconds.
 The start record shows the requested mode and resolved count, for example
-`ingest_threads=auto workers=8` or `model_io_threads=auto workers=1`. Auto uses
-CPUs actually available to the process (including affinity/cgroup limits),
+`ingest_threads=auto workers=8` or `model_io_threads=auto workers=1`. The
+model record reports the existing positional-I/O worker count; ordered tree
+conversion independently bounds the same request by tree work. Auto uses CPUs
+actually available to the process (including affinity/cgroup limits),
 independent work, and a conservative transient-memory bound. A positive value
 overrides CPU auto-selection but remains bounded by available work and memory.
 Pass `quiet=True` to suppress routine messages.
@@ -559,7 +578,7 @@ empty `evals_result()`.
 | `hist_streams` | automatic | Planned by GPU planner based on execution path, block width, and VRAM; override with `1` or `2` |
 | `hist_nodes_per_batch` | automatic | Multi-node merge batch size (`1..=32`) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
-| `model_io_threads` | `0` (auto) | Size/work/memory bound model-file I/O; small models use one worker |
+| `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
 | `seed` | `0` | Alias: `random_state` |
 | `base_score` | `0.5` | Value before the objective transform |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |

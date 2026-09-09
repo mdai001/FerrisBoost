@@ -835,6 +835,337 @@ fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool
     }
 }
 
+const PREDICTION_PARQUET_ROW_GROUP_ROWS: usize = 1024 * 1024;
+const PREDICTION_PARQUET_CHANNEL_BATCHES: usize = 2;
+
+enum PredictionParquetMessage {
+    Batch(Vec<f32>),
+    Finish,
+}
+
+struct IncompletePredictionOutput {
+    path: std::path::PathBuf,
+    complete: bool,
+}
+
+impl Drop for IncompletePredictionOutput {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn prediction_parquet_writer(
+    file: std::fs::File,
+    output_path: std::path::PathBuf,
+    prediction_column: String,
+    receiver: std::sync::mpsc::Receiver<PredictionParquetMessage>,
+) -> anyhow::Result<usize> {
+    use arrow::array::{ArrayRef, Float32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    let mut cleanup = IncompletePredictionOutput {
+        path: output_path,
+        complete: false,
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        prediction_column,
+        DataType::Float32,
+        false,
+    )]));
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+        .context("创建 prediction Parquet writer 失败")?;
+    let mut rows_written = 0usize;
+    loop {
+        match receiver.recv() {
+            Ok(PredictionParquetMessage::Batch(values)) => {
+                rows_written = rows_written
+                    .checked_add(values.len())
+                    .context("prediction 输出行数溢出")?;
+                let values: ArrayRef = Arc::new(Float32Array::from(values));
+                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
+                    .context("创建 prediction Arrow batch 失败")?;
+                writer
+                    .write(&batch)
+                    .context("写 prediction Parquet batch 失败")?;
+            }
+            Ok(PredictionParquetMessage::Finish) => break,
+            Err(_) => anyhow::bail!("prediction Parquet pipeline 在完成前被取消"),
+        }
+    }
+    writer
+        .finish()
+        .context("完成 prediction Parquet footer 失败")?;
+    writer
+        .inner()
+        .sync_all()
+        .context("同步 prediction Parquet 文件失败")?;
+    cleanup.complete = true;
+    Ok(rows_written)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_files_to_parquet(
+    model: &PyModel,
+    py: Python<'_>,
+    path_specs: Vec<String>,
+    output_path: &str,
+    prediction_column: &str,
+    output_margin: bool,
+    n_trees: Option<usize>,
+    header: bool,
+    predict_threads: usize,
+) -> PyResult<usize> {
+    use crate::tree::SchemaMode;
+
+    if prediction_column.trim().is_empty() {
+        return Err(PyValueError::new_err(
+            "prediction_column 不能为空或只包含空白",
+        ));
+    }
+    let output_path = std::path::PathBuf::from(output_path);
+    let valid_extension = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("parquet") || extension.eq_ignore_ascii_case("pq")
+        });
+    if !valid_extension {
+        return Err(PyValueError::new_err(
+            "prediction 输出路径必须使用 .parquet 或 .pq 扩展名",
+        ));
+    }
+
+    let resolved = crate::source::input::resolve(&path_specs)
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+    let mode = model.inner.schema_mode.ok_or_else(|| {
+        PyValueError::new_err(
+            "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
+             空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
+             二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
+        )
+    })?;
+    if mode == SchemaMode::Named && model.inner.feature_names.is_empty() {
+        return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
+    }
+    if resolved.format == crate::source::input::InputFormat::Parquet && !header {
+        return Err(PyValueError::new_err("header=False 只适用于 CSV"));
+    }
+    if resolved.format == crate::source::input::InputFormat::Csv {
+        match (mode, header) {
+            (SchemaMode::Named, false) => {
+                return Err(PyValueError::new_err(
+                    "命名模式模型不能用 header=False 的位置 CSV 预测",
+                ))
+            }
+            (SchemaMode::Positional, true) => {
+                return Err(PyValueError::new_err(
+                    "位置模式模型预测 CSV 时必须显式传 header=False",
+                ))
+            }
+            _ => {}
+        }
+    }
+
+    let names = model.inner.feature_names.clone();
+    let canonical_n_features = model.inner.n_features;
+    let inference = model.inference_model().map_err(to_py_err)?;
+    let projected_features = inference.canonical_features().to_vec();
+    let n_features = inference.n_features();
+    let upto = n_trees.unwrap_or(model.inner.trees.len());
+    let inner = inference.model();
+    let rows_total = if resolved.format == crate::source::input::InputFormat::Parquet {
+        resolved
+            .paths
+            .iter()
+            .try_fold(0u64, |total, path| {
+                crate::source::parquet_source::peek_n_rows(path).map(|rows| total + rows)
+            })
+            .ok()
+    } else {
+        None
+    };
+    let initially_resolved_ingest = resolved_ingest_workers(
+        model.ingest_threads,
+        resolved.format.label(),
+        &resolved.paths,
+        n_features,
+        n_features.max(1),
+    );
+    let work_per_row = prediction_work_per_row(inner, upto);
+    let (ingest_workers, predict_worker_cap, oversubscribed) = prediction_output_pipeline_workers(
+        model.ingest_threads,
+        predict_threads,
+        initially_resolved_ingest,
+    );
+    if oversubscribed && !model.quiet {
+        eprintln!(
+            "PREDICT_OUTPUT warning=explicit_cpu_oversubscription ingest_workers={} \
+             predict_workers={} writer_workers=1 available={}",
+            ingest_workers,
+            predict_worker_cap,
+            effective_nthread(0),
+        );
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
+                "prediction 输出已存在,不会覆盖: {}",
+                output_path.display()
+            )))
+        }
+        Err(error) => {
+            return Err(PyValueError::new_err(format!(
+                "无法创建 prediction 输出 {}: {error}",
+                output_path.display()
+            )))
+        }
+    };
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(PREDICTION_PARQUET_CHANNEL_BATCHES);
+    let writer_path = output_path.clone();
+    let writer_column = prediction_column.to_string();
+    let writer_handle = match std::thread::Builder::new()
+        .name("fb-predict-parquet".to_string())
+        .spawn(move || prediction_parquet_writer(file, writer_path, writer_column, receiver))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_path);
+            return Err(PyRuntimeError::new_err(format!(
+                "无法启动 prediction Parquet writer: {error}"
+            )));
+        }
+    };
+
+    if !model.quiet {
+        eprintln!(
+            "PREDICT_OUTPUT start format=parquet output={} column={} \
+             ingest_workers={} predict_workers={} writer_workers=1 queue_batches={}",
+            output_path.display(),
+            prediction_column,
+            ingest_workers,
+            predict_worker_cap,
+            PREDICTION_PARQUET_CHANNEL_BATCHES,
+        );
+    }
+    let started = std::time::Instant::now();
+    let reporter = IngestReporter::start(
+        model.quiet,
+        resolved.format.label(),
+        &resolved.paths,
+        model.ingest_threads,
+        ingest_workers,
+        rows_total,
+    );
+    let mut predict_pool = None;
+    let input_result = py.detach(|| {
+        crate::source::predict_input::for_each_projected_batch(
+            &resolved,
+            &names,
+            canonical_n_features,
+            &projected_features,
+            header,
+            ingest_workers,
+            |rows| {
+                let workers = resolved_predict_workers(
+                    predict_threads,
+                    predict_worker_cap,
+                    rows.len(),
+                    work_per_row,
+                );
+                let batch = score_rows(rows.len(), workers, &mut predict_pool, |row| {
+                    predict_value(inner, &rows[row], upto, output_margin)
+                })?;
+                sender
+                    .send(PredictionParquetMessage::Batch(batch))
+                    .map_err(|_| {
+                        anyhow::anyhow!("prediction Parquet writer stopped before batch commit")
+                    })
+            },
+        )
+    });
+
+    if let Err(input_error) = input_result {
+        drop(sender);
+        let writer_result = writer_handle.join();
+        if input_error
+            .to_string()
+            .contains("prediction Parquet writer stopped before batch commit")
+        {
+            match writer_result {
+                Ok(Err(writer_error)) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "prediction Parquet 写出失败: {writer_error:#}"
+                    )))
+                }
+                Err(_) => return Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
+                Ok(Ok(_)) => {}
+            }
+        }
+        return Err(PyValueError::new_err(format!("{input_error:#}")));
+    }
+    let rows_read = input_result.expect("checked above");
+    if sender.send(PredictionParquetMessage::Finish).is_err() {
+        drop(sender);
+        return match writer_handle.join() {
+            Ok(Err(writer_error)) => Err(PyRuntimeError::new_err(format!(
+                "prediction Parquet 写出失败: {writer_error:#}"
+            ))),
+            Err(_) => Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
+            Ok(Ok(_)) => Err(PyRuntimeError::new_err(
+                "prediction Parquet writer 在完成信号前停止",
+            )),
+        };
+    }
+    drop(sender);
+    let rows_written = match writer_handle.join() {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(error)) => {
+            return Err(PyRuntimeError::new_err(format!(
+                "prediction Parquet 写出失败: {error:#}"
+            )))
+        }
+        Err(_) => return Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
+    };
+    if rows_read != rows_written {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(PyRuntimeError::new_err(format!(
+            "prediction 输出行数不一致:读取 {rows_read},写入 {rows_written}"
+        )));
+    }
+
+    reporter.complete(rows_read);
+    if !model.quiet {
+        let bytes = std::fs::metadata(&output_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        eprintln!(
+            "PREDICT_OUTPUT complete rows={} bytes={} seconds={:.3} output={}",
+            rows_written,
+            bytes,
+            started.elapsed().as_secs_f64(),
+            output_path.display(),
+        );
+    }
+    Ok(rows_written)
+}
+
 fn project_canonical_rows(
     row_major: &[f32],
     n_rows: usize,
@@ -869,7 +1200,38 @@ fn prediction_pipeline_workers(
     predict_requested: usize,
     resolved_ingest: usize,
 ) -> (usize, usize, bool) {
-    let budget = effective_nthread(0).max(1);
+    prediction_pipeline_workers_with_reserve(
+        ingest_requested,
+        predict_requested,
+        resolved_ingest,
+        0,
+    )
+}
+
+/// A single Parquet file has one ordered writer, but it runs concurrently with
+/// ingest and scoring. Auto mode reserves one process-visible CPU for that
+/// writer, then divides the rest between ingest and prediction.
+fn prediction_output_pipeline_workers(
+    ingest_requested: usize,
+    predict_requested: usize,
+    resolved_ingest: usize,
+) -> (usize, usize, bool) {
+    prediction_pipeline_workers_with_reserve(
+        ingest_requested,
+        predict_requested,
+        resolved_ingest,
+        1,
+    )
+}
+
+fn prediction_pipeline_workers_with_reserve(
+    ingest_requested: usize,
+    predict_requested: usize,
+    resolved_ingest: usize,
+    reserved_workers: usize,
+) -> (usize, usize, bool) {
+    let total_budget = effective_nthread(0).max(1);
+    let budget = total_budget.saturating_sub(reserved_workers).max(1);
     let (ingest, predict) = match (ingest_requested, predict_requested) {
         (0, 0) if budget > 1 => {
             let ingest = resolved_ingest.min((budget / 2).max(1));
@@ -889,8 +1251,15 @@ fn prediction_pipeline_workers(
         ),
         (_, explicit_predict) => (resolved_ingest, effective_nthread(explicit_predict)),
     };
-    let explicit_oversubscription =
-        ingest_requested > 0 && predict_requested > 0 && ingest + predict > budget;
+    let explicit_oversubscription = if reserved_workers == 0 {
+        ingest_requested > 0 && predict_requested > 0 && ingest + predict > total_budget
+    } else {
+        (ingest_requested > 0 || predict_requested > 0)
+            && ingest
+                .saturating_add(predict)
+                .saturating_add(reserved_workers)
+                > total_budget
+    };
     (ingest.max(1), predict.max(1), explicit_oversubscription)
 }
 
@@ -1305,6 +1674,42 @@ impl PyModel {
         Ok(PyArray1::from_vec(py, out))
     }
 
+    /// Stream file prediction directly to one Parquet file. CPU scoring uses
+    /// deterministic row-parallel workers; one ordered writer thread overlaps
+    /// Parquet encoding/output with the next ingest/score batch.
+    #[pyo3(signature = (data, output_path, output_margin=false, n_trees=None, header=true, *,
+                        predict_threads=0, prediction_column="prediction"))]
+    fn predict_to_parquet(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        output_path: &str,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        prediction_column: &str,
+    ) -> PyResult<usize> {
+        guard(|| {
+            let path_specs = path_specs_of(data)?.ok_or_else(|| {
+                PyValueError::new_err(
+                    "predict_to_parquet 只接受文件路径、路径列表、目录或 glob 输入",
+                )
+            })?;
+            predict_files_to_parquet(
+                self,
+                py,
+                path_specs,
+                output_path,
+                prediction_column,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+            )
+        })
+    }
+
     #[pyo3(signature = (path, quiet=None, model_io_threads=None))]
     fn save_model(
         &self,
@@ -1317,7 +1722,7 @@ impl PyModel {
         guard(|| {
             let json = self
                 .inner
-                .to_xgboost_json()
+                .to_xgboost_json_with_threads(requested)
                 .map_err(|e| PyRuntimeError::new_err(format!("导出失败:{e}")))?;
             parallel_model_write(path, json.as_bytes(), requested, quiet)
                 .map_err(|e| PyValueError::new_err(format!("写不了 {path}:{e}")))
@@ -1345,7 +1750,7 @@ impl PyModel {
             })?;
             let raw = String::from_utf8(raw)
                 .map_err(|e| PyValueError::new_err(format!("{path} 不是 UTF-8 JSON:{e}")))?;
-            let inner = Model::from_xgboost_json(&raw)
+            let inner = Model::from_xgboost_json_with_threads(&raw, model_io_threads)
                 .map_err(|e| PyValueError::new_err(format!("{path} 解析失败:{e}")))?;
             Ok(Self {
                 inner,
