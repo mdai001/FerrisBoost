@@ -3,19 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FerrisBoost — GPU-accelerated gradient boosted trees in Rust</title>
-  <meta name="description" content="FerrisBoost is a Rust-backed gradient boosted tree library for Python with direct Parquet, CSV, Arrow, and NumPy input, adaptive GPU memory, and XGBoost-compatible models.">
-  <meta name="keywords" content="FerrisBoost, gradient boosted trees, GBDT, machine learning, Rust, Python, CUDA, GPU, XGBoost, Parquet, Apache Arrow">
-  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
+  <title>FerrisBoost — Rust-backed gradient boosted trees</title>
+  <meta name="description" content="FerrisBoost is a Rust-backed gradient boosted tree library for large tabular data with direct Parquet, CSV, Arrow, and NumPy input and optional CUDA acceleration.">
+  <meta name="robots" content="index,follow">
   <link rel="canonical" href="https://mdai001.github.io/FerrisBoost/">
-  <meta property="og:type" content="website">
-  <meta property="og:title" content="FerrisBoost — GPU-accelerated gradient boosted trees in Rust">
-  <meta property="og:description" content="Train directly from Parquet, CSV, Arrow, or NumPy with adaptive GPU memory and deterministic CPU/GPU semantics.">
-  <meta property="og:url" content="https://mdai001.github.io/FerrisBoost/">
-  <meta property="og:site_name" content="FerrisBoost">
-  <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="FerrisBoost">
-  <meta name="twitter:description" content="Rust-backed, GPU-accelerated gradient boosted trees for large tabular data.">
   <link rel="stylesheet" href="./styles.css">
   <script type="application/ld+json">
   {
@@ -26,190 +17,86 @@
     "url": "https://mdai001.github.io/FerrisBoost/",
     "codeRepository": "https://github.com/mdai001/FerrisBoost",
     "programmingLanguage": ["Rust", "Python", "CUDA"],
-    "runtimePlatform": ["Python 3.9+", "Linux x86-64", "Windows x86-64", "NVIDIA CUDA"],
-    "license": "https://www.apache.org/licenses/LICENSE-2.0",
-    "downloadUrl": "https://pypi.org/project/ferrisboost/"
+    "license": "https://www.apache.org/licenses/LICENSE-2.0"
   }
   </script>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to content</a>
-
-  <header class="site-header">
-    <a class="brand" href="./" aria-label="FerrisBoost home">
-      <span class="brand-mark" aria-hidden="true">F<span>↑</span></span>
-      <span>FerrisBoost</span>
-    </a>
-    <nav aria-label="Primary navigation">
-      <a href="#why">Why FerrisBoost</a>
-      <a href="#performance">Performance</a>
-      <a href="./source.html">Source map</a>
-      <a class="nav-github" href="https://github.com/mdai001/FerrisBoost">GitHub <span aria-hidden="true">↗</span></a>
+  <header>
+    <a class="brand" href="./">FerrisBoost</a>
+    <nav aria-label="Project links">
+      <a href="https://github.com/mdai001/FerrisBoost">GitHub</a>
+      <a href="https://pypi.org/project/ferrisboost/">PyPI</a>
+      <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">How-To</a>
     </nav>
   </header>
 
-  <main id="main">
+  <main>
     <section class="hero">
-      <div class="hero-copy">
-        <p class="eyebrow"><span class="status-dot"></span> Open source · Apache-2.0</p>
-        <h1>Gradient boosting,<br><em>without the data detour.</em></h1>
-        <p class="hero-lead">FerrisBoost trains large tabular models directly from Parquet, CSV, Arrow, or NumPy. Its Rust data plane and adaptive CUDA backend keep setup, host memory, and GPU execution under control.</p>
-        <div class="hero-actions">
-          <a class="button primary" href="#install">Get started</a>
-          <a class="button secondary" href="https://github.com/mdai001/FerrisBoost">Explore the source</a>
-        </div>
-        <div class="hero-meta" aria-label="Project highlights">
-          <span>Python 3.9+</span>
-          <span>Rust core</span>
-          <span>Optional CUDA</span>
-          <span>XGBoost interchange</span>
-        </div>
+      <p class="label">Rust · Python · optional CUDA</p>
+      <h1>Gradient boosted trees for large tabular data.</h1>
+      <p class="lead">FerrisBoost is a Rust-backed gradient-boosted tree library with XGBoost-compatible training semantics for supported objectives and a Python API with familiar parameter names.</p>
+      <div class="actions">
+        <a class="primary" href="https://pypi.org/project/ferrisboost/">Install from PyPI</a>
+        <a href="https://github.com/mdai001/FerrisBoost">View source</a>
       </div>
+    </section>
 
-      <div class="terminal-card" aria-label="FerrisBoost Python example">
-        <div class="terminal-bar">
-          <span></span><span></span><span></span>
-          <p>train.py</p>
-        </div>
-        <pre><code><span class="syntax-dim">import</span> ferrisboost <span class="syntax-dim">as</span> fb
+    <section>
+      <h2>Why FerrisBoost</h2>
+      <div class="grid">
+        <article>
+          <h3>File-first pipeline</h3>
+          <p>Train directly from Parquet, CSV, CSV.gz, PyArrow tables, or NumPy arrays without constructing an intermediate DMatrix.</p>
+        </article>
+        <article>
+          <h3>Adaptive GPU memory</h3>
+          <p>The planner selects full residency, hybrid caching, or streaming execution based on the workload and available VRAM.</p>
+        </article>
+        <article>
+          <h3>Deterministic modes</h3>
+          <p><code>gpu_math="exact"</code> produces byte-identical CPU/GPU models. Fast mode remains deterministic.</p>
+        </article>
+        <article>
+          <h3>XGBoost interchange</h3>
+          <p>Supported models save and load through an XGBoost-compatible JSON representation.</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Install</h2>
+      <pre><code>pip install ferrisboost</code></pre>
+      <p>The portable wheel supports CPU use without an NVIDIA driver. CUDA is loaded only when a GPU device is requested.</p>
+    </section>
+
+    <section>
+      <h2>Quick start</h2>
+      <pre><code>import ferrisboost as fb
 
 model = fb.train(
     {
-        <span class="syntax-key">"objective"</span>: <span class="syntax-string">"binary:logistic"</span>,
-        <span class="syntax-key">"device"</span>: <span class="syntax-string">"cuda"</span>,
-        <span class="syntax-key">"gpu_math"</span>: <span class="syntax-string">"exact"</span>,
-        <span class="syntax-key">"max_depth"</span>: <span class="syntax-number">6</span>,
+        "objective": "binary:logistic",
+        "device": "cuda",
+        "max_depth": 6,
     },
-    <span class="syntax-string">"train.parquet"</span>,
-    label=<span class="syntax-string">"target"</span>,
-    num_boost_round=<span class="syntax-number">100</span>,
+    "train.parquet",
+    label="target",
+    num_boost_round=100,
 )
 
-pred = model.predict(<span class="syntax-string">"test.parquet"</span>)</code></pre>
-        <div class="terminal-result"><span>✓</span> File-first training · bounded memory</div>
-      </div>
+prediction = model.predict("test.parquet")</code></pre>
     </section>
 
-    <section class="signal-strip" aria-label="Key performance observations">
-      <div><strong>0.14–0.36×</strong><span>setup time vs XGBoost</span></div>
-      <div><strong>0.33–0.46×</strong><span>peak host RAM</span></div>
-      <div><strong>0.47–0.68×</strong><span>combined GPU footprint</span></div>
-      <div><strong>Exact</strong><span>CPU/GPU model parity</span></div>
-    </section>
-
-    <section class="section" id="why">
-      <div class="section-heading">
-        <p class="eyebrow">Designed around the data path</p>
-        <h2>Spend less time preparing data.<br>More time boosting.</h2>
-        <p>FerrisBoost treats ingestion, quantization, memory planning, and training as one coordinated pipeline instead of a chain of full-data materializations.</p>
-      </div>
-
-      <div class="feature-grid">
-        <article class="feature feature-wide">
-          <div class="feature-number">01</div>
-          <div>
-            <h3>File-first Rust pipeline</h3>
-            <p>Stream Parquet, CSV, and CSV.gz directly into quantized column blocks. Multi-file inputs, directories, and globs preserve deterministic ordering without constructing an intermediate Python training matrix.</p>
-            <div class="format-row" aria-label="Supported inputs">
-              <span>Parquet</span><span>CSV</span><span>CSV.gz</span><span>Arrow</span><span>NumPy</span>
-            </div>
-          </div>
-        </article>
-        <article class="feature">
-          <div class="feature-number">02</div>
-          <h3>Adaptive VRAM</h3>
-          <p>The planner chooses full residency, hybrid caching, or streaming execution from the workload and available GPU memory.</p>
-        </article>
-        <article class="feature">
-          <div class="feature-number">03</div>
-          <h3>Determinism by design</h3>
-          <p><code>gpu_math="exact"</code> preserves byte-identical CPU/GPU models. Fast mode remains deterministic when maximum throughput matters.</p>
-        </article>
-        <article class="feature">
-          <div class="feature-number">04</div>
-          <h3>Physical column sampling</h3>
-          <p>Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output.</p>
-        </article>
-        <article class="feature">
-          <div class="feature-number">05</div>
-          <h3>Model portability</h3>
-          <p>Supported objectives serialize to standard XGBoost-compatible JSON, keeping training and prediction backends independent.</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="section performance" id="performance">
-      <div class="section-heading compact">
-        <p class="eyebrow">Measured on narrow and wide workloads</p>
-        <h2>Performance in context</h2>
-        <p>Ratios are FerrisBoost divided by the corresponding XGBoost backend. Values below 1.0× favor FerrisBoost. Results cover standardized HIGGS Parquet and Epsilon CSV workloads.</p>
-      </div>
-
-      <div class="metric-cards">
-        <article>
-          <p>Setup</p>
-          <strong>0.14<span>–</span>0.36×</strong>
-          <small>input through initial preparation</small>
-        </article>
-        <article>
-          <p>GPU-fast training</p>
-          <strong>0.97<span>–</span>0.99×</strong>
-          <small>boosting time only</small>
-        </article>
-        <article>
-          <p>Setup + GPU fast</p>
-          <strong>0.19<span>–</span>0.52×</strong>
-          <small>end of training, before scoring</small>
-        </article>
-        <article>
-          <p>Peak host RAM</p>
-          <strong>0.33<span>–</span>0.46×</strong>
-          <small>observed process RSS</small>
-        </article>
-      </div>
-
-      <p class="fine-print">These observations describe the tested datasets and hardware, not universal guarantees. Metric scoring is excluded from training time. Combined memory is a secondary observed footprint indicator.</p>
-    </section>
-
-    <section class="section install" id="install">
-      <div class="install-copy">
-        <p class="eyebrow">One command to begin</p>
-        <h2>CPU ready.<br>CUDA optional.</h2>
-        <p>The portable wheel supports CPU use without an NVIDIA driver. CUDA is loaded only when a GPU device is requested.</p>
-        <div class="link-list">
-          <a href="https://pypi.org/project/ferrisboost/"><span>PyPI package</span><span>↗</span></a>
-          <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md"><span>Python API how-to</span><span>↗</span></a>
-          <a href="./source.html"><span>Source-code map</span><span>→</span></a>
-        </div>
-      </div>
-      <div class="install-command">
-        <span>Portable CPU + optional CUDA</span>
-        <pre><code>pip install ferrisboost</code></pre>
-        <span>x86-64-v3 optimized distribution</span>
-        <pre><code>pip install ferrisboost-v3</code></pre>
-        <p>Install one distribution, not both.</p>
-      </div>
-    </section>
-
-    <section class="section source-cta">
-      <p class="eyebrow">Read the implementation</p>
-      <h2>Small public surface.<br>Inspectable engine.</h2>
-      <p>Follow the training path from input readers and quantization through histogram construction, GPU planning, tree growth, and model serialization.</p>
-      <div class="hero-actions">
-        <a class="button primary" href="./source.html">Open the source map</a>
-        <a class="button secondary" href="https://github.com/mdai001/FerrisBoost/tree/develop/src">Browse src on GitHub</a>
-      </div>
+    <section>
+      <h2>Observed performance</h2>
+      <p>On the standardized HIGGS Parquet and Epsilon CSV workloads reported in the README, FerrisBoost used 0.14–0.36× XGBoost setup time, 0.33–0.46× peak host RAM, and 0.47–0.68× combined RAM plus active VRAM on GPU. These results describe the tested workloads, not universal guarantees.</p>
     </section>
   </main>
 
   <footer>
-    <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">F<span>↑</span></span><span>FerrisBoost</span></a>
-    <p>Rust-backed gradient boosted trees for large tabular data.</p>
-    <div>
-      <a href="https://github.com/mdai001/FerrisBoost">GitHub</a>
-      <a href="https://pypi.org/project/ferrisboost/">PyPI</a>
-      <a href="https://github.com/mdai001/FerrisBoost/blob/develop/LICENSE">Apache-2.0</a>
-    </div>
+    <span>FerrisBoost</span>
+    <span>Apache-2.0</span>
   </footer>
 </body>
 </html>

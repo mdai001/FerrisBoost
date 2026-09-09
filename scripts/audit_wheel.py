@@ -39,6 +39,9 @@ CHECKS = [
     ("shell history",         [b".bash_history", b".zsh_history"]),
     ("cargo registry (raw)",  [b"/home/", b"/Users/", b"C:\\\\Users"]),
     ("embedded GPU name",     [b"GeForce", b"Quadro", b"Tesla V", b"RTX "]),
+    ("compiler fingerprint",  [b"Compiler Build ID:",
+                               b"Cuda compilation tools, release",
+                               b"Based on NVVM "]),
     ("debug logs",            [b".log\x00"]),
 ]
 
