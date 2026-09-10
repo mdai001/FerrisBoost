@@ -18,6 +18,8 @@ cwd = os.getcwd()
 APPROVED_PUBLIC_IDENTIFIERS = [
     b"https://github.com/mdai001/FerrisBoost",
     b"github.com/mdai001/FerrisBoost",
+    b"https://mdai001.github.io/FerrisBoost",
+    b"mdai001.github.io/FerrisBoost",
 ]
 
 CHECKS = [
