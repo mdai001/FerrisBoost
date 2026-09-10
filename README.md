@@ -6,6 +6,11 @@ semantics for supported objectives, and a Python API with parameter names famili
 to XGBoost. Training runs on a single GPU today; the architecture is multi-GPU
 ready (WIP).
 
+FerrisBoost is an independent, column-blocked gradient boosting implementation
+licensed under Apache 2.0. It provides XGBoost-compatible training semantics and
+model interchange, but does not use or depend on the XGBoost runtime and is not
+affiliated with or endorsed by the XGBoost project or its maintainers.
+
 ## Why FerrisBoost
 
 In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not by GPU compute kernels, but by host-memory overhead, data ingest, and rigid memory limits. FerrisBoost focuses on reducing ingest, memory, and execution overhead in large tabular workflows:
