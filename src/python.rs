@@ -823,6 +823,51 @@ where
     Ok(out)
 }
 
+/// Cache-friendly fast path for C-contiguous NumPy input. Parallelism still
+/// owns disjoint deterministic row ranges; inside each range the CPU inference
+/// model blocks rows while preserving every row's original tree-add order.
+fn score_contiguous_rows(
+    model: &crate::inference::CpuInferenceModel,
+    data: &[f32],
+    n_rows: usize,
+    n_features: usize,
+    n_trees: usize,
+    workers: usize,
+    pool: &mut Option<rayon::ThreadPool>,
+) -> anyhow::Result<Vec<f32>> {
+    let mut out = vec![0.0f32; n_rows];
+    if n_rows == 0 {
+        return Ok(out);
+    }
+    if workers <= 1 {
+        model.predict_margins(data, n_features, n_trees, &mut out)?;
+        return Ok(out);
+    }
+    if pool.is_none() {
+        *pool = Some(crate::threading::build_pool(workers)?);
+    }
+    let chunks = workers.saturating_mul(4).max(1);
+    let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
+    pool.as_ref()
+        .expect("prediction pool just initialized")
+        .install(|| {
+            out.par_chunks_mut(rows_per_chunk)
+                .enumerate()
+                .try_for_each(|(chunk, values)| {
+                    let first = chunk * rows_per_chunk;
+                    let value_first = first * n_features;
+                    let value_last = value_first + values.len() * n_features;
+                    model.predict_margins(
+                        &data[value_first..value_last],
+                        n_features,
+                        n_trees,
+                        values,
+                    )
+                })
+        })?;
+    Ok(out)
+}
+
 fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool) -> f32 {
     let margin = model.predict_margin_upto(row, n_trees);
     if output_margin {
@@ -1291,7 +1336,6 @@ fn gpu_prediction_selected(
         && n_rows.saturating_mul(work_per_row) >= AUTO_GPU_PREDICT_MIN_WORK
 }
 
-#[cfg(feature = "cuda")]
 fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin: bool) {
     if !output_margin && model.objective == Objective::Logistic {
         for value in values {
@@ -1307,6 +1351,7 @@ pub struct PyModel {
     quiet: bool,
     model_io_threads: usize,
     ingest_threads: usize,
+    cpu_predictor: Mutex<Option<Arc<crate::inference::CpuInferenceModel>>>,
     inference_model: Mutex<Option<Arc<crate::inference::CompactInferenceModel>>>,
     #[cfg(feature = "cuda")]
     gpu_predictors:
@@ -1314,6 +1359,19 @@ pub struct PyModel {
 }
 
 impl PyModel {
+    fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
+        let mut cache = self
+            .cpu_predictor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU prediction model cache poisoned"))?;
+        if let Some(model) = cache.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(crate::inference::CpuInferenceModel::new(&self.inner)?);
+        *cache = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
     fn inference_model(&self) -> anyhow::Result<Arc<crate::inference::CompactInferenceModel>> {
         let mut cache = self
             .inference_model
@@ -1475,16 +1533,13 @@ impl PyModel {
             // interpreted as row-major.
             let out = if x.is_c_contiguous() {
                 let data = x.as_slice()?;
+                let predictor = self.cpu_predictor().map_err(to_py_err)?;
                 py.detach(|| {
-                    score_rows(n_rows, workers, &mut pool, |row| {
-                        let first = row * n_features;
-                        predict_value(
-                            &self.inner,
-                            &data[first..first + n_features],
-                            upto,
-                            output_margin,
-                        )
-                    })
+                    let mut out = score_contiguous_rows(
+                        &predictor, data, n_rows, n_features, upto, workers, &mut pool,
+                    )?;
+                    transform_prediction_margins(&self.inner, &mut out, output_margin);
+                    Ok(out)
                 })
             } else {
                 let view = x.as_array();
@@ -1758,6 +1813,7 @@ impl PyModel {
                 quiet,
                 model_io_threads,
                 ingest_threads,
+                cpu_predictor: Mutex::new(None),
                 #[cfg(feature = "cuda")]
                 gpu_predictors: Mutex::new(std::collections::HashMap::new()),
                 inference_model: Mutex::new(None),
@@ -2039,6 +2095,7 @@ fn finish(
         quiet,
         model_io_threads,
         ingest_threads,
+        cpu_predictor: Mutex::new(None),
         inference_model: Mutex::new(None),
         #[cfg(feature = "cuda")]
         gpu_predictors: Mutex::new(std::collections::HashMap::new()),

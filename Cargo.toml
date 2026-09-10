@@ -1,6 +1,6 @@
 [package]
 name = "ferrisboost"
-version = "0.0.2"
+version = "0.0.2-post1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Column-blocked gradient boosted trees that train directly from Arrow / Parquet / CSV"
