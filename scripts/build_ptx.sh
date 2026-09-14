@@ -16,13 +16,16 @@ cd "$(dirname "$0")/.."
 NVCC=${NVCC:-/usr/local/cuda/bin/nvcc}
 SRC=src/backend/cuda/histogram.cu
 OUT=src/backend/cuda/histogram.ptx
+EXPECTED_PTX_VERSION=8.0
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
 
-"$NVCC" --ptx -std=c++14 -arch=compute_75 -lineinfo "$SRC" -o "$OUT"
+"$NVCC" --ptx -std=c++14 -arch=compute_75 -lineinfo "$SRC" -o "$TMP"
 
 # Rewrite the absolute source path to the repo-relative one.
-python3 - "$OUT" "$SRC" <<'PY'
+python3 - "$TMP" "$SRC" "$EXPECTED_PTX_VERSION" <<'PY'
 import re, sys
-out, src = sys.argv[1], sys.argv[2]
+out, src, expected_version = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(out, encoding="utf-8").read()
 new, n = re.subn(r'(\.file\s+\d+\s+")[^"]*/(histogram\.cu")', rf'\g<1>{src[:-len("histogram.cu")]}\g<2>', text)
 # nvcc 的 banner 含 compiler build ID 和精确工具链版本。它们对 PTX
@@ -32,6 +35,12 @@ ptx_start = new.find(".version ")
 if ptx_start < 0:
     raise SystemExit("ERROR: generated PTX has no .version directive")
 new = new[ptx_start:]
+actual_version = new.splitlines()[0].strip()
+expected_directive = f".version {expected_version}"
+if actual_version != expected_directive:
+    raise SystemExit(
+        f"ERROR: expected {expected_directive}, generated {actual_version}")
+new = "\n".join(line.rstrip() for line in new.splitlines()) + "\n"
 source = open(src, "rb").read()
 fnv = 0xcbf29ce484222325
 for byte in source:
@@ -41,9 +50,11 @@ open(out, "w", encoding="utf-8").write(new)
 print(f"  rewrote {n} .file directive(s) to a relative path")
 PY
 
-if grep -q "$HOME\|$(pwd)" "$OUT"; then
-  echo "ERROR: $OUT still contains build-machine paths" >&2
-  grep -n "$HOME\|$(pwd)" "$OUT" | head -3 >&2
+if grep -q "$HOME\|$(pwd)" "$TMP"; then
+  echo "ERROR: generated PTX still contains build-machine paths" >&2
+  grep -n "$HOME\|$(pwd)" "$TMP" | head -3 >&2
   exit 1
 fi
+mv "$TMP" "$OUT"
+trap - EXIT
 echo "  $OUT regenerated and sanitised"

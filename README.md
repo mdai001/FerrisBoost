@@ -52,6 +52,13 @@ pip install ferrisboost
 
 One wheel, CPU and NVIDIA GPU support. GPU acceleration is optional; CPU training and inference work without NVIDIA hardware or drivers.
 
+The bundled GPU kernels use PTX 8.0 and target compute capability 7.5 or newer
+(Turing-class devices, including 20-series GPUs and T4, or later). GPU use requires a driver
+compatible with CUDA 12.0: Linux driver 525.60.13 or newer, or Windows/WSL host
+driver 527.41 or newer. The wheel bundles the PTX kernels, so a local CUDA
+Toolkit is not required; systems with CUDA 13 remain compatible when the driver
+meets these requirements.
+
 The default package is the portable x86-64 build. Systems that implement the
 x86-64-v3 ISA level can explicitly install the optimized distribution instead;
 both distributions provide the same `ferrisboost` Python API and model format:

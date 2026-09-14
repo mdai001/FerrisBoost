@@ -661,6 +661,16 @@ fn checked_in_ptx_is_not_older_than_its_source() {
         ptx.lines().any(|line| line == marker),
         "histogram.ptx 不是由当前 histogram.cu 生成的。请运行 scripts/build_ptx.sh"
     );
+    assert_eq!(
+        ptx.lines().find(|line| line.starts_with(".version ")),
+        Some(".version 8.0"),
+        "发布 PTX 必须保持在 CUDA 12.0 的 PTX ISA 8.0"
+    );
+    assert_eq!(
+        ptx.lines().find(|line| line.starts_with(".target ")),
+        Some(".target sm_75"),
+        "发布 PTX 必须继续支持 Turing / RTX 20 系列"
+    );
 }
 
 /// `colsample_bytree` 的跨后端契约。
