@@ -3,7 +3,8 @@
 use ferrisboost::{
     backend::cuda::{
         build_histogram, build_histogram_shared, build_histogram_shared_with_config,
-        partition_rows_gpu, GpuTrainCtx, SharedHistogramConfig, SharedHistogramLayout,
+        partition_rows_gpu, GpuRowSpan, GpuTrainCtx, SharedHistogramConfig,
+        SharedHistogramLayout,
     },
     hist,
     source::DenseSource,
@@ -327,6 +328,181 @@ fn gpu_histogram_handles_single_feature_single_row() {
     assert_cpu_global_shared_equal(&missing, 1, 1, &offsets, &gpair, Some(&rows));
 }
 
+/// Reuse one histogram slot while active D2H lengths grow, shrink, then grow
+/// again. The batches include empty spans between non-empty spans so their
+/// output slices must remain zero while the neighboring histograms are fresh.
+#[test]
+fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
+    let n_rows = 128usize;
+    let config = SharedHistogramConfig {
+        runtime_log: false,
+        threads_per_block: 128,
+        hist_streams: Some(1),
+        hist_nodes_per_batch: Some(4),
+        resident_blocks: Some(0),
+        ..SharedHistogramConfig::default()
+    };
+    let ctx = GpuTrainCtx::new(0, n_rows, 4, 8, 1, 128, config, false).unwrap();
+    let gpair: Vec<_> = (0..n_rows)
+        .map(|row| GradPairFixed {
+            grad: (row as i64 % 17) - 8,
+            hess: (row as i64 % 11) + 1,
+        })
+        .collect();
+    ctx.upload_gpair(&gpair).unwrap();
+    ctx.begin_tree_rows().unwrap();
+
+    let make_bins = |offsets: &[u32]| {
+        let n_feats = offsets.len() - 1;
+        (0..n_feats)
+            .flat_map(|feat| {
+                let width = (offsets[feat + 1] - offsets[feat]) as usize;
+                (0..n_rows).map(move |row| {
+                    if (row + feat * 13) % 29 == 0 {
+                        MISSING_BIN
+                    } else {
+                        ((row * 7 + feat * 3) % width) as u8
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let check_batch = |offsets: &[u32], spans: &[GpuRowSpan]| {
+        let bins = make_bins(offsets);
+        let n_feats = offsets.len() - 1;
+        let mut outputs: Vec<Vec<GradPairFixed>> = (0..spans.len())
+            .map(|_| vec![GradPairFixed { grad: 91, hess: -37 }; 9])
+            .collect();
+        let (batched, timing) = {
+            let mut batched = false;
+            let timing;
+            {
+                let mut session = ctx
+                    .block_session(0, &bins, n_rows, n_feats, offsets, None)
+                    .unwrap();
+                if session.hist_nodes_batch_capacity() > 1 || session.requires_batched_hist() {
+                    batched = true;
+                    let mut out_refs: Vec<_> = outputs.iter_mut().collect();
+                    session.histogram_device_batch(spans, &mut out_refs).unwrap();
+                } else {
+                    // Bucket profiling disables the batched kernel; exercise the
+                    // same slot sequence through the single-node fallback there.
+                    for (span, out) in spans.iter().zip(&mut outputs) {
+                        session.histogram_device(*span, out).unwrap();
+                    }
+                }
+                timing = session.timing();
+            }
+            (batched, timing)
+        };
+        let n_hist = *offsets.last().unwrap() as usize;
+        let nonempty = spans.iter().filter(|span| span.len > 0).count();
+        let expected_calls = if batched {
+            usize::from(nonempty > 0)
+        } else {
+            nonempty
+        };
+        let expected_bytes = if batched && nonempty > 0 {
+            n_hist * spans.len() * std::mem::size_of::<GradPairFixed>()
+        } else {
+            n_hist * nonempty * std::mem::size_of::<GradPairFixed>()
+        };
+        assert_eq!(timing.d2h_calls, expected_calls as u64);
+        assert_eq!(timing.d2h_bytes, expected_bytes as u64);
+        for (index, (&span, got)) in spans.iter().zip(&outputs).enumerate() {
+            let rows: Vec<RowId> = (span.offset..span.offset + span.len)
+                .map(|row| row as RowId)
+                .collect();
+            let mut want = vec![GradPairFixed::default(); *offsets.last().unwrap() as usize];
+            hist::build(
+                &bins,
+                n_rows,
+                n_feats,
+                offsets,
+                &gpair,
+                Some(rows.as_slice()),
+                &mut want,
+            );
+            assert_eq!(got, &want, "batch node {index}, span={span:?}");
+        }
+    };
+
+    // Active D2H size: 6 bins × 4 nodes, then 1 × 1, then 3 × 4.
+    // Empty spans are deliberately interspersed with non-empty nodes.
+    check_batch(
+        &[0, 2, 4, 6],
+        &[
+            GpuRowSpan { offset: 0, len: 128 },
+            GpuRowSpan { offset: 0, len: 0 },
+            GpuRowSpan { offset: 0, len: 64 },
+            GpuRowSpan { offset: 64, len: 0 },
+        ],
+    );
+    check_batch(
+        &[0, 2, 4, 6],
+        &[
+            GpuRowSpan { offset: 0, len: 0 },
+            GpuRowSpan { offset: 32, len: 0 },
+            GpuRowSpan { offset: 64, len: 0 },
+            GpuRowSpan { offset: 96, len: 0 },
+        ],
+    );
+    check_batch(&[0, 1], &[GpuRowSpan { offset: 0, len: 128 }]);
+    check_batch(
+        &[0, 1, 3],
+        &[
+            GpuRowSpan { offset: 0, len: 32 },
+            GpuRowSpan { offset: 32, len: 0 },
+            GpuRowSpan { offset: 32, len: 32 },
+            GpuRowSpan { offset: 64, len: 64 },
+        ],
+    );
+
+    // Also cover the single-node D2H call site through the same reused slot.
+    for offsets in [&[0, 2, 4, 6][..], &[0, 1][..], &[0, 1, 3][..]] {
+        let bins = make_bins(offsets);
+        let n_feats = offsets.len() - 1;
+        let span = GpuRowSpan { offset: 0, len: n_rows };
+        let mut got = vec![GradPairFixed { grad: 91, hess: -37 }; 9];
+        let timing;
+        {
+            let mut session = ctx
+                .block_session(0, &bins, n_rows, n_feats, offsets, None)
+                .unwrap();
+            // The optional row-major path requires the batched entry point,
+            // even when the batch contains just one node.
+            if session.requires_batched_hist() {
+                break;
+            }
+            session.histogram_device(span, &mut got).unwrap();
+            timing = session.timing();
+        }
+        let mut want = vec![GradPairFixed::default(); *offsets.last().unwrap() as usize];
+        hist::build(&bins, n_rows, n_feats, offsets, &gpair, None, &mut want);
+        assert_eq!(got, want, "single-node offsets={offsets:?}");
+        assert_eq!(timing.d2h_calls, 1);
+        assert_eq!(
+            timing.d2h_bytes,
+            (want.len() * std::mem::size_of::<GradPairFixed>()) as u64
+        );
+    }
+
+    // A zero-row scalar call has no D2H, but must replace stale output with a
+    // correctly sized zero histogram before the next reuse of this slot.
+    let offsets = [0, 2, 4];
+    let bins = make_bins(&offsets);
+    let mut got = vec![GradPairFixed { grad: 91, hess: -37 }; 9];
+    let timing;
+    {
+        let mut session = ctx.block_session(0, &bins, n_rows, 2, &offsets, None).unwrap();
+        session.histogram_device(GpuRowSpan { offset: 0, len: 0 }, &mut got).unwrap();
+        timing = session.timing();
+    }
+    assert_eq!(got, vec![GradPairFixed::default(); 4]);
+    assert_eq!(timing.d2h_calls, 0);
+    assert_eq!(timing.d2h_bytes, 0);
+}
+
 /// 30 × 255 bins 需要 122,400 bytes,超过测试路径配置的单-block
 /// shared-memory budget,保证 host 真的跨多个 feature tile 启动。
 /// 257 行也保证第二个 row block 带尾部。
@@ -366,6 +542,7 @@ fn shared_histogram_tiles_features_and_rows() {
             hist_streams: None,
             device_quantize: None,
             hist_nodes_per_batch: None,
+            gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
             threads_per_block: 64,
             shared_memory_budget_bytes: Some(16 * 1024),
@@ -444,6 +621,7 @@ fn atomic32_layout_is_bit_exact_when_low_word_overflows() {
             hist_streams: None,
             device_quantize: None,
             hist_nodes_per_batch: None,
+            gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
             threads_per_block: 256,
             shared_memory_budget_bytes: Some(16 * 1024),
@@ -953,4 +1131,240 @@ fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     let even_streaming = run(15, 0); // 30 / 15 = [15, 15]
     let even_full = run(15, 2);
     assert_eq!(even_streaming, even_full, "等宽切分下全常驻本来就该一致");
+}
+
+/// The resident split cache is an exact, bounded alternative to the existing
+/// host split path. Cover both GPU histogram layouts and both objectives with
+/// missing values, row and column sampling, tree resets, and depth beyond the
+/// two-generation cache capacity. The 40-column first block selects the
+/// column-major kernel; the 16+14 split selects row-major and makes the final
+/// resident block narrower than the first.
+#[test]
+fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {
+    let n_rows = 768usize;
+    let fixtures = [(70usize, 40usize), (30usize, 16usize)];
+    let bytes = |m: &ferrisboost::tree::Model| serde_json::to_vec(m).unwrap();
+
+    let run = |source: &DenseSource,
+               labels: &[f32],
+               objective: ferrisboost::types::Objective,
+               gpu: bool,
+               cache: bool,
+               hist_nodes_per_batch: Option<usize>,
+               subsample: f32,
+               colsample_bytree: f32|
+     -> ferrisboost::tree::Model {
+        let params = ferrisboost::types::TrainParams {
+            n_rounds: 3,
+            max_depth: 8,
+            nthread: 1,
+            subsample,
+            colsample_bytree,
+            seed: 73,
+            hist_nodes_per_batch,
+            resident_blocks: Some(2),
+            gpu_split_cache: cache,
+            ..Default::default()
+        };
+        let cfg = TrainConfig::new(params, objective);
+        if gpu {
+            train_gpu(0, source, labels, &[], &cfg, &mut [], &Local).unwrap()
+        } else {
+            train(source, labels, &[], &cfg, &mut [], &Local).unwrap()
+        }
+    };
+
+    for (n_feats, cols_per_block) in fixtures {
+        let data: Vec<f32> = (0..n_rows)
+            .flat_map(|row| {
+                (0..n_feats).map(move |feat| {
+                    if (row * 17 + feat * 29) % 89 == 0 {
+                        f32::NAN
+                    } else {
+                        ((row * 13 + feat * 31 + row * feat) % 127) as f32 / 127.0
+                    }
+                })
+            })
+            .collect();
+        let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, cols_per_block);
+        let objectives = [
+            (
+                ferrisboost::types::Objective::Logistic,
+                (0..n_rows)
+                    .map(|row| if (row * 11 + row / 7) % 23 < 11 { 1.0 } else { 0.0 })
+                    .collect::<Vec<f32>>(),
+            ),
+            (
+                ferrisboost::types::Objective::SquaredError,
+                (0..n_rows)
+                    .map(|row| ((row * 7) % 101) as f32 / 100.0)
+                    .collect::<Vec<f32>>(),
+            ),
+        ];
+
+        for (objective, labels) in objectives {
+            let cpu = run(&source, &labels, objective, false, false, Some(2), 0.6, 0.6);
+            let baseline_gpu = run(&source, &labels, objective, true, false, Some(2), 0.6, 0.6);
+            let cached_gpu = run(&source, &labels, objective, true, true, Some(2), 0.6, 0.6);
+            assert_eq!(bytes(&baseline_gpu), bytes(&cpu), "uncached GPU mismatch: {n_feats} features, {objective:?}");
+            assert_eq!(bytes(&cached_gpu), bytes(&cpu), "cached GPU mismatch: {n_feats} features, {objective:?}");
+            assert_eq!(bytes(&cached_gpu), bytes(&baseline_gpu), "cache changed model: {n_feats} features, {objective:?}");
+
+            // None selects the production default cap (16). At least two
+            // nodes are eligible together in this fixed, grown tree shape.
+            for (subsample, colsample_bytree) in [(0.6, 0.6), (1.0, 1.0)] {
+                let cpu = run(&source, &labels, objective, false, false, None, subsample, colsample_bytree);
+                let baseline_gpu = run(&source, &labels, objective, true, false, None, subsample, colsample_bytree);
+                let cached_gpu = run(&source, &labels, objective, true, true, None, subsample, colsample_bytree);
+                assert!(max_nonleaf_width(&cached_gpu) > 1,
+                    "default cap must exercise multi-node levels: features={n_feats}, {objective:?}, sampling=({subsample}, {colsample_bytree})");
+                assert_eq!(bytes(&baseline_gpu), bytes(&cpu), "uncached default-cap GPU mismatch: {n_feats} features, {objective:?}");
+                assert_eq!(bytes(&cached_gpu), bytes(&cpu), "cached default-cap GPU mismatch: {n_feats} features, {objective:?}");
+                assert_eq!(bytes(&cached_gpu), bytes(&baseline_gpu), "default-cap cache changed model: {n_feats} features, {objective:?}");
+            }
+        }
+    }
+}
+
+fn max_nonleaf_width(model: &ferrisboost::tree::Model) -> usize {
+    model
+        .trees
+        .iter()
+        .map(|tree| {
+            let mut level = vec![0usize];
+            let mut max_width = 0;
+            while !level.is_empty() {
+                let mut next = Vec::new();
+                let mut nonleaf_width = 0;
+                for index in level {
+                    let node = &tree.nodes[index];
+                    if !node.is_leaf {
+                        nonleaf_width += 1;
+                        next.push(node.left as usize);
+                        next.push(node.right as usize);
+                    }
+                }
+                max_width = max_width.max(nonleaf_width);
+                level = next;
+            }
+            max_width
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Capacity pressure, residency choices, and host fallbacks must preserve the
+/// same exact model. Depth 8 grows past the cache's two-node capacity; cap 1
+/// disables cache storage, and zero residency exercises the streaming path.
+#[test]
+fn gpu_split_cache_capacity_and_residency_fallbacks_are_exact() {
+    let n_rows = 768usize;
+    let n_feats = 30usize;
+    let cols_per_block = 16usize; // [16, 14], so full residency includes the narrow tail.
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 19 + feat * 23) % 83 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 11 + feat * 37 + row * feat) % 113) as f32 / 113.0
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| if (row * 5 + row / 9) % 29 < 14 { 1.0 } else { 0.0 })
+        .collect();
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, cols_per_block);
+    let bytes = |m: &ferrisboost::tree::Model| serde_json::to_vec(m).unwrap();
+
+    let run = |cache: bool,
+               resident: usize,
+               cap: Option<usize>,
+               nthread: usize,
+               gpu_math: ferrisboost::types::GpuMath|
+     -> ferrisboost::tree::Model {
+        let params = ferrisboost::types::TrainParams {
+            n_rounds: 3,
+            max_depth: 8,
+            nthread,
+            subsample: 0.6,
+            colsample_bytree: 0.6,
+            seed: 91,
+            hist_nodes_per_batch: cap,
+            resident_blocks: Some(resident),
+            gpu_split_cache: cache,
+            gpu_math,
+            ..Default::default()
+        };
+        let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
+        train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap()
+    };
+
+    let exact = ferrisboost::types::GpuMath::Exact;
+    let baseline_model = run(false, 2, Some(2), 1, exact);
+    assert!(max_nonleaf_width(&baseline_model) > 2,
+        "fallback fixture must have more than two nonleaf parents at one depth, creating four or more children");
+    let baseline = bytes(&baseline_model);
+    let no_resident = bytes(&run(true, 0, Some(2), 1, exact));
+    let partial_resident = bytes(&run(true, 1, Some(2), 1, exact));
+    let full_resident = bytes(&run(true, 2, Some(2), 1, exact));
+    let cap_one_fallback = bytes(&run(true, 2, Some(1), 1, exact));
+    let four_threads = bytes(&run(true, 2, Some(2), 4, exact));
+    assert_eq!(no_resident, baseline, "cache enabled with no resident blocks changed the model");
+    assert_eq!(partial_resident, baseline, "partial residency changed the model");
+    assert_eq!(full_resident, baseline, "full residency or capacity overflow changed the model");
+    assert_eq!(cap_one_fallback, bytes(&run(false, 2, Some(1), 1, exact)), "capacity-one fallback changed the model");
+    assert_eq!(four_threads, baseline, "nthread=4 changed the cached model");
+
+    let fast = ferrisboost::types::GpuMath::Fast;
+    let fast_baseline = bytes(&run(false, 2, None, 1, fast));
+    let fast_cached = bytes(&run(true, 2, None, 1, fast));
+    let fast_cached_repeat = bytes(&run(true, 2, None, 1, fast));
+    assert_eq!(fast_cached, fast_baseline, "fast cached path changed the baseline model");
+    assert_eq!(fast_cached_repeat, fast_cached, "fast cached path must remain deterministic");
+}
+
+/// Cache accounting follows the allocations actually enabled by a resident
+/// slot. It stays zero when streaming has no resident cache or when cap=1
+/// disables the feature, and includes both parent generations and scratch at
+/// cap=2.
+#[test]
+fn gpu_split_cache_bytes_match_allocations_and_activation_rules() {
+    use ferrisboost::backend::cuda::SharedHistogramConfig;
+
+    let n_rows = 512usize;
+    let max_feats = 12usize;
+    let max_hist_bins = 12 * 16;
+    let n_blocks = 2usize;
+    let make_ctx = |cache: bool, resident: usize, cap: usize| {
+        GpuTrainCtx::new(
+            0,
+            n_rows,
+            max_feats,
+            max_hist_bins,
+            n_blocks,
+            128,
+            SharedHistogramConfig {
+                runtime_log: false,
+                resident_blocks: Some(resident),
+                hist_nodes_per_batch: Some(cap),
+                gpu_split_cache: cache,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(make_ctx(true, 0, 2).budget().split_cache_bytes, 0);
+    assert_eq!(make_ctx(true, 2, 1).budget().split_cache_bytes, 0);
+    let expected_per_slot = max_hist_bins * 16 * 2 * 2
+        + max_feats * (2 * 64 + 8)
+        + 2 * 96;
+    assert_eq!(
+        make_ctx(true, 2, 2).budget().split_cache_bytes,
+        2 * expected_per_slot,
+        "budget must include two histogram generations, feature candidates, packets, sums, metadata, and feature masks"
+    );
 }

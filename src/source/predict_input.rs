@@ -60,6 +60,37 @@ pub fn for_each_projected_batch<F>(
 where
     F: FnMut(&[Vec<f32>]) -> Result<()>,
 {
+    for_each_projected_contiguous_batch(
+        resolved,
+        canonical_feature_names,
+        canonical_n_features,
+        projected_features,
+        csv_has_header,
+        ingest_threads,
+        |data, _| {
+            let rows = data
+                .chunks_exact(projected_features.len())
+                .map(|row| row.to_vec())
+                .collect::<Vec<_>>();
+            on_rows(&rows)
+        },
+    )
+}
+
+/// Bounded, reusable row-major batches in compact feature order. The callback
+/// borrows the buffer; it must finish consuming it before the next batch.
+pub fn for_each_projected_contiguous_batch<F>(
+    resolved: &ResolvedInput,
+    canonical_feature_names: &[String],
+    canonical_n_features: usize,
+    projected_features: &[usize],
+    csv_has_header: bool,
+    ingest_threads: usize,
+    mut on_rows: F,
+) -> Result<usize>
+where
+    F: FnMut(&[f32], usize) -> Result<()>,
+{
     if projected_features.is_empty() {
         bail!("prediction feature projection 不能为空");
     }
@@ -102,11 +133,14 @@ where
             },
         ))
     };
+    let mut rows = Vec::new();
     for batch in batches {
         let batch = batch?;
-        let rows = batch_to_rows(&batch, projected_features.len())?;
-        total += rows.len();
-        on_rows(&rows)?;
+        batch_to_contiguous_rows(&batch, projected_features.len(), &mut rows)?;
+        total = total
+            .checked_add(batch.num_rows())
+            .context("prediction row count overflow")?;
+        on_rows(&rows, batch.num_rows())?;
     }
     Ok(total)
 }
@@ -191,18 +225,26 @@ fn bind(
     Ok(proj)
 }
 
-/// RecordBatch → 行式 f32。缺失值保持 NaN,交给模型的缺失方向处理。
-fn batch_to_rows(batch: &RecordBatch, n_features: usize) -> Result<Vec<Vec<f32>>> {
-    let mut cols = Vec::with_capacity(n_features);
-    for c in 0..n_features {
-        cols.push(super::arrow_source::column_as_f32(batch, c)?);
+/// Keep at most one converted column alongside the reusable row-major batch.
+/// Missing values retain the existing Arrow conversion's NaN semantics.
+fn batch_to_contiguous_rows(
+    batch: &RecordBatch,
+    n_features: usize,
+    rows: &mut Vec<f32>,
+) -> Result<()> {
+    if n_features == 0 || batch.num_columns() != n_features {
+        bail!("prediction batch feature count mismatch");
     }
-    let n_rows = batch.num_rows();
-    let mut rows = vec![Vec::with_capacity(n_features); n_rows];
-    for col in cols.iter() {
-        for (r, v) in col.iter().enumerate() {
-            rows[r].push(*v);
+    let values = batch
+        .num_rows()
+        .checked_mul(n_features)
+        .context("prediction batch size overflow")?;
+    rows.resize(values, 0.0);
+    for c in 0..n_features {
+        let column = super::arrow_source::column_as_f32(batch, c)?;
+        for (row, value) in rows.chunks_exact_mut(n_features).zip(column) {
+            row[c] = value;
         }
     }
-    Ok(rows)
+    Ok(())
 }

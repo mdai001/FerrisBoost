@@ -14,6 +14,7 @@ use crate::types::{Bin, GradPairFixed, RowId, MISSING_BIN};
 
 mod inference;
 mod train_ctx;
+pub(crate) use train_ctx::GpuSplitGroup;
 pub use inference::GpuInferenceModel;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
@@ -98,6 +99,7 @@ pub struct SharedHistogramConfig {
     /// `TrainParams::hist_nodes_per_batch`:一次 launch 合并多少个 Accumulate 节点。
     /// 批内每个节点要一份独立直方图切片,**改变内存计划**,所以是参数。
     pub hist_nodes_per_batch: Option<usize>,
+    pub gpu_split_cache: bool,
     /// `TrainParams::gpu_math`。`Fast` 会让 prediction 和 label 常驻 device
     /// (+8 B/行),**改变内存计划**。
     pub gpu_math: crate::types::GpuMath,
@@ -127,6 +129,7 @@ impl Default for SharedHistogramConfig {
             hist_streams: None,
             device_quantize: None,
             hist_nodes_per_batch: None,
+            gpu_split_cache: false,
             gpu_memory_budget: None,
             resident_blocks: None,
             gpu_math: crate::types::GpuMath::Exact,

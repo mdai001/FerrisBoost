@@ -21,8 +21,13 @@ pub struct StreamingMemModel {
     pub fixed_bytes: u64,
     /// 每多一列要多付的字节:量化列块本身(n_rows)+ 该列的直方图切片。
     pub per_col_bytes: u64,
-    /// **一个 slot、一列**的字节数。streaming slot 与 resident slot 同价。
+    /// **一个 slot、一列**的基础字节数。启用 split/cache 时,resident slot 另有增量。
     pub slot_col_bytes: u64,
+    /// Resident-only per-feature cost: two generation histograms, candidate
+    /// scratch, and global feature ID/enabled metadata.
+    pub resident_extra_col_bytes: u64,
+    /// Resident-only per-block scratch that does not scale with block width.
+    pub resident_extra_fixed_bytes: u64,
 }
 
 impl StreamingMemModel {
@@ -73,14 +78,36 @@ impl StreamingMemModel {
             fixed_bytes,
             per_col_bytes: slot_col_bytes * hist_streams,
             slot_col_bytes,
+            resident_extra_col_bytes: 0,
+            resident_extra_fixed_bytes: 0,
         }
+    }
+
+    /// Add the bounded resident split/cache allocation to this model.
+    ///
+    /// `hist_nodes_per_batch` is the cache capacity. Capacities below two
+    /// disable the cache at runtime, so they carry no resident-only charge.
+    pub fn with_resident_split_cache(mut self, max_bin: u64, hist_nodes_per_batch: u64) -> Self {
+        if hist_nodes_per_batch < 2 {
+            return self;
+        }
+        let cap = hist_nodes_per_batch;
+        self.resident_extra_col_bytes = cap
+            .saturating_mul(max_bin.saturating_add(1))
+            .saturating_mul(16)
+            .saturating_mul(2)
+            .saturating_add(cap.saturating_mul(64))
+            .saturating_add(8);
+        // 16 B node sum + 16 B metadata + 64 B result packet per slot.
+        self.resident_extra_fixed_bytes = cap.saturating_mul(96);
+        self
     }
 
     /// 定下 `cols` 和 stream 数之后,剩下的预算还能**再常驻几个物理块**。
     ///
-    /// 每个常驻块就是多一个 slot,单价和 streaming slot 完全一样
-    /// (`cols × slot_col_bytes`)。实测 wide c=64 每块 614 MB,
-    /// 和 `64 × 10M` 对得上。
+    /// 每个常驻块都有一个基础 streaming slot (`cols × slot_col_bytes`)；启用
+    /// split/cache 时还要加上 resident-only 的 per-column 和 per-block 成本。
+    /// 无 cache 时实测 wide c=64 每块 614 MB,和 `64 × 10M` 对得上。
     ///
     /// ⚠️ **夹到 `total_blocks`**:常驻块比物理块还多没有意义,而且会真的
     /// 去分配用不到的 slot。
@@ -91,25 +118,49 @@ impl StreamingMemModel {
         streams: u64,
         total_blocks: u64,
     ) -> u64 {
-        let per_slot = cols.saturating_mul(self.slot_col_bytes);
-        if per_slot == 0 {
+        let streaming_slot = cols.saturating_mul(self.slot_col_bytes);
+        if streaming_slot == 0 {
             return 0;
         }
-        let base = self.fixed_bytes + per_slot * streams;
+        let base = self
+            .fixed_bytes
+            .saturating_add(streaming_slot.saturating_mul(streams));
         if base >= budget_bytes {
             return 0;
         }
-        ((budget_bytes - base) / per_slot).min(total_blocks)
+        let resident_slot = cols
+            .saturating_mul(
+                self.slot_col_bytes
+                    .saturating_add(self.resident_extra_col_bytes),
+            )
+            .saturating_add(self.resident_extra_fixed_bytes);
+        if resident_slot == 0 {
+            return 0;
+        }
+        ((budget_bytes - base) / resident_slot).min(total_blocks)
     }
 
     /// `cols` 宽、`streams` 条流、`resident` 个常驻块时的峰值。
     pub fn peak_for_layout(&self, cols: u64, streams: u64, resident: u64) -> u64 {
-        self.fixed_bytes + cols.saturating_mul(self.slot_col_bytes) * (streams + resident)
+        self.fixed_bytes
+            .saturating_add(
+                cols.saturating_mul(self.slot_col_bytes)
+                    .saturating_mul(streams),
+            )
+            .saturating_add(
+                cols.saturating_mul(
+                    self.slot_col_bytes
+                        .saturating_add(self.resident_extra_col_bytes),
+                )
+                .saturating_add(self.resident_extra_fixed_bytes)
+                .saturating_mul(resident),
+            )
     }
 
     /// 给定块宽的估计峰值。
     pub fn peak_for(&self, cols_per_block: u64) -> u64 {
-        self.fixed_bytes + cols_per_block * self.per_col_bytes
+        self.fixed_bytes
+            .saturating_add(cols_per_block.saturating_mul(self.per_col_bytes))
     }
 
     /// 在预算内解出最大可用块宽,并夹到 `[1, n_features]`。
@@ -490,6 +541,100 @@ mod tests {
     /// | 28 | 774.8 MiB |
     fn higgs_model() -> StreamingMemModel {
         StreamingMemModel::new(10_500_000, 255, 1, 16, true, true, true, 32 * 1024 * 1024)
+    }
+
+    #[test]
+    fn legacy_models_keep_resident_cache_costs_at_zero() {
+        let m = higgs_model();
+        assert_eq!(m.resident_extra_col_bytes, 0);
+        assert_eq!(m.resident_extra_fixed_bytes, 0);
+        assert_eq!(
+            m.peak_for_layout(7, 2, 3),
+            m.fixed_bytes + 7 * m.slot_col_bytes * 5
+        );
+        let budget = m.fixed_bytes + 7 * m.slot_col_bytes * 5;
+        assert_eq!(m.resident_capacity(budget, 7, 2, 9), 3);
+    }
+
+    #[test]
+    fn resident_split_cache_is_disabled_below_two_nodes() {
+        let base = higgs_model();
+        let disabled = base.with_resident_split_cache(255, 1);
+        assert_eq!(disabled.resident_extra_col_bytes, 0);
+        assert_eq!(disabled.resident_extra_fixed_bytes, 0);
+        assert_eq!(
+            base.with_resident_split_cache(255, 0)
+                .resident_extra_col_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn resident_split_cache_prices_exact_two_and_sixteen_node_caps() {
+        let base = higgs_model();
+        let two = base.with_resident_split_cache(255, 2);
+        assert_eq!(two.resident_extra_col_bytes, 2 * 256 * 16 * 2 + 2 * 64 + 8);
+        assert_eq!(two.resident_extra_fixed_bytes, 2 * 96);
+
+        let sixteen = base.with_resident_split_cache(255, 16);
+        assert_eq!(
+            sixteen.resident_extra_col_bytes,
+            16 * 256 * 16 * 2 + 16 * 64 + 8
+        );
+        assert_eq!(sixteen.resident_extra_fixed_bytes, 16 * 96);
+    }
+
+    #[test]
+    fn resident_capacity_clamps_around_one_resident_slot() {
+        let m = StreamingMemModel {
+            fixed_bytes: 100,
+            per_col_bytes: 10,
+            slot_col_bytes: 10,
+            resident_extra_col_bytes: 5,
+            resident_extra_fixed_bytes: 20,
+        };
+        // Base = fixed + 2 columns * one stream * 10 = 120.
+        // A resident costs 2 * (10 + 5) + 20 = 50.
+        assert_eq!(m.resident_capacity(119, 2, 1, 8), 0);
+        assert_eq!(m.resident_capacity(169, 2, 1, 8), 0);
+        assert_eq!(m.resident_capacity(170, 2, 1, 8), 1);
+        assert_eq!(m.resident_capacity(220, 2, 1, 8), 2);
+
+        let budgets = [120, 169, 170, 219, 220, 500];
+        let capacities: Vec<_> = budgets
+            .iter()
+            .map(|&budget| m.resident_capacity(budget, 2, 1, 8))
+            .collect();
+        assert!(capacities.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn explicit_resident_override_uses_the_cache_aware_peak() {
+        let model = |streams| StreamingMemModel {
+            fixed_bytes: 100,
+            per_col_bytes: 10 * streams,
+            slot_col_bytes: 10,
+            resident_extra_col_bytes: 5,
+            resident_extra_fixed_bytes: 20,
+        };
+        let budget = 170;
+        let free_vram = budget + default_safety_reserve(budget * 2);
+        let p = resolve_gpu_streaming_plan(
+            Some(2),
+            Some(1),
+            Some(2),
+            4,
+            free_vram,
+            1024 * 1024 * 1024,
+            model,
+        )
+        .unwrap();
+        assert_eq!(p.resident_blocks, 2);
+        assert_eq!(p.estimated_peak, 220);
+        assert!(
+            p.estimated_peak > budget,
+            "explicit residency remains an override"
+        );
     }
 
     #[test]

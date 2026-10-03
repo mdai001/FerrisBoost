@@ -19,6 +19,8 @@ pub mod source;
 pub mod backend;
 mod inference;
 mod threading;
+#[cfg(any(feature = "python", test))]
+mod model_io;
 
 #[cfg(feature = "python")]
 mod python;

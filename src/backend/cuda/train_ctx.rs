@@ -80,6 +80,8 @@ pub struct GpuMemoryBudget {
     pub block_bins_bytes: usize,
     /// 直方图输出。multi-node batching 打开时是 `hist_nodes_per_batch` 份切片。
     pub hist_bytes: usize,
+    /// Two bounded resident generations plus split scratch and metadata.
+    pub split_cache_bytes: usize,
     /// multi-node batching 的 block -> node 映射数组。关闭时为 0。
     pub hist_nodes_batch_idx_bytes: usize,
     /// `gpu_math = "fast"` 的常驻 prediction + label,各 O(行数)。exact 下为 0。
@@ -138,6 +140,7 @@ impl GpuMemoryBudget {
             + self.partition_col_bytes
             + self.block_bins_bytes
             + self.hist_bytes
+            + self.split_cache_bytes
             + self.offsets_bytes
             + self.prediction_bytes
             + self.gpair_f32_bytes
@@ -164,7 +167,7 @@ impl GpuMemoryBudget {
         format!(
             "预分配显存 {:.1} MB({} 条 histogram stream) = gpair {:.1} + row_idx {:.1} + partition 输出 {:.1} \
              + partition 临时 {:.1} + partition 取列 {:.1} + 列块 buffer {:.1} \
-             + 直方图 {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
+             + 直方图 {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -174,6 +177,7 @@ impl GpuMemoryBudget {
             mb(self.partition_col_bytes),
             mb(self.block_bins_bytes),
             mb(self.hist_bytes),
+            mb(self.split_cache_bytes),
             mb(self.offsets_bytes),
             mb(self.hist_feature_select_bytes),
             mb(self.prediction_bytes),
@@ -194,13 +198,27 @@ impl GpuMemoryBudget {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuSegmentTiming {
     /// CUDA event 圈的纯 kernel 时间。
+    /// This remains inclusive of split kernels; `split_kernel_ms` is a subset.
     pub kernel_ms: f32,
     /// 大块数据的 H2D:histogram 段是量化列块,partition 段是选中的那一列。
     pub block_h2d_ms: f32,
     /// 行索引的 H2D。
     pub rows_h2d_ms: f32,
     /// D2H 墙钟。
+    /// This remains inclusive of split D2H; `split_d2h_ms` is a subset.
     pub d2h_ms: f32,
+    /// Split-kernel subset of `kernel_ms`.
+    pub split_kernel_ms: f32,
+    pub split_kernel_calls: u64,
+    /// Compact split packet subset of `d2h_ms`; fallback histograms remain
+    /// in the histogram portion of the inclusive total.
+    pub split_d2h_ms: f32,
+    pub split_d2h_calls: u64,
+    pub split_d2h_bytes: u64,
+    /// Split metadata H2D is reported separately, not included in existing H2D totals.
+    pub split_metadata_h2d_ms: f32,
+    pub split_metadata_h2d_calls: u64,
+    pub split_metadata_h2d_bytes: u64,
     /// Number of H2D / D2H submissions represented by this segment.  These
     /// are deliberately separate from kernel launches: one block upload can
     /// serve every active node at a level.
@@ -297,15 +315,23 @@ impl GpuSegmentTiming {
 
     pub fn add(&mut self, other: &Self) {
         self.kernel_ms += other.kernel_ms;
+        self.split_kernel_ms += other.split_kernel_ms;
+        self.split_kernel_calls += other.split_kernel_calls;
         self.block_h2d_ms += other.block_h2d_ms;
         self.rows_h2d_ms += other.rows_h2d_ms;
         self.d2h_ms += other.d2h_ms;
+        self.split_d2h_ms += other.split_d2h_ms;
+        self.split_metadata_h2d_ms += other.split_metadata_h2d_ms;
         self.block_h2d_calls += other.block_h2d_calls;
         self.rows_h2d_calls += other.rows_h2d_calls;
         self.d2h_calls += other.d2h_calls;
+        self.split_d2h_calls += other.split_d2h_calls;
+        self.split_metadata_h2d_calls += other.split_metadata_h2d_calls;
         self.block_h2d_bytes += other.block_h2d_bytes;
         self.rows_h2d_bytes += other.rows_h2d_bytes;
         self.d2h_bytes += other.d2h_bytes;
+        self.split_d2h_bytes += other.split_d2h_bytes;
+        self.split_metadata_h2d_bytes += other.split_metadata_h2d_bytes;
         self.kernel_calls += other.kernel_calls;
     }
 }
@@ -351,7 +377,12 @@ struct GpuBuffers {
 
 /// 每条 histogram stream 独占的一整套可覆写资源。共享这些 buffer 会让
 /// 下一块的 H2D 覆盖仍在被上一块 kernel 读取的数据，形成低概率竞态。
+#[path = "split_ctx.rs"]
+mod split_ctx;
+pub(crate) use split_ctx::GpuSplitGroup;
+
 struct GpuHistBuffers {
+    split_cache: Option<split_ctx::ResidentSplitBuffers>,
     stream: Arc<CudaStream>,
     bins: CudaSlice<u8>,
     offsets: CudaSlice<u32>,
@@ -455,6 +486,8 @@ impl<T> HostSlice<T> for PinnedPrefix<'_, T> {
 }
 
 pub struct GpuTrainCtx {
+    split_features_fn: Option<CudaFunction>,
+    split_nodes_fn: Option<CudaFunction>,
     #[allow(dead_code)]
     state: Arc<DeviceState>,
     stream: Arc<CudaStream>,
@@ -617,6 +650,13 @@ impl GpuTrainCtx {
         if hist_nodes_per_batch > MAX_HIST_NODES_PER_BATCH {
             bail!("hist_nodes_per_batch 上限是 {MAX_HIST_NODES_PER_BATCH},收到 {hist_nodes_per_batch}");
         }
+        let split_cache_enabled = config.gpu_split_cache && hist_nodes_per_batch >= 2 && !bucket_profile;
+        let split_features_fn = if split_cache_enabled {
+            Some(state.module.load_function("split_cached_features")?)
+        } else { None };
+        let split_nodes_fn = if split_cache_enabled {
+            Some(state.module.load_function("split_cached_nodes")?)
+        } else { None };
         // `gpu_math = "fast"`:prediction / gradient / quantization 全程留在
         // device。只有 Fast 才加载 kernel 和分配那两块常驻 buffer。
         let gpu_math = config.gpu_math;
@@ -1053,6 +1093,7 @@ impl GpuTrainCtx {
                 .with_context(|| format!("创建 histogram slot {slot} 结束 event"))?;
             let rm_stage = alloc_rm_staging(&hist_stream, &format!("histogram slot {slot}"))?;
             hist_slots.push(Mutex::new(GpuHistBuffers {
+                split_cache: None,
                 stream: hist_stream,
                 bins,
                 offsets,
@@ -1098,6 +1139,10 @@ impl GpuTrainCtx {
                 None
             };
             hist_slots.push(Mutex::new(GpuHistBuffers {
+                split_cache: if split_cache_enabled {
+                    Some(split_ctx::ResidentSplitBuffers::new(&hist_stream,
+                        max_hist_bins, max_block_feats, hist_nodes_per_batch)?)
+                } else { None },
                 stream: hist_stream, bins, offsets, feature_select, hist_out, batch_idx,
                 hist_host: Vec::new(),
                 bins_host, rm_stage, start_event, end_event,
@@ -1136,6 +1181,12 @@ impl GpuTrainCtx {
             partition_col_bytes: n_rows,
             block_bins_bytes: bins_len * (hist_stream_count + resident_block_count),
             hist_bytes: hist_words * 8 * hist_nodes_per_batch * (hist_stream_count + resident_block_count),
+            split_cache_bytes: if split_cache_enabled {
+                resident_block_count * ((max_hist_bins * 2 * hist_nodes_per_batch).max(1) * 8 * 2
+                    + (max_block_feats * hist_nodes_per_batch * 64).max(1)
+                    + max_block_feats.max(1) * 8
+                    + hist_nodes_per_batch * 96)
+            } else { 0 },
             hist_nodes_batch_idx_bytes: if batch_capable {
                 batch_idx_len * 4 * (hist_stream_count + resident_block_count)
             } else {
@@ -1177,6 +1228,8 @@ impl GpuTrainCtx {
             .context("创建 GPU 计时结束 event")?;
 
         let ctx = Self {
+            split_features_fn,
+            split_nodes_fn,
             rm_transpose_fn,
             rm_hist_fn,
             rm_count_fn,
@@ -1331,6 +1384,10 @@ impl GpuTrainCtx {
                 self.rm_chunk_rows,
             )
             + &format!(" max_bins_per_tile={}", self.max_bins_per_tile)
+            + &format!(" split={} split_cache_capacity={} split_cache_bytes={}",
+                if self.budget.split_cache_bytes > 0 { "gpu_resident_cache" } else { "cpu" },
+                if self.budget.split_cache_bytes > 0 { self.hist_nodes_per_batch } else { 0 },
+                self.budget.split_cache_bytes)
     }
 
     pub fn timing_enabled(&self) -> bool {
@@ -2351,9 +2408,9 @@ impl GpuBlockSession<'_> {
         node_index: usize,
     ) -> Result<()> {
         out.clear();
-        out.resize(self.n_hist, GradPairFixed::default());
         let n_selected = span.len;
         if self.n_hist == 0 || n_selected == 0 {
+            out.resize(self.n_hist, GradPairFixed::default());
             return Ok(());
         }
 
@@ -2682,34 +2739,7 @@ impl GpuBlockSession<'_> {
                 .context("计算 shared histogram kernel 时间")?;
         }
 
-        let started = std::time::Instant::now();
-        {
-            let slot = self.slot.as_mut().expect("histogram slot lease missing");
-            slot.hist_host.clear();
-            slot.hist_host.resize(self.n_hist * 2, 0);
-            let GpuHistBuffers {
-                hist_out,
-                hist_host,
-                ..
-            } = &mut **slot;
-            let view = hist_out.slice(..hist_host.len());
-            stream
-                .memcpy_dtoh(&view, hist_host.as_mut_slice())
-                .context("histogram D2H")?;
-        }
-        // Host 枚举马上消费结果；只等本 slot，不阻塞另一条 stream。
-        stream.synchronize().context("等待 histogram D2H")?;
-        if self.ctx.timing {
-            self.timing.d2h_ms += started.elapsed().as_secs_f32() * 1e3;
-        }
-        self.timing.d2h_calls += 1;
-        self.timing.d2h_bytes += (self.n_hist * std::mem::size_of::<GradPairFixed>()) as u64;
-        let slot = self.slot.as_ref().expect("histogram slot lease missing");
-        for (dst, pair) in out.iter_mut().zip(slot.hist_host.as_chunks::<2>().0) {
-            dst.grad = pair[0];
-            dst.hess = pair[1];
-        }
-        Ok(())
+        self.download_histograms(&mut [out])
     }
 
     /// 本层的多个 `Accumulate` 节点合并进**一次** launch。
@@ -2733,6 +2763,22 @@ impl GpuBlockSession<'_> {
         if spans.len() != outs.len() {
             bail!("histogram batch:spans {} 与 outs {} 不等长", spans.len(), outs.len());
         }
+        for out in outs.iter_mut() {
+            out.clear();
+        }
+        self.produce_histogram_device_batch(spans)?;
+        if !spans.is_empty() && spans.iter().all(|span| span.len == 0) {
+            for out in outs.iter_mut() { out.resize(self.n_hist, GradPairFixed::default()); }
+            return Ok(());
+        }
+        if self.n_hist > 0 && !spans.is_empty() {
+            self.download_histograms(outs)?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue one batched histogram build without copying the result to host.
+    pub(super) fn produce_histogram_device_batch(&mut self, spans: &[GpuRowSpan]) -> Result<()> {
         // 行主序 kernel 每线程一行(整行 32 B 一次向量取数进寄存器),
         // 列主序 kernel 每线程四行。**每 block 覆盖的行数因此不同**,
         // blk_ptr 必须按各自的 rows_per_block 算,否则批内节点边界会错位。
@@ -2752,10 +2798,6 @@ impl GpuBlockSession<'_> {
                 spans.len(),
                 self.ctx.hist_nodes_per_batch
             );
-        }
-        for out in outs.iter_mut() {
-            out.clear();
-            out.resize(self.n_hist, GradPairFixed::default());
         }
         for span in spans {
             if span.offset.saturating_add(span.len) > self.ctx.n_rows {
@@ -2791,9 +2833,19 @@ impl GpuBlockSession<'_> {
             node_off.push(u32::try_from(span.offset).context("row span offset 超过 u32")?);
             node_len.push(u32::try_from(span.len).context("row span len 超过 u32")?);
         }
-        // 整批都空(可能发生在极端的行分布上)时没有任何 block 要跑,
-        // 但 outs 已经清成零直方图,语义正确。
+        // An empty batch still returns full-width zero histograms, including
+        // when the output vectors contain values from a previous invocation.
         if total_blocks == 0 {
+            let hist_stride = self.n_hist * 2;
+            let stream = self
+                .slot
+                .as_ref()
+                .expect("histogram slot lease missing")
+                .stream
+                .clone();
+            let slot = self.slot.as_mut().expect("histogram slot lease missing");
+            let mut view = slot.hist_out.slice_mut(..hist_stride * n_nodes);
+            stream.memset_zeros(&mut view).context("清零空批直方图 buffer")?;
             return Ok(());
         }
 
@@ -2918,12 +2970,27 @@ impl GpuBlockSession<'_> {
                 .context("计算批 histogram kernel 时间")?;
         }
 
-        // **整批一次 D2H**。原来是每个节点一次,而且每次都要 host 等
-        // scatter 退休 —— 那正是审计里 3.47 ms host 延迟的来源。
+        Ok(())
+    }
+
+    /// Keep one D2H per batch. A single node can download into its final owner;
+    /// multiple nodes retain packed staging to avoid extra transfer/sync calls.
+    fn download_histograms(&mut self, outs: &mut [&mut Vec<GradPairFixed>]) -> Result<()> {
+        let n_nodes = outs.len();
+        let hist_stride = self.n_hist * 2;
         let started = std::time::Instant::now();
-        {
-            let slot = self.slot.as_mut().expect("histogram slot lease missing");
-            slot.hist_host.clear();
+        let slot = self.slot.as_mut().expect("histogram slot lease missing");
+        let stream = slot.stream.clone();
+        if n_nodes == 1 {
+            let out = &mut outs[0];
+            out.resize(self.n_hist, GradPairFixed::default());
+            let view = slot.hist_out.slice(..hist_stride);
+            stream
+                .memcpy_dtoh(&view, GradPairFixed::flatten_mut(out))
+                .context("histogram D2H")?;
+        } else {
+            // D2H overwrites the complete active staging slice. Reuse its
+            // initialized storage; only growth needs initialization.
             slot.hist_host.resize(hist_stride * n_nodes, 0);
             let GpuHistBuffers { hist_out, hist_host, .. } = &mut **slot;
             let view = hist_out.slice(..hist_host.len());
@@ -2931,19 +2998,23 @@ impl GpuBlockSession<'_> {
                 .memcpy_dtoh(&view, hist_host.as_mut_slice())
                 .context("批 histogram D2H")?;
         }
-        stream.synchronize().context("等待批 histogram D2H")?;
+        // Synchronize before consuming host output and preserve error reporting.
+        stream.synchronize().context("等待 histogram D2H")?;
         if self.ctx.timing {
             self.timing.d2h_ms += started.elapsed().as_secs_f32() * 1e3;
         }
         self.timing.d2h_calls += 1;
-        self.timing.d2h_bytes += (self.n_hist * n_nodes * bytes_per_bin) as u64;
-
-        let slot = self.slot.as_ref().expect("histogram slot lease missing");
-        for (node, out) in outs.iter_mut().enumerate() {
-            let chunk = &slot.hist_host[node * hist_stride..(node + 1) * hist_stride];
-            for (dst, pair) in out.iter_mut().zip(chunk.as_chunks::<2>().0) {
-                dst.grad = pair[0];
-                dst.hess = pair[1];
+        self.timing.d2h_bytes +=
+            (self.n_hist * n_nodes * std::mem::size_of::<GradPairFixed>()) as u64;
+        if n_nodes > 1 {
+            for (node, out) in outs.iter_mut().enumerate() {
+                let chunk = &slot.hist_host[node * hist_stride..(node + 1) * hist_stride];
+                // The caller cleared each vector. Initialize with final values,
+                // rather than zeroing every bin before immediately overwriting it.
+                out.extend(chunk.as_chunks::<2>().0.iter().map(|pair| GradPairFixed {
+                    grad: pair[0],
+                    hess: pair[1],
+                }));
             }
         }
         Ok(())

@@ -73,6 +73,9 @@ pub mod prof {
         GPU_HIST_KERNEL,
         GPU_HIST_D2H,
         GPU_HIST_HOST,
+        GPU_SPLIT_METADATA_H2D,
+        GPU_SPLIT_KERNEL,
+        GPU_SPLIT_D2H,
         GPU_PART_COL_H2D,
         GPU_PART_ROWS_H2D,
         GPU_PART_KERNEL,
@@ -91,6 +94,11 @@ pub mod prof {
     pub static GPU_HIST_ROWS_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_HIST_D2H_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static GPU_HIST_D2H_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_D2H_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_D2H_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_METADATA_H2D_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_METADATA_H2D_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_PART_COL_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static GPU_PART_COL_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_PART_ROWS_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -127,6 +135,11 @@ pub mod prof {
             &GPU_HIST_ROWS_BYTES,
             &GPU_HIST_D2H_CALLS,
             &GPU_HIST_D2H_BYTES,
+            &GPU_SPLIT_KERNEL_CALLS,
+            &GPU_SPLIT_D2H_CALLS,
+            &GPU_SPLIT_D2H_BYTES,
+            &GPU_SPLIT_METADATA_H2D_CALLS,
+            &GPU_SPLIT_METADATA_H2D_BYTES,
             &GPU_PART_COL_CALLS,
             &GPU_PART_COL_BYTES,
             &GPU_PART_ROWS_CALLS,
@@ -199,12 +212,15 @@ pub mod prof {
     }
 
     pub fn report_gpu(rounds: usize) {
-        let names: [(&str, &AtomicU64); 12] = [
+        let names: [(&str, &AtomicU64); 15] = [
             ("H2D:gpair(每轮一次)", &GPU_GPAIR_H2D),
             ("H2D:量化列块", &GPU_HIST_BLOCK_H2D),
             ("H2D:histogram 行索引", &GPU_HIST_ROWS_H2D),
-            ("hist_build kernel", &GPU_HIST_KERNEL),
-            ("D2H:直方图", &GPU_HIST_D2H),
+            ("hist_build kernels", &GPU_HIST_KERNEL),
+            ("GPU split metadata H2D", &GPU_SPLIT_METADATA_H2D),
+            ("GPU split kernels", &GPU_SPLIT_KERNEL),
+            ("GPU split D2H", &GPU_SPLIT_D2H),
+            ("D2H:histogram remainder", &GPU_HIST_D2H),
             ("histogram wrapper 残差", &GPU_HIST_HOST),
             ("H2D:partition 取列", &GPU_PART_COL_H2D),
             ("H2D:partition 行索引", &GPU_PART_ROWS_H2D),
@@ -228,10 +244,13 @@ pub mod prof {
         }
         // 这一行就是这次改造的验收指标:改造前 wrapper 是 kernel 的
         // 500 倍以上,说明量到的是分配器不是架构。
-        let hist_kernel = GPU_HIST_KERNEL.load(Ordering::Relaxed).max(1);
+        let hist_kernel = (GPU_HIST_KERNEL.load(Ordering::Relaxed)
+            + GPU_SPLIT_KERNEL.load(Ordering::Relaxed)).max(1);
         let hist_wrap = GPU_HIST_BLOCK_H2D.load(Ordering::Relaxed)
             + GPU_HIST_ROWS_H2D.load(Ordering::Relaxed)
             + GPU_HIST_D2H.load(Ordering::Relaxed)
+            + GPU_SPLIT_METADATA_H2D.load(Ordering::Relaxed)
+            + GPU_SPLIT_D2H.load(Ordering::Relaxed)
             + GPU_HIST_HOST.load(Ordering::Relaxed);
         let part_kernel = GPU_PART_KERNEL.load(Ordering::Relaxed).max(1);
         let part_wrap = GPU_PART_COL_H2D.load(Ordering::Relaxed)
@@ -240,11 +259,11 @@ pub mod prof {
             + GPU_PART_HOST.load(Ordering::Relaxed)
             + GPU_PRED_D2H.load(Ordering::Relaxed);
         eprintln!(
-            "histogram wrapper / kernel = {:.1}×;partition wrapper / kernel = {:.1}×",
+            "histogram + split wrapper / kernels = {:.1}×;partition wrapper / kernel = {:.1}×",
             hist_wrap as f64 / hist_kernel as f64,
             part_wrap as f64 / part_kernel as f64
         );
-        let transfer_rows: [(&str, &AtomicU64, &AtomicU64); 8] = [
+        let transfer_rows: [(&str, &AtomicU64, &AtomicU64); 10] = [
             ("H2D:gpair", &GPU_GPAIR_CALLS, &GPU_GPAIR_BYTES),
             (
                 "H2D:histogram block",
@@ -256,7 +275,17 @@ pub mod prof {
                 &GPU_HIST_ROWS_CALLS,
                 &GPU_HIST_ROWS_BYTES,
             ),
-            ("D2H:histogram", &GPU_HIST_D2H_CALLS, &GPU_HIST_D2H_BYTES),
+            ("D2H:histogram remainder", &GPU_HIST_D2H_CALLS, &GPU_HIST_D2H_BYTES),
+            (
+                "H2D:split metadata",
+                &GPU_SPLIT_METADATA_H2D_CALLS,
+                &GPU_SPLIT_METADATA_H2D_BYTES,
+            ),
+            (
+                "D2H:split packets",
+                &GPU_SPLIT_D2H_CALLS,
+                &GPU_SPLIT_D2H_BYTES,
+            ),
             (
                 "H2D:partition column",
                 &GPU_PART_COL_CALLS,
@@ -304,8 +333,12 @@ pub mod prof {
             d2h_bytes as f64 / 1e9 / rounds as f64
         );
         eprintln!(
-            "CUDA kernels{:>21.1} launches/轮",
+            "Histogram/split/partition kernels{:>5.1} launches/轮",
             GPU_KERNEL_CALLS.load(Ordering::Relaxed) as f64 / rounds as f64
+        );
+        eprintln!(
+            "  split kernel subset{:>18.1} launches/轮",
+            GPU_SPLIT_KERNEL_CALLS.load(Ordering::Relaxed) as f64 / rounds as f64
         );
     }
 
@@ -321,25 +354,53 @@ pub mod prof {
         host: &'static AtomicU64,
     ) {
         let ms_to_ns = |ms: f32| (ms as f64 * 1e6) as u64;
+        let is_hist = std::ptr::eq(block_h2d, &GPU_HIST_BLOCK_H2D);
+        let hist_kernel_ms = if is_hist {
+            (t.kernel_ms - t.split_kernel_ms).max(0.0)
+        } else {
+            t.kernel_ms
+        };
+        let hist_d2h_ms = if is_hist {
+            (t.d2h_ms - t.split_d2h_ms).max(0.0)
+        } else {
+            t.d2h_ms
+        };
+        // `kernel_ms` and `d2h_ms` are inclusive. Their split-specific
+        // counters are subsets, so include each total only once in the wall sum.
         let parts = ms_to_ns(t.block_h2d_ms)
             + ms_to_ns(t.rows_h2d_ms)
             + ms_to_ns(t.kernel_ms)
-            + ms_to_ns(t.d2h_ms);
+            + ms_to_ns(t.d2h_ms)
+            + ms_to_ns(t.split_metadata_h2d_ms);
         block_h2d.fetch_add(ms_to_ns(t.block_h2d_ms), Ordering::Relaxed);
         rows_h2d.fetch_add(ms_to_ns(t.rows_h2d_ms), Ordering::Relaxed);
-        kernel.fetch_add(ms_to_ns(t.kernel_ms), Ordering::Relaxed);
-        d2h.fetch_add(ms_to_ns(t.d2h_ms), Ordering::Relaxed);
+        kernel.fetch_add(ms_to_ns(hist_kernel_ms), Ordering::Relaxed);
+        d2h.fetch_add(ms_to_ns(hist_d2h_ms), Ordering::Relaxed);
         host.fetch_add(wall_ns.saturating_sub(parts), Ordering::Relaxed);
+        GPU_SPLIT_METADATA_H2D.fetch_add(ms_to_ns(t.split_metadata_h2d_ms), Ordering::Relaxed);
+        GPU_SPLIT_KERNEL.fetch_add(ms_to_ns(t.split_kernel_ms), Ordering::Relaxed);
+        GPU_SPLIT_D2H.fetch_add(ms_to_ns(t.split_d2h_ms), Ordering::Relaxed);
+        GPU_SPLIT_KERNEL_CALLS.fetch_add(t.split_kernel_calls, Ordering::Relaxed);
+        GPU_SPLIT_D2H_CALLS.fetch_add(t.split_d2h_calls, Ordering::Relaxed);
+        GPU_SPLIT_D2H_BYTES.fetch_add(t.split_d2h_bytes, Ordering::Relaxed);
+        GPU_SPLIT_METADATA_H2D_CALLS.fetch_add(t.split_metadata_h2d_calls, Ordering::Relaxed);
+        GPU_SPLIT_METADATA_H2D_BYTES.fetch_add(t.split_metadata_h2d_bytes, Ordering::Relaxed);
 
         // The call site identifies histogram versus partition; the segment
         // itself carries exact counts/bytes from the CUDA boundary.
-        if std::ptr::eq(block_h2d, &GPU_HIST_BLOCK_H2D) {
+        if is_hist {
             GPU_HIST_BLOCK_CALLS.fetch_add(t.block_h2d_calls, Ordering::Relaxed);
             GPU_HIST_BLOCK_BYTES.fetch_add(t.block_h2d_bytes, Ordering::Relaxed);
             GPU_HIST_ROWS_CALLS.fetch_add(t.rows_h2d_calls, Ordering::Relaxed);
             GPU_HIST_ROWS_BYTES.fetch_add(t.rows_h2d_bytes, Ordering::Relaxed);
-            GPU_HIST_D2H_CALLS.fetch_add(t.d2h_calls, Ordering::Relaxed);
-            GPU_HIST_D2H_BYTES.fetch_add(t.d2h_bytes, Ordering::Relaxed);
+            GPU_HIST_D2H_CALLS.fetch_add(
+                t.d2h_calls.saturating_sub(t.split_d2h_calls),
+                Ordering::Relaxed,
+            );
+            GPU_HIST_D2H_BYTES.fetch_add(
+                t.d2h_bytes.saturating_sub(t.split_d2h_bytes),
+                Ordering::Relaxed,
+            );
         } else {
             GPU_PART_COL_CALLS.fetch_add(t.block_h2d_calls, Ordering::Relaxed);
             GPU_PART_COL_BYTES.fetch_add(t.block_h2d_bytes, Ordering::Relaxed);
@@ -403,6 +464,70 @@ pub mod prof {
         fn drop(&mut self) {
             self.0
                 .fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn split_timing_is_subtracted_from_totals_and_reported_separately() {
+            let _guard = PROFILE_RUN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reset();
+            struct ResetOnDrop;
+            impl Drop for ResetOnDrop {
+                fn drop(&mut self) {
+                    reset();
+                }
+            }
+            let _cleanup = ResetOnDrop;
+
+            let timing = crate::backend::cuda::GpuSegmentTiming {
+                kernel_ms: 10.0,
+                split_kernel_ms: 3.0,
+                split_kernel_calls: 2,
+                d2h_ms: 5.0,
+                split_d2h_ms: 2.0,
+                split_d2h_calls: 1,
+                split_d2h_bytes: 192,
+                split_metadata_h2d_ms: 1.0,
+                split_metadata_h2d_calls: 1,
+                split_metadata_h2d_bytes: 64,
+                block_h2d_ms: 2.0,
+                rows_h2d_ms: 1.0,
+                d2h_calls: 4,
+                d2h_bytes: 1000,
+                kernel_calls: 5,
+                ..Default::default()
+            };
+            record_gpu(
+                &timing,
+                20_000_000,
+                &GPU_HIST_BLOCK_H2D,
+                &GPU_HIST_ROWS_H2D,
+                &GPU_HIST_KERNEL,
+                &GPU_HIST_D2H,
+                &GPU_HIST_HOST,
+            );
+
+            assert_eq!(GPU_HIST_KERNEL.load(Ordering::Relaxed), 7_000_000);
+            assert_eq!(GPU_SPLIT_KERNEL.load(Ordering::Relaxed), 3_000_000);
+            assert_eq!(GPU_HIST_D2H.load(Ordering::Relaxed), 3_000_000);
+            assert_eq!(GPU_SPLIT_D2H.load(Ordering::Relaxed), 2_000_000);
+            assert_eq!(GPU_SPLIT_METADATA_H2D.load(Ordering::Relaxed), 1_000_000);
+            assert_eq!(GPU_HIST_HOST.load(Ordering::Relaxed), 1_000_000);
+
+            assert_eq!(GPU_HIST_D2H_CALLS.load(Ordering::Relaxed), 3);
+            assert_eq!(GPU_HIST_D2H_BYTES.load(Ordering::Relaxed), 808);
+            assert_eq!(GPU_SPLIT_D2H_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(GPU_SPLIT_D2H_BYTES.load(Ordering::Relaxed), 192);
+            assert_eq!(GPU_SPLIT_METADATA_H2D_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(GPU_SPLIT_METADATA_H2D_BYTES.load(Ordering::Relaxed), 64);
+            assert_eq!(GPU_KERNEL_CALLS.load(Ordering::Relaxed), 5);
+            assert_eq!(GPU_SPLIT_KERNEL_CALLS.load(Ordering::Relaxed), 2);
         }
     }
 }
@@ -812,6 +937,7 @@ fn train_with_backend(
                     // 规划之后这个字段保存的是**生效值**(见 TrainParams 文档)。
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
+                    gpu_split_cache: cfg.params.gpu_split_cache,
                     gpu_math: cfg.params.gpu_math,
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
@@ -1674,10 +1800,15 @@ fn build_tree(
                     let mut per_node: Vec<Histogram> = level
                         .iter()
                         .map(|ln| match ln.hist_from {
-                            HistFrom::Accumulate => Histogram::zeros(width),
-                            HistFrom::Subtract { .. } => Histogram::zeros(0),
+                            // CPU builds accumulate in place; GPU downloads
+                            // supply complete values and allocate their outputs.
+                            HistFrom::Accumulate if gpu.is_none() => Histogram::zeros(width),
+                            _ => Histogram::zeros(0),
                         })
                         .collect();
+
+                    let mut gpu_done = vec![false; level.len()];
+                    let mut gpu_candidates = vec![None; level.len()];
 
                     // 先算要实际累加的那些
                     if let Some(ctx) = gpu {
@@ -1709,10 +1840,38 @@ fn build_tree(
                         // 行主序 kernel 只有 batched 一个入口,批里只有一个
                         // 节点也必须走它。
                         let must_batch = session.requires_batched_hist();
+                        #[cfg(feature = "cuda")]
+                        if session.begin_split_level(depth)? {
+                            use crate::backend::cuda::GpuSplitGroup;
+                            let mut groups = Vec::new();
+                            if depth == 0 {
+                                groups.push(GpuSplitGroup { small: 0,
+                                    span: level[0].rows.device(), sum: level[0].sum, large: None });
+                            } else {
+                                for (i, ln) in level.iter().enumerate() {
+                                    if let HistFrom::Subtract { parent, sibling } = ln.hist_from {
+                                        if let Some(cache_slot) = session.cached_parent_slot(parent) {
+                                            groups.push(GpuSplitGroup { small: sibling,
+                                                span: level[sibling].rows.device(), sum: level[sibling].sum,
+                                                large: Some((i, cache_slot, ln.sum)) });
+                                        }
+                                    }
+                                }
+                            }
+                            for chunk in groups.chunks((cap / 2).max(1)) {
+                                for (i, candidate, histogram) in session.split_cached_batch(chunk,
+                                    &plan.hist_feats, sampled, q, p, depth + 1 < p.max_depth)? {
+                                    gpu_done[i] = true;
+                                    gpu_candidates[i] = candidate;
+                                    if let Some(bins) = histogram { per_node[i].bins = bins; }
+                                }
+                            }
+                            session.finish_split_level(depth);
+                        }
                         let todo: Vec<usize> = level
                             .iter()
                             .enumerate()
-                            .filter(|(_, ln)| matches!(ln.hist_from, HistFrom::Accumulate))
+                            .filter(|(i, ln)| !gpu_done[*i] && matches!(ln.hist_from, HistFrom::Accumulate))
                             .map(|(i, _)| i)
                             .collect();
                         if cap <= 1 && !must_batch {
@@ -1782,6 +1941,7 @@ fn build_tree(
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
                     // 里的先后顺序。
                     for i in 0..level.len() {
+                        if gpu_done[i] { continue; }
                         if let HistFrom::Subtract { parent, sibling } = level[i].hist_from {
                             let ph = parent_hist
                                 .as_mut()
@@ -1811,6 +1971,7 @@ fn build_tree(
                         .iter()
                         .enumerate()
                         .map(|(i, ln)| {
+                            if gpu_done[i] { return gpu_candidates[i]; }
                             split::best_split_in_block(
                                 &per_node[i],
                                 &plan.hist_feats,

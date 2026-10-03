@@ -129,6 +129,15 @@ impl GradPairFixed {
         // 生命周期由入参 slice 借出,不产生悬垂。
         unsafe { std::slice::from_raw_parts(pairs.as_ptr().cast::<i64>(), pairs.len() * 2) }
     }
+
+    /// Mutable interleaved view for downloading directly into initialized pairs.
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn flatten_mut(pairs: &mut [Self]) -> &mut [i64] {
+        // SAFETY: repr(C) and the size/alignment assertions above guarantee two
+        // consecutive i64 fields without padding. Every i64 bit pattern is valid.
+        // The exclusive borrow covers exactly the original slice's lifetime.
+        unsafe { std::slice::from_raw_parts_mut(pairs.as_mut_ptr().cast::<i64>(), pairs.len() * 2) }
+    }
 }
 
 impl std::ops::AddAssign for GradPairFixed {
@@ -165,6 +174,8 @@ const OVERFLOW_MSG: &str =
 pub struct GradQuantizer {
     grad_scale: f64,
     hess_scale: f64,
+    grad_inverse_scale: f64,
+    hess_inverse_scale: f64,
 }
 
 impl GradQuantizer {
@@ -191,9 +202,13 @@ impl GradQuantizer {
     pub fn from_bounds(max_grad: f64, max_hess: f64, n_rows: usize) -> Self {
         // grad 和 hess 分开定 scale:logistic 的 hess 最大 0.25,
         // 和 grad 不是一个量级,共用一个 scale 白扔几位精度。
+        let grad_scale = pow2_scale(max_grad, n_rows);
+        let hess_scale = pow2_scale(max_hess, n_rows);
         Self {
-            grad_scale: pow2_scale(max_grad, n_rows),
-            hess_scale: pow2_scale(max_hess, n_rows),
+            grad_scale,
+            hess_scale,
+            grad_inverse_scale: grad_scale.recip(),
+            hess_inverse_scale: hess_scale.recip(),
         }
     }
 
@@ -207,7 +222,11 @@ impl GradQuantizer {
     /// 反量化成 f64。算 gain 和叶子权重走这条 —— 整条累加链路是整数,
     /// 只在最后一步转浮点,中途不要来回转。
     pub fn to_f64(&self, g: GradPairFixed) -> (f64, f64) {
-        (g.grad as f64 / self.grad_scale, g.hess as f64 / self.hess_scale)
+        // pow2_scale returns 2^k, -1000 <= k <= 1000. Its reciprocal is
+        // exactly representable and normal, so multiplying by it has the
+        // same exact real result and IEEE rounding as division by the scale.
+        // Cache it once per round instead of dividing for every split bin.
+        (g.grad as f64 * self.grad_inverse_scale, g.hess as f64 * self.hess_inverse_scale)
     }
 
     /// 反量化成 f32。存进树里的 sum_hess 之类走这条。
@@ -380,6 +399,8 @@ pub struct TrainParams {
     ///
     /// `1` 表示关闭,回到逐节点 launch。
     pub hist_nodes_per_batch: Option<usize>,
+    /// Experimental bounded resident histogram/split cache. Off by default.
+    pub gpu_split_cache: bool,
     /// GPU streaming 可以使用的显存上限(字节)。`None` = 从运行时空闲显存推断。
     ///
     /// 语义是**「最多可以用到大约这么多」,不是「就分配这么多」**:它是一个
@@ -440,6 +461,7 @@ impl Default for TrainParams {
             hist_streams: None,
             resident_blocks: None,
             hist_nodes_per_batch: None,
+            gpu_split_cache: false,
             gpu_memory_budget: None,
             gpu_math: GpuMath::default(),
             device_quantize: None,
@@ -481,5 +503,108 @@ mod layout_tests {
     #[test]
     fn flatten_handles_empty_without_dangling() {
         assert!(GradPairFixed::flatten(&[]).is_empty());
+    }
+
+    #[test]
+    fn flatten_mut_matches_manual_interleave_including_field_order() {
+        let mut pairs = vec![
+            GradPairFixed { grad: 1, hess: 2 },
+            GradPairFixed { grad: -3, hess: 4 },
+            GradPairFixed { grad: i64::MIN, hess: i64::MAX },
+        ];
+        let flat = GradPairFixed::flatten_mut(&mut pairs);
+        assert_eq!(flat, &[1, 2, -3, 4, i64::MIN, i64::MAX]);
+        flat[0] = i64::MAX;
+        flat[1] = i64::MIN;
+        assert_eq!(pairs[0], GradPairFixed { grad: i64::MAX, hess: i64::MIN });
+    }
+
+    #[test]
+    fn flatten_mut_handles_empty_slice() {
+        assert!(GradPairFixed::flatten_mut(&mut []).is_empty());
+    }
+
+    #[test]
+    fn flatten_mut_exclusive_view_updates_only_borrowed_slice() {
+        let mut pairs = vec![
+            GradPairFixed { grad: 10, hess: 20 },
+            GradPairFixed { grad: 30, hess: 40 },
+            GradPairFixed { grad: 50, hess: 60 },
+        ];
+        {
+            let flat = GradPairFixed::flatten_mut(&mut pairs[1..2]);
+            assert_eq!(flat, &[30, 40]);
+            flat.copy_from_slice(&[i64::MIN, i64::MAX]);
+        }
+        assert_eq!(
+            pairs,
+            vec![
+                GradPairFixed { grad: 10, hess: 20 },
+                GradPairFixed { grad: i64::MIN, hess: i64::MAX },
+                GradPairFixed { grad: 50, hess: 60 },
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod inverse_scale_tests {
+    use super::*;
+
+    #[test]
+    fn cached_inverse_matches_division_for_every_scale_exponent() {
+        let mut values = vec![i64::MIN, i64::MAX, 0, 1, -1, (1i64 << 53) - 1,
+                              (1i64 << 53) + 1, -(1i64 << 53) - 1];
+        let mut state = 37u64;
+        for _ in 0..128 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(state as i64);
+        }
+        for exponent in -1000..=1000 {
+            let grad_scale = 2.0f64.powi(exponent);
+            let hess_scale = 2.0f64.powi(-exponent);
+            let q = GradQuantizer {
+                grad_scale,
+                hess_scale,
+                grad_inverse_scale: grad_scale.recip(),
+                hess_inverse_scale: hess_scale.recip(),
+            };
+            for &value in &values {
+                let got = q.to_f64(GradPairFixed { grad: value, hess: value });
+                assert_eq!(got.0.to_bits(), (value as f64 / grad_scale).to_bits(),
+                           "gradient exponent={exponent} value={value}");
+                assert_eq!(got.1.to_bits(), (value as f64 / hess_scale).to_bits(),
+                           "hessian exponent={exponent} value={value}");
+            }
+        }
+    }
+
+    #[test]
+    fn constructors_keep_inverse_scales_in_sync() {
+        for rows in [0, 1, 100, 10_500_000, usize::MAX] {
+            for bound in [0.0, f32::from_bits(1) as f64, 0.25, 1.0,
+                          f32::MAX as f64, f64::NAN, f64::INFINITY] {
+                let q = GradQuantizer::from_bounds(bound, 0.25, rows);
+                let value = GradPairFixed { grad: -123456789, hess: 987654321 };
+                let got = q.to_f64(value);
+                assert_eq!(got.0.to_bits(), (value.grad as f64 / q.grad_scale()).to_bits());
+                assert_eq!(got.1.to_bits(), (value.hess as f64 / q.hess_scale()).to_bits());
+            }
+        }
+        let q = GradQuantizer::new(&[GradPair { grad: -0.75, hess: 0.25 }], 1);
+        let got = q.to_f64(q.to_fixed(GradPair { grad: -0.75, hess: 0.25 }));
+        assert_eq!(got, (-0.75, 0.25));
+
+        // Exercise the constructor's upper clamp without taking its nonfinite
+        // raw-scale fallback. The lower endpoint uses a valid budget as well.
+        let upper = GradQuantizer::from_bounds(2.0f64.powi(-940), 1.0, 1);
+        assert_eq!(upper.grad_scale(), 2.0f64.powi(1000));
+        assert_eq!(upper.grad_inverse_scale, 2.0f64.powi(-1000));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let lower = GradQuantizer::from_bounds(2.0f64.powi(1000), 1.0, 1usize << 62);
+            assert_eq!(lower.grad_scale(), 2.0f64.powi(-1000));
+            assert_eq!(lower.grad_inverse_scale, 2.0f64.powi(1000));
+        }
     }
 }

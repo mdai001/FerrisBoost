@@ -155,6 +155,27 @@ def test_save_load_round_trip(tmp_path):
     assert parallel.predict(x, output_margin=True).tobytes() == expected
 
 
+def test_save_model_overwrites_existing_model_without_leaking_temp_files(tmp_path):
+    x, y = toy(seed=10)
+    x_new, y_new = toy(seed=11)
+    old_model = fb.train(BASE, x, label=y, num_boost_round=2)
+    new_model = fb.train(BASE, x_new, label=y_new, num_boost_round=4)
+    path = tmp_path / "replace.json"
+    old_model.save_model(str(path), quiet=True)
+    old_bytes = path.read_bytes()
+    siblings_before = {child.name for child in tmp_path.iterdir() if child != path}
+
+    new_model.save_model(str(path), quiet=True, model_io_threads=4)
+
+    assert path.read_bytes() != old_bytes
+    loaded = fb.Model.load_model(str(path), quiet=True)
+    assert loaded.num_trees == new_model.num_trees
+    assert loaded.predict(x_new, output_margin=True).tobytes() == new_model.predict(
+        x_new, output_margin=True
+    ).tobytes()
+    assert {child.name for child in tmp_path.iterdir() if child != path} == siblings_before
+
+
 def test_model_io_progress_and_quiet(tmp_path, capfd):
     x, y = toy(n=80)
     model = fb.train(BASE, x, label=y, num_boost_round=2)
@@ -340,13 +361,19 @@ def test_file_prediction_compacts_used_features_but_validates_full_schema(tmp_pa
     pq = pytest.importorskip("pyarrow.parquet")
     rng = np.random.default_rng(20260908)
     x = np.zeros((1200, 8), dtype=np.float32)
-    x[:, 0] = rng.normal(size=len(x))
-    y = (x[:, 0] > 0).astype(np.float32)
+    x[:, 3] = rng.normal(size=len(x))
+    x[::37, 3] = np.nan
+    y = (np.nan_to_num(x[:, 3], nan=-1.0) > 0).astype(np.float32)
     names = [f"f{i}" for i in range(x.shape[1])]
     train_path = tmp_path / "compact-train.parquet"
     pq.write_table(
         pa.table({**{name: x[:, i] for i, name in enumerate(names)}, "target": y}),
         train_path,
+    )
+    predict_path = tmp_path / "compact-predict-reversed.parquet"
+    pq.write_table(
+        pa.table({**{names[i]: x[:, i] for i in reversed(range(x.shape[1]))}, "target": y}),
+        predict_path,
     )
     model = fb.train(
         {**BASE, "max_depth": 3, "nthread": 1},
@@ -358,9 +385,34 @@ def test_file_prediction_compacts_used_features_but_validates_full_schema(tmp_pa
 
     before = tmp_path / "canonical-before.json"
     model.save_model(str(before), quiet=True)
-    want = model.predict(x, output_margin=True, predict_threads=1)
-    got = model.predict(train_path, output_margin=True, predict_threads=4)
-    assert got.tobytes() == want.tobytes()
+    for n_trees in (0, 1, model.num_trees, model.num_trees + 3):
+        for output_margin in (False, True):
+            want = model.predict(
+                x, output_margin=output_margin, n_trees=n_trees, predict_threads=1
+            )
+            for threads in (1, 4):
+                got = model.predict(
+                    predict_path,
+                    output_margin=output_margin,
+                    n_trees=n_trees,
+                    predict_threads=threads,
+                )
+                assert got.tobytes() == want.tobytes()
+
+            # Exercise the same compacted file path through the streaming
+            # Parquet writer, including both margins and transformed scores.
+            output = tmp_path / f"compact-{n_trees}-{int(output_margin)}.parquet"
+            rows = model.predict_to_parquet(
+                predict_path,
+                str(output),
+                output_margin=output_margin,
+                n_trees=n_trees,
+                predict_threads=4,
+            )
+            values = pq.read_table(output).column("prediction").combine_chunks().to_numpy()
+            assert rows == len(x)
+            assert values.tobytes() == want.tobytes()
+
     after = tmp_path / "canonical-after.json"
     model.save_model(str(after), quiet=True)
     assert before.read_bytes() == after.read_bytes()

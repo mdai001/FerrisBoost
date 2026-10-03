@@ -30,6 +30,7 @@ pub mod cuda {
         pub gpu_memory_budget: Option<usize>,
         pub device_quantize: Option<bool>,
         pub hist_nodes_per_batch: Option<usize>,
+        pub gpu_split_cache: bool,
         pub gpu_math: crate::types::GpuMath,
     }
     #[derive(Clone, Copy, Debug)]
@@ -46,9 +47,17 @@ pub mod cuda {
     #[derive(Clone, Copy, Debug, Default)]
     pub struct GpuSegmentTiming {
         pub kernel_ms: f32,
+        pub split_kernel_ms: f32,
+        pub split_kernel_calls: u64,
         pub block_h2d_ms: f32,
         pub rows_h2d_ms: f32,
         pub d2h_ms: f32,
+        pub split_d2h_ms: f32,
+        pub split_d2h_calls: u64,
+        pub split_d2h_bytes: u64,
+        pub split_metadata_h2d_ms: f32,
+        pub split_metadata_h2d_calls: u64,
+        pub split_metadata_h2d_bytes: u64,
         pub block_h2d_calls: u64,
         pub rows_h2d_calls: u64,
         pub d2h_calls: u64,

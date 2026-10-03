@@ -231,16 +231,21 @@ fn resolve_blocking(
                     .map_or(free as u64, |b| (b as u64).min(free as u64)),
                 total as u64,
                 |streams| {
-                    StreamingMemModel::new(
+                    let model = StreamingMemModel::new(
                         rows,
                         max_bin,
                         streams,
-                        16,
-                        true,
+                        cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
+                        cfg.params.device_quantize.unwrap_or(true),
                         fast,
                         true,
                         32 * 1024 * 1024,
-                    )
+                    );
+                    if cfg.params.gpu_split_cache && !matches!(
+                        std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(), Ok("1") | Ok("true")) {
+                        model.with_resident_split_cache(max_bin,
+                            cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64)
+                    } else { model }
                 },
             )
             .map_err(to_py_err)?;
@@ -663,33 +668,34 @@ fn parallel_model_write(
 ) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     let workers = resolved_model_io_workers(bytes.len(), requested);
-    let file = std::fs::File::create(path)?;
-    file.set_len(bytes.len() as u64)?;
     let reporter = ModelIoReporter::start(quiet, "SAVE", path, bytes.len(), requested, workers);
-    let progress = reporter.counter();
-    let chunk_size = bytes.len().max(1).div_ceil(workers);
-    std::thread::scope(|scope| -> anyhow::Result<()> {
-        let mut handles = Vec::new();
-        for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-            let output = file.try_clone()?;
-            let progress = std::sync::Arc::clone(&progress);
-            handles.push(scope.spawn(move || -> std::io::Result<()> {
-                let base = index * chunk_size;
-                for (part_index, part) in chunk.chunks(MODEL_IO_CHUNK).enumerate() {
-                    write_all_at(&output, part, (base + part_index * MODEL_IO_CHUNK) as u64)?;
-                    progress.fetch_add(part.len() as u64, Ordering::Relaxed);
-                }
-                Ok(())
-            }));
-        }
-        for handle in handles {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("model save worker panicked"))??;
-        }
+    crate::model_io::atomic_write(std::path::Path::new(path), |file| {
+        file.set_len(bytes.len() as u64)?;
+        let progress = reporter.counter();
+        let chunk_size = bytes.len().max(1).div_ceil(workers);
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let mut handles = Vec::new();
+            for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+                let output = file.try_clone()?;
+                let progress = std::sync::Arc::clone(&progress);
+                handles.push(scope.spawn(move || -> std::io::Result<()> {
+                    let base = index * chunk_size;
+                    for (part_index, part) in chunk.chunks(MODEL_IO_CHUNK).enumerate() {
+                        write_all_at(&output, part, (base + part_index * MODEL_IO_CHUNK) as u64)?;
+                        progress.fetch_add(part.len() as u64, Ordering::Relaxed);
+                    }
+                    Ok(())
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("model save worker panicked"))??;
+            }
+            Ok(())
+        })?;
         Ok(())
     })?;
-    file.sync_all()?;
     reporter.complete();
     Ok(())
 }
@@ -1120,23 +1126,31 @@ fn predict_files_to_parquet(
     );
     let mut predict_pool = None;
     let input_result = py.detach(|| {
-        crate::source::predict_input::for_each_projected_batch(
+        let predictor = inference.cpu_predictor()?;
+        crate::source::predict_input::for_each_projected_contiguous_batch(
             &resolved,
             &names,
             canonical_n_features,
             &projected_features,
             header,
             ingest_workers,
-            |rows| {
+            |data, n_rows| {
                 let workers = resolved_predict_workers(
                     predict_threads,
                     predict_worker_cap,
-                    rows.len(),
+                    n_rows,
                     work_per_row,
                 );
-                let batch = score_rows(rows.len(), workers, &mut predict_pool, |row| {
-                    predict_value(inner, &rows[row], upto, output_margin)
-                })?;
+                let mut batch = score_contiguous_rows(
+                    &predictor,
+                    data,
+                    n_rows,
+                    n_features,
+                    upto,
+                    workers,
+                    &mut predict_pool,
+                )?;
+                transform_prediction_margins(inner, &mut batch, output_margin);
                 sender
                     .send(PredictionParquetMessage::Batch(batch))
                     .map_err(|_| {
@@ -1676,16 +1690,17 @@ impl PyModel {
             .detach(|| {
                 #[cfg(feature = "cuda")]
                 let mut gpu_predictor = None;
-                crate::source::predict_input::for_each_projected_batch(
+                let mut cpu_predictor = None;
+                crate::source::predict_input::for_each_projected_contiguous_batch(
                     &resolved,
                     &names,
                     canonical_n_features,
                     &projected_features,
                     header,
                     ingest_workers,
-                    |rows| {
+                    |data, n_rows| {
                         let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
-                            gpu_prediction_selected(use_gpu, rows.len(), n_features, work_per_row)
+                            gpu_prediction_selected(use_gpu, n_rows, n_features, work_per_row)
                         });
                         #[cfg(feature = "cuda")]
                         if gpu_batch {
@@ -1697,11 +1712,7 @@ impl PyModel {
                                     predictor
                                 }
                             };
-                            let mut data = Vec::with_capacity(rows.len() * n_features);
-                            for row in rows {
-                                data.extend_from_slice(row);
-                            }
-                            let mut batch = predictor.predict_margins(&data, rows.len(), upto)?;
+                            let mut batch = predictor.predict_margins(data, n_rows, upto)?;
                             transform_prediction_margins(inner, &mut batch, output_margin);
                             out.extend(batch);
                             return Ok(());
@@ -1710,12 +1721,27 @@ impl PyModel {
                         let workers = resolved_predict_workers(
                             predict_threads,
                             predict_worker_cap,
-                            rows.len(),
+                            n_rows,
                             work_per_row,
                         );
-                        let batch = score_rows(rows.len(), workers, &mut predict_pool, |row| {
-                            predict_value(inner, &rows[row], upto, output_margin)
-                        })?;
+                        let predictor = match &cpu_predictor {
+                            Some(predictor) => Arc::clone(predictor),
+                            None => {
+                                let predictor = inference.cpu_predictor()?;
+                                cpu_predictor = Some(Arc::clone(&predictor));
+                                predictor
+                            }
+                        };
+                        let mut batch = score_contiguous_rows(
+                            &predictor,
+                            data,
+                            n_rows,
+                            n_features,
+                            upto,
+                            workers,
+                            &mut predict_pool,
+                        )?;
+                        transform_prediction_margins(inner, &mut batch, output_margin);
                         // Batch completion order is irrelevant: the reader yields
                         // batches in canonical file/row order and this callback
                         // commits each complete batch synchronously.
@@ -1919,6 +1945,20 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         };
     }
     let objective: String = get!("objective");
+    let requested_device: Option<String> = get!("device");
+    let requested_hist_cap: Option<usize> = get!("hist_nodes_per_batch");
+    let hist_cap = if requested_device.as_deref().is_some_and(|d| d != "cpu") {
+        let cap = match requested_hist_cap {
+            Some(cap) => cap,
+            None => match std::env::var("FB_HIST_NODES_PER_BATCH") {
+                Ok(v) => v.trim().parse::<usize>().map_err(|_| PyValueError::new_err(
+                    "FB_HIST_NODES_PER_BATCH must be an integer"))?,
+                Err(_) => 16,
+            },
+        };
+        if !(1..=32).contains(&cap) { return Err(PyValueError::new_err("hist_nodes_per_batch must be in 1..=32")); }
+        Some(cap)
+    } else { requested_hist_cap };
     let objective = match objective.as_str() {
         "binary:logistic" => Objective::Logistic,
         "reg:squarederror" => Objective::SquaredError,
@@ -1946,7 +1986,10 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             // 「让 planner 按模式选」,给 1/2 就完全按用户的来。
             hist_streams: get!("hist_streams"),
             resident_blocks: get!("resident_blocks"),
-            hist_nodes_per_batch: get!("hist_nodes_per_batch"),
+            hist_nodes_per_batch: hist_cap,
+            // Resolve once: planner and runtime must see the same opt-in.
+            gpu_split_cache: std::env::var("FB_GPU_SPLIT_CACHE")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true")),
             gpu_memory_budget: get!("gpu_memory_budget"),
             gpu_math: {
                 let raw: Option<String> = get!("gpu_math");
@@ -1961,7 +2004,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         requested_cols_per_block: get!("cols_per_block"),
         device: {
             // `device="cuda"` / `"cuda:0"` / `"gpu"` → GPU;不给或 "cpu" → CPU。
-            let raw: Option<String> = get!("device");
+            let raw = requested_device;
             match raw.as_deref() {
                 None | Some("cpu") => None,
                 Some(d) if d == "cuda" || d == "gpu" => Some(0),

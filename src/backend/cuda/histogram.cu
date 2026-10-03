@@ -1,5 +1,126 @@
 #include <stdint.h>
 
+// Exact split evaluation. Integer scans are explicitly modulo 2^64; floating
+// operations use round-to-nearest intrinsics (no contraction/reassociation).
+struct SplitPair { int64_t grad, hess; };
+struct SplitPacket {
+    uint32_t feat, bin; float gain; uint32_t flags;
+    SplitPair left, right;
+    float left_weight, right_weight, left_hess, right_hess;
+};
+static_assert(sizeof(SplitPacket) == 64, "split packet ABI");
+__device__ SplitPair split_add(SplitPair a, SplitPair b) {
+    return {(int64_t)((uint64_t)a.grad + (uint64_t)b.grad),
+            (int64_t)((uint64_t)a.hess + (uint64_t)b.hess)};
+}
+__device__ SplitPair split_sub(SplitPair a, SplitPair b) {
+    return {(int64_t)((uint64_t)a.grad - (uint64_t)b.grad),
+            (int64_t)((uint64_t)a.hess - (uint64_t)b.hess)};
+}
+__device__ double split_value(int64_t x, double inv) {
+    return __dmul_rn(__ll2double_rn(x), inv);
+}
+__device__ double split_gain(SplitPair a, double ig, double ih, float lambda) {
+    double g = split_value(a.grad, ig), h = split_value(a.hess, ih);
+    return __ddiv_rn(__dmul_rn(g, g), __dadd_rn(h, (double)lambda));
+}
+__device__ SplitPacket split_candidate(SplitPair l, SplitPair r,
+    uint32_t feat, uint32_t bin, bool missing, double parent,
+    double ig, double ih, float lambda, float gamma, float mcw) {
+    SplitPacket p{};
+    if (split_value(l.hess, ih) < (double)mcw || split_value(r.hess, ih) < (double)mcw)
+        return p;
+    float gain = __double2float_rn(__dsub_rn(__dsub_rn(
+        __dadd_rn(split_gain(l, ig, ih, lambda), split_gain(r, ig, ih, lambda)),
+        parent), (double)gamma));
+    if (!(gain > 1.e-6f)) return p;
+    p.feat = feat; p.bin = bin; p.gain = gain;
+    p.flags = 1u | (missing ? 2u : 0u); p.left = l; p.right = r;
+    return p;
+}
+__device__ bool split_better(SplitPacket a, uint32_t ao, SplitPacket b, uint32_t bo) {
+    return (a.flags & 1u) && (!(b.flags & 1u) || a.gain > b.gain ||
+        (a.gain == b.gain && ao < bo));
+}
+
+// Per-node metadata: working output slot, small-input slot, previous-cache
+// parent slot (UINT32_MAX = direct), next-cache slot (UINT32_MAX = uncached).
+// Cache generations are disjoint; no CTA writes an input used by another CTA.
+extern "C" __global__ void split_cached_features(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    SplitPacket* output) {
+    __shared__ SplitPair prefix[256];
+    __shared__ double parent_gain;
+    __shared__ SplitPacket winners[256];
+    __shared__ uint32_t ordinals[256];
+    uint32_t t = threadIdx.x, f = blockIdx.x, n = blockIdx.y;
+    uint32_t lo = offsets[f], count = offsets[f + 1] - lo;
+    const uint32_t* m = metadata + n * 4;
+    SplitPair v{};
+    if (t < count) {
+        size_t i = (size_t)m[0] * hist_stride + lo + t;
+        if (m[2] != 0xffffffffu) {
+            v = split_sub(previous[(size_t)m[2] * cache_stride + lo + t],
+                hist[(size_t)m[1] * hist_stride + lo + t]);
+            hist[i] = v;
+        } else v = hist[i];
+        if (m[3] != 0xffffffffu)
+            next[(size_t)m[3] * cache_stride + lo + t] = v;
+    }
+    if (!t) parent_gain = split_gain(sums[n], ig, ih, lambda);
+    prefix[t] = v; __syncthreads();
+    for (uint32_t step = 1; step < 256; step *= 2) {
+        SplitPair prev{}; if (t >= step) prev = prefix[t - step];
+        __syncthreads(); prefix[t] = split_add(prefix[t], prev); __syncthreads();
+    }
+    SplitPacket best{}; uint32_t ordinal = 0xffffffffu;
+    if (t < count && enabled[f]) {
+        SplitPair sum = sums[n], total = prefix[count - 1];
+        best = split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
+            false, parent_gain, ig, ih, lambda, gamma, mcw);
+        ordinal = t;
+        if (total.grad != sum.grad || total.hess != sum.hess) {
+            SplitPair before = t ? prefix[t - 1] : SplitPair{};
+            SplitPair right = split_sub(total, before);
+            SplitPacket reverse = split_candidate(split_sub(sum, right), right, feats[f], t,
+                true, parent_gain, ig, ih, lambda, gamma, mcw);
+            uint32_t ro = count + count - 1 - t;
+            if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
+        }
+    }
+    winners[t] = best; ordinals[t] = ordinal; __syncthreads();
+    for (uint32_t step = 128; step; step /= 2) {
+        if (t < step && split_better(winners[t + step], ordinals[t + step],
+                                    winners[t], ordinals[t])) {
+            winners[t] = winners[t + step]; ordinals[t] = ordinals[t + step];
+        }
+        __syncthreads();
+    }
+    if (!t) output[(size_t)n * features + f] = winners[0];
+}
+extern "C" __global__ void split_cached_nodes(const SplitPacket* features,
+    uint32_t n_features, double ig, double ih, float lambda, SplitPacket* output) {
+    if (threadIdx.x) return;
+    SplitPacket best{};
+    for (uint32_t f = 0; f < n_features; ++f) {
+        SplitPacket p = features[(size_t)blockIdx.x * n_features + f];
+        if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
+    }
+    if (best.flags & 1u) {
+        double lh = split_value(best.left.hess, ih), rh = split_value(best.right.hess, ih);
+        best.left_weight = __double2float_rn(__ddiv_rn(-split_value(best.left.grad, ig),
+            __dadd_rn(lh, (double)lambda)));
+        best.right_weight = __double2float_rn(__ddiv_rn(-split_value(best.right.grad, ig),
+            __dadd_rn(rh, (double)lambda)));
+        best.left_hess = __double2float_rn(lh); best.right_hess = __double2float_rn(rh);
+    }
+    output[blockIdx.x] = best;
+}
+
 // R=4 multi-row/thread 的每线程行数。见 hist_build_shared_planar32_fused_r4。
 #define ROWS_PER_THREAD 4
 

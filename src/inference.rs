@@ -294,6 +294,7 @@ impl CpuInferenceModel {
 pub(crate) struct CompactInferenceModel {
     model: Model,
     canonical_features: Vec<usize>,
+    cpu_predictor: std::sync::Mutex<Option<std::sync::Arc<CpuInferenceModel>>>,
 }
 
 impl CompactInferenceModel {
@@ -347,7 +348,21 @@ impl CompactInferenceModel {
         Ok(Self {
             model,
             canonical_features,
+            cpu_predictor: std::sync::Mutex::new(None),
         })
+    }
+
+    pub(crate) fn cpu_predictor(&self) -> Result<std::sync::Arc<CpuInferenceModel>> {
+        let mut cache = self
+            .cpu_predictor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compact CPU prediction cache poisoned"))?;
+        if let Some(predictor) = cache.as_ref() {
+            return Ok(std::sync::Arc::clone(predictor));
+        }
+        let predictor = std::sync::Arc::new(CpuInferenceModel::new(&self.model)?);
+        *cache = Some(std::sync::Arc::clone(&predictor));
+        Ok(predictor)
     }
 
     pub(crate) fn model(&self) -> &Model {
