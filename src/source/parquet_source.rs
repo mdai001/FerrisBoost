@@ -75,9 +75,73 @@ fn batch_reader(
     path: &Path,
     columns: &[usize],
     batch_size: usize,
-) -> anyhow::Result<impl Iterator<Item = anyhow::Result<RecordBatch>>> {
-    let reader = projected_reader(path, columns, batch_size, None)?;
-    Ok(reader.map(|r| r.map_err(anyhow::Error::from)))
+) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
+    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    if coalesced_projection(&metadata, columns) {
+        let input = crate::source::parquet_io::CoalescedFile::new(file)?;
+        if metadata.metadata().num_row_groups() > 1 {
+            return coalesced_row_group_reader(input, metadata, columns, batch_size);
+        }
+        let reader = build_projected_reader(input, metadata, columns, batch_size, None)?;
+        Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
+    } else {
+        let reader = build_projected_reader(file, metadata, columns, batch_size, None)?;
+        Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
+    }
+}
+
+/// An Arrow batch spanning small row groups reads column A from both groups,
+/// then column B from both groups. That makes a single lookahead window bounce
+/// between distant file regions for every column. Scope decoding to one group
+/// at a time, retaining the same shared window and strictly increasing row order.
+/// Sketch insertion is per value, not per batch; quantization uses row offsets.
+fn coalesced_row_group_reader(
+    input: crate::source::parquet_io::CoalescedFile,
+    metadata: ArrowReaderMetadata,
+    columns: &[usize],
+    batch_size: usize,
+) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
+    let n_groups = metadata.metadata().num_row_groups();
+    anyhow::ensure!(n_groups > 0, "Parquet 文件没有 row group");
+    let columns = columns.to_vec();
+    let mut current = build_projected_reader(
+        input.clone(),
+        metadata.clone(),
+        &columns,
+        batch_size,
+        Some(0),
+    )?;
+    let mut next_group = 1;
+    let mut failed = false;
+    Ok(Box::new(std::iter::from_fn(move || loop {
+        if failed {
+            return None;
+        }
+        if let Some(batch) = current.next() {
+            failed = batch.is_err();
+            return Some(batch.map_err(anyhow::Error::from));
+        }
+        if next_group == n_groups {
+            return None;
+        }
+        match build_projected_reader(
+            input.clone(),
+            metadata.clone(),
+            &columns,
+            batch_size,
+            Some(next_group),
+        ) {
+            Ok(reader) => {
+                current = reader;
+                next_group += 1;
+            }
+            Err(error) => {
+                failed = true;
+                return Some(Err(error));
+            }
+        }
+    })))
 }
 
 fn batch_reader_row_group(
@@ -115,7 +179,10 @@ fn projected_reader(
 
 fn coalesced_projection(metadata: &ArrowReaderMetadata, columns: &[usize]) -> bool {
     let fields = metadata.schema().fields().len();
-    if columns.len() < 256 || columns.len().saturating_add(1) < fields {
+    if metadata.metadata().num_row_groups() == 0
+        || columns.len() < 256
+        || columns.len().saturating_add(1) < fields
+    {
         return false;
     }
     // Nested roots do not map one-to-one to physical chunks. Keep them, sparse
@@ -1521,9 +1588,10 @@ impl ParquetBlockSource {
 mod tests {
     use super::*;
     use crate::source::DenseSource;
-    use arrow::array::{Float32Array, Float64Array, Int64Array};
+    use arrow::array::{Array, Float32Array, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
 
     /// 每个测试写自己的文件:cargo 默认并行跑测试,共用一个路径会
@@ -1737,6 +1805,369 @@ mod tests {
         }
         w.close().unwrap();
         path
+    }
+
+    fn rewrite_with_row_group_size(source: &Path, name: &str, max_rows: usize) -> PathBuf {
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(source).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let schema = metadata.schema().clone();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(source).unwrap())
+            .unwrap()
+            .with_batch_size(BATCH_SIZE)
+            .build()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("fb_parquet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.parquet"));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(max_rows)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+        for batch in reader {
+            writer.write(&batch.unwrap()).unwrap();
+        }
+        writer.close().unwrap();
+        path
+    }
+
+    fn batch_rows_as_bits(batches: &[RecordBatch]) -> Vec<Vec<Option<u64>>> {
+        let mut columns: Vec<Vec<Option<u64>>> = (0..256).map(|_| Vec::new()).collect();
+        for batch in batches {
+            for (column, output) in columns.iter_mut().enumerate() {
+                let values = batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                output.extend(
+                    (0..values.len())
+                        .map(|row| (!values.is_null(row)).then(|| values.value(row).to_bits())),
+                );
+            }
+        }
+        columns
+    }
+
+    fn assert_cuts_bitwise_equal(left: &BinCuts, right: &BinCuts, context: &str) {
+        assert_eq!(left.offsets, right.offsets, "{context}: cut offsets");
+        assert_eq!(
+            left.values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "{context}: cut value bits"
+        );
+    }
+
+    #[test]
+    fn coalesced_small_row_groups_bound_reads_and_preserve_source_values() {
+        let initial = write_wide_range("coalesced_groups_source", 64, 256);
+        let path = rewrite_with_row_group_size(&initial, "coalesced_groups_16", 16);
+        std::fs::remove_file(initial).ok();
+
+        let file = File::open(&path).unwrap();
+        let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).unwrap();
+        assert_eq!(metadata.metadata().num_row_groups(), 4);
+        assert!(metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .all(|group| group.num_rows() == 16));
+        let features: Vec<_> = (0..256).collect();
+        assert!(coalesced_projection(&metadata, &features));
+
+        // Reproduce the old multi-group access through one shared bounded
+        // cache, then compare it with the new one-row-group-at-a-time reader.
+        let baseline_input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        let baseline_probe = baseline_input.clone();
+        let baseline =
+            build_projected_reader(baseline_input, metadata.clone(), &features, 32, None).unwrap();
+        let baseline_batches: Vec<_> = baseline.map(Result::unwrap).collect();
+
+        let scoped_input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        let scoped_probe = scoped_input.clone();
+        let scoped =
+            coalesced_row_group_reader(scoped_input, metadata.clone(), &features, 32).unwrap();
+        let scoped_batches: Vec<_> = scoped.map(Result::unwrap).collect();
+
+        let ordinary = build_projected_reader(
+            File::open(&path).unwrap(),
+            metadata.clone(),
+            &features,
+            32,
+            None,
+        )
+        .unwrap();
+        let ordinary_batches: Vec<_> = ordinary.map(Result::unwrap).collect();
+        assert_eq!(
+            baseline_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![32, 32]
+        );
+        assert_eq!(
+            scoped_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![16, 16, 16, 16]
+        );
+        assert_eq!(
+            ordinary_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![32, 32]
+        );
+        let expected_rows = batch_rows_as_bits(&ordinary_batches);
+        assert_eq!(batch_rows_as_bits(&baseline_batches), expected_rows);
+        assert_eq!(batch_rows_as_bits(&scoped_batches), expected_rows);
+
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+        let baseline_reads = baseline_probe.test_backing_bytes();
+        let scoped_reads = scoped_probe.test_backing_bytes();
+        assert!(
+            scoped_reads <= file_bytes + 2 * 4096,
+            "scoped reader read {scoped_reads} backing bytes for {file_bytes} file bytes"
+        );
+        assert!(
+            baseline_reads > scoped_reads * 4,
+            "unscoped reads {baseline_reads} bytes, scoped reads {scoped_reads} bytes"
+        );
+
+        // A batch smaller than one row group must also preserve row order
+        // across the scoped-reader handoff and within each row group.
+        let baseline_small_input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        let baseline_small =
+            build_projected_reader(baseline_small_input, metadata.clone(), &features, 8, None)
+                .unwrap();
+        let baseline_small_batches: Vec<_> = baseline_small.map(Result::unwrap).collect();
+        let scoped_small_input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        let scoped_small =
+            coalesced_row_group_reader(scoped_small_input, metadata.clone(), &features, 8).unwrap();
+        let scoped_small_batches: Vec<_> = scoped_small.map(Result::unwrap).collect();
+        let ordinary_small = build_projected_reader(
+            File::open(&path).unwrap(),
+            metadata.clone(),
+            &features,
+            8,
+            None,
+        )
+        .unwrap();
+        let ordinary_small_batches: Vec<_> = ordinary_small.map(Result::unwrap).collect();
+        assert_eq!(
+            baseline_small_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![8; 8]
+        );
+        assert_eq!(
+            scoped_small_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![8; 8]
+        );
+        assert_eq!(
+            ordinary_small_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![8; 8]
+        );
+        assert_eq!(
+            batch_rows_as_bits(&baseline_small_batches),
+            batch_rows_as_bits(&ordinary_small_batches)
+        );
+        assert_eq!(
+            batch_rows_as_bits(&scoped_small_batches),
+            batch_rows_as_bits(&ordinary_small_batches)
+        );
+
+        // The public path and row-group parallel path must produce the same
+        // max-bin sketch as the ordinary File reader at either thread count.
+        let plain_cuts = crate::source::arrow_source::build_cuts_with_nthread(
+            Box::new(
+                build_projected_reader(
+                    File::open(&path).unwrap(),
+                    metadata.clone(),
+                    &features,
+                    BATCH_SIZE,
+                    None,
+                )
+                .unwrap()
+                .map(|batch| batch.map_err(anyhow::Error::from)),
+            ),
+            255,
+            1,
+        )
+        .unwrap();
+        for nthread in [1, 2] {
+            let routed_cuts = crate::source::arrow_source::build_cuts_with_nthread(
+                parallel_row_groups(path.clone(), features.clone(), BATCH_SIZE, nthread).unwrap(),
+                255,
+                nthread,
+            )
+            .unwrap();
+            assert_cuts_bitwise_equal(&plain_cuts, &routed_cuts, &format!("nthread={nthread}"));
+        }
+
+        let (one, labels_one) =
+            ParquetBlockSource::open_with_nthread(&path, "target", 255, 256, 1).unwrap();
+        let (two, labels_two) =
+            ParquetBlockSource::open_with_nthread(&path, "target", 255, 256, 2).unwrap();
+        assert_eq!(labels_one, labels_two);
+        assert_cuts_bitwise_equal(one.cuts(), two.cuts(), "quantization nthread 1 vs 2");
+        assert_cuts_bitwise_equal(&plain_cuts, one.cuts(), "plain vs quantized cuts");
+        for block in 0..one.n_blocks() {
+            one.with_block(block, &mut |left| {
+                two.with_block(block, &mut |right| {
+                    assert_eq!(left.feat_ids, right.feat_ids);
+                    assert_eq!(left.n_rows, right.n_rows);
+                    assert_eq!(left.data, right.data, "quantized block {block}");
+                })
+                .unwrap();
+            })
+            .unwrap();
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn coalesced_reader_preserves_a_short_last_row_group() {
+        let initial = write_wide_range("coalesced_short_source", 50, 256);
+        let path = rewrite_with_row_group_size(&initial, "coalesced_short_16", 16);
+        std::fs::remove_file(initial).ok();
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        assert_eq!(
+            metadata
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|group| group.num_rows())
+                .collect::<Vec<_>>(),
+            vec![16, 16, 16, 2]
+        );
+        let features: Vec<_> = (0..256).collect();
+        let scoped = coalesced_row_group_reader(
+            crate::source::parquet_io::CoalescedFile::test_with_capacity(
+                File::open(&path).unwrap(),
+                4096,
+            )
+            .unwrap(),
+            metadata.clone(),
+            &features,
+            32,
+        )
+        .unwrap();
+        let scoped_batches: Vec<_> = scoped.map(Result::unwrap).collect();
+        let ordinary =
+            build_projected_reader(File::open(&path).unwrap(), metadata, &features, 32, None)
+                .unwrap();
+        let ordinary_batches: Vec<_> = ordinary.map(Result::unwrap).collect();
+        assert_eq!(
+            scoped_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![16, 16, 16, 2]
+        );
+        assert_eq!(
+            batch_rows_as_bits(&scoped_batches),
+            batch_rows_as_bits(&ordinary_batches)
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn empty_wide_parquet_uses_the_ordinary_reader_path() {
+        let path = write_wide_range("coalesced_empty", 0, 256);
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let features: Vec<_> = (0..256).collect();
+        assert!(!coalesced_projection(&metadata, &features));
+        let batches: Vec<_> = batch_reader(&path, &features, BATCH_SIZE)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        assert!(batches.is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn coalesced_row_group_reader_stops_after_first_decode_error() {
+        let initial = write_wide_range("coalesced_error_source", 64, 256);
+        let path = rewrite_with_row_group_size(&initial, "coalesced_error_16", 16);
+        std::fs::remove_file(initial).ok();
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let group_two_first_data_page =
+            metadata.metadata().row_groups()[2].columns()[0].data_page_offset();
+        let input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(group_two_first_data_page as u64)
+            .unwrap();
+
+        let features: Vec<_> = (0..256).collect();
+        let mut reader = coalesced_row_group_reader(input, metadata, &features, 32).unwrap();
+        let mut batch_count = 0;
+        let mut error_count = 0;
+        for result in reader.by_ref() {
+            match result {
+                Ok(_) => batch_count += 1,
+                Err(_) => error_count += 1,
+            }
+        }
+        assert!(
+            batch_count > 0,
+            "earlier row groups should decode before truncation"
+        );
+        assert_eq!(
+            error_count, 1,
+            "the first decode error must terminate the stream"
+        );
+        assert!(
+            reader.next().is_none(),
+            "reader must stay fused after its error"
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -15,6 +15,8 @@ struct State {
     start: u64,
     valid: usize,
     buffer: Vec<u8>,
+    #[cfg(test)]
+    backing_bytes: u64,
 }
 
 struct Inner {
@@ -23,6 +25,7 @@ struct Inner {
     state: Mutex<State>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CoalescedFile(Arc<Inner>);
 
 impl CoalescedFile {
@@ -40,8 +43,20 @@ impl CoalescedFile {
                 start: 0,
                 valid: 0,
                 buffer: Vec::new(),
+                #[cfg(test)]
+                backing_bytes: 0,
             }),
         })))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_capacity(file: File, capacity: usize) -> io::Result<Self> {
+        Self::with_capacity(file, capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backing_bytes(&self) -> u64 {
+        self.0.state.lock().unwrap().backing_bytes
     }
 }
 
@@ -76,11 +91,19 @@ impl Inner {
                     file,
                     buffer,
                     valid,
+                    #[cfg(test)]
+                    backing_bytes,
                     ..
                 } = &mut *state;
                 match file.read(&mut buffer[*valid..length]) {
                     Ok(0) => break,
-                    Ok(n) => *valid += n,
+                    Ok(n) => {
+                        *valid += n;
+                        #[cfg(test)]
+                        {
+                            *backing_bytes += n as u64;
+                        }
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
                 }
