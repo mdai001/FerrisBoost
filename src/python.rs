@@ -204,7 +204,7 @@ fn resolve_blocking(
             // 分配却发生在 GPU 1。两张卡型号不同、或占用不同时,轻则规划过小
             // (白白 streaming),重则在 GPU 1 上 **OOM**。
             // 规划和分配必须看同一张卡。
-            let ctx = cudarc::driver::CudaContext::new(ordinal)
+            let ctx = crate::backend::cuda::cuda_context(ordinal)
                 .map_err(|e| PyValueError::new_err(format!("打不开 CUDA device {ordinal}:{e}")))?;
             let (free, total) = ctx
                 .mem_get_info()

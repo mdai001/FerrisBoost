@@ -33,7 +33,35 @@ struct DeviceState {
 
 static DEVICE_STATES: OnceLock<Mutex<HashMap<usize, Arc<DeviceState>>>> = OnceLock::new();
 
+/// Check optional driver loading before cudarc's context constructor, whose
+/// dynamic loader panics (rather than returning DriverError) when absent.
+/// Cache successes only: a failed request must not poison the device cache or
+/// prevent a later retry. CPU-only calls never enter this helper.
+fn ensure_cuda_driver(device_ordinal: usize) -> Result<()> {
+    static DRIVER_PRESENT: OnceLock<()> = OnceLock::new();
+    if DRIVER_PRESENT.get().is_none() {
+        // SAFETY: use cudarc's own platform library-name candidates to probe
+        // driver availability. No CUDA symbols or device pointers are used.
+        if !unsafe { sys::is_culib_present() } {
+            bail!(
+                "CUDA driver library unavailable; install an NVIDIA driver to use \
+                 device=\"cuda:{device_ordinal}\", or select device=\"cpu\""
+            );
+        }
+        let _ = DRIVER_PRESENT.set(());
+    }
+    Ok(())
+}
+
+pub(crate) fn cuda_context(device_ordinal: usize) -> Result<Arc<CudaContext>> {
+    ensure_cuda_driver(device_ordinal)?;
+    CudaContext::new(device_ordinal).context("创建 CUDA context")
+}
+
 fn device_state(device_ordinal: usize) -> Result<Arc<DeviceState>> {
+    // Probe before acquiring the cache lock, so a missing optional driver
+    // cannot unwind through the lock and poison subsequent GPU requests.
+    ensure_cuda_driver(device_ordinal)?;
     let cache = DEVICE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut states = cache
         .lock()
@@ -41,7 +69,7 @@ fn device_state(device_ordinal: usize) -> Result<Arc<DeviceState>> {
     if let Some(state) = states.get(&device_ordinal) {
         return Ok(state.clone());
     }
-    let ctx = CudaContext::new(device_ordinal).context("创建 CUDA context")?;
+    let ctx = cuda_context(device_ordinal)?;
     let module = ctx
         .load_module(Ptx::from_src(HISTOGRAM_PTX))
         .context("加载预编译 histogram PTX")?;
