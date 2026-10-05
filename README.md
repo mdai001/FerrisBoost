@@ -16,7 +16,7 @@ affiliated with or endorsed by the XGBoost project or its maintainers.
 In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not by GPU compute kernels, but by host-memory overhead, data ingest, and rigid memory limits. FerrisBoost focuses on reducing ingest, memory, and execution overhead in large tabular workflows:
 
 - **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–8× faster** while slashing peak host RAM by **2–4×** (`0.24–0.48× XGBoost`).
-- **Adaptive VRAM Management**: Instead of requiring manual external-memory configurations when datasets exceed physical VRAM, FerrisBoost features an adaptive GPU memory planner that automatically manages residency—seamlessly transitioning between full VRAM residency, hybrid CPU/GPU caching, and streaming execution under memory pressure.
+- **Adaptive VRAM Management**: FerrisBoost's GPU memory planner selects a stable full-residency, hybrid-residency, or streaming plan from the dataset shape and available memory budget. The plan stays fixed during training rather than continuously migrating data between modes.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
@@ -134,7 +134,7 @@ model = fb.train(
 ```
 
 - **`device`**: Single GPU today (`device="cuda"` or `device="cuda:N"`); multi-GPU scaling is in progress (WIP).
-- **Adaptive VRAM**: Automatically manages GPU memory, dynamically adapting between full residency and streaming execution based on dataset size and available VRAM.
+- **Adaptive VRAM**: Automatically selects a stable full-residency, hybrid-residency, or streaming plan based on dataset shape and the available VRAM budget.
 - **`colsample_bytree`**: Selects a deterministic feature subset per tree. Column-major GPU execution uses that subset as the logical histogram execution/output width while preserving the physical resident-block layout and model compatibility.
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
 - **`nthread`**: `0` selects available physical CPU parallelism.
@@ -235,6 +235,16 @@ Source code: [github.com/mdai001/FerrisBoost](https://github.com/mdai001/FerrisB
 See the [Python API How-To](documents/howto.md) for installation details,
 Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
+
+## Changelog
+
+### 0.0.3 (unreleased)
+
+- Improved data-loading and model I/O performance.
+- Reduced prediction overhead and improved throughput.
+- Improved GPU training performance.
+
+Performance gains vary by workload and execution mode.
 
 ## License
 

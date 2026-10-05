@@ -94,6 +94,17 @@ prediction = model.predict("test.parquet")</code></pre>
       <h2>Observed performance</h2>
       <p>On the standardized HIGGS Parquet and Epsilon CSV workloads reported in the README, FerrisBoost used 0.14–0.36× XGBoost setup time, 0.33–0.46× peak host RAM, and 0.47–0.68× combined RAM plus active VRAM on GPU. These results describe the tested workloads, not universal guarantees.</p>
     </section>
+
+    <section>
+      <h2>Changelog</h2>
+      <h3>0.0.3 (unreleased)</h3>
+      <ul>
+        <li>Improved data-loading and model I/O performance.</li>
+        <li>Reduced prediction overhead and improved throughput.</li>
+        <li>Improved GPU training performance.</li>
+      </ul>
+      <p>Performance gains vary by workload and execution mode.</p>
+    </section>
   </main>
 
   <footer>
