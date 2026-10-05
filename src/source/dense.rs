@@ -22,7 +22,7 @@ pub struct DenseSource {
 impl DenseSource {
     /// 从行主序矩阵构建。`data.len() == n_rows * n_features`,
     /// 元素按 `data[row * n_features + feat]` 排列 —— 这是用户手里
-    /// numpy / Vec<Vec<f32>> 摊平后最自然的形状。
+    /// numpy / `Vec<Vec<f32>>` 摊平后最自然的形状。
     ///
     /// 内部转成列主序:量化后的 `ColumnBlock.data` 是
     /// `data[local_feat * n_rows + row]`。转置在这里发生一次,

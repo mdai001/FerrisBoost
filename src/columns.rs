@@ -1,6 +1,6 @@
 //! 列块 —— 整个设计的核心数据结构。
 //!
-//! 关键约束:bin 数据存成扁平的 Vec<u8>,不是 Vec<Vec<_>>,也不带
+//! 关键约束:bin 数据存成扁平的 `Vec<u8>`,不是 `Vec<Vec<_>>`,也不带
 //! 生命周期的 view 类型。取指针就能直接传给 C++,阶段 3 不用重构。
 
 use crate::types::{Bin, FeatId, GradPairFixed};
@@ -39,13 +39,13 @@ impl ColumnBlock {
 
 /// 分箱边界。所有列块共享,常驻内存。
 ///
-/// cuts[feat] 是该特征的切分点,长度 = 该特征实际 bin 数 - 1。
+/// `cuts[feat]` 是该特征的切分点,长度 = 该特征实际 bin 数 - 1。
 /// 不同特征的 bin 数可以不同(低基数特征用不满 max_bin)。
 #[derive(Clone)]
 pub struct BinCuts {
     /// 扁平存放,用 offsets 索引。
     pub values: Vec<f32>,
-    /// offsets[feat]..offsets[feat+1] 是该特征的切分点范围。
+    /// `offsets[feat]..offsets[feat+1]` 是该特征的切分点范围。
     pub offsets: Vec<u32>,
     /// hist_offsets[feat] = 前面所有特征的 bin 数之和。
     /// 预计算的前缀和,直方图索引每次都要用,不能现算。
@@ -180,7 +180,7 @@ impl BinCuts {
     }
 
     /// 给一个值定 bin。语义必须和 sketch::cuts 一致:
-    /// cut 是上界,落入第一个满足 v < cuts[i] 的 i。
+    /// cut 是上界,落入第一个满足 `v < cuts[i]` 的 i。
     ///
     /// NaN(缺失)不走这里 —— 它在训练时由 default direction 决定
     /// 去向,不占 bin。调用方负责先判断。

@@ -169,7 +169,7 @@ impl FeatureSketch {
     /// 输出切分点,最多 max_bins - 1 个。
     ///
     /// 语义和 XGBoost 一致:cut 是**上界**,值 v 落入的 bin 是第一个
-    /// 满足 v < cuts[i] 的 i;都不满足则落入最后一个 bin。
+    /// 满足 `v < cuts[i]` 的 i;都不满足则落入最后一个 bin。
     // Keep the current closure form until the crate's supported Rust version is explicit.
     #[allow(clippy::unnecessary_map_or)]
     pub fn cuts(&mut self, max_bins: usize) -> Vec<f32> {

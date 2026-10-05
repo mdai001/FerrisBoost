@@ -19,7 +19,7 @@ pub(crate) const DEFAULT_GPU_SPLIT_CACHE: bool = true;
 /// ⚠️ 写下这条约定的原因:`gpu_math="fast"` 第一版只在一个地方加了
 /// 「fast 就跳过 D2H」,结果 `build_tree` 里另一条路径照样每棵树拉回
 /// 40 MB(实测 16.5 ms/轮,吃掉一半以上收益)。所以现在由
-/// [`GpuTrainCtx::download_prediction_delta`] 一侧**主动报错**来兜底,
+/// `GpuTrainCtx::download_prediction_delta` 一侧**主动报错**来兜底,
 /// 而不是指望每个调用点都记得判断。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictionAuthority {
@@ -314,7 +314,7 @@ pub type Bin = u8;
 ///
 /// 代价:真实 bin 只剩 255 个,所以 max_bin 上限是 255 而不是 256。
 /// 想要 256 得把 Bin 换成 u16,但那样 ColumnBlock.data 就不是
-/// Vec<u8> 了,内存翻倍、FFI 契约也要跟着改 —— 不值得。
+/// `Vec<u8>` 了,内存翻倍、FFI 契约也要跟着改 —— 不值得。
 /// 和 XGBoost 对拍时两边都设 max_bin=255 即可。
 pub const MISSING_BIN: Bin = u8::MAX;
 
