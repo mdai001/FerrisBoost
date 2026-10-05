@@ -8,14 +8,17 @@ use cudarc::{
     driver::{sys, CudaContext, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
-use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use crate::types::{Bin, GradPairFixed, RowId, MISSING_BIN};
 
 mod inference;
 mod train_ctx;
-pub(crate) use train_ctx::GpuSplitGroup;
 pub use inference::GpuInferenceModel;
+pub(crate) use train_ctx::GpuSplitGroup;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
     GpuSegmentTiming, GpuTrainCtx,
@@ -32,7 +35,9 @@ static DEVICE_STATES: OnceLock<Mutex<HashMap<usize, Arc<DeviceState>>>> = OnceLo
 
 fn device_state(device_ordinal: usize) -> Result<Arc<DeviceState>> {
     let cache = DEVICE_STATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut states = cache.lock().map_err(|_| anyhow::anyhow!("CUDA device cache poisoned"))?;
+    let mut states = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CUDA device cache poisoned"))?;
     if let Some(state) = states.get(&device_ordinal) {
         return Ok(state.clone());
     }
@@ -129,7 +134,7 @@ impl Default for SharedHistogramConfig {
             hist_streams: None,
             device_quantize: None,
             hist_nodes_per_batch: None,
-            gpu_split_cache: false,
+            gpu_split_cache: crate::types::DEFAULT_GPU_SPLIT_CACHE,
             gpu_memory_budget: None,
             resident_blocks: None,
             gpu_math: crate::types::GpuMath::Exact,
@@ -192,6 +197,7 @@ pub fn partition_rows_gpu(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)] // Profile remains paired with the two stable partitions.
 pub fn partition_rows_gpu_with_profile(
     device_ordinal: usize,
     block_data: &[Bin],
@@ -202,19 +208,21 @@ pub fn partition_rows_gpu_with_profile(
     missing_left: bool,
     threads_per_block: u32,
 ) -> Result<((Vec<RowId>, Vec<RowId>), PartitionProfile)> {
-    if block_n_rows == 0 || feature >= block_data.len().checked_div(block_n_rows).unwrap_or(0)
-    {
+    if block_n_rows == 0 || feature >= block_data.len().checked_div(block_n_rows).unwrap_or(0) {
         bail!("partition GPU 的 feature 不在 bins 列范围内");
     }
     if threads_per_block == 0 || threads_per_block > 1024 || !threads_per_block.is_power_of_two() {
         bail!("partition threads_per_block 必须是 1..=1024 的 2 次幂");
     }
     if rows.is_empty() {
-        return Ok(((Vec::new(), Vec::new()), PartitionProfile {
-            kernel_ms: 0.0,
-            threads_per_block,
-            blocks: 0,
-        }));
+        return Ok((
+            (Vec::new(), Vec::new()),
+            PartitionProfile {
+                kernel_ms: 0.0,
+                threads_per_block,
+                blocks: 0,
+            },
+        ));
     }
     if rows.iter().any(|&row| row as usize >= block_n_rows) {
         bail!("partition row_idx 含越界行");
@@ -335,10 +343,16 @@ pub fn partition_rows_gpu_with_profile(
     let end = stream
         .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
         .context("记录 partition 结束 event")?;
-    let kernel_ms = start.elapsed_ms(&end).context("计算 partition kernel 时间")?;
+    let kernel_ms = start
+        .elapsed_ms(&end)
+        .context("计算 partition kernel 时间")?;
 
-    let left = stream.clone_dtoh(&left_out_dev).context("partition left D2H")?;
-    let right = stream.clone_dtoh(&right_out_dev).context("partition right D2H")?;
+    let left = stream
+        .clone_dtoh(&left_out_dev)
+        .context("partition left D2H")?;
+    let right = stream
+        .clone_dtoh(&right_out_dev)
+        .context("partition right D2H")?;
     let total_right = *right_offsets.last().unwrap();
     Ok((
         (

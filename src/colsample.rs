@@ -59,7 +59,11 @@ pub fn sampled_count(n_features: usize, rate: f32) -> usize {
         return 0;
     }
     let n = (f64::from(rate) * n_features as f64).floor();
-    let n = if n.is_finite() && n >= 1.0 { n as usize } else { 1 };
+    let n = if n.is_finite() && n >= 1.0 {
+        n as usize
+    } else {
+        1
+    };
     n.min(n_features).max(1)
 }
 
@@ -127,7 +131,7 @@ mod tests {
         assert_eq!(sampled_count(300, 0.3), 90);
         assert_eq!(sampled_count(28, 0.7), 19); // 19.6 -> 19,不是 20
         assert_eq!(sampled_count(10, 0.99), 9); // 9.9 -> 9
-        // 极小比例仍然至少一个。
+                                                // 极小比例仍然至少一个。
         assert_eq!(sampled_count(300, 0.0001), 1);
         assert_eq!(sampled_count(300, 0.0), 1);
         assert_eq!(sampled_count(1, 0.5), 1);
@@ -167,12 +171,8 @@ mod tests {
     #[test]
     fn required_blocks_skips_blocks_without_sampled_features() {
         // 4 块 × 3 特征 = 12 个特征。
-        let blocks: Vec<Vec<FeatId>> = vec![
-            vec![0, 1, 2],
-            vec![3, 4, 5],
-            vec![6, 7, 8],
-            vec![9, 10, 11],
-        ];
+        let blocks: Vec<Vec<FeatId>> =
+            vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9, 10, 11]];
         // 只选第 0 块的一个和第 2 块的两个 —— 第 1、3 块必须整块跳过。
         let sampled: Vec<FeatId> = vec![1, 6, 8];
         let req = required_blocks(&sampled, &blocks);

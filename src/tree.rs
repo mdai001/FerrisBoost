@@ -25,11 +25,7 @@ const NO_PARENT: i32 = 2147483647;
 const MODEL_TREE_PARALLEL_MIN_NODES: usize = 4096;
 const MODEL_TREE_WORKER_MEMORY: usize = 1024 * 1024;
 
-fn model_tree_conversion_workers(
-    requested: usize,
-    tree_count: usize,
-    total_nodes: usize,
-) -> usize {
+fn model_tree_conversion_workers(requested: usize, tree_count: usize, total_nodes: usize) -> usize {
     if tree_count <= 1 || (requested == 0 && total_nodes < MODEL_TREE_PARALLEL_MIN_NODES) {
         return 1;
     }
@@ -40,7 +36,11 @@ fn model_tree_pool(workers: usize) -> Result<rayon::ThreadPool, serde_json::Erro
     rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()
-        .map_err(|e| unsupported(format_args!("model tree conversion thread pool failed: {e}")))
+        .map_err(|e| {
+            unsupported(format_args!(
+                "model tree conversion thread pool failed: {e}"
+            ))
+        })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,7 +161,11 @@ impl Tree {
                 // XGBoost 的判据就是 v < split_cond 走左,不是 <=。
                 v < n.split_cond
             };
-            i = if go_left { n.left as usize } else { n.right as usize };
+            i = if go_left {
+                n.left as usize
+            } else {
+                n.right as usize
+            };
         }
     }
 }
@@ -311,7 +315,10 @@ impl Model {
                     // 自由字段,不需要为它改格式,别的实现读到也只是多一个
                     // 不认识的属性,不会因此读不了模型。
                     if let Some(m) = self.schema_mode {
-                        a.insert("ferrisboost_schema_mode".to_string(), m.as_str().to_string());
+                        a.insert(
+                            "ferrisboost_schema_mode".to_string(),
+                            m.as_str().to_string(),
+                        );
                     }
                     a
                 },
@@ -379,7 +386,11 @@ impl Model {
                 mp.num_class
             )));
         }
-        if parse_param::<i32>("num_parallel_tree", &booster.model.gbtree_model_param.num_parallel_tree)? != 1 {
+        if parse_param::<i32>(
+            "num_parallel_tree",
+            &booster.model.gbtree_model_param.num_parallel_tree,
+        )? != 1
+        {
             return Err(unsupported(format_args!(
                 "num_parallel_tree = {}(random forest 模式)不支持",
                 booster.model.gbtree_model_param.num_parallel_tree
@@ -390,7 +401,9 @@ impl Model {
             "reg:squarederror" | "reg:linear" => Objective::SquaredError,
             "binary:logistic" => Objective::Logistic,
             other => {
-                return Err(unsupported(format_args!("objective {other} 不在第一版范围里")))
+                return Err(unsupported(format_args!(
+                    "objective {other} 不在第一版范围里"
+                )))
             }
         };
 
@@ -431,7 +444,9 @@ impl Model {
             best_iteration: attrs
                 .get("best_iteration")
                 .and_then(|v| v.trim().parse::<usize>().ok()),
-            best_score: attrs.get("best_score").and_then(|v| v.trim().parse::<f32>().ok()),
+            best_score: attrs
+                .get("best_score")
+                .and_then(|v| v.trim().parse::<f32>().ok()),
         })
     }
 }
@@ -495,9 +510,15 @@ fn objective_name(obj: Objective) -> &'static str {
 /// 两个 objective 都挂在 reg_loss_param 下面,XGBoost 加载时会找它。
 fn reg_loss_param() -> BTreeMap<String, serde_json::Value> {
     let mut inner = serde_json::Map::new();
-    inner.insert("scale_pos_weight".into(), serde_json::Value::String("1".into()));
+    inner.insert(
+        "scale_pos_weight".into(),
+        serde_json::Value::String("1".into()),
+    );
     let mut rest = BTreeMap::new();
-    rest.insert("reg_loss_param".to_string(), serde_json::Value::Object(inner));
+    rest.insert(
+        "reg_loss_param".to_string(),
+        serde_json::Value::Object(inner),
+    );
     rest
 }
 
@@ -694,7 +715,8 @@ mod xgb {
 
         pub fn to_tree(&self) -> Result<super::Tree, serde_json::Error> {
             let n = self.left_children.len();
-            let n_features = parse_param::<usize>("tree_param.num_feature", &self.tree_param.num_feature)?;
+            let n_features =
+                parse_param::<usize>("tree_param.num_feature", &self.tree_param.num_feature)?;
             if n == 0 {
                 return Err(unsupported(format_args!("树 {} 没有根节点", self.id)));
             }
@@ -775,7 +797,10 @@ mod xgb {
                 });
             }
             if parents[0] != 0 {
-                return Err(unsupported(format_args!("树 {} 的根节点被别的节点引用", self.id)));
+                return Err(unsupported(format_args!(
+                    "树 {} 的根节点被别的节点引用",
+                    self.id
+                )));
             }
             let mut seen = vec![false; n];
             let mut stack = vec![0usize];
@@ -789,7 +814,10 @@ mod xgb {
                 }
             }
             if let Some(i) = seen.iter().position(|&reachable| !reachable) {
-                return Err(unsupported(format_args!("树 {} 的节点 {i} 从根不可达", self.id)));
+                return Err(unsupported(format_args!(
+                    "树 {} 的节点 {i} 从根不可达",
+                    self.id
+                )));
             }
             Ok(super::Tree { nodes })
         }
@@ -840,8 +868,7 @@ mod tests {
                 let node_count = tree.nodes.len();
                 for (node_id, node) in tree.nodes.iter_mut().enumerate() {
                     if node.is_leaf {
-                        node.leaf_value +=
-                            (tree_id * node_count + node_id) as f32 / 1024.0;
+                        node.leaf_value += (tree_id * node_count + node_id) as f32 / 1024.0;
                     }
                 }
                 tree
@@ -957,12 +984,9 @@ mod tests {
 
     #[test]
     fn parallel_tree_conversion_reports_the_same_first_error() {
-        let mut json: serde_json::Value = serde_json::from_str(
-            &many_tree_model(64)
-                .to_xgboost_json_with_threads(1)
-                .unwrap(),
-        )
-        .unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&many_tree_model(64).to_xgboost_json_with_threads(1).unwrap())
+                .unwrap();
         let trees = json["learner"]["gradient_booster"]["model"]["trees"]
             .as_array_mut()
             .unwrap();
@@ -977,12 +1001,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(parallel, serial);
-        assert!(serial.contains("树 3"), "must report the first invalid tree: {serial}");
+        assert!(
+            serial.contains("树 3"),
+            "must report the first invalid tree: {serial}"
+        );
     }
 
     #[test]
     fn logistic_model_round_trips() {
-        let m = Model { objective: Objective::Logistic, base_score: 0.25, ..fixture_model() };
+        let m = Model {
+            objective: Objective::Logistic,
+            base_score: 0.25,
+            ..fixture_model()
+        };
         let back = Model::from_xgboost_json(&m.to_xgboost_json().unwrap()).unwrap();
         assert_eq!(back.objective, Objective::Logistic);
         // base_score 存的是概率空间的值,不能在导出时就转成 logit ——
@@ -1003,7 +1034,10 @@ mod tests {
         let learner = &v["learner"];
         assert_eq!(learner["gradient_booster"]["name"], "gbtree");
         assert_eq!(learner["objective"]["name"], "reg:squarederror");
-        assert_eq!(learner["objective"]["reg_loss_param"]["scale_pos_weight"], "1");
+        assert_eq!(
+            learner["objective"]["reg_loss_param"]["scale_pos_weight"],
+            "1"
+        );
         // 所有 param 都是字符串,不是数字
         assert_eq!(learner["learner_model_param"]["num_feature"], "2");
         assert_eq!(learner["learner_model_param"]["num_class"], "0");
@@ -1023,9 +1057,18 @@ mod tests {
         assert_eq!(t["default_left"], serde_json::json!([1, 0, 0, 0, 0]));
         assert_eq!(t["split_indices"], serde_json::json!([0, 1, 0, 0, 0]));
         // 叶子的值存在 split_conditions 里
-        assert_eq!(t["split_conditions"], serde_json::json!([1.5, 0.5, 3.0, 1.0, 2.0]));
-        assert_eq!(t["sum_hessian"], serde_json::json!([10.0, 6.0, 4.0, 3.0, 3.0]));
-        assert_eq!(t["loss_changes"], serde_json::json!([4.0, 2.0, 0.0, 0.0, 0.0]));
+        assert_eq!(
+            t["split_conditions"],
+            serde_json::json!([1.5, 0.5, 3.0, 1.0, 2.0])
+        );
+        assert_eq!(
+            t["sum_hessian"],
+            serde_json::json!([10.0, 6.0, 4.0, 3.0, 3.0])
+        );
+        assert_eq!(
+            t["loss_changes"],
+            serde_json::json!([4.0, 2.0, 0.0, 0.0, 0.0])
+        );
         // 数值分裂,不带类别
         assert_eq!(t["split_type"], serde_json::json!([0, 0, 0, 0, 0]));
         assert_eq!(t["categories"], serde_json::json!([]));
@@ -1100,17 +1143,36 @@ mod tests {
         let cases = [
             ("\"num_class\": \"0\"", "\"num_class\": \"3\"", "多分类"),
             ("\"binary:logistic\"", "\"rank:pairwise\"", "objective"),
-            ("\"num_parallel_tree\": \"1\"", "\"num_parallel_tree\": \"4\"", "森林"),
-            ("\"split_type\": [0, 0, 0]", "\"split_type\": [1, 0, 0]", "类别分裂"),
-            ("\"left_children\": [1, -1, -1]", "\"left_children\": [0, -1, -1]", "环"),
-            ("\"right_children\": [2, -1, -1]", "\"right_children\": [-1, -1, -1]", "单边孩子"),
-            ("\"split_indices\": [1, 0, 0]", "\"split_indices\": [3, 0, 0]", "越界特征"),
+            (
+                "\"num_parallel_tree\": \"1\"",
+                "\"num_parallel_tree\": \"4\"",
+                "森林",
+            ),
+            (
+                "\"split_type\": [0, 0, 0]",
+                "\"split_type\": [1, 0, 0]",
+                "类别分裂",
+            ),
+            (
+                "\"left_children\": [1, -1, -1]",
+                "\"left_children\": [0, -1, -1]",
+                "环",
+            ),
+            (
+                "\"right_children\": [2, -1, -1]",
+                "\"right_children\": [-1, -1, -1]",
+                "单边孩子",
+            ),
+            (
+                "\"split_indices\": [1, 0, 0]",
+                "\"split_indices\": [3, 0, 0]",
+                "越界特征",
+            ),
         ];
         for (from, to, what) in cases {
             let broken = XGB_DUMP.replace(from, to);
             assert_ne!(broken, XGB_DUMP, "替换没生效:{from}");
-            let err = Model::from_xgboost_json(&broken)
-                .expect_err(&format!("{what} 应该被拒绝"));
+            let err = Model::from_xgboost_json(&broken).expect_err(&format!("{what} 应该被拒绝"));
             // 报错要说人话,不能是 "invalid type at line 1"
             assert!(!err.to_string().is_empty());
         }
@@ -1141,8 +1203,22 @@ mod tests {
         // f32::MAX 不在探针里:见 split_threshold 的文档,右端哨兵是
         // 有限值,v == f32::MAX 是唯一对不上的取值。下面单独断言它。
         let probes = [
-            f32::MIN, -1e9, -3.0, -2.5, -2.49, -0.1, 0.0, 0.1, 1.4, 1.5,
-            1.6, 7.0, 7.25, 7.26, 1e9, f32::MAX / 2.0,
+            f32::MIN,
+            -1e9,
+            -3.0,
+            -2.5,
+            -2.49,
+            -0.1,
+            0.0,
+            0.1,
+            1.4,
+            1.5,
+            1.6,
+            7.0,
+            7.25,
+            7.26,
+            1e9,
+            f32::MAX / 2.0,
         ];
         for bin in 0..=n_bins {
             let thr = split_threshold(&cuts, 0, bin);

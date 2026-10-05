@@ -34,10 +34,16 @@ pub fn enabled() -> bool {
 }
 
 fn read_kv(path: &str, key: &str) -> u64 {
-    let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(key) {
-            return rest.split_whitespace().next().and_then(|t| t.parse().ok()).unwrap_or(0);
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0);
         }
     }
     0
@@ -45,12 +51,21 @@ fn read_kv(path: &str, key: &str) -> u64 {
 
 /// 整个进程(含所有线程)的 CPU 节拍。
 fn cpu_ticks() -> u64 {
-    let Ok(text) = std::fs::read_to_string("/proc/self/stat") else { return 0 };
+    let Ok(text) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
     // comm 字段可能含空格和括号,所以从最后一个 ')' 之后开始切。
-    let Some((_, rest)) = text.rsplit_once(')') else { return 0 };
+    let Some((_, rest)) = text.rsplit_once(')') else {
+        return 0;
+    };
     let fields: Vec<&str> = rest.split_whitespace().collect();
     // rest 的第 0 项是 state(原第 3 字段),所以 utime/stime 是 11/12。
-    let get = |i: usize| fields.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let get = |i: usize| {
+        fields
+            .get(i)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
     get(11) + get(12)
 }
 
@@ -120,7 +135,10 @@ pub fn sub(name: &'static str) -> Option<Sub> {
     if !enabled() {
         return None;
     }
-    Some(Sub { name, wall: Instant::now() })
+    Some(Sub {
+        name,
+        wall: Instant::now(),
+    })
 }
 
 impl Drop for Sub {
@@ -178,7 +196,11 @@ pub fn report() {
     eprintln!("\n--- 细分(只测墙钟)---");
     eprintln!("{:<14}{:>9}{:>7}{:>14}", "段", "wall", "占比", "次数");
     for (name, ns, calls) in subs.iter() {
-        eprintln!("{name:<14}{:>8.1}s{:>6.0}%{:>14}",
-            *ns as f64 / 1e9, *ns as f64 / sub_total as f64 * 100.0, calls);
+        eprintln!(
+            "{name:<14}{:>8.1}s{:>6.0}%{:>14}",
+            *ns as f64 / 1e9,
+            *ns as f64 / sub_total as f64 * 100.0,
+            calls
+        );
     }
 }

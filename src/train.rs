@@ -7,6 +7,7 @@
 use crate::callback::{Callback, RoundMetrics};
 use crate::columns::{BinCuts, ColumnBlock};
 use crate::comm::Comm;
+use anyhow::Context;
 use rayon::prelude::*;
 
 /// 分段计时。`FB_PROFILE=1` 时在训练结束打一张耗时分布表。
@@ -108,6 +109,12 @@ pub mod prof {
     pub static GPU_PRED_D2H_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static GPU_PRED_D2H_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_KERNEL_CALLS: AtomicU64 = AtomicU64::new(0);
+    // GPU split-cache telemetry is per-training accounting, separate from timings.
+    pub static GPU_SPLIT_CACHE_PARENT_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_CACHE_PARENT_MISSES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_CACHE_ADMITTED_NODES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_CACHE_SPILLED_NODES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_EVALUATED_NODES: AtomicU64 = AtomicU64::new(0);
     pub static ROUND_WALL: AtomicU64 = AtomicU64::new(0);
 
     /// partition 的规模:取了多少次列、处理了多少行。
@@ -149,6 +156,11 @@ pub mod prof {
             &GPU_PRED_D2H_CALLS,
             &GPU_PRED_D2H_BYTES,
             &GPU_KERNEL_CALLS,
+            &GPU_SPLIT_CACHE_PARENT_HITS,
+            &GPU_SPLIT_CACHE_PARENT_MISSES,
+            &GPU_SPLIT_CACHE_ADMITTED_NODES,
+            &GPU_SPLIT_CACHE_SPILLED_NODES,
+            &GPU_SPLIT_EVALUATED_NODES,
             &ROUND_WALL,
         ] {
             c.store(0, Ordering::Relaxed);
@@ -245,7 +257,8 @@ pub mod prof {
         // 这一行就是这次改造的验收指标:改造前 wrapper 是 kernel 的
         // 500 倍以上,说明量到的是分配器不是架构。
         let hist_kernel = (GPU_HIST_KERNEL.load(Ordering::Relaxed)
-            + GPU_SPLIT_KERNEL.load(Ordering::Relaxed)).max(1);
+            + GPU_SPLIT_KERNEL.load(Ordering::Relaxed))
+        .max(1);
         let hist_wrap = GPU_HIST_BLOCK_H2D.load(Ordering::Relaxed)
             + GPU_HIST_ROWS_H2D.load(Ordering::Relaxed)
             + GPU_HIST_D2H.load(Ordering::Relaxed)
@@ -275,7 +288,11 @@ pub mod prof {
                 &GPU_HIST_ROWS_CALLS,
                 &GPU_HIST_ROWS_BYTES,
             ),
-            ("D2H:histogram remainder", &GPU_HIST_D2H_CALLS, &GPU_HIST_D2H_BYTES),
+            (
+                "D2H:histogram remainder",
+                &GPU_HIST_D2H_CALLS,
+                &GPU_HIST_D2H_BYTES,
+            ),
             (
                 "H2D:split metadata",
                 &GPU_SPLIT_METADATA_H2D_CALLS,
@@ -340,6 +357,14 @@ pub mod prof {
             "  split kernel subset{:>18.1} launches/轮",
             GPU_SPLIT_KERNEL_CALLS.load(Ordering::Relaxed) as f64 / rounds as f64
         );
+        let cache_parent_hits = GPU_SPLIT_CACHE_PARENT_HITS.load(Ordering::Relaxed);
+        let cache_parent_misses = GPU_SPLIT_CACHE_PARENT_MISSES.load(Ordering::Relaxed);
+        let cache_admitted_nodes = GPU_SPLIT_CACHE_ADMITTED_NODES.load(Ordering::Relaxed);
+        let cache_spilled_nodes = GPU_SPLIT_CACHE_SPILLED_NODES.load(Ordering::Relaxed);
+        let split_evaluated_nodes = GPU_SPLIT_EVALUATED_NODES.load(Ordering::Relaxed);
+        eprintln!(
+            "GPU_SPLIT_CACHE parents_hit={cache_parent_hits} parents_miss={cache_parent_misses} admitted_nodes={cache_admitted_nodes} spilled_nodes={cache_spilled_nodes} evaluated_nodes={split_evaluated_nodes}"
+        );
     }
 
     /// 把一次 GPU session 的分段耗时记进计数器。`wall` 是整段墙钟,
@@ -385,6 +410,11 @@ pub mod prof {
         GPU_SPLIT_D2H_BYTES.fetch_add(t.split_d2h_bytes, Ordering::Relaxed);
         GPU_SPLIT_METADATA_H2D_CALLS.fetch_add(t.split_metadata_h2d_calls, Ordering::Relaxed);
         GPU_SPLIT_METADATA_H2D_BYTES.fetch_add(t.split_metadata_h2d_bytes, Ordering::Relaxed);
+        GPU_SPLIT_CACHE_PARENT_HITS.fetch_add(t.cache_parent_hits, Ordering::Relaxed);
+        GPU_SPLIT_CACHE_PARENT_MISSES.fetch_add(t.cache_parent_misses, Ordering::Relaxed);
+        GPU_SPLIT_CACHE_ADMITTED_NODES.fetch_add(t.cache_admitted_nodes, Ordering::Relaxed);
+        GPU_SPLIT_CACHE_SPILLED_NODES.fetch_add(t.cache_spilled_nodes, Ordering::Relaxed);
+        GPU_SPLIT_EVALUATED_NODES.fetch_add(t.split_evaluated_nodes, Ordering::Relaxed);
 
         // The call site identifies histogram versus partition; the segment
         // itself carries exact counts/bytes from the CUDA boundary.
@@ -529,6 +559,52 @@ pub mod prof {
             assert_eq!(GPU_KERNEL_CALLS.load(Ordering::Relaxed), 5);
             assert_eq!(GPU_SPLIT_KERNEL_CALLS.load(Ordering::Relaxed), 2);
         }
+
+        #[test]
+        fn split_cache_counters_record_and_reset_per_profile_run() {
+            let _guard = PROFILE_RUN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reset();
+            struct ResetOnDrop;
+            impl Drop for ResetOnDrop {
+                fn drop(&mut self) {
+                    reset();
+                }
+            }
+            let _cleanup = ResetOnDrop;
+
+            let timing = crate::backend::cuda::GpuSegmentTiming {
+                cache_parent_hits: 7,
+                cache_parent_misses: 3,
+                cache_admitted_nodes: 5,
+                cache_spilled_nodes: 2,
+                split_evaluated_nodes: 11,
+                ..Default::default()
+            };
+            record_gpu(
+                &timing,
+                0,
+                &GPU_HIST_BLOCK_H2D,
+                &GPU_HIST_ROWS_H2D,
+                &GPU_HIST_KERNEL,
+                &GPU_HIST_D2H,
+                &GPU_HIST_HOST,
+            );
+
+            assert_eq!(GPU_SPLIT_CACHE_PARENT_HITS.load(Ordering::Relaxed), 7);
+            assert_eq!(GPU_SPLIT_CACHE_PARENT_MISSES.load(Ordering::Relaxed), 3);
+            assert_eq!(GPU_SPLIT_CACHE_ADMITTED_NODES.load(Ordering::Relaxed), 5);
+            assert_eq!(GPU_SPLIT_CACHE_SPILLED_NODES.load(Ordering::Relaxed), 2);
+            assert_eq!(GPU_SPLIT_EVALUATED_NODES.load(Ordering::Relaxed), 11);
+
+            reset();
+            assert_eq!(GPU_SPLIT_CACHE_PARENT_HITS.load(Ordering::Relaxed), 0);
+            assert_eq!(GPU_SPLIT_CACHE_PARENT_MISSES.load(Ordering::Relaxed), 0);
+            assert_eq!(GPU_SPLIT_CACHE_ADMITTED_NODES.load(Ordering::Relaxed), 0);
+            assert_eq!(GPU_SPLIT_CACHE_SPILLED_NODES.load(Ordering::Relaxed), 0);
+            assert_eq!(GPU_SPLIT_EVALUATED_NODES.load(Ordering::Relaxed), 0);
+        }
     }
 }
 
@@ -572,7 +648,7 @@ impl TrainConfig {
 
 /// 一个验证集。名字会出现在日志和 evals_result 里。
 ///
-/// early stopping 默认盯**最后一个** eval 的第一个 metric —— 语义
+/// early stopping 默认盯**最后一个** eval 的最后一个 metric —— 语义
 /// 和 XGBoost 一致,所以顺序有意义。
 pub struct EvalSet<'a> {
     pub name: String,
@@ -680,6 +756,12 @@ pub trait BlockSource: Send + Sync {
     /// 混成一个数字就看不出「省的到底是读取还是传输」。
     /// 不统计的实现返回 `None`。
     fn source_bytes_read(&self) -> Option<u64> {
+        None
+    }
+
+    /// Source block materializations, separate from raw file ingestion and GPU
+    /// uploads. Implementations that do not track this return None.
+    fn source_block_reads(&self) -> Option<u64> {
         None
     }
 
@@ -797,6 +879,8 @@ fn train_with_backend(
     } else {
         anyhow::ensure!(cfg.base_score.is_finite(), "base_score 必须是有限值");
     }
+    let source_bytes_start = source.source_bytes_read();
+    let source_reads_start = source.source_block_reads();
     let p = &cfg.params;
     anyhow::ensure!(
         (1..=crate::types::MAX_BIN_LIMIT).contains(&p.max_bin),
@@ -928,7 +1012,7 @@ fn train_with_backend(
                 max_block_feats,
                 max_hist_bins,
                 source.n_blocks(),
-                GPU_PARTITION_THREADS,
+                crate::gpu_mem_plan::GPU_PARTITION_THREADS,
                 crate::backend::cuda::SharedHistogramConfig {
                     runtime_log: !cfg.quiet,
                     // 用户显式给的 stream 数走正式参数,不走 env。
@@ -1022,6 +1106,8 @@ fn train_with_backend(
         let fuse = pending_delta;
         // fast 模式下 host 侧完全不产生 gpair:prediction apply、objective
         // gradient 和量化在 device 上一次做完。
+        let exact_gradient_phase =
+            (!fast_math).then(|| crate::diagnostic::Phase::new(b"fb.host.exact.gradient\0"));
         let gpair_f32 = if fast_math {
             Vec::new()
         } else if fuse {
@@ -1050,6 +1136,7 @@ fn train_with_backend(
                 compute_gradients(&predictions, labels, cfg.objective)
             })
         };
+        drop(exact_gradient_phase);
         // ⬅ **行采样在这里发生**:完整梯度已经算出来,root sum / 直方图还没开始。
         //
         // ⚠️ 改的是**工作副本**:未选中的行 gpair 置零,于是它们对直方图和
@@ -1059,7 +1146,11 @@ fn train_with_backend(
         //
         // uniform 采样**不做 `1/p` 加权**(那是 gradient-based 采样才需要的)。
         let mut gpair_f32 = gpair_f32;
-        if cfg.params.subsample < 1.0 && !fast_math {
+        let device_quant = gpu.as_ref().is_some_and(|c| c.device_quantize_enabled());
+        // Device quantization masks in its existing max scan before selecting
+        // scale. CPU and explicit host quantization retain the host mask below.
+        if cfg.params.subsample < 1.0 && !fast_math && !device_quant {
+            let _phase = crate::diagnostic::Phase::new(b"fb.host.exact.subsample\0");
             let kept = {
                 // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
@@ -1068,7 +1159,10 @@ fn train_with_backend(
                     if crate::subsample::row_selected(i as u64, th, cfg.params.seed, round as u64) {
                         kept += 1;
                     } else {
-                        *g = GradPair { grad: 0.0, hess: 0.0 };
+                        *g = GradPair {
+                            grad: 0.0,
+                            hess: 0.0,
+                        };
                     }
                 }
                 kept
@@ -1085,7 +1179,7 @@ fn train_with_backend(
         // device-side quantization:求 scale、转定点、归约 root sum 都在 device 上,
         // 走 PCIe 的是 f32(8 B/行)而不是定点(16 B/行)。位精确的理由见
         // `GpuTrainCtx::upload_and_quantize_gpair`。CPU 路径完全不变。
-        let device_quant = gpu.as_ref().is_some_and(|c| c.device_quantize_enabled());
+        let quantize_phase = crate::diagnostic::Phase::new(b"fb.host.quantize\0");
         let (quantizer, fixed, dev_root_sum) = if fast_math {
             // prediction D2H、host 按行 gradient、gpair H2D —— 三项都不存在。
             // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
@@ -1106,11 +1200,18 @@ fn train_with_backend(
         } else if device_quant {
             let ctx = gpu.as_ref().expect("device_quant 蕴含 gpu 存在");
             let _t = prof::Timer::new(&prof::QUANTIZE);
-            let (q, root, ms) = ctx.upload_and_quantize_gpair(&gpair_f32)?;
+            let (q, root, ms) = ctx.upload_and_quantize_gpair_sampled(
+                &gpair_f32,
+                crate::subsample::threshold_for(cfg.params.subsample),
+                cfg.params.seed,
+                round as u64,
+            )?;
             drop(_t);
             if prof::enabled() {
-                prof::GPU_GPAIR_H2D
-                    .fetch_add((ms as f64 * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+                prof::GPU_GPAIR_H2D.fetch_add(
+                    (ms as f64 * 1e6) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 prof::GPU_GPAIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 prof::GPU_GPAIR_BYTES.fetch_add(
                     (gpair_f32.len() * std::mem::size_of::<GradPair>()) as u64,
@@ -1122,12 +1223,18 @@ fn train_with_backend(
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::QUANTIZE);
                 let quantizer = GradQuantizer::new(&gpair_f32, n);
-                let fixed: Vec<GradPairFixed> =
-                    gpair_f32.par_iter().map(|&g| quantizer.to_fixed(g)).collect();
+                let fixed: Vec<GradPairFixed> = gpair_f32
+                    .par_iter()
+                    .map(|&g| quantizer.to_fixed(g))
+                    .collect();
                 (quantizer, fixed, None)
             })
         };
-        drop(gpair_f32);
+        drop(quantize_phase);
+        {
+            let _phase = crate::diagnostic::Phase::new(b"fb.host.gpair_release\0");
+            drop(gpair_f32);
+        }
         // 定点梯度每轮传一次,不是每个列块重传一次。
         if let (Some(ctx), false) = (gpu.as_ref(), device_quant) {
             let h2d_ms = ctx.upload_gpair(&fixed)?;
@@ -1188,6 +1295,8 @@ fn train_with_backend(
 
         let m = evaluate(&eval_preds, evals, round, cfg);
         // 任一 callback 返回 false 就停 —— early stopping 走这条路。
+        // Every callback must run even after an earlier callback requests stopping.
+        #[allow(clippy::unnecessary_fold)]
         let keep_going = callbacks
             .iter_mut()
             .map(|cb| cb.after_iteration(&m))
@@ -1266,6 +1375,17 @@ fn train_with_backend(
         model.best_score = Some(score);
     }
 
+    if !cfg.quiet {
+        if let (Some(before), Some(after)) = (source_bytes_start, source.source_bytes_read()) {
+            eprintln!(
+                "TRAIN_SOURCE quantized_bytes_read={}",
+                after.saturating_sub(before)
+            );
+        }
+        if let (Some(before), Some(after)) = (source_reads_start, source.source_block_reads()) {
+            eprintln!("TRAIN_SOURCE block_reads={}", after.saturating_sub(before));
+        }
+    }
     Ok(model)
 }
 
@@ -1327,9 +1447,9 @@ pub fn train_gpu_one_tree(
 
     let Some(chosen) = comm.allreduce_best_split(best) else {
         return Ok(Model {
-        // 训练层没有列名概念;由知道 schema 的入口层填。
-        feature_names: Vec::new(),
-        schema_mode: None,
+            // 训练层没有列名概念;由知道 schema 的入口层填。
+            feature_names: Vec::new(),
+            schema_mode: None,
             trees: vec![tree],
             base_score: cfg.base_score,
             objective: cfg.objective,
@@ -1382,8 +1502,7 @@ pub fn train_gpu_one_tree(
 ///
 /// 预测值是外面增量维护的(每轮只累加新树),这里只负责套指标。
 /// 顺序是「eval 外层、metric 内层」,所以 `RoundMetrics::last()` 拿到的
-/// 是**最后一个 eval 的最后一个 metric**;early stopping 盯的是
-/// 最后一个 eval 的**第一个** metric,由 `first_of_last_eval` 负责。
+/// 是**最后一个 eval 的最后一个 metric**,也是 early stopping 的默认指标。
 fn evaluate(
     eval_preds: &[Vec<f32>],
     evals: &[EvalSet],
@@ -1403,6 +1522,7 @@ fn evaluate(
     RoundMetrics { round, entries }
 }
 
+#[cfg(test)]
 fn predict_on(model: &Model, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
     // 返回的是 raw margin(链接函数之前)。metrics.rs 里的 logloss
     // 自己会过 sigmoid,这里再变换一次就成了 sigmoid(sigmoid(x))。
@@ -1550,10 +1670,6 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
     Ok(at.iter().map(|&n| t.nodes[n as usize].leaf_value).collect())
 }
 
-/// GPU 行重分区的 block 大小。512 是 1M 行粗扫里最快的一档
-/// (见 CLAUDE.md「GPU 行重分区」),和 CPU 的 `cols_per_block` 无关。
-const GPU_PARTITION_THREADS: u32 = 512;
-
 /// 本层里的一个活跃节点。
 struct LevelNode {
     /// 在 tree.nodes 里的下标
@@ -1604,6 +1720,7 @@ enum HistFrom {
     Subtract { parent: usize, sibling: usize },
 }
 
+#[allow(clippy::too_many_arguments)] // Keep the established source/backend ownership interface explicit.
 fn build_tree(
     source: &dyn BlockSource,
     gpair: &[GradPairFixed],
@@ -1765,6 +1882,9 @@ fn build_tree(
 
         // 真实墙钟:整个块级并行段进出各一次。**不要**用累加计时器去推它。
         let _phase = prof::Timer::new(&prof::HIST_PHASE_WALL);
+        let hist_phase = crate::diagnostic::Phase::new(b"fb.host.hist_phase\0");
+        #[allow(clippy::type_complexity)]
+        // Paired histogram and split results retain per-block ownership.
         let per_block: anyhow::Result<Vec<(Vec<Histogram>, Vec<Option<SplitCandidate>>)>> = parents
             .into_par_iter()
             .enumerate()
@@ -1775,21 +1895,29 @@ fn build_tree(
                 // 物理块号、原始局部下标、offsets 全部从 plan 里显式取。
                 let plan = &plans[b];
                 let phys = plan.physical;
-                let run = |block: &ColumnBlock| -> anyhow::Result<_> {
-                    anyhow::ensure!(
-                        block.n_rows == source.n_rows(),
-                        "列块 {phys} 有 {} 行,数据源声明 {} 行",
-                        block.n_rows,
-                        source.n_rows()
-                    );
-                    anyhow::ensure!(
-                        block.feat_ids == plan.handed_feats,
-                        "列块 {phys} 交回的特征与 plan 不一致"
-                    );
-                    anyhow::ensure!(
-                        block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
-                        "列块 {b} 数据长度与行数 × 特征数不一致"
-                    );
+                let selected_local = match sampled {
+                    Some(_) if !plan.compact => Some(plan.orig_local.as_slice()),
+                    _ => None,
+                };
+                let mut run = |block: Option<&ColumnBlock>,
+                               resident: Option<crate::backend::cuda::GpuBlockSession<'_>>|
+                 -> anyhow::Result<_> {
+                    if let Some(block) = block {
+                        anyhow::ensure!(
+                            block.n_rows == source.n_rows(),
+                            "列块 {phys} 有 {} 行,数据源声明 {} 行",
+                            block.n_rows,
+                            source.n_rows()
+                        );
+                        anyhow::ensure!(
+                            block.feat_ids == plan.handed_feats,
+                            "列块 {phys} 交回的特征与 plan 不一致"
+                        );
+                        anyhow::ensure!(
+                            block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
+                            "列块 {b} 数据长度与行数 × 特征数不一致"
+                        );
+                    }
                     let width = *plan.hist_offsets.last().unwrap() as usize;
                     // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
                     // 原来这里给每个槽位都分配 + 清零一个完整直方图,相减节点
@@ -1816,24 +1944,25 @@ fn build_tree(
                         // 早期版本是每个节点重新上传一遍整块,那是纯浪费。
                         let _t = prof::Timer::new(&prof::HIST);
                         let started = std::time::Instant::now();
-                // ⚠️ **必须用物理块号**。resident 缓存按物理块号索引,而
-                // `b` 是 colsample 过滤之后的位置 —— 传 `b` 会把 slot 认错:
-                // partition 那边用 `block_ids[b]` 查,两边对不上,轻则
-                // resident 命中失败退回整列上传(实测 wide 上出现
-                // `PART_COL_SOURCE=upload`),重则不同轮次的采样集让同一个
-                // 位置映射到不同物理块,直接读到别的块的数据。
-                let (hist_data, hist_rows) = (&block.data[..], block.n_rows);
-                let mut session = ctx.block_session(
-                    phys,
-                    hist_data,
-                            hist_rows,
-                            block.n_feats(),
-                            &plan.hist_offsets,
-                            match sampled {
-                                Some(_) if !plan.compact => Some(plan.orig_local.as_slice()),
-                                _ => None,
-                            },
-                        )?;
+                        // Physical identity and original-local feature identity
+                        // come from this plan; neither is inferred from its
+                        // colsample-filtered position. Partition lookup uses
+                        // the same plan mapping.
+                        let mut session = match resident {
+                            Some(session) => session,
+                            None => {
+                                let block =
+                                    block.context("GPU cache miss requires source payload")?;
+                                ctx.block_session(
+                                    phys,
+                                    &block.data,
+                                    block.n_rows,
+                                    block.n_feats(),
+                                    &plan.hist_offsets,
+                                    selected_local,
+                                )?
+                            }
+                        };
                         // 整层的 Accumulate 节点按容量分批合并 launch。
                         // 容量 1 就是原来的逐节点路径,一个字都没变。
                         let cap = session.hist_nodes_batch_capacity();
@@ -1845,25 +1974,39 @@ fn build_tree(
                             use crate::backend::cuda::GpuSplitGroup;
                             let mut groups = Vec::new();
                             if depth == 0 {
-                                groups.push(GpuSplitGroup { small: 0,
-                                    span: level[0].rows.device(), sum: level[0].sum, large: None });
+                                groups.push(GpuSplitGroup {
+                                    small: 0,
+                                    span: level[0].rows.device(),
+                                    sum: level[0].sum,
+                                    large: None,
+                                });
                             } else {
                                 for (i, ln) in level.iter().enumerate() {
                                     if let HistFrom::Subtract { parent, sibling } = ln.hist_from {
-                                        if let Some(cache_slot) = session.cached_parent_slot(parent) {
-                                            groups.push(GpuSplitGroup { small: sibling,
-                                                span: level[sibling].rows.device(), sum: level[sibling].sum,
-                                                large: Some((i, cache_slot, ln.sum)) });
+                                        if let Some(cache_slot) = session.cached_parent_slot(parent)
+                                        {
+                                            groups.push(GpuSplitGroup {
+                                                small: sibling,
+                                                span: level[sibling].rows.device(),
+                                                sum: level[sibling].sum,
+                                                large: Some((i, cache_slot, ln.sum)),
+                                            });
                                         }
                                     }
                                 }
                             }
-                            for chunk in groups.chunks((cap / 2).max(1)) {
-                                for (i, candidate, histogram) in session.split_cached_batch(chunk,
-                                    &plan.hist_feats, sampled, q, p, depth + 1 < p.max_depth)? {
-                                    gpu_done[i] = true;
-                                    gpu_candidates[i] = candidate;
-                                    if let Some(bins) = histogram { per_node[i].bins = bins; }
+                            for (i, candidate, histogram) in session.split_cached_batch(
+                                &groups,
+                                &plan.hist_feats,
+                                sampled,
+                                q,
+                                p,
+                                depth + 1 < p.max_depth,
+                            )? {
+                                gpu_done[i] = true;
+                                gpu_candidates[i] = candidate;
+                                if let Some(bins) = histogram {
+                                    per_node[i].bins = bins;
                                 }
                             }
                             session.finish_split_level(depth);
@@ -1871,7 +2014,9 @@ fn build_tree(
                         let todo: Vec<usize> = level
                             .iter()
                             .enumerate()
-                            .filter(|(i, ln)| !gpu_done[*i] && matches!(ln.hist_from, HistFrom::Accumulate))
+                            .filter(|(i, ln)| {
+                                !gpu_done[*i] && matches!(ln.hist_from, HistFrom::Accumulate)
+                            })
                             .map(|(i, _)| i)
                             .collect();
                         if cap <= 1 && !must_batch {
@@ -1916,6 +2061,7 @@ fn build_tree(
                             &prof::GPU_HIST_HOST,
                         );
                     } else {
+                        let block = block.context("CPU histogram requires source payload")?;
                         for (i, ln) in level.iter().enumerate() {
                             if matches!(ln.hist_from, HistFrom::Accumulate) {
                                 // 根节点走 None 那条路:少一层行下标的间接寻址,
@@ -1941,7 +2087,9 @@ fn build_tree(
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
                     // 里的先后顺序。
                     for i in 0..level.len() {
-                        if gpu_done[i] { continue; }
+                        if gpu_done[i] {
+                            continue;
+                        }
                         if let HistFrom::Subtract { parent, sibling } = level[i].hist_from {
                             let ph = parent_hist
                                 .as_mut()
@@ -1971,7 +2119,9 @@ fn build_tree(
                         .iter()
                         .enumerate()
                         .map(|(i, ln)| {
-                            if gpu_done[i] { return gpu_candidates[i]; }
+                            if gpu_done[i] {
+                                return gpu_candidates[i];
+                            }
                             split::best_split_in_block(
                                 &per_node[i],
                                 &plan.hist_feats,
@@ -1985,19 +2135,38 @@ fn build_tree(
                         .collect();
                     Ok((per_node, cands))
                 };
-                // 压实块只读选中的列(source 侧就少读);resident 块整块借出,
-                // 采样只影响 compute。**两条路都用 `plan.physical` 寻址**,
-                // 绝不从数组位置反推身份。
+                // Check the dedicated resident slot before asking the source to
+                // materialize bins. Its payload passed source/shape validation
+                // on first upload; current tree metadata still goes through the
+                // same GPU session validation. Physical identity is never a
+                // filtered plan position. Streaming and cold misses keep the
+                // source read/checksum path.
+                if !plan.compact {
+                    if let Some(ctx) = gpu {
+                        if let Some(session) = ctx.block_session_resident(
+                            phys,
+                            source.n_rows(),
+                            plan.handed_feats.len(),
+                            &plan.hist_offsets,
+                            selected_local,
+                        )? {
+                            return run(None, Some(session));
+                        }
+                    }
+                }
                 if plan.compact {
-                    source.with_block_cols_ret(phys, &plan.orig_local, run)?
+                    source.with_block_cols_ret(phys, &plan.orig_local, |block| {
+                        run(Some(block), None)
+                    })?
                 } else {
-                    source.with_block_ret(phys, run)?
+                    source.with_block_ret(phys, |block| run(Some(block), None))?
                 }
                 // 本块的父直方图到此为止 —— 闭包一结束,它和刚借来的
                 // 块一起释放,这一层内存最紧的时候正好都不在手上。
             })
             .collect();
         let per_block = per_block?;
+        drop(hist_phase);
         drop(_phase);
 
         // 跨块归约按**块序**做,和单线程逐块推进完全一样。
@@ -2006,6 +2175,7 @@ fn build_tree(
         // (与顺序无关),块间的归约顺序在这里固定死。少了任何一件,
         // 并列的候选就会因为"哪个线程先跑完"而胜负不同 ——
         // tests/bit_exact_vs_xgboost.rs 盯着这条。
+        let split_reduce_phase = crate::diagnostic::Phase::new(b"fb.host.split_reduce\0");
         let mut best: Vec<Option<SplitCandidate>> = vec![None; level.len()];
         let mut hists: Vec<Vec<Histogram>> = Vec::with_capacity(n_blocks);
         for (per_node, cands) in per_block {
@@ -2022,6 +2192,8 @@ fn build_tree(
             .into_iter()
             .map(|c| comm.allreduce_best_split(c))
             .collect();
+        drop(split_reduce_phase);
+        let partition_phase = crate::diagnostic::Phase::new(b"fb.host.partition\0");
 
         // ---- 第二趟:行重分区 ----
         //
@@ -2047,52 +2219,64 @@ fn build_tree(
                 by_feat.entry(c.feat).or_default().push(i);
             }
         }
-        for (feat, node_idxs) in by_feat {
-            // resident 命中时,这一列的 bin 已经在 device 上了。**必须在取列
-            // 之前就判断**,否则 host 那份 `Vec<Bin>`(每次 O(行数))照样会被
-            // 物化出来 —— 实测 HIGGS 上 PART_FETCH 25.9 ms/轮 + 列 H2D
-            // 52.1 ms/轮,合计占整轮 20%,而且传的是已经在卡上的字节。
-            let resident_session = match gpu {
-                Some(ctx) => {
-                    // 同样:`block_feats` 是过滤后的,resident 缓存按物理
-                    // 块号索引,所以这里要换回 `block_ids[b]`。
-                    // ⚠️ 这里要的是**原始块里的局部下标**,和压实与否无关 ——
-                    // resident 缓存按物理块号 + 原始局部下标寻址。
-                    // 压实块的物理块号 >= resident_block_count,
-                    // `partition_session_resident` 会直接返回 None,
-                    // 所以两条身份不会串。
-                    let loc = plans.iter().find_map(|pl| {
-                        pl.sampled_global
+        // Group resident requests by PHYSICAL block, not selected feature.
+        // Original-local feature IDs survive colsample/compaction unchanged.
+        // Keep the existing per-feature upload fallback for nonresident blocks.
+        if let Some(ctx) = gpu {
+            let mut resident_groups: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+                Default::default();
+            for (&feat, node_idxs) in &by_feat {
+                let loc = plans.iter().find_map(|pl| {
+                    pl.sampled_global
+                        .iter()
+                        .position(|&f| f == feat)
+                        .map(|i| (pl.physical, pl.orig_local[i]))
+                });
+                if let Some((block, local)) =
+                    loc.filter(|&(block, _)| block < ctx.resident_block_count())
+                {
+                    resident_groups
+                        .entry(block)
+                        .or_default()
+                        .extend(node_idxs.iter().map(|&i| (i, local)));
+                }
+            }
+            for (block, nodes) in resident_groups {
+                if let Some(mut session) = ctx.partition_session_resident(block, 0)? {
+                    let started = std::time::Instant::now();
+                    for chunk in nodes.chunks(crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY) {
+                        let requests: Vec<_> = chunk
                             .iter()
-                            .position(|&f| f == feat)
-                            .map(|i| (pl.physical, pl.orig_local[i]))
-                    });
-                    match loc {
-                        Some((b, local)) => ctx.partition_session_resident(b, local)?,
-                        None => None,
+                            .map(|&(i, local)| {
+                                let c = chosen[i].expect("resident group contains chosen nodes");
+                                (level[i].rows.device(), local, c.bin, c.missing_left)
+                            })
+                            .collect();
+                        let tokens = session.partition_resident_batch(&requests)?;
+                        for (&(i, _), token) in chunk.iter().zip(tokens) {
+                            part_tokens[i] = Some(token);
+                        }
                     }
+                    let timing = session.timing();
+                    drop(session);
+                    prof::record_gpu(
+                        &timing,
+                        started.elapsed().as_nanos() as u64,
+                        &prof::GPU_PART_COL_H2D,
+                        &prof::GPU_PART_ROWS_H2D,
+                        &prof::GPU_PART_KERNEL,
+                        &prof::GPU_PART_D2H,
+                        &prof::GPU_PART_HOST,
+                    );
                 }
-                None => None,
-            };
-            if let Some(mut session) = resident_session {
-                let started = std::time::Instant::now();
-                for i in node_idxs {
-                    let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    // 只登记,不同步:左右行数整层结束后一次取回。
-                    part_tokens[i] =
-                        Some(session.partition(level[i].rows.device(), c.bin, c.missing_left)?);
-                }
-                let timing = session.timing();
-                drop(session);
-                prof::record_gpu(
-                    &timing,
-                    started.elapsed().as_nanos() as u64,
-                    &prof::GPU_PART_COL_H2D,
-                    &prof::GPU_PART_ROWS_H2D,
-                    &prof::GPU_PART_KERNEL,
-                    &prof::GPU_PART_D2H,
-                    &prof::GPU_PART_HOST,
-                );
+            }
+        }
+        for (feat, node_idxs) in by_feat {
+            let node_idxs: Vec<_> = node_idxs
+                .into_iter()
+                .filter(|&i| part_tokens[i].is_none())
+                .collect();
+            if node_idxs.is_empty() {
                 continue;
             }
             let t = prof::Timer::new(&prof::PART_FETCH);
@@ -2156,6 +2340,8 @@ fn build_tree(
             }
         }
 
+        drop(partition_phase);
+        let _next_phase = crate::diagnostic::Phase::new(b"fb.host.next_level\0");
         let _t = prof::Timer::new(&prof::NEXT_LEVEL);
         let mut next: Vec<LevelNode> = Vec::new();
         for (i, ln) in level.into_iter().enumerate() {
@@ -2247,9 +2433,7 @@ fn build_tree(
         // exact:host 是权威副本,delta 要交回去施加。
         // fast:device 是权威副本,delta 由 device 的 gradient kernel 直接
         // 消费,这一次 4 B/行 的 D2H 整个不存在。
-        if let Some(ctx) =
-            gpu.filter(|c| c.prediction_authority() == PredictionAuthority::Host)
-        {
+        if let Some(ctx) = gpu.filter(|c| c.prediction_authority() == PredictionAuthority::Host) {
             // 只取回 delta;施加推迟到下一轮开头,和求梯度合并成一次遍历
             // (见 train_with_backend 里那一段)。
             let d2h_ms = ctx.download_prediction_delta()?;
@@ -2260,7 +2444,7 @@ fn build_tree(
                 );
                 prof::GPU_PRED_D2H_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 prof::GPU_PRED_D2H_BYTES.fetch_add(
-                    (predictions.len() * std::mem::size_of::<f32>()) as u64,
+                    std::mem::size_of_val(predictions) as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 // One f32 delta per training row is downloaded once per tree.
@@ -2427,6 +2611,8 @@ fn split_rows_by_prefix(rows: &[RowId], bits: &[u8]) -> (Vec<RowId>, Vec<RowId>)
         .zip(right_parts)
         .for_each(|(((start_byte, end_byte), left_out), right_out)| {
             let (mut li, mut ri) = (0usize, 0usize);
+            #[allow(clippy::needless_range_loop)]
+            // Physical byte offsets index both masks and stable row spans.
             for byte in start_byte..end_byte {
                 let start = byte * 8;
                 let chunk = &rows[start..(start + 8).min(rows.len())];
@@ -2581,15 +2767,27 @@ mod tests {
         assert_eq!(crate::types::MAX_DEPTH_LIMIT, 14);
         // 下界 0 是合法的(根节点树),不该被校验挡掉。
         let (x, y, n_rows, n_feats) = tiny_fixture();
-        let mut p = TrainParams { max_depth: 0, n_rounds: 1, ..Default::default() };
+        let mut p = TrainParams {
+            max_depth: 0,
+            n_rounds: 1,
+            ..Default::default()
+        };
         p.cols_per_block = n_feats;
         let cfg = TrainConfig::new(p, Objective::SquaredError);
         let src = DenseSource::from_row_major(&x, n_rows, n_feats, 32, n_feats);
         train(&src, &y, &[], &cfg, &mut [], &Local).expect("max_depth=0 是合法的根节点树");
         // 上限就是那个 buffer 装得下的最深一层。
         let deepest_partitioned_level = crate::types::MAX_DEPTH_LIMIT - 1;
-        assert_eq!(1usize << deepest_partitioned_level, 8192, "depth 14 正好用满 8192 个槽位");
-        assert!(1usize << crate::types::MAX_DEPTH_LIMIT > 8192, "depth 15 一定超");
+        assert_eq!(
+            1usize << deepest_partitioned_level,
+            8192,
+            "depth 14 正好用满 8192 个槽位"
+        );
+        assert_eq!(
+            1usize << crate::types::MAX_DEPTH_LIMIT,
+            16384,
+            "depth 15 需要 16384 个槽位"
+        );
     }
 
     /// 越界的 `max_depth` 必须在**共享校验**里被挡下来,而不是留给某个后端
@@ -2601,7 +2799,11 @@ mod tests {
         let (x, y, n_rows, n_feats) = tiny_fixture();
         // ⚠️ 0 **不在**这里 —— 它是合法的根节点树,不是越界值。
         for bad in [crate::types::MAX_DEPTH_LIMIT + 1, 32, 100] {
-            let mut p = TrainParams { max_depth: bad, n_rounds: 1, ..Default::default() };
+            let mut p = TrainParams {
+                max_depth: bad,
+                n_rounds: 1,
+                ..Default::default()
+            };
             p.cols_per_block = n_feats;
             let cfg = TrainConfig::new(p, Objective::SquaredError);
             let src = DenseSource::from_row_major(&x, n_rows, n_feats, 32, n_feats);
@@ -2641,7 +2843,7 @@ mod tests {
     use crate::callback::{EarlyStopping, RecordHistory, RoundMetrics, VerboseEval};
     use crate::columns::{BinCuts, ColumnBlock};
     use crate::comm::Local;
-    use crate::metrics::{LogLoss, Rmse};
+    use crate::metrics::{LogLoss, Metric, Rmse};
     use crate::source::DenseSource;
 
     const MISSING: f32 = f32::NAN;
@@ -3039,9 +3241,9 @@ mod tests {
     }
 
     #[test]
-    fn watched_metric_is_the_first_of_the_last_eval() {
-        // entries 是「eval 外层、metric 内层」,所以 last() 是最后一个
-        // metric,watched() 才是第一个 —— 配两个 metric 时才看得出区别
+    fn watched_metric_is_the_last_of_the_last_eval() {
+        // entries 是「eval 外层、metric 内层」,early stopping 应盯最后
+        // 一个 eval 下的最后一个 metric。
         let m = RoundMetrics {
             round: 0,
             entries: vec![
@@ -3051,8 +3253,8 @@ mod tests {
                 ("valid".into(), "rmse".into(), 4.0),
             ],
         };
-        assert_eq!(m.watched().unwrap().1, "logloss");
-        assert_eq!(m.watched().unwrap().2, 3.0);
+        assert_eq!(m.watched().unwrap().1, "rmse");
+        assert_eq!(m.watched().unwrap().2, 4.0);
         assert_eq!(m.last().unwrap().2, 4.0, "last() 是最后一个 metric");
     }
 
@@ -3082,15 +3284,83 @@ mod tests {
         let mut cbs: Vec<Box<dyn Callback>> = vec![Box::new(recorder)];
         train(&src, &y, &evals, &cfg, &mut cbs, &Local).unwrap();
 
-        // 两个 metric 都要出现,顺序就是配置的顺序(early stopping 盯第一个)
+        // 两个 metric 都要出现且保留配置顺序;watched 选最后一个。
         let recorded = history.lock().unwrap();
         assert_eq!(recorded.len(), 3);
         for m in recorded.iter() {
             assert_eq!(m.entries.len(), 2, "一个 eval × 两个 metric");
             assert_eq!(m.entries[0].1, "logloss");
             assert_eq!(m.entries[1].1, "rmse");
-            assert_eq!(m.watched().unwrap().1, "logloss", "盯的必须是第一个");
+            assert_eq!(m.watched().unwrap().1, "rmse", "盯的必须是最后一个");
+            assert_eq!(m.watched().unwrap().2, m.entries[1].2);
         }
+    }
+
+    #[test]
+    fn early_stopping_uses_last_metric_even_when_first_metric_keeps_improving() {
+        struct ConstantMetric;
+        impl Metric for ConstantMetric {
+            fn name(&self) -> &str {
+                "constant"
+            }
+
+            fn eval(&self, _pred: &[f32], _label: &[f32]) -> f32 {
+                1.0
+            }
+        }
+
+        let (x, y, n_features) = step_data(60);
+        let p = params(2, 20);
+        let train_src =
+            DenseSource::from_row_major(&x, 60, n_features, p.max_bin, p.cols_per_block);
+        let valid = DenseSource::with_cuts(
+            &x,
+            60,
+            n_features,
+            DenseSource::from_row_major(&x, 60, n_features, p.max_bin, p.cols_per_block)
+                .into_cuts(),
+            p.cols_per_block,
+        );
+        let cfg = TrainConfig {
+            eval_metrics: vec![Box::new(LogLoss), Box::new(ConstantMetric)],
+            ..TrainConfig::new(p, Objective::Logistic)
+        };
+        let evals = [EvalSet {
+            name: "valid".into(),
+            source: &valid,
+            labels: &y,
+        }];
+        let recorder = RecordHistory::new();
+        let history = recorder.handle();
+        let mut callbacks: Vec<Box<dyn Callback>> =
+            vec![Box::new(recorder), Box::new(EarlyStopping::new(2, true))];
+
+        let model = train(&train_src, &y, &evals, &cfg, &mut callbacks, &Local).unwrap();
+        assert_eq!(
+            model.trees.len(),
+            3,
+            "equal watched scores stop after patience two"
+        );
+        assert_eq!(model.best_iteration, Some(0));
+        assert_eq!(model.best_score, Some(1.0));
+
+        let recorded = history.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        let first_metric: Vec<f32> = recorded
+            .iter()
+            .map(|round| {
+                assert_eq!(round.entries.len(), 2);
+                assert_eq!(round.entries[0].1, "logloss");
+                assert_eq!(round.entries[1].1, "constant");
+                assert_eq!(round.entries[1].2, 1.0);
+                assert_eq!(round.watched().unwrap().1, "constant");
+                round.entries[0].2
+            })
+            .collect();
+        assert!(
+            first_metric.windows(2).all(|pair| pair[1] < pair[0]),
+            "the earlier logloss metric must keep improving over the three recorded rounds: {first_metric:?}"
+        );
     }
 
     /// 加载次数必须跟着**块数 / 列数**走,不是节点数。
@@ -3232,5 +3502,95 @@ mod tests {
         for (i, (x, y)) in a.iter().zip(&b).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(), "第 {i} 行");
         }
+    }
+
+    #[test]
+    fn quantized_leaf_values_clear_feature_lookup_between_blocks_and_passes() {
+        use crate::tree::{Node, Tree};
+
+        let rows = [
+            0.0,
+            0.0,
+            3.0, // f0 -> f1 -> f0, left at the last split
+            1.0,
+            0.0,
+            4.0, // f0 -> f1 -> f0, right at the last split
+            2.0,
+            0.0,
+            5.0, // root right
+            f32::NAN,
+            0.0,
+            6.0, // missing f0 follows the root's left default
+            f32::NAN,
+            f32::NAN,
+            7.0, // missing f0 and f1 follow distinct defaults
+            1.0,
+            2.0,
+            8.0, // f1 threshold boundary
+            1.0,
+            f32::NAN,
+            9.0, // missing f1 follows its right default
+        ];
+        let source = DenseSource::from_row_major(&rows, 7, 3, 32, 1);
+
+        // Each feature is in its own block. The route through nodes 0, 1, 2
+        // returns to feature 0 in a later pass after feature 1 was loaded.
+        let mut root = Node::leaf(0.0, 1.0);
+        root.feat = 0;
+        root.split_cond = 2.0;
+        root.left = 1;
+        root.right = 6;
+        root.default_left = true;
+        root.is_leaf = false;
+
+        let mut node1 = Node::leaf(0.0, 1.0);
+        node1.feat = 1;
+        node1.split_cond = 2.0;
+        node1.left = 2;
+        node1.right = 5;
+        node1.default_left = false;
+        node1.is_leaf = false;
+
+        let mut node2 = Node::leaf(0.0, 1.0);
+        node2.feat = 0;
+        node2.split_cond = 1.0;
+        node2.left = 3;
+        node2.right = 4;
+        node2.default_left = false;
+        node2.is_leaf = false;
+
+        let tree = Tree {
+            nodes: vec![
+                root,
+                node1,
+                node2,
+                Node::leaf(10.0, 1.0),
+                Node::leaf(20.0, 1.0),
+                Node::leaf(30.0, 1.0),
+                Node::leaf(99.0, 1.0),
+            ],
+        };
+        let expected = [10.0f32, 20.0, 99.0, 20.0, 30.0, 30.0, 30.0];
+
+        for _ in 0..2 {
+            let got = leaf_values(&tree, &source).unwrap();
+            assert_eq!(
+                got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let single_leaf = Tree {
+            nodes: vec![Node::leaf(0.25, 1.0)],
+        };
+        let got = leaf_values(&single_leaf, &source).unwrap();
+        assert_eq!(got.len(), 7);
+        assert!(got.iter().all(|value| value.to_bits() == 0.25f32.to_bits()));
+
+        let empty = DenseSource::from_row_major(&[], 0, 3, 32, 1);
+        assert!(leaf_values(&tree, &empty).unwrap().is_empty());
     }
 }

@@ -8,9 +8,9 @@
 
 use crate::columns::{partition_features, BinCuts, BinningStrategy, ColumnBlock};
 use crate::sketch::FeatureSketch;
-use rayon::prelude::*;
 use crate::train::BlockSource;
 use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
+use rayon::prelude::*;
 
 pub struct DenseSource {
     cuts: BinCuts,
@@ -34,9 +34,7 @@ impl DenseSource {
         max_bins: u32,
         cols_per_block: usize,
     ) -> Self {
-        Self::from_row_major_with_nthread(
-            data, n_rows, n_features, max_bins, cols_per_block, 0,
-        )
+        Self::from_row_major_with_nthread(data, n_rows, n_features, max_bins, cols_per_block, 0)
     }
 
     /// `from_row_major`,但分箱明确服从 `nthread`。0 = 用满可用核。
@@ -52,7 +50,9 @@ impl DenseSource {
             data,
             n_rows,
             n_features,
-            BinningStrategy::Sketch { max_bins: max_bins as usize },
+            BinningStrategy::Sketch {
+                max_bins: max_bins as usize,
+            },
             cols_per_block,
             nthread,
         )
@@ -104,8 +104,7 @@ impl DenseSource {
                 // 代价:每个特征要跨 stride 读(行主序下同一特征的相邻
                 // 两个值隔着 n_features 个 f32)。宽数据上这不划算,
                 // 但它换来的是零同步。
-                let pool = crate::threading::build_pool(nthread)
-                    .expect("分箱线程池创建失败");
+                let pool = crate::threading::build_pool(nthread).expect("分箱线程池创建失败");
                 let per_feat: Vec<Vec<f32>> = pool.install(|| {
                     (0..n_features)
                         .into_par_iter()
@@ -150,11 +149,7 @@ impl DenseSource {
         cols_per_block: usize,
     ) -> Self {
         assert_eq!(data.len(), n_rows * n_features);
-        assert_eq!(
-            cuts.n_feats(),
-            n_features,
-            "cuts 的特征数和数据对不上"
-        );
+        assert_eq!(cuts.n_feats(), n_features, "cuts 的特征数和数据对不上");
         Self::quantize_row_major(data, n_rows, n_features, cuts, cols_per_block)
     }
 
@@ -187,11 +182,20 @@ impl DenseSource {
                         };
                     }
                 }
-                ColumnBlock { feat_ids, data: block, n_rows }
+                ColumnBlock {
+                    feat_ids,
+                    data: block,
+                    n_rows,
+                }
             })
             .collect();
 
-        Self { cuts, blocks, n_rows, n_features }
+        Self {
+            cuts,
+            blocks,
+            n_rows,
+            n_features,
+        }
     }
 
     /// 交出分箱边界的所有权,用来构建验证集。
@@ -230,8 +234,6 @@ impl BlockSource for DenseSource {
     fn cuts(&self) -> &BinCuts {
         &self.cuts
     }
-
-
 
     /// 纯元数据,不碰数据。
     fn block_features(&self, i: usize) -> anyhow::Result<Vec<FeatId>> {
@@ -346,9 +348,12 @@ mod tests {
     #[test]
     fn nan_becomes_missing_sentinel() {
         let data = vec![
-            1.0, f32::NAN, //
-            2.0, 5.0, //
-            f32::NAN, 6.0, //
+            1.0,
+            f32::NAN, //
+            2.0,
+            5.0, //
+            f32::NAN,
+            6.0, //
         ];
         let src = DenseSource::from_row_major(&data, 3, 2, 16, 8);
 
@@ -377,8 +382,7 @@ mod tests {
         }
 
         let cuts_of = |threads: usize| {
-            DenseSource::from_row_major_with_nthread(&data, n_rows, nf, 64, 4, threads)
-                .into_cuts()
+            DenseSource::from_row_major_with_nthread(&data, n_rows, nf, 64, 4, threads).into_cuts()
         };
 
         let a = cuts_of(1);
@@ -417,8 +421,17 @@ mod tests {
         // 8 个唯一值的特征 + 一个常数特征,照 3.4.1 实际输出的形状
         let indptr = vec![0u32, 9, 11];
         let edges = vec![
-            f32::NEG_INFINITY, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 14.0, // feat 0
-            f32::NEG_INFINITY, 6.0, // feat 1:常数,没有内部切分点
+            f32::NEG_INFINITY,
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            14.0, // feat 0
+            f32::NEG_INFINITY,
+            6.0, // feat 1:常数,没有内部切分点
         ];
         let cuts = BinCuts::from_xgboost_edges(&indptr, &edges).unwrap();
 

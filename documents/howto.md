@@ -17,10 +17,10 @@ Use the source-oriented API as the default:
   quantization, block width, resident versus streaming execution, and spill
   behavior without materializing the full table first.
 
-For CUDA training, this is an adaptive residency decision rather than a fixed
-mode switch: FerrisBoost automatically trades GPU memory for training speed,
-from full residency through hybrid execution to pure streaming when memory is
-under pressure.
+For CUDA training, FerrisBoost chooses a stable residency plan from the
+training shape and memory budget: full residency, hybrid execution, or
+streaming. It does not continuously migrate data between these modes during a
+training run.
 - **In-memory convenience: NumPy and PyArrow are optional.** Use them when the
   data is already in memory and comfortably fits there.
 
@@ -191,8 +191,9 @@ print(history["valid"]["logloss"])
 FerrisBoost automatically reuses the training cuts for validation data. This
 is required for consistent bin assignments.
 
-Early stopping watches the first metric of the last validation set. The
-currently supported objectives each expose one default metric:
+Early stopping watches the last configured metric of the last validation set.
+The Python API currently uses one default metric selected by the objective;
+there is no `eval_metric` parameter yet:
 
 - `binary:logistic`: `logloss`
 - `reg:squarederror`: `rmse`
@@ -411,11 +412,26 @@ model = fb.train(
 )
 ```
 
-FerrisBoost's memory planner automatically trades GPU memory for training speed without manual chunk or batch tuning:
-- **Adaptive residency**: Dynamically adapts across full VRAM residency, hybrid CPU/GPU caching, and pure streaming under extreme memory pressure.
-- **`gpu_memory_budget`**: Sets the memory ceiling in bytes for GPU operations. When omitted, FerrisBoost defaults to available free VRAM on the device.
-- **`gpu_math`**: `"exact"` (default) produces a byte-by-byte exact model matching CPU training. Setting `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models, trading bit-level CPU reproducibility for maximum GPU throughput.
-- **`device_quantize`**: `True` (default) performs feature binning directly on the GPU.
+FerrisBoost's memory planner chooses a training plan from the input shape and
+memory budget, without manual chunk or batch tuning:
+- **Residency plan**: The planner selects full GPU residency, hybrid residency,
+  or streaming from the training shape and budget. The plan stays stable during
+  training; data is not continuously migrated between modes.
+- **`gpu_memory_budget`**: Sets the planner's budget for GPU training memory.
+  When omitted, the planner derives a budget from currently free VRAM and keeps
+  safety headroom. It is not a hard cap on all GPU memory used by this process
+  or by other processes.
+- **`gpu_math`**: `"exact"` (default) produces a byte-by-byte exact model
+  matching CPU training. `"fast"` is deterministic, but CPU and GPU models are
+  not guaranteed to be bit-identical; FerrisBoost does not promise universal
+  parity with XGBoost GPU training.
+- **`device_quantize`**: `True` (default) performs fixed-point gradient and
+  Hessian quantization on the GPU. Feature binning and feature bins remain on
+  the host/source side.
+- **Bounded split cache**: A bounded resident histogram/split cache is enabled
+  by default and included in the GPU memory plan. Unsupported cases and cache
+  overflow use the exact host fallback. This is managed internally and is not
+  a public Python parameter.
 - **`hist_streams`**: Defaults to automatic (`None`), resolved by the GPU planner based on execution path, block width, and VRAM budget (selects 2 streams for chunked row-major streaming when memory allows, and 1 stream for resident or column-major paths); can be explicitly set to `1` or `2`.
 - **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU scaling is in progress (WIP).
 - **`max_depth`**: Depth-wise tree growth on GPU is constrained to `0..=14` by partition buffer limits.
@@ -576,9 +592,9 @@ empty `evals_result()`.
 | `cols_per_block` | automatic | Positive integer; normally leave unset |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
-| `gpu_memory_budget` | automatic | Positive integer byte limit for GPU memory (defaults to free VRAM) |
-| `gpu_math` | `"exact"` | `"exact"` (byte-by-byte identical to CPU) or `"fast"` (matches XGBoost GPU behavior) |
-| `device_quantize` | `True` | Direct GPU feature quantization |
+| `gpu_memory_budget` | automatic | Positive integer planner budget for GPU training memory; auto derives from free VRAM with safety headroom |
+| `gpu_math` | `"exact"` | `"exact"` (byte-by-byte identical to CPU) or deterministic `"fast"` (CPU/GPU models need not be bit-identical) |
+| `device_quantize` | `True` | Fixed-point gradient/Hessian quantization on GPU; feature binning remains on host/source |
 | `hist_streams` | automatic | Planned by GPU planner based on execution path, block width, and VRAM; override with `1` or `2` |
 | `hist_nodes_per_batch` | automatic | Multi-node merge batch size (`1..=32`) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |

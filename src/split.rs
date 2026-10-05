@@ -72,12 +72,7 @@ fn gain(grad: f64, hess: f64, p: &TrainParams) -> f64 {
 ///
 /// `parent_gain` 是调用方按节点算好一次传进来的:它在整个节点的枚举
 /// 里是常数,放进内层循环纯属浪费。
-fn split_gain(
-    parent_gain: f64,
-    left: (f64, f64),
-    right: (f64, f64),
-    p: &TrainParams,
-) -> f32 {
+fn split_gain(parent_gain: f64, left: (f64, f64), right: (f64, f64), p: &TrainParams) -> f32 {
     let g = gain(left.0, left.1, p) + gain(right.0, right.1, p) - parent_gain - p.gamma as f64;
     // 和 XGBoost 一样,在这里截断成 f32 再拿去比
     g as f32
@@ -88,7 +83,7 @@ fn split_gain(
 /// 严格大于是刻意的:枚举顺序是「特征升序 → 正向 → 反向」,并列时
 /// 保留先来的就等于「特征 id 小的优先、缺失走右优先」,和 XGBoost 的
 /// `SplitEntry::Update` 一致,也让结果不依赖遍历顺序的偶然性。
-#[allow(clippy::neg_cmp_op_on_partial_ord)] // 见下面对 NaN 的处理
+#[allow(clippy::neg_cmp_op_on_partial_ord, clippy::unnecessary_map_or)] // Preserve NaN and strict first-winner semantics.
 fn update_best(best: &mut Option<SplitCandidate>, cand: SplitCandidate) {
     // 写成 !(gain > eps) 而不是 gain <= eps,是为了让 NaN 也走这条:
     // λ = 0 且某侧梯度全零时 0/0 会冒出 NaN,不挡住会污染整个归约
@@ -282,7 +277,14 @@ mod tests {
         ) -> Self {
             let q = GradQuantizer::new(&float, n_rows);
             let gpair = float.iter().map(|&g| q.to_fixed(g)).collect();
-            Self { block, n_rows, feat_ids, feat_offsets, gpair, q }
+            Self {
+                block,
+                n_rows,
+                feat_ids,
+                feat_offsets,
+                gpair,
+                q,
+            }
         }
 
         fn n_feats(&self) -> usize {
@@ -416,11 +418,20 @@ mod tests {
                         + rf.0 * rf.0 / (rf.1 + p.lambda as f64)
                         - parent_gain
                         - p.gamma as f64) as f32;
+                    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                    // Reference rejects NaN just like production.
                     if !(g > MIN_GAIN_EPS) {
                         continue;
                     }
+                    #[allow(clippy::unnecessary_map_or)]
+                    // Keep the independent strict-gain reference unchanged.
                     if best.map_or(true, |b| g > b.gain) {
-                        best = Some(SplitCandidate { gain: g, left: l, right: r, ..cand });
+                        best = Some(SplitCandidate {
+                            gain: g,
+                            left: l,
+                            right: r,
+                            ..cand
+                        });
                     }
                 }
             }
@@ -477,7 +488,10 @@ mod tests {
     fn candidate_sums_match_its_own_partition() {
         for seed in 0..20u64 {
             let case = random_case(seed, 48, 3, 20);
-            let p = TrainParams { lambda: 1.0, ..Default::default() };
+            let p = TrainParams {
+                lambda: 1.0,
+                ..Default::default()
+            };
             let c = case.best(&p).expect("随机数据总能分出来");
 
             let (l, r) = case.partition(&c);
@@ -496,12 +510,30 @@ mod tests {
         // 一个特征、2 个 bin。bin 0 的梯度是 -1,bin 1 是 +1,
         // 缺失行的梯度由参数给。
         let float = vec![
-            GradPair { grad: -1.0, hess: 1.0 },
-            GradPair { grad: -1.0, hess: 1.0 },
-            GradPair { grad: 1.0, hess: 1.0 },
-            GradPair { grad: 1.0, hess: 1.0 },
-            GradPair { grad: missing_grad, hess: 1.0 },
-            GradPair { grad: missing_grad, hess: 1.0 },
+            GradPair {
+                grad: -1.0,
+                hess: 1.0,
+            },
+            GradPair {
+                grad: -1.0,
+                hess: 1.0,
+            },
+            GradPair {
+                grad: 1.0,
+                hess: 1.0,
+            },
+            GradPair {
+                grad: 1.0,
+                hess: 1.0,
+            },
+            GradPair {
+                grad: missing_grad,
+                hess: 1.0,
+            },
+            GradPair {
+                grad: missing_grad,
+                hess: 1.0,
+            },
         ];
         Case::new(
             vec![0, 0, 1, 1, MISSING_BIN, MISSING_BIN],
@@ -514,7 +546,11 @@ mod tests {
 
     #[test]
     fn missing_goes_to_the_side_it_agrees_with() {
-        let p = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
 
         // 缺失行梯度为负,和 bin 0 那一侧同号 —— 该走左
         let case = missing_direction_case(-1.0);
@@ -540,7 +576,11 @@ mod tests {
         // 扫描才对得上。这个断言就是在钉住那个 continue。
         //
         // 定点之后判断「有没有缺失」是精确的整数判等,不再靠容差。
-        let p = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
         for seed in 0..10u64 {
             let case = random_case(seed, 32, 3, 0);
             let c = case.best(&p).unwrap();
@@ -561,15 +601,37 @@ mod tests {
             vec![0],
             vec![0, 2],
             vec![
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: -3.0, hess: 1.0 },
-                GradPair { grad: -3.0, hess: 1.0 },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -3.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -3.0,
+                    hess: 1.0,
+                },
             ],
         );
-        let p = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
         let c = case.best(&p).unwrap();
 
         assert_eq!(c.bin, 2, "所有非缺失行走左边,右边界就是 bin 数");
@@ -586,13 +648,29 @@ mod tests {
             vec![0],
             vec![0, 1],
             vec![
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: -1.0, hess: 1.0 },
-                GradPair { grad: 2.0, hess: 1.0 },
-                GradPair { grad: -2.0, hess: 1.0 },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 2.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -2.0,
+                    hess: 1.0,
+                },
             ],
         );
-        let p = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
         assert!(case.best(&p).is_none());
     }
 
@@ -611,19 +689,48 @@ mod tests {
             vec![0, 1],
             vec![0, 2, 4],
             vec![
-                GradPair { grad: -5.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
+                GradPair {
+                    grad: -5.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
             ],
         );
 
-        let loose = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
-        assert_eq!(case.best(&loose).unwrap().feat, 0, "不剪枝时特征 0 增益最高");
+        let loose = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            case.best(&loose).unwrap().feat,
+            0,
+            "不剪枝时特征 0 增益最高"
+        );
 
-        let strict = TrainParams { min_child_weight: 2.0, ..loose.clone() };
+        let strict = TrainParams {
+            min_child_weight: 2.0,
+            ..loose.clone()
+        };
         let c = case.best(&strict).unwrap();
         assert_eq!(c.feat, 1, "min_child_weight 该在比增益之前就把特征 0 挡掉");
         // hess 恒等于 1 时反量化必须精确还原成整数,不然 mcw 的比较
@@ -643,13 +750,30 @@ mod tests {
             vec![0],
             vec![0, 2],
             vec![
-                GradPair { grad: -1.0, hess: 1.0 },
-                GradPair { grad: -1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
+                GradPair {
+                    grad: -1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
             ],
         );
-        let base = TrainParams { lambda: 1.0, gamma: 0.0, min_child_weight: 0.0, ..Default::default() };
+        let base = TrainParams {
+            lambda: 1.0,
+            gamma: 0.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
 
         // 手算:GL = -2, GR = 2, HL = HR = 2, G = 0, λ = 1
         // 增益 = 4/3 + 4/3 - 0 = 8/3(不是 4/3)
@@ -658,10 +782,16 @@ mod tests {
 
         // γ 略小于 8/3:还留得住;略大于:该被剪掉。
         // 要是哪天有人"顺手"把 0.5 补回去,这两条会一起挂。
-        let keep = TrainParams { gamma: 8.0 / 3.0 - 0.01, ..base.clone() };
+        let keep = TrainParams {
+            gamma: 8.0 / 3.0 - 0.01,
+            ..base.clone()
+        };
         assert!(case.best(&keep).is_some());
 
-        let prune = TrainParams { gamma: 8.0 / 3.0 + 0.01, ..base.clone() };
+        let prune = TrainParams {
+            gamma: 8.0 / 3.0 + 0.01,
+            ..base.clone()
+        };
         assert!(case.best(&prune).is_none(), "γ 超过增益就该剪掉");
     }
 
@@ -675,13 +805,29 @@ mod tests {
             vec![0],
             vec![0, 4],
             vec![
-                GradPair { grad: -1.0, hess: 1.0 },
-                GradPair { grad: -1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
-                GradPair { grad: 1.0, hess: 1.0 },
+                GradPair {
+                    grad: -1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: -1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
+                GradPair {
+                    grad: 1.0,
+                    hess: 1.0,
+                },
             ],
         );
-        let p = TrainParams { lambda: 1.0, min_child_weight: 0.0, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.0,
+            min_child_weight: 0.0,
+            ..Default::default()
+        };
         let c = case.best(&p).unwrap();
 
         assert_eq!(c.bin, 2, "bin 0/1 归左、bin 2/3 归右,右边界就是 2");
@@ -694,7 +840,10 @@ mod tests {
         // 同 seed 必须逐位一致。定点累加之后这是结构性的,
         // 不再依赖"行按升序遍历"。
         let case = random_case(7, 64, 4, 25);
-        let p = TrainParams { lambda: 1.5, ..Default::default() };
+        let p = TrainParams {
+            lambda: 1.5,
+            ..Default::default()
+        };
         let a = case.best(&p).unwrap();
         let b = case.best(&p).unwrap();
         assert_eq!(a.gain.to_bits(), b.gain.to_bits());
@@ -718,7 +867,10 @@ mod tests {
         };
 
         assert!(reduce_best(&[None, None]).is_none());
-        assert_eq!(reduce_best(&[None, mk(3, 0.5), mk(9, 2.0)]).unwrap().feat, 9);
+        assert_eq!(
+            reduce_best(&[None, mk(3, 0.5), mk(9, 2.0)]).unwrap().feat,
+            9
+        );
         // 并列时保留先来的:块的划分方式变了也不该换一棵树
         assert_eq!(reduce_best(&[mk(3, 2.0), mk(9, 2.0)]).unwrap().feat, 3);
         // 低于 eps 的候选一个都不该留下

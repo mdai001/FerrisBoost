@@ -24,8 +24,6 @@ use cudarc::driver::{
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use rayon::prelude::*;
-
 use crate::types::{Bin, GradPair, GradPairFixed, GradQuantizer, RowId};
 
 use super::{device_state, DeviceState, SharedHistogramConfig};
@@ -233,6 +231,12 @@ pub struct GpuSegmentTiming {
     pub d2h_bytes: u64,
     /// CUDA kernel launches represented by this segment.
     pub kernel_calls: u64,
+    /// Cache lookup and split evaluation counts for resident GPU split work.
+    pub cache_parent_hits: u64,
+    pub cache_parent_misses: u64,
+    pub cache_admitted_nodes: u64,
+    pub cache_spilled_nodes: u64,
+    pub split_evaluated_nodes: u64,
 }
 
 /// 一个已经 launch、但 totals 还没取回的 partition。
@@ -301,7 +305,12 @@ const RM_STAGE_MIN_PER_SLOT: usize = 4 * 1024 * 1024;
 /// `partition()` 的返回值:本层内的登记号,`resolve_partitions()` 后才有行数。
 pub type PartitionToken = usize;
 
-/// A contiguous node-row span in the current device-side level arena.
+/// A contiguous node-row span in the current or next device-side level arena.
+///
+/// Input spans address the current arena and must not be used after
+/// `finish_partition_level` swaps arenas. Spans returned by
+/// `resolve_partitions` address the next arena and become active after that
+/// swap; consume terminal leaf spans before swapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuRowSpan {
     pub offset: usize,
@@ -333,6 +342,11 @@ impl GpuSegmentTiming {
         self.split_d2h_bytes += other.split_d2h_bytes;
         self.split_metadata_h2d_bytes += other.split_metadata_h2d_bytes;
         self.kernel_calls += other.kernel_calls;
+        self.cache_parent_hits += other.cache_parent_hits;
+        self.cache_parent_misses += other.cache_parent_misses;
+        self.cache_admitted_nodes += other.cache_admitted_nodes;
+        self.cache_spilled_nodes += other.cache_spilled_nodes;
+        self.split_evaluated_nodes += other.split_evaluated_nodes;
     }
 }
 
@@ -360,6 +374,7 @@ struct GpuBuffers {
     part_block_counts: CudaSlice<u32>,
     part_left_offsets: CudaSlice<u32>,
     part_right_offsets: CudaSlice<u32>,
+    part_descriptors: CudaSlice<u32>,
     part_right_out: CudaSlice<u32>,
     /// 下一层 row arena 在 `part_right_out` 中顺序分配到的位置。
     next_rows_cursor: usize,
@@ -388,6 +403,12 @@ struct GpuHistBuffers {
     offsets: CudaSlice<u32>,
     /// Column-major colsample index scratch, one u32 per local feature.
     feature_select: CudaSlice<u32>,
+    /// Exact metadata currently queued on this slot's stream. The host offsets
+    /// also serve session tile geometry, instead of being cloned per session.
+    /// Physical identity and shape prevent reuse across reassigned stream slots.
+    metadata_shape: Option<(usize, usize, usize)>,
+    offsets_host: Vec<u32>,
+    selected_host: Vec<usize>,
     hist_out: CudaSlice<i64>,
     /// Multi-node batching 的 block -> node 映射,布局是
     /// `[blk_ptr(batch+1) | node_off(batch) | node_len(batch)]`。
@@ -407,6 +428,7 @@ struct GpuHistBuffers {
     /// 行距就是特征数,用错会**整块读偏**,而且只在"最后那块也常驻"时
     /// 才发作 —— 等宽的块碰巧对,所以这个 bug 藏得很深。
     resident_feats: usize,
+    resident_rows: usize,
     /// `Some(block)` marks an immutable, device-resident training block.
     /// Streaming slots always leave this as None.
     resident_block: Option<usize>,
@@ -516,6 +538,9 @@ pub struct GpuTrainCtx {
     count_fn: CudaFunction,
     scan_fn: CudaFunction,
     scatter_layer_fn: CudaFunction,
+    partition_batch_count_fn: CudaFunction,
+    partition_batch_scan_fn: CudaFunction,
+    partition_batch_scatter_fn: CudaFunction,
     assign_leaf_fn: CudaFunction,
     init_tree_fn: CudaFunction,
     start_event: CudaEvent,
@@ -555,12 +580,14 @@ pub struct GpuTrainCtx {
     device_ordinal: usize,
     echoed_resident_col: std::sync::atomic::AtomicBool,
     echoed_upload_col: std::sync::atomic::AtomicBool,
+    echoed_partition_batch: std::sync::atomic::AtomicBool,
 }
 
 impl GpuTrainCtx {
     /// 按**最坏情况**预分配:`max_block_feats` 是最宽的列块,
     /// `max_hist_bins` 是最宽的那块直方图。这样整个训练过程中不再有
     /// 任何 device 分配 / 释放。
+    #[allow(clippy::too_many_arguments)] // Preserve the validated GPU allocation/lifetime interface.
     pub fn new(
         device_ordinal: usize,
         n_rows: usize,
@@ -640,7 +667,10 @@ impl GpuTrainCtx {
         let hist_nodes_per_batch = match config.hist_nodes_per_batch {
             Some(n) => n,
             None => match std::env::var("FB_HIST_NODES_PER_BATCH") {
-                Ok(v) => v.trim().parse::<usize>().context("FB_HIST_NODES_PER_BATCH 必须是整数")?,
+                Ok(v) => v
+                    .trim()
+                    .parse::<usize>()
+                    .context("FB_HIST_NODES_PER_BATCH 必须是整数")?,
                 Err(_) => 16,
             },
         };
@@ -650,13 +680,18 @@ impl GpuTrainCtx {
         if hist_nodes_per_batch > MAX_HIST_NODES_PER_BATCH {
             bail!("hist_nodes_per_batch 上限是 {MAX_HIST_NODES_PER_BATCH},收到 {hist_nodes_per_batch}");
         }
-        let split_cache_enabled = config.gpu_split_cache && hist_nodes_per_batch >= 2 && !bucket_profile;
+        let split_cache_enabled =
+            config.gpu_split_cache && hist_nodes_per_batch >= 2 && !bucket_profile;
         let split_features_fn = if split_cache_enabled {
             Some(state.module.load_function("split_cached_features")?)
-        } else { None };
+        } else {
+            None
+        };
         let split_nodes_fn = if split_cache_enabled {
             Some(state.module.load_function("split_cached_nodes")?)
-        } else { None };
+        } else {
+            None
+        };
         // `gpu_math = "fast"`:prediction / gradient / quantization 全程留在
         // device。只有 Fast 才加载 kernel 和分配那两块常驻 buffer。
         let gpu_math = config.gpu_math;
@@ -678,11 +713,10 @@ impl GpuTrainCtx {
         // 限制:只支持 `n_feats <= 32` 且能整除 16 的向量取数快路径之外的
         // 情况会回落到标量路径;`hist_nodes_per_batch > 1` 才有意义
         // (复用 batched 的 blk_ptr 语义,batching 本身不变)。
-        // ⚠️ 行主序 kernel 用「两条 lane 一行、每条一次 uint4」的映射,
-        // 一行最多覆盖 **32 个特征**。超过就会**静默丢掉**后面的特征 ——
-        // 已经因此让 `gpu_training_reuses_resources_without_changing_the_model`
-        // 挂过一次。所以这里是硬门槛,不满足就整个关掉回到列主序,
-        // 而不是让它悄悄算错。
+        // ⚠️ The fused row-major kernel uses R=4, with each thread processing
+        // four rows. A row can cover at most **32 features**; exceeding that
+        // bound would silently omit later features. This hard width gate keeps
+        // the tested fallback to column-major whenever the shape is unsupported.
         // **默认开启**(2026-09-04)。判据全部满足:wide fast −22.4%、
         // wide exact −15.6%,HIGGS 两种模式在真实轮数下打平,
         // exact 仍与 CPU 逐字节相同,常驻显存只多 32 MB。
@@ -707,12 +741,24 @@ impl GpuTrainCtx {
             && max_block_feats as u64 <= crate::gpu_mem_plan::ROW_MAJOR_MAX_FEATS;
         let (rm_transpose_fn, rm_hist_fn, rm_count_fn) = if row_major {
             (
-                Some(state.module.load_function("transpose_bins_to_row_major")
-                    .context("PTX 中找不到 transpose_bins_to_row_major")?),
-                Some(state.module.load_function("hist_build_shared_planar32_batched_rm")
-                    .context("PTX 中找不到 hist_build_shared_planar32_batched_rm")?),
-                Some(state.module.load_function("partition_count_rm")
-                    .context("PTX 中找不到 partition_count_rm")?),
+                Some(
+                    state
+                        .module
+                        .load_function("transpose_bins_to_row_major")
+                        .context("PTX 中找不到 transpose_bins_to_row_major")?,
+                ),
+                Some(
+                    state
+                        .module
+                        .load_function("hist_build_shared_planar32_batched_rm")
+                        .context("PTX 中找不到 hist_build_shared_planar32_batched_rm")?,
+                ),
+                Some(
+                    state
+                        .module
+                        .load_function("partition_count_rm")
+                        .context("PTX 中找不到 partition_count_rm")?,
+                ),
             )
         } else {
             (None, None, None)
@@ -757,6 +803,18 @@ impl GpuTrainCtx {
             .module
             .load_function("partition_scatter_layer")
             .context("PTX 中找不到 partition_scatter_layer")?;
+        let partition_batch_count_fn = state
+            .module
+            .load_function("partition_count_batched")
+            .context("PTX 中找不到 partition_count_batched")?;
+        let partition_batch_scan_fn = state
+            .module
+            .load_function("partition_scan_batched")
+            .context("PTX 中找不到 partition_scan_batched")?;
+        let partition_batch_scatter_fn = state
+            .module
+            .load_function("partition_scatter_batched")
+            .context("PTX 中找不到 partition_scatter_batched")?;
         let assign_leaf_fn = state
             .module
             .load_function("assign_leaf_value")
@@ -793,7 +851,10 @@ impl GpuTrainCtx {
             bail!("设备没有足够 shared memory 放一个 GradPairFixed");
         }
 
-        let n_part_blocks = (n_rows as u32).div_ceil(partition_threads) as usize;
+        let (n_part_blocks, n_part_offsets) =
+            crate::gpu_mem_plan::partition_batch_capacities(n_rows, partition_threads as usize);
+        let n_part_descriptors = crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY
+            * crate::gpu_mem_plan::PARTITION_DESCRIPTOR_WORDS;
         let bins_len = max_block_feats * n_rows;
         let hist_words = max_hist_bins * 2;
         let offsets_len = max_block_feats + 1;
@@ -803,7 +864,11 @@ impl GpuTrainCtx {
         // `hist_nodes_per_batch == 1` 也要按批分配 —— 否则批里那一个节点
         // 要写 4 个 u32 到一个长度为 1 的 buffer 上,cudarc 直接 panic。
         let batch_capable = hist_fused_fn.is_some() || row_major;
-        let batch_idx_len = if batch_capable { hist_nodes_per_batch.max(1) * 3 + 1 } else { 1 };
+        let batch_idx_len = if batch_capable {
+            hist_nodes_per_batch.max(1) * 3 + 1
+        } else {
+            1
+        };
 
         // 默认双流；同一 binary 可用 1 做严格 A/B。只开放 1/2，避免把
         // 实验开关误当成任意并发度配置，显存也因此始终可精确预算。
@@ -923,18 +988,20 @@ impl GpuTrainCtx {
         let part_flags = stream
             .alloc_zeros::<u8>(n_rows)
             .context("partition flags 分配")?;
-        // counts/offsets 仍然按**一个节点**定容量:同一条 stream 上
-        // count → scan → scatter 是顺序的,节点 i 的 scatter 一定在
-        // 节点 i+1 的 count 之前跑完,所以这两块照旧可以按节点复用。
+        // Segmented scratch covers at most 32 disjoint spans, never a full
+        // layer's worth of independent row-sized allocations.
         let part_block_counts = stream
             .alloc_zeros::<u32>(n_part_blocks)
             .context("partition block counts 分配")?;
         let part_left_offsets = stream
-            .alloc_zeros::<u32>(n_part_blocks + 1)
+            .alloc_zeros::<u32>(n_part_offsets)
             .context("partition left offsets 分配")?;
         let part_right_offsets = stream
-            .alloc_zeros::<u32>(n_part_blocks + 1)
+            .alloc_zeros::<u32>(n_part_offsets)
             .context("partition right offsets 分配")?;
+        let part_descriptors = stream
+            .alloc_zeros::<u32>(n_part_descriptors)
+            .context("partition batch descriptors 分配")?;
         // **唯一需要活到本层结束的东西**:每个节点的左右行数。
         // 一层最多 MAX_LEVEL_NODES 个节点,每个两个 u32。
         let part_totals = stream
@@ -1020,40 +1087,45 @@ impl GpuTrainCtx {
             0
         };
         let rm_stage_len = rm_chunk_rows * max_block_feats;
-        let alloc_rm_staging = |stream: &Arc<CudaStream>, what: &str| -> Result<Option<RmStaging>> {
-            if !row_major {
-                return Ok(None);
-            }
-            let mut dev = Vec::with_capacity(rm_bufs);
-            let mut host = Vec::with_capacity(if use_pinned { rm_bufs } else { 0 });
-            for b in 0..rm_bufs {
-                dev.push(
-                    stream
-                        .alloc_zeros::<u8>(rm_stage_len.max(1))
-                        .with_context(|| format!("{what} 行主序暂存 {b} 分配"))?,
-                );
-                if use_pinned {
-                    // ⚠️ 双 buffer 轮转的**全部**安全性都压在
-                    // `PinnedHostSlice` 自带的那个 event 上:H2D 之后由
-                    // cudarc 记录,下一轮 `as_mut_slice()` 等它。
-                    // 但 cudarc 只在 `is_managing_stream_synchronization()`
-                    // 为真时才**真的记录**;为假时那个 event 从未被 record,
-                    // `synchronize()` 于是立刻返回 —— host 会覆写一块仍在
-                    // 被 DMA 读的 buffer,而且**静默**,只表现为偶发错值。
-                    // 这个前提必须显式检查,不能默认它一直成立。
-                    ensure!(
-                        state.ctx.is_managing_stream_synchronization(),
-                        "行主序 pinned 双 buffer 需要 cudarc 的 stream 事件跟踪,\
-                         但当前 context 未开启;继续下去会静默覆写在飞的 pinned buffer"
-                    );
-                    host.push(
-                        unsafe { state.ctx.alloc_pinned::<u8>(rm_stage_len.max(1)) }
-                            .with_context(|| format!("{what} 行主序 pinned 暂存 {b} 分配"))?,
-                    );
+        let alloc_rm_staging =
+            |stream: &Arc<CudaStream>, what: &str| -> Result<Option<RmStaging>> {
+                if !row_major {
+                    return Ok(None);
                 }
-            }
-            Ok(Some(RmStaging { dev, host, chunk_rows: rm_chunk_rows }))
-        };
+                let mut dev = Vec::with_capacity(rm_bufs);
+                let mut host = Vec::with_capacity(if use_pinned { rm_bufs } else { 0 });
+                for b in 0..rm_bufs {
+                    dev.push(
+                        stream
+                            .alloc_zeros::<u8>(rm_stage_len.max(1))
+                            .with_context(|| format!("{what} 行主序暂存 {b} 分配"))?,
+                    );
+                    if use_pinned {
+                        // ⚠️ 双 buffer 轮转的**全部**安全性都压在
+                        // `PinnedHostSlice` 自带的那个 event 上:H2D 之后由
+                        // cudarc 记录,下一轮 `as_mut_slice()` 等它。
+                        // 但 cudarc 只在 `is_managing_stream_synchronization()`
+                        // 为真时才**真的记录**;为假时那个 event 从未被 record,
+                        // `synchronize()` 于是立刻返回 —— host 会覆写一块仍在
+                        // 被 DMA 读的 buffer,而且**静默**,只表现为偶发错值。
+                        // 这个前提必须显式检查,不能默认它一直成立。
+                        ensure!(
+                            state.ctx.is_managing_stream_synchronization(),
+                            "行主序 pinned 双 buffer 需要 cudarc 的 stream 事件跟踪,\
+                         但当前 context 未开启;继续下去会静默覆写在飞的 pinned buffer"
+                        );
+                        host.push(
+                            unsafe { state.ctx.alloc_pinned::<u8>(rm_stage_len.max(1)) }
+                                .with_context(|| format!("{what} 行主序 pinned 暂存 {b} 分配"))?,
+                        );
+                    }
+                }
+                Ok(Some(RmStaging {
+                    dev,
+                    host,
+                    chunk_rows: rm_chunk_rows,
+                }))
+            };
 
         let mut hist_slots = Vec::with_capacity(hist_stream_count);
         for (slot, hist_stream) in hist_streams.into_iter().enumerate() {
@@ -1098,6 +1170,9 @@ impl GpuTrainCtx {
                 bins,
                 offsets,
                 feature_select,
+                metadata_shape: None,
+                offsets_host: Vec::new(),
+                selected_host: Vec::new(),
                 hist_out,
                 batch_idx,
                 hist_host: Vec::new(),
@@ -1106,24 +1181,36 @@ impl GpuTrainCtx {
                 start_event,
                 end_event,
                 resident_feats: 0,
+                resident_rows: 0,
                 resident_block: None,
             }));
         }
         for cache_slot in 0..resident_block_count {
-            let hist_stream = state.ctx.new_stream()
+            let hist_stream = state
+                .ctx
+                .new_stream()
                 .with_context(|| format!("创建 resident block stream {cache_slot}"))?;
-            let bins = hist_stream.alloc_zeros::<u8>(bins_len.max(1))
+            let bins = hist_stream
+                .alloc_zeros::<u8>(bins_len.max(1))
                 .with_context(|| format!("resident block {cache_slot} buffer 分配"))?;
-            let offsets = hist_stream.alloc_zeros::<u32>(offsets_len)
+            let offsets = hist_stream
+                .alloc_zeros::<u32>(offsets_len)
                 .with_context(|| format!("resident block {cache_slot} offsets 分配"))?;
-            let feature_select = hist_stream.alloc_zeros::<u32>(max_block_feats.max(1))
+            let feature_select = hist_stream
+                .alloc_zeros::<u32>(max_block_feats.max(1))
                 .with_context(|| format!("resident block {cache_slot} colsample buffer 分配"))?;
-            let hist_out = hist_stream.alloc_zeros::<i64>((hist_words * hist_nodes_per_batch).max(1))
+            let hist_out = hist_stream
+                .alloc_zeros::<i64>((hist_words * hist_nodes_per_batch).max(1))
                 .with_context(|| format!("resident block {cache_slot} histogram 分配"))?;
-            let batch_idx = hist_stream.alloc_zeros::<u32>(batch_idx_len)
+            let batch_idx = hist_stream
+                .alloc_zeros::<u32>(batch_idx_len)
                 .with_context(|| format!("resident block {cache_slot} batch 索引分配"))?;
-            let start_event = state.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-            let end_event = state.ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            let start_event = state
+                .ctx
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            let end_event = state
+                .ctx
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
             let rm_stage = alloc_rm_staging(&hist_stream, &format!("resident block {cache_slot}"))?;
             // ⚠️ resident slot 也要 pinned staging:它同样要**加载一次**自己的
             // 块,走的是和 streaming slot 完全相同的 `block_session`。
@@ -1132,21 +1219,41 @@ impl GpuTrainCtx {
             // 默认 0 的年代没人同时打开这两个开关,所以一直没暴露。
             let bins_host = if use_pinned && !row_major {
                 Some(
-                    unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }
-                        .with_context(|| format!("resident block {cache_slot} pinned staging 分配"))?,
+                    unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }.with_context(
+                        || format!("resident block {cache_slot} pinned staging 分配"),
+                    )?,
                 )
             } else {
                 None
             };
             hist_slots.push(Mutex::new(GpuHistBuffers {
                 split_cache: if split_cache_enabled {
-                    Some(split_ctx::ResidentSplitBuffers::new(&hist_stream,
-                        max_hist_bins, max_block_feats, hist_nodes_per_batch)?)
-                } else { None },
-                stream: hist_stream, bins, offsets, feature_select, hist_out, batch_idx,
+                    Some(split_ctx::ResidentSplitBuffers::new(
+                        &hist_stream,
+                        max_hist_bins,
+                        max_block_feats,
+                        hist_nodes_per_batch,
+                    )?)
+                } else {
+                    None
+                },
+                stream: hist_stream,
+                bins,
+                offsets,
+                feature_select,
+                hist_out,
+                batch_idx,
+                metadata_shape: None,
+                offsets_host: Vec::new(),
+                selected_host: Vec::new(),
                 hist_host: Vec::new(),
-                bins_host, rm_stage, start_event, end_event,
-                resident_feats: 0, resident_block: None,
+                bins_host,
+                rm_stage,
+                start_event,
+                end_event,
+                resident_feats: 0,
+                resident_rows: 0,
+                resident_block: None,
             }));
         }
 
@@ -1154,8 +1261,16 @@ impl GpuTrainCtx {
         // 「每一项预分配都必须出现在预算报告里」。
         let (pred_resident, label_resident) = if fast_math {
             (
-                Some(stream.alloc_zeros::<f32>(n_rows.max(1)).context("fast pred 分配")?),
-                Some(stream.alloc_zeros::<f32>(n_rows.max(1)).context("fast label 分配")?),
+                Some(
+                    stream
+                        .alloc_zeros::<f32>(n_rows.max(1))
+                        .context("fast pred 分配")?,
+                ),
+                Some(
+                    stream
+                        .alloc_zeros::<f32>(n_rows.max(1))
+                        .context("fast label 分配")?,
+                ),
             )
         } else {
             (None, None)
@@ -1163,7 +1278,11 @@ impl GpuTrainCtx {
         // 行主序转置的落地区:H2D 先进这里(列主序),转置后写进 slot.bins
         let budget = GpuMemoryBudget {
             fast_math_bytes: if fast_math { n_rows * 4 * 2 } else { 0 },
-            rm_stage_bytes: if row_major { rm_stage_len * rm_bufs * rm_slot_count } else { 0 },
+            rm_stage_bytes: if row_major {
+                rm_stage_len * rm_bufs * rm_slot_count
+            } else {
+                0
+            },
             hist_streams: hist_stream_count + resident_block_count,
             gpair_bytes: n_rows * 2 * 8,
             row_idx_bytes: n_rows * 4,
@@ -1174,26 +1293,38 @@ impl GpuTrainCtx {
             // ⚠️ device quantization 的三块 buffer **必须**出现在预算里。
             // 上一次尝试正是漏报了它们(报告仍打 1142.1 MB),事后才发现。
             gpair_f32_bytes: if device_quantize { n_rows * 2 * 4 } else { 0 }
-                + if device_quantize { n_gpair_blocks * 2 * (8 + 8) } else { 0 },
+                + if device_quantize {
+                    n_gpair_blocks * 2 * (8 + 8)
+                } else {
+                    0
+                },
             partition_scratch_bytes: n_rows
-                + (n_part_blocks * 3 + 2) * 4
+                + (n_part_blocks + n_part_offsets * 2 + n_part_descriptors) * 4
                 + MAX_LEVEL_NODES * 2 * 4,
             partition_col_bytes: n_rows,
             block_bins_bytes: bins_len * (hist_stream_count + resident_block_count),
-            hist_bytes: hist_words * 8 * hist_nodes_per_batch * (hist_stream_count + resident_block_count),
+            hist_bytes: hist_words
+                * 8
+                * hist_nodes_per_batch
+                * (hist_stream_count + resident_block_count),
             split_cache_bytes: if split_cache_enabled {
-                resident_block_count * ((max_hist_bins * 2 * hist_nodes_per_batch).max(1) * 8 * 2
-                    + (max_block_feats * hist_nodes_per_batch * 64).max(1)
-                    + max_block_feats.max(1) * 8
-                    + hist_nodes_per_batch * 96)
-            } else { 0 },
+                resident_block_count
+                    * ((max_hist_bins * 2 * hist_nodes_per_batch).max(1) * 8 * 2
+                        + (max_block_feats * hist_nodes_per_batch * 64).max(1)
+                        + max_block_feats.max(1) * 8
+                        + hist_nodes_per_batch
+                            * (32 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES))
+            } else {
+                0
+            },
             hist_nodes_batch_idx_bytes: if batch_capable {
                 batch_idx_len * 4 * (hist_stream_count + resident_block_count)
             } else {
                 0
             },
             offsets_bytes: offsets_len * 4 * (hist_stream_count + resident_block_count),
-            hist_feature_select_bytes: max_block_feats.max(1) * 4
+            hist_feature_select_bytes: max_block_feats.max(1)
+                * 4
                 * (hist_stream_count + resident_block_count),
             prediction_bytes: n_rows * 4,
         };
@@ -1246,6 +1377,9 @@ impl GpuTrainCtx {
             count_fn,
             scan_fn,
             scatter_layer_fn,
+            partition_batch_count_fn,
+            partition_batch_scan_fn,
+            partition_batch_scatter_fn,
             assign_leaf_fn,
             init_tree_fn,
             start_event,
@@ -1271,6 +1405,7 @@ impl GpuTrainCtx {
                 part_block_counts,
                 part_left_offsets,
                 part_right_offsets,
+                part_descriptors,
                 part_right_out,
                 next_rows_cursor: 0,
                 part_totals,
@@ -1294,6 +1429,7 @@ impl GpuTrainCtx {
             device_ordinal,
             echoed_resident_col: std::sync::atomic::AtomicBool::new(false),
             echoed_upload_col: std::sync::atomic::AtomicBool::new(false),
+            echoed_partition_batch: std::sync::atomic::AtomicBool::new(false),
         };
         // 见 `path_summary`:A/B 只信这一行,不信环境变量。
         if ctx.config.runtime_log {
@@ -1343,11 +1479,17 @@ impl GpuTrainCtx {
             } else {
                 " layout_gpu=col_major hist_map=row_per_lane"
             }
+            + " partition=resident_block_batched partition_batch_cap=32"
             + match self.gpu_math {
                 crate::types::GpuMath::Exact => " gpu_math=exact",
                 crate::types::GpuMath::Fast => " gpu_math=fast",
             }
             + if self.gpair_quantize_fn.is_some() { " quantize=device" } else { " quantize=host" }
+            + match (self.gpu_math, self.gpair_quantize_fn.is_some()) {
+                (crate::types::GpuMath::Fast, _) => " subsample=device_gradient",
+                (crate::types::GpuMath::Exact, true) => " subsample=device_max",
+                (crate::types::GpuMath::Exact, false) => " subsample=host",
+            }
             // ⚠️ 这一段回显的是**列块 H2D 实际执行的那条路**,不是
             // `use_pinned` 这个字段。两者曾经不一致:行主序(默认)臂
             // 根本没有 pinned 分支,于是 `FB_CUDA_PINNED=1` 那一档跟
@@ -1388,6 +1530,10 @@ impl GpuTrainCtx {
                 if self.budget.split_cache_bytes > 0 { "gpu_resident_cache" } else { "cpu" },
                 if self.budget.split_cache_bytes > 0 { self.hist_nodes_per_batch } else { 0 },
                 self.budget.split_cache_bytes)
+            + " hist_metadata=slot_reuse"
+            + &format!(" packet_collection={} packet_window_batches={}",
+                if self.budget.split_cache_bytes > 0 { "bounded_window" } else { "cpu" },
+                if self.budget.split_cache_bytes > 0 { crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES } else { 0 })
     }
 
     pub fn timing_enabled(&self) -> bool {
@@ -1474,20 +1620,30 @@ impl GpuTrainCtx {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let started = std::time::Instant::now();
+        let _started = std::time::Instant::now();
         buf.part_offsets_host.clear();
         buf.part_offsets_host.resize(n * 2, 0);
         {
-            let GpuBuffers { part_totals, part_offsets_host, .. } = &mut *buf;
+            let GpuBuffers {
+                part_totals,
+                part_offsets_host,
+                ..
+            } = &mut *buf;
             self.stream
-                .memcpy_dtoh(&part_totals.slice(..n * 2), part_offsets_host.as_mut_slice())
+                .memcpy_dtoh(
+                    &part_totals.slice(..n * 2),
+                    part_offsets_host.as_mut_slice(),
+                )
                 .context("partition totals D2H(整层一次)")?;
         }
 
         let mut out = Vec::with_capacity(n);
         for (slot, p) in buf.part_pending.iter().enumerate() {
             if p.n_selected == 0 {
-                let empty = GpuRowSpan { offset: p.out_offset, len: 0 };
+                let empty = GpuRowSpan {
+                    offset: p.out_offset,
+                    len: 0,
+                };
                 out.push((empty, empty));
                 continue;
             }
@@ -1495,8 +1651,14 @@ impl GpuTrainCtx {
             let total_right = buf.part_offsets_host[slot * 2 + 1] as usize;
             debug_assert_eq!(total_left + total_right, p.n_selected);
             out.push((
-                GpuRowSpan { offset: p.out_offset, len: total_left },
-                GpuRowSpan { offset: p.out_offset + total_left, len: total_right },
+                GpuRowSpan {
+                    offset: p.out_offset,
+                    len: total_left,
+                },
+                GpuRowSpan {
+                    offset: p.out_offset + total_left,
+                    len: total_right,
+                },
             ));
         }
         Ok(out)
@@ -1574,7 +1736,11 @@ impl GpuTrainCtx {
         let mut buf = self.lock()?;
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
-        let GpuBuffers { prediction_delta, prediction_host, .. } = &mut *buf;
+        let GpuBuffers {
+            prediction_delta,
+            prediction_host,
+            ..
+        } = &mut *buf;
         self.stream
             .memcpy_dtoh(&*prediction_delta, prediction_host.as_mut_slice())
             .context("leaf prediction D2H")?;
@@ -1596,7 +1762,6 @@ impl GpuTrainCtx {
         f(buf.prediction_host.as_slice());
         Ok(())
     }
-
 
     /// 每轮传一次定点梯度。整个训练期间 buffer 不重新分配。
     pub fn upload_gpair(&self, gpair: &[GradPairFixed]) -> Result<f32> {
@@ -1677,32 +1842,50 @@ impl GpuTrainCtx {
         &self,
         gpair: &[GradPair],
     ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        self.upload_and_quantize_gpair_sampled(gpair, u64::MAX, 0, 0)
+    }
+
+    /// Exact integer row sampling fused into the existing device max scan.
+    /// Mask before bounds/scale selection; never mask prediction updates.
+    /// `u64::MAX` retains the original unmasked quantization path.
+    pub fn upload_and_quantize_gpair_sampled(
+        &self,
+        gpair: &[GradPair],
+        subsample_threshold: u64,
+        subsample_seed: u64,
+        subsample_tree: u64,
+    ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
         if gpair.len() != self.n_rows {
             bail!("gpair 长度 {} 与训练行数 {} 不符", gpair.len(), self.n_rows);
         }
-        let max_fn = self
-            .gpair_max_fn
+        self.gpair_max_fn
             .as_ref()
             .context("device quantization 未启用")?;
-        let quant_fn = self
-            .gpair_quantize_fn
+        self.gpair_quantize_fn
             .as_ref()
             .context("device quantization 未启用")?;
 
         // `GradPair` 是 #[repr(C)] 的两个 f32,所以整个 slice 本来就是交错的
         // [grad, hess, ...] —— 和 GradPairFixed::flatten 同一个道理,
         // host 侧不需要再打包一遍。
-        let flat: &[f32] = unsafe {
-            std::slice::from_raw_parts(gpair.as_ptr().cast::<f32>(), gpair.len() * 2)
-        };
+        let flat: &[f32] =
+            unsafe { std::slice::from_raw_parts(gpair.as_ptr().cast::<f32>(), gpair.len() * 2) };
         let mut buf = self.lock()?;
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
         {
             let f32_buf = buf.gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
-            self.stream.memcpy_htod(flat, f32_buf).context("f32 gpair H2D")?;
+            self.stream
+                .memcpy_htod(flat, f32_buf)
+                .context("f32 gpair H2D")?;
         }
-        self.quantize_resident_gpair(&mut buf, started)
+        self.quantize_resident_gpair(
+            &mut buf,
+            started,
+            subsample_threshold,
+            subsample_seed,
+            subsample_tree,
+        )
     }
 
     /// `gpu_math = "fast"`:一次 launch 完成 prediction apply + objective
@@ -1746,7 +1929,9 @@ impl GpuTrainCtx {
                 ..
             } = &mut *buf;
             let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
-            let label = label_resident.as_ref().context("fast label buffer 未分配")?;
+            let label = label_resident
+                .as_ref()
+                .context("fast label buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
@@ -1766,7 +1951,8 @@ impl GpuTrainCtx {
                 .arg(&subsample_tree);
             unsafe { launch.launch(cfg) }.context("launch apply_delta_and_gradient")?;
         }
-        self.quantize_resident_gpair(&mut buf, started)
+        // The objective kernel already masked this pair. Do not resample it.
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
     }
 
     pub fn fast_math_enabled(&self) -> bool {
@@ -1791,29 +1977,49 @@ impl GpuTrainCtx {
     /// 而不是藏在某个 getter 后面。
     pub fn sync_prediction_to_host(&self, out: &mut [f32]) -> Result<()> {
         if out.len() != self.n_rows {
-            bail!("prediction 长度 {} 与训练行数 {} 不符", out.len(), self.n_rows);
+            bail!(
+                "prediction 长度 {} 与训练行数 {} 不符",
+                out.len(),
+                self.n_rows
+            );
         }
         let buf = self.lock()?;
         let pred = buf
             .pred_resident
             .as_ref()
             .context("device 上没有常驻 prediction(gpu_math=exact 时 host 已是权威副本)")?;
-        self.stream.memcpy_dtoh(pred, out).context("prediction D2H")?;
+        self.stream
+            .memcpy_dtoh(pred, out)
+            .context("prediction D2H")?;
         self.stream.synchronize().context("等待 prediction D2H")?;
         Ok(())
     }
 
     pub fn init_fast_math(&self, labels: &[f32], margin: f32) -> Result<()> {
         if labels.len() != self.n_rows {
-            bail!("label 长度 {} 与训练行数 {} 不符", labels.len(), self.n_rows);
+            bail!(
+                "label 长度 {} 与训练行数 {} 不符",
+                labels.len(),
+                self.n_rows
+            );
         }
         let mut buf = self.lock()?;
-        let GpuBuffers { pred_resident, label_resident, .. } = &mut *buf;
-        let label = label_resident.as_mut().context("fast label buffer 未分配")?;
-        self.stream.memcpy_htod(labels, label).context("label H2D")?;
+        let GpuBuffers {
+            pred_resident,
+            label_resident,
+            ..
+        } = &mut *buf;
+        let label = label_resident
+            .as_mut()
+            .context("fast label buffer 未分配")?;
+        self.stream
+            .memcpy_htod(labels, label)
+            .context("label H2D")?;
         let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
         let host_pred = vec![margin; self.n_rows];
-        self.stream.memcpy_htod(&host_pred, pred).context("初始 prediction H2D")?;
+        self.stream
+            .memcpy_htod(&host_pred, pred)
+            .context("初始 prediction H2D")?;
         self.stream.synchronize().context("等待 fast-math 初始化")?;
         Ok(())
     }
@@ -1825,15 +2031,29 @@ impl GpuTrainCtx {
         &self,
         buf: &mut GpuBuffers,
         started: std::time::Instant,
+        subsample_threshold: u64,
+        subsample_seed: u64,
+        subsample_tree: u64,
     ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
-        let max_fn = self.gpair_max_fn.as_ref().context("device quantization 未启用")?;
-        let quant_fn = self.gpair_quantize_fn.as_ref().context("device quantization 未启用")?;
+        let max_fn = self
+            .gpair_max_fn
+            .as_ref()
+            .context("device quantization 未启用")?;
+        let quant_fn = self
+            .gpair_quantize_fn
+            .as_ref()
+            .context("device quantization 未启用")?;
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let threads = GPAIR_THREADS as u32;
-        let blocks = u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
+        let blocks =
+            u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
         {
-            let GpuBuffers { gpair_f32, gpair_max, .. } = &mut *buf;
-            let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
+            let GpuBuffers {
+                gpair_f32,
+                gpair_max,
+                ..
+            } = &mut *buf;
+            let src = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
             let dst = gpair_max.as_mut().context("gpair max buffer 未分配")?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
@@ -1841,11 +2061,21 @@ impl GpuTrainCtx {
                 shared_mem_bytes: threads * 2 * std::mem::size_of::<f64>() as u32,
             };
             let mut launch = self.stream.launch_builder(max_fn);
-            launch.arg(src).arg(&n_rows_u32).arg(dst);
+            launch
+                .arg(src)
+                .arg(&n_rows_u32)
+                .arg(dst)
+                .arg(&subsample_threshold)
+                .arg(&subsample_seed)
+                .arg(&subsample_tree);
             unsafe { launch.launch(cfg) }.context("launch gpair_max_abs")?;
         }
         {
-            let GpuBuffers { gpair_max, gpair_max_host, .. } = &mut *buf;
+            let GpuBuffers {
+                gpair_max,
+                gpair_max_host,
+                ..
+            } = &mut *buf;
             let src = gpair_max.as_ref().context("gpair max buffer 未分配")?;
             self.stream
                 .memcpy_dtoh(src, gpair_max_host.as_mut_slice())
@@ -1865,7 +2095,12 @@ impl GpuTrainCtx {
         {
             let grad_scale = quantizer.grad_scale();
             let hess_scale = quantizer.hess_scale();
-            let GpuBuffers { gpair_f32, gpair: gpair_dev, gpair_sum, .. } = &mut *buf;
+            let GpuBuffers {
+                gpair_f32,
+                gpair: gpair_dev,
+                gpair_sum,
+                ..
+            } = &mut *buf;
             let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
             let sums = gpair_sum.as_mut().context("gpair sum buffer 未分配")?;
             let cfg = LaunchConfig {
@@ -1884,7 +2119,11 @@ impl GpuTrainCtx {
             unsafe { launch.launch(cfg) }.context("launch gpair_quantize")?;
         }
         {
-            let GpuBuffers { gpair_sum, gpair_sum_host, .. } = &mut *buf;
+            let GpuBuffers {
+                gpair_sum,
+                gpair_sum_host,
+                ..
+            } = &mut *buf;
             let src = gpair_sum.as_ref().context("gpair sum buffer 未分配")?;
             self.stream
                 .memcpy_dtoh(src, gpair_sum_host.as_mut_slice())
@@ -1894,7 +2133,10 @@ impl GpuTrainCtx {
         // 用 `+=`(AddAssign)而不是 wrapping_add:debug 下仍然检查溢出。
         let mut root_sum = GradPairFixed::default();
         for pair in buf.gpair_sum_host.as_chunks::<2>().0 {
-            root_sum += GradPairFixed { grad: pair[0], hess: pair[1] };
+            root_sum += GradPairFixed {
+                grad: pair[0],
+                hess: pair[1],
+            };
         }
 
         self.sync_if_timing()?;
@@ -1919,6 +2161,47 @@ impl GpuTrainCtx {
         feat_offsets: &[u32],
         selected_local: Option<&[usize]>,
     ) -> Result<GpuBlockSession<'_>> {
+        self.block_session_impl(
+            block_index,
+            Some(block_data),
+            block_n_rows,
+            n_feats,
+            feat_offsets,
+            selected_local,
+        )?
+        .context("payload-backed histogram session unavailable")
+    }
+
+    /// Borrow already validated resident bins without materializing host payload.
+    /// A miss does not upload or mark the slot resident; the caller must load and
+    /// validate its source block before using the ordinary payload-backed entry.
+    pub fn block_session_resident(
+        &self,
+        block_index: usize,
+        block_n_rows: usize,
+        n_feats: usize,
+        feat_offsets: &[u32],
+        selected_local: Option<&[usize]>,
+    ) -> Result<Option<GpuBlockSession<'_>>> {
+        self.block_session_impl(
+            block_index,
+            None,
+            block_n_rows,
+            n_feats,
+            feat_offsets,
+            selected_local,
+        )
+    }
+
+    fn block_session_impl(
+        &self,
+        block_index: usize,
+        block_payload: Option<&[Bin]>,
+        block_n_rows: usize,
+        n_feats: usize,
+        feat_offsets: &[u32],
+        selected_local: Option<&[usize]>,
+    ) -> Result<Option<GpuBlockSession<'_>>> {
         // selected-row packing 之后,交给 histogram 的块**行数会更少**
         // (只含采样行),所以这里不能再要求等于训练行数。
         //
@@ -1927,14 +2210,17 @@ impl GpuTrainCtx {
         // 所以少行数是安全的;列主序参照臂会用它当 stride,因此那条路上
         // 压实是关掉的(见 train.rs 里只在 streaming + 行主序时压实)。
         if block_n_rows > self.n_rows {
-            bail!(
-                "列块行数 {block_n_rows} 超过训练行数 {}",
-                self.n_rows
-            );
+            bail!("列块行数 {block_n_rows} 超过训练行数 {}", self.n_rows);
         }
-        if block_data.len() != n_feats.saturating_mul(block_n_rows) {
+        let payload_len = n_feats
+            .checked_mul(block_n_rows)
+            .context("bins shape overflow")?;
+        if block_payload.is_some_and(|data| data.len() != payload_len) {
             bail!("bins 长度与 n_feats × n_rows 不符");
         }
+        // No fake/zero-filled host block is allocated for the resident entry.
+        // This slice is only consumed when an actual payload is present.
+        let block_data = block_payload.unwrap_or(&[]);
         if feat_offsets.is_empty() || feat_offsets.first() != Some(&0) {
             bail!("feat_offsets 必须从 0 开始且非空");
         }
@@ -1950,6 +2236,18 @@ impl GpuTrainCtx {
             }
         }
         let column_major = self.rm_transpose_fn.is_none();
+        // Bucket profiling uses the legacy full-width column-major kernels.
+        // They cannot consume a selected-index map; sampling is still applied
+        // by host split enumeration. Do not validate that map as compact ABI.
+        let selected_local = if column_major && self.hist_batched_fn.is_none() {
+            anyhow::ensure!(
+                hist_n_feats == n_feats,
+                "legacy column-major histogram requires physical full-width offsets"
+            );
+            None
+        } else {
+            selected_local
+        };
         if column_major {
             if let Some(selected) = selected_local {
                 if selected.len() != hist_n_feats {
@@ -1969,41 +2267,61 @@ impl GpuTrainCtx {
         // 产生,要么 < n_bins 要么是 MISSING_BIN。debug 构建仍然验一遍,
         // 因为越界的后果是 shared memory 越界写,不是一个错数字。
         debug_assert!(
-            (0..hist_n_feats).all(|hist_feat| {
-                let physical_feat = if column_major {
-                    selected_local.map_or(hist_feat, |selected| selected[hist_feat])
-                } else {
-                    hist_feat
-                };
-                let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
-                block_data[physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows]
-                    .iter()
-                    .all(|&bin| bin == crate::types::MISSING_BIN || u32::from(bin) < n_bins)
-            }),
+            block_payload.is_none()
+                || (0..hist_n_feats).all(|hist_feat| {
+                    let physical_feat = if column_major {
+                        selected_local.map_or(hist_feat, |selected| selected[hist_feat])
+                    } else {
+                        hist_feat
+                    };
+                    let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
+                    block_data[physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows]
+                        .iter()
+                        .all(|&bin| bin == crate::types::MISSING_BIN || u32::from(bin) < n_bins)
+                }),
             "列块里有超出 feat_offsets 宽度的 bin"
         );
 
         let (slot_index, lease) = if block_index < self.resident_block_count {
             (self.hist_stream_count + block_index, None)
         } else {
+            if block_payload.is_none() {
+                return Ok(None);
+            }
             let lease = self.hist_slot_pool.acquire()?;
             (lease.index, Some(lease))
         };
         let mut slot = self.hist_slots[slot_index]
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU histogram slot {slot_index} poisoned"))?;
-        if block_data.len() > slot.bins.len() {
+        if payload_len > slot.bins.len() {
             bail!(
                 "列块 {} 字节超过预分配的 {} 字节 buffer",
-                block_data.len(),
+                payload_len,
                 slot.bins.len()
             );
         }
         if n_hist * 2 > slot.hist_out.len() {
             bail!("直方图宽度 {n_hist} 超过预分配上限");
         }
+        anyhow::ensure!(
+            feat_offsets.len() <= slot.offsets.len(),
+            "histogram offsets exceed preallocated metadata capacity"
+        );
+        anyhow::ensure!(
+            n_feats <= slot.feature_select.len(),
+            "physical feature count exceeds preallocated metadata capacity"
+        );
 
         let cache_hit = slot.resident_block == Some(block_index);
+        if cache_hit {
+            anyhow::ensure!(
+                slot.resident_rows == block_n_rows && slot.resident_feats == n_feats,
+                "resident block shape differs from source metadata"
+            );
+        } else if block_payload.is_none() {
+            return Ok(None);
+        }
         let selection_active = selected_local.is_some_and(|selected| selected.len() < n_feats);
         let row_major_feat_mask = if selection_active {
             let mut mask = 0u32;
@@ -2034,134 +2352,157 @@ impl GpuTrainCtx {
         self.sync_hist_if_timing(&hist_stream)?;
         let started = std::time::Instant::now();
         if !cache_hit {
-        {
-            let GpuHistBuffers {
-                bins,
-                bins_host,
-                rm_stage,
-                ..
-            } = &mut *slot;
-            // 行主序原型:H2D 仍然是**原封不动的列主序**(host / Parquet /
-            // Arrow / 量化 cache / FFI 全不动),只是先落到暂存区,再在
-            // device 上转置一次进 slot.bins。转置**每个 resident 块只做一次**,
-            // 之后所有层、所有轮直接复用 —— 这是能不能摊薄的关键。
-            match self.rm_transpose_fn.as_ref() {
-                Some(tfn) => {
-                    // **按行分块**上传 + 转置,暂存区因此和列块大小无关。
-                    // 每块的列主序源数据在 host 上是 n_feats 段、段内连续,
-                    // 所以一个 chunk 要 n_feats 次 H2D;这只在 warm-up 发生
-                    // (resident 块每块一次),之后全是 cache hit。
-                    // ⚠️ 这里**没有** `self.lock()`。暂存区是 slot 自己的,
-                    // 所以下面的 `synchronize()` 只等自己这条流 —— 全局锁
-                    // 曾经把它变成"等所有流",多流重叠因此结构上不可能。
-                    let staging = rm_stage.as_mut().context("行主序暂存未分配")?;
-                    let pinned = staging.pinned();
-                    let n_bufs = staging.dev.len();
-                    let n_rows_total = block_n_rows;
-                    let chunk = staging.chunk_rows.max(1);
-                    let n_feats_u = u32::try_from(n_feats).context("特征数超过 u32")?;
-                    let mut r0 = 0usize;
-                    let mut turn = 0usize;
-                    while r0 < n_rows_total {
-                        let r1 = (r0 + chunk).min(n_rows_total);
-                        let len = r1 - r0;
-                        let b = turn % n_bufs;
-                        if pinned {
-                            // ⚠️ `as_mut_slice()` 只等**这一块**自己的 event,
-                            // 不是整条流。所以上一块的 H2D + 转置仍在飞,
-                            // host 这边已经可以填下一块 —— 重叠就在这里。
-                            // 换成 `hist_stream.synchronize()` 会当场毁掉它。
-                            let hbuf = staging.host[b]
-                                .as_mut_slice()
-                                .context("访问行主序 pinned 暂存")?;
-                            for f in 0..n_feats {
-                                let src =
-                                    &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
-                                hbuf[f * len..(f + 1) * len].copy_from_slice(src);
-                            }
-                            // pinned 源 → 这一次 `cuMemcpyHtoDAsync` 才**真的**异步,
-                            // 而且整块只发一次,不是 n_feats 次。
-                            let src = PinnedPrefix {
-                                inner: &mut staging.host[b],
-                                len: len * n_feats,
-                            };
-                            let mut dst = staging.dev[b].slice_mut(..len * n_feats);
-                            hist_stream
-                                .memcpy_htod(&src, &mut dst)
-                                .context("量化列块 H2D(行主序 pinned)")?;
-                        } else {
-                            for f in 0..n_feats {
-                                let src =
-                                    &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
-                                let mut dst = staging.dev[b].slice_mut(f * len..(f + 1) * len);
+            {
+                let GpuHistBuffers {
+                    bins,
+                    bins_host,
+                    rm_stage,
+                    ..
+                } = &mut *slot;
+                // 行主序原型:H2D 仍然是**原封不动的列主序**(host / Parquet /
+                // Arrow / 量化 cache / FFI 全不动),只是先落到暂存区,再在
+                // device 上转置一次进 slot.bins。转置**每个 resident 块只做一次**,
+                // 之后所有层、所有轮直接复用 —— 这是能不能摊薄的关键。
+                match self.rm_transpose_fn.as_ref() {
+                    Some(tfn) => {
+                        // **按行分块**上传 + 转置,暂存区因此和列块大小无关。
+                        // 每块的列主序源数据在 host 上是 n_feats 段、段内连续,
+                        // 所以一个 chunk 要 n_feats 次 H2D;这只在 warm-up 发生
+                        // (resident 块每块一次),之后全是 cache hit。
+                        // ⚠️ 这里**没有** `self.lock()`。暂存区是 slot 自己的,
+                        // 所以下面的 `synchronize()` 只等自己这条流 —— 全局锁
+                        // 曾经把它变成"等所有流",多流重叠因此结构上不可能。
+                        let staging = rm_stage.as_mut().context("行主序暂存未分配")?;
+                        let pinned = staging.pinned();
+                        let n_bufs = staging.dev.len();
+                        let n_rows_total = block_n_rows;
+                        let chunk = staging.chunk_rows.max(1);
+                        let n_feats_u = u32::try_from(n_feats).context("特征数超过 u32")?;
+                        let mut r0 = 0usize;
+                        let mut turn = 0usize;
+                        while r0 < n_rows_total {
+                            let r1 = (r0 + chunk).min(n_rows_total);
+                            let len = r1 - r0;
+                            let b = turn % n_bufs;
+                            if pinned {
+                                // ⚠️ `as_mut_slice()` 只等**这一块**自己的 event,
+                                // 不是整条流。所以上一块的 H2D + 转置仍在飞,
+                                // host 这边已经可以填下一块 —— 重叠就在这里。
+                                // 换成 `hist_stream.synchronize()` 会当场毁掉它。
+                                let hbuf = staging.host[b]
+                                    .as_mut_slice()
+                                    .context("访问行主序 pinned 暂存")?;
+                                for f in 0..n_feats {
+                                    let src =
+                                        &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
+                                    hbuf[f * len..(f + 1) * len].copy_from_slice(src);
+                                }
+                                // pinned 源 → 这一次 `cuMemcpyHtoDAsync` 才**真的**异步,
+                                // 而且整块只发一次,不是 n_feats 次。
+                                let src = PinnedPrefix {
+                                    inner: &mut staging.host[b],
+                                    len: len * n_feats,
+                                };
+                                let mut dst = staging.dev[b].slice_mut(..len * n_feats);
                                 hist_stream
-                                    .memcpy_htod(src, &mut dst)
-                                    .context("量化列块 H2D(行主序分块)")?;
+                                    .memcpy_htod(&src, &mut dst)
+                                    .context("量化列块 H2D(行主序 pinned)")?;
+                            } else {
+                                for f in 0..n_feats {
+                                    let src =
+                                        &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
+                                    let mut dst = staging.dev[b].slice_mut(f * len..(f + 1) * len);
+                                    hist_stream
+                                        .memcpy_htod(src, &mut dst)
+                                        .context("量化列块 H2D(行主序分块)")?;
+                                }
                             }
+                            let src = staging.dev[b].slice(..len * n_feats);
+                            let mut dst = bins.slice_mut(r0 * n_feats..r1 * n_feats);
+                            let len_u = u32::try_from(len).context("chunk 行数超过 u32")?;
+                            let cfg = LaunchConfig {
+                                grid_dim: (len_u.div_ceil(32), n_feats_u.div_ceil(32), 1),
+                                block_dim: (32, 32, 1),
+                                shared_mem_bytes: 0,
+                            };
+                            let mut lb = hist_stream.launch_builder(tfn);
+                            lb.arg(&src).arg(&mut dst).arg(&len_u).arg(&n_feats_u);
+                            unsafe { lb.launch(cfg) }
+                                .context("launch transpose_bins_to_row_major")?;
+                            // ⚠️ 暂存区下一个 chunk 就要覆写,而转置是异步的。
+                            // **enqueue 完成不等于 buffer 可复用。**
+                            //
+                            // 试过删掉它:同流顺序**确实**保证了正确性(暂存区
+                            // 已经是 per-slot,一个 slot 只有一条流),但墙钟上
+                            // 单流只快 1.2~1.5%(噪声量级),而**双流反而变慢**
+                            // (HIGGS 0.481 → 0.546、wide 3.220 → 3.365)——
+                            // 少了这个节流,两条流的可分页 H2D 互相抢 driver 的
+                            // 暂存池。所以保留:它不是双流收益的来源
+                            //(那个假设已被这次实测推翻),删了也不划算。
+                            if !pinned {
+                                hist_stream.synchronize().context("等待行主序转置 chunk")?;
+                            }
+                            r0 = r1;
+                            turn += 1;
                         }
-                        let src = staging.dev[b].slice(..len * n_feats);
-                        let mut dst = bins.slice_mut(r0 * n_feats..r1 * n_feats);
-                        let len_u = u32::try_from(len).context("chunk 行数超过 u32")?;
-                        let cfg = LaunchConfig {
-                            grid_dim: (len_u.div_ceil(32), n_feats_u.div_ceil(32), 1),
-                            block_dim: (32, 32, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        let mut lb = hist_stream.launch_builder(tfn);
-                        lb.arg(&src).arg(&mut dst).arg(&len_u).arg(&n_feats_u);
-                        unsafe { lb.launch(cfg) }
-                            .context("launch transpose_bins_to_row_major")?;
-                        // ⚠️ 暂存区下一个 chunk 就要覆写,而转置是异步的。
-                        // **enqueue 完成不等于 buffer 可复用。**
-                        //
-                        // 试过删掉它:同流顺序**确实**保证了正确性(暂存区
-                        // 已经是 per-slot,一个 slot 只有一条流),但墙钟上
-                        // 单流只快 1.2~1.5%(噪声量级),而**双流反而变慢**
-                        // (HIGGS 0.481 → 0.546、wide 3.220 → 3.365)——
-                        // 少了这个节流,两条流的可分页 H2D 互相抢 driver 的
-                        // 暂存池。所以保留:它不是双流收益的来源
-                        //(那个假设已被这次实测推翻),删了也不划算。
-                        if !pinned {
-                            hist_stream.synchronize().context("等待行主序转置 chunk")?;
+                        if pinned {
+                            // 块级收尾:两块暂存都要在离开前退休,否则下一块的
+                            // host 填充会覆写仍在被读的 pinned buffer。
+                            hist_stream
+                                .synchronize()
+                                .context("等待行主序 pinned 收尾")?;
                         }
-                        r0 = r1;
-                        turn += 1;
                     }
-                    if pinned {
-                        // 块级收尾:两块暂存都要在离开前退休,否则下一块的
-                        // host 填充会覆写仍在被读的 pinned buffer。
-                        hist_stream.synchronize().context("等待行主序 pinned 收尾")?;
-                    }
-                }
-                None => {
-                    let mut bins_view = bins.slice_mut(..block_data.len());
-                    if self.use_pinned {
-                        let pinned = PinnedPrefix {
-                            inner: bins_host.as_mut().context("pinned 列块 staging 未分配")?,
-                            len: block_data.len(),
-                        };
-                        hist_stream.memcpy_htod(&pinned, &mut bins_view).context("量化列块 H2D")?;
-                    } else {
-                        hist_stream.memcpy_htod(block_data, &mut bins_view).context("量化列块 H2D")?;
+                    None => {
+                        let mut bins_view = bins.slice_mut(..block_data.len());
+                        if self.use_pinned {
+                            let pinned = PinnedPrefix {
+                                inner: bins_host.as_mut().context("pinned 列块 staging 未分配")?,
+                                len: block_data.len(),
+                            };
+                            hist_stream
+                                .memcpy_htod(&pinned, &mut bins_view)
+                                .context("量化列块 H2D")?;
+                        } else {
+                            hist_stream
+                                .memcpy_htod(block_data, &mut bins_view)
+                                .context("量化列块 H2D")?;
+                        }
                     }
                 }
             }
+            if block_index < self.resident_block_count {
+                // 宽度和块号**必须一起写** —— 只写块号就等于让下游去反推宽度,
+                // 而那正是上面说的那个读偏。
+                slot.resident_feats = n_feats;
+                slot.resident_rows = block_n_rows;
+                slot.resident_block = Some(block_index);
+            }
         }
-        if block_index < self.resident_block_count {
-            // 宽度和块号**必须一起写** —— 只写块号就等于让下游去反推宽度,
-            // 而那正是上面说的那个读偏。
-            slot.resident_feats = n_feats;
-            slot.resident_block = Some(block_index);
-        }
-        }
-        {
+        let metadata_shape = (block_index, block_n_rows, n_feats);
+        let same_shape = slot.metadata_shape == Some(metadata_shape);
+        // Row-major kernels consume the scalar mask, never the device index map.
+        // Keep the map only for the normal column-major compact ABI.
+        let selected = if selection_active && column_major {
+            selected_local.expect("selection_active 蕴含 selected_local")
+        } else {
+            &[]
+        };
+        let upload_offsets = !same_shape || slot.offsets_host != feat_offsets;
+        let upload_selection =
+            !selected.is_empty() && (!same_shape || slot.selected_host != selected);
+        // All callers still pass through validation above. A failed enqueue must
+        // not leave an old valid key attached to partially replaced device data.
+        // This slot's mutex and stream order cover both metadata producers and
+        // consumers; dropping a session is not treated as a completion fence.
+        slot.metadata_shape = None;
+        if upload_offsets {
             let mut offsets_view = slot.offsets.slice_mut(..feat_offsets.len());
             hist_stream
                 .memcpy_htod(feat_offsets, &mut offsets_view)
                 .context("feat_offsets H2D")?;
         }
-        if selection_active {
-            let selected = selected_local.expect("selection_active 蕴含 selected_local");
+        if upload_selection {
             let selected_u32: Vec<u32> = selected
                 .iter()
                 .map(|&feat| u32::try_from(feat).context("局部特征下标超过 u32"))
@@ -2171,7 +2512,16 @@ impl GpuTrainCtx {
                 .memcpy_htod(&selected_u32, &mut feature_select_view)
                 .context("colsample feature indices H2D")?;
         }
+        if upload_offsets {
+            slot.offsets_host.clear();
+            slot.offsets_host.extend_from_slice(feat_offsets);
+        }
+        if !same_shape || slot.selected_host != selected {
+            slot.selected_host.clear();
+            slot.selected_host.extend_from_slice(selected);
+        }
         self.sync_hist_if_timing(&hist_stream)?;
+        slot.metadata_shape = Some(metadata_shape);
         let block_h2d_ms = if self.timing {
             started.elapsed().as_secs_f32() * 1e3
         } else {
@@ -2180,27 +2530,27 @@ impl GpuTrainCtx {
 
         let timing = GpuSegmentTiming {
             block_h2d_ms,
-            block_h2d_calls: u64::from(!cache_hit) + 1 + u64::from(selection_active),
+            block_h2d_calls: u64::from(!cache_hit)
+                + u64::from(upload_offsets)
+                + u64::from(upload_selection),
             block_h2d_bytes: u64::from(!cache_hit) * block_data.len() as u64
-                + std::mem::size_of_val(feat_offsets) as u64
-                + selected_local.map_or(0, |selected| {
-                    (selected.len() * std::mem::size_of::<u32>()) as u64
-                }),
+                + u64::from(upload_offsets) * std::mem::size_of_val(feat_offsets) as u64
+                + u64::from(upload_selection)
+                    * (selected.len() * std::mem::size_of::<u32>()) as u64,
             ..Default::default()
         };
-        Ok(GpuBlockSession {
+        Ok(Some(GpuBlockSession {
             ctx: self,
             slot: Some(slot),
             lease,
             physical_n_feats: n_feats,
             n_feats: hist_n_feats,
             n_hist,
-            feat_offsets: feat_offsets.to_vec(),
             selection_active,
             row_major_feat_mask,
             timing,
             feature_tiles: 0,
-        })
+        }))
     }
 
     /// resident 命中时的 partition:**一个字节都不传**。
@@ -2273,7 +2623,11 @@ impl GpuTrainCtx {
             return;
         }
         use std::sync::atomic::Ordering;
-        let flag = if resident { &self.echoed_resident_col } else { &self.echoed_upload_col };
+        let flag = if resident {
+            &self.echoed_resident_col
+        } else {
+            &self.echoed_upload_col
+        };
         if !flag.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "PART_COL_SOURCE={}",
@@ -2357,7 +2711,6 @@ pub struct GpuBlockSession<'a> {
     /// Number of logical columns represented in the histogram output.
     n_feats: usize,
     n_hist: usize,
-    feat_offsets: Vec<u32>,
     selection_active: bool,
     row_major_feat_mask: u32,
     timing: GpuSegmentTiming,
@@ -2372,6 +2725,14 @@ impl Drop for GpuBlockSession<'_> {
 }
 
 impl GpuBlockSession<'_> {
+    fn feat_offsets(&self) -> &[u32] {
+        &self
+            .slot
+            .as_ref()
+            .expect("histogram slot lease missing")
+            .offsets_host
+    }
+
     /// Histogram a node whose rows already live in the current device arena.
     pub fn histogram_device(
         &mut self,
@@ -2451,10 +2812,10 @@ impl GpuBlockSession<'_> {
             let mut count = 0usize;
             let mut begin = 0usize;
             while begin < self.n_feats {
-                let hist_begin = self.feat_offsets[begin] as usize;
+                let hist_begin = self.feat_offsets()[begin] as usize;
                 let mut end = begin;
                 while end < self.n_feats
-                    && self.feat_offsets[end + 1] as usize - hist_begin
+                    && self.feat_offsets()[end + 1] as usize - hist_begin
                         <= self.ctx.max_bins_per_tile
                 {
                     end += 1;
@@ -2487,15 +2848,18 @@ impl GpuBlockSession<'_> {
             // R=4 时每个 block 覆盖 threads*4 行,余数交回 R=1 的融合 kernel。
             // 两个 kernel 的数值行为完全相同(同样的 atomic、同样的进位),
             // 所以拆不拆边界都不影响位精确。
-            let rows_per_thread = if self.ctx.hist_fused_r4_fn.is_some() { 4usize } else { 1 };
+            let rows_per_thread = if self.ctx.hist_fused_r4_fn.is_some() {
+                4usize
+            } else {
+                1
+            };
             let rows_per_block = threads_per_block as usize * rows_per_thread;
             let r4_rows = if rows_per_thread > 1 {
                 n_selected / rows_per_block * rows_per_block
             } else {
                 0
             };
-            let r4_blocks = u32::try_from(r4_rows / rows_per_block)
-                .context("R4 grid 超过 u32")?;
+            let r4_blocks = u32::try_from(r4_rows / rows_per_block).context("R4 grid 超过 u32")?;
             // shared 按这个列块**实际用到的最大 tile** 来要,不要一律按
             // `max_bins_per_tile` 顶格要 —— 窄列块顶格会白占 shared,
             // 把每个 SM 能常驻的 block 数压下去。这里跑的贪心切分和
@@ -2503,17 +2867,16 @@ impl GpuBlockSession<'_> {
             let mut max_tile_slots = 0usize;
             let mut probe = 0usize;
             while probe < self.n_feats {
-                let hist_begin = self.feat_offsets[probe] as usize;
+                let hist_begin = self.feat_offsets()[probe] as usize;
                 let mut end = probe;
                 while end < self.n_feats
-                    && self.feat_offsets[end + 1] as usize - hist_begin
+                    && self.feat_offsets()[end + 1] as usize - hist_begin
                         <= self.ctx.max_bins_per_tile
                 {
                     end += 1;
                 }
                 debug_assert!(end > probe, "单个特征的 bin 数超过 tile 上限");
-                max_tile_slots =
-                    max_tile_slots.max(self.feat_offsets[end] as usize - hist_begin);
+                max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
                 probe = end;
             }
             let shared_mem_bytes = u32::try_from(max_tile_slots * bytes_per_bin)
@@ -2523,7 +2886,12 @@ impl GpuBlockSession<'_> {
                 u32::try_from(self.ctx.max_bins_per_tile).context("tile bin 上限超过 u32")?;
 
             let slot = self.slot.as_mut().expect("histogram slot lease missing");
-            let GpuHistBuffers { bins, offsets, hist_out, .. } = &mut **slot;
+            let GpuHistBuffers {
+                bins,
+                offsets,
+                hist_out,
+                ..
+            } = &mut **slot;
             let GpuBuffers { gpair, rows, .. } = &*core;
             let bins_view = bins.slice(0..self.n_feats * self.ctx.n_rows);
             let offsets_view = offsets.slice(0..=self.n_feats);
@@ -2558,8 +2926,8 @@ impl GpuBlockSession<'_> {
             // 余下的行(含 R=1 时的全部行)走原来的一行/线程融合 kernel。
             let rest_begin = r4_rows;
             let rest_len = n_selected - r4_rows;
-            let full_rows = rest_begin + rest_len / threads_per_block as usize
-                * threads_per_block as usize;
+            let full_rows =
+                rest_begin + rest_len / threads_per_block as usize * threads_per_block as usize;
             let full_blocks = u32::try_from((full_rows - rest_begin) / threads_per_block as usize)
                 .context("CUDA histogram grid 超过 u32")?;
             let tail_rows = u32::try_from(n_selected - full_rows).context("tail 超过 u32")?;
@@ -2605,123 +2973,125 @@ impl GpuBlockSession<'_> {
             }
             self.feature_tiles = 1;
         } else {
-
-        let mut feature_tiles = 0usize;
-        let mut feat_begin = 0usize;
-        while feat_begin < self.n_feats {
-            let hist_begin = self.feat_offsets[feat_begin] as usize;
-            let mut feat_end = feat_begin;
-            while feat_end < self.n_feats
-                && self.feat_offsets[feat_end + 1] as usize - hist_begin
-                    <= self.ctx.max_bins_per_tile
-            {
-                feat_end += 1;
-            }
-            if feat_end == feat_begin {
-                let bins = self.feat_offsets[feat_begin + 1] - self.feat_offsets[feat_begin];
-                bail!(
-                    "特征 {feat_begin} 的 {bins} 个 bin 超过 shared-memory tile 上限 {}",
-                    self.ctx.max_bins_per_tile
-                );
-            }
-            let tile_bins = self.feat_offsets[feat_end] as usize - hist_begin;
-            let shared_mem_bytes = u32::try_from(tile_bins * bytes_per_bin)
-                .context("shared-memory tile 大小超过 u32")?;
-            let tile_n_feats = (feat_end - feat_begin) as u32;
-
-            let slot = self.slot.as_mut().expect("histogram slot lease missing");
-            let GpuHistBuffers {
-                bins,
-                offsets,
-                hist_out,
-                start_event,
-                end_event,
-                ..
-            } = &mut **slot;
-            let GpuBuffers { gpair, rows, .. } = &*core;
-            let bins_view = bins.slice(feat_begin * self.ctx.n_rows..feat_end * self.ctx.n_rows);
-            let offsets_view = offsets.slice(feat_begin..=feat_end);
-            let mut out_view = hist_out.slice_mut(..self.n_hist * 2);
-
-            if full_blocks > 0 {
-                let rows_view = rows.slice(span.offset..span.offset + full_rows);
-                let cfg = LaunchConfig {
-                    grid_dim: (full_blocks, 1, 1),
-                    block_dim: (threads_per_block, 1, 1),
-                    shared_mem_bytes,
-                };
-                let mut launch = stream.launch_builder(&self.ctx.hist_fn);
-                launch
-                    .arg(&bins_view)
-                    .arg(gpair)
-                    .arg(&rows_view)
-                    .arg(&n_rows_u32)
-                    .arg(&tile_n_feats)
-                    .arg(&offsets_view)
-                    .arg(&mut out_view);
-                // 参数顺序和 histogram.cu 的七项 C ABI 逐项对应;所有 device
-                // view 活到 D2H 完成,device row span 已在入口验过范围,
-                // feature tile 保证动态 shared memory 不越 driver 上限。
-                if self.ctx.bucket_profile {
-                    start_event
-                        .record(&stream)
-                        .context("记录 histogram bucket 起始 event")?;
+            let mut feature_tiles = 0usize;
+            let mut feat_begin = 0usize;
+            while feat_begin < self.n_feats {
+                let hist_begin = self.feat_offsets()[feat_begin] as usize;
+                let mut feat_end = feat_begin;
+                while feat_end < self.n_feats
+                    && self.feat_offsets()[feat_end + 1] as usize - hist_begin
+                        <= self.ctx.max_bins_per_tile
+                {
+                    feat_end += 1;
                 }
-                unsafe { launch.launch(cfg) }.context("launch hist_build_shared full blocks")?;
-                if self.ctx.bucket_profile {
-                    end_event
-                        .record(&stream)
-                        .context("记录 histogram bucket 结束 event")?;
-                    let ms = start_event
-                        .elapsed_ms(end_event)
-                        .context("计算 histogram bucket kernel 时间")?;
-                    self.timing.kernel_ms += ms;
-                    eprintln!(
+                if feat_end == feat_begin {
+                    let bins =
+                        self.feat_offsets()[feat_begin + 1] - self.feat_offsets()[feat_begin];
+                    bail!(
+                        "特征 {feat_begin} 的 {bins} 个 bin 超过 shared-memory tile 上限 {}",
+                        self.ctx.max_bins_per_tile
+                    );
+                }
+                let tile_bins = self.feat_offsets()[feat_end] as usize - hist_begin;
+                let shared_mem_bytes = u32::try_from(tile_bins * bytes_per_bin)
+                    .context("shared-memory tile 大小超过 u32")?;
+                let tile_n_feats = (feat_end - feat_begin) as u32;
+
+                let slot = self.slot.as_mut().expect("histogram slot lease missing");
+                let GpuHistBuffers {
+                    bins,
+                    offsets,
+                    hist_out,
+                    start_event,
+                    end_event,
+                    ..
+                } = &mut **slot;
+                let GpuBuffers { gpair, rows, .. } = &*core;
+                let bins_view =
+                    bins.slice(feat_begin * self.ctx.n_rows..feat_end * self.ctx.n_rows);
+                let offsets_view = offsets.slice(feat_begin..=feat_end);
+                let mut out_view = hist_out.slice_mut(..self.n_hist * 2);
+
+                if full_blocks > 0 {
+                    let rows_view = rows.slice(span.offset..span.offset + full_rows);
+                    let cfg = LaunchConfig {
+                        grid_dim: (full_blocks, 1, 1),
+                        block_dim: (threads_per_block, 1, 1),
+                        shared_mem_bytes,
+                    };
+                    let mut launch = stream.launch_builder(&self.ctx.hist_fn);
+                    launch
+                        .arg(&bins_view)
+                        .arg(gpair)
+                        .arg(&rows_view)
+                        .arg(&n_rows_u32)
+                        .arg(&tile_n_feats)
+                        .arg(&offsets_view)
+                        .arg(&mut out_view);
+                    // 参数顺序和 histogram.cu 的七项 C ABI 逐项对应;所有 device
+                    // view 活到 D2H 完成,device row span 已在入口验过范围,
+                    // feature tile 保证动态 shared memory 不越 driver 上限。
+                    if self.ctx.bucket_profile {
+                        start_event
+                            .record(&stream)
+                            .context("记录 histogram bucket 起始 event")?;
+                    }
+                    unsafe { launch.launch(cfg) }
+                        .context("launch hist_build_shared full blocks")?;
+                    if self.ctx.bucket_profile {
+                        end_event
+                            .record(&stream)
+                            .context("记录 histogram bucket 结束 event")?;
+                        let ms = start_event
+                            .elapsed_ms(end_event)
+                            .context("计算 histogram bucket kernel 时间")?;
+                        self.timing.kernel_ms += ms;
+                        eprintln!(
                         "FB_HIST_BUCKET,depth={depth},node={node_index},node_rows={n_selected},kind=full,tile={feature_tiles},node_tiles={feature_tile_count},tile_features={tile_n_feats},grid_blocks={full_blocks},launch_rows={full_rows},shared_bytes={shared_mem_bytes},kernel_ms={ms:.6}"
                     );
+                    }
+                    self.timing.kernel_calls += 1;
                 }
-                self.timing.kernel_calls += 1;
-            }
-            if tail_rows > 0 {
-                let rows_view = rows.slice(span.offset + full_rows..span.offset + n_selected);
-                let cfg = LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (tail_rows, 1, 1),
-                    shared_mem_bytes,
-                };
-                let mut launch = stream.launch_builder(&self.ctx.hist_fn);
-                launch
-                    .arg(&bins_view)
-                    .arg(gpair)
-                    .arg(&rows_view)
-                    .arg(&n_rows_u32)
-                    .arg(&tile_n_feats)
-                    .arg(&offsets_view)
-                    .arg(&mut out_view);
-                if self.ctx.bucket_profile {
-                    start_event
-                        .record(&stream)
-                        .context("记录 histogram tail bucket 起始 event")?;
-                }
-                unsafe { launch.launch(cfg) }.context("launch hist_build_shared tail")?;
-                if self.ctx.bucket_profile {
-                    end_event
-                        .record(&stream)
-                        .context("计算 histogram tail bucket 结束 event")?;
-                    let ms = start_event
-                        .elapsed_ms(end_event)
-                        .context("计算 histogram tail bucket kernel 时间")?;
-                    self.timing.kernel_ms += ms;
-                    eprintln!(
+                if tail_rows > 0 {
+                    let rows_view = rows.slice(span.offset + full_rows..span.offset + n_selected);
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (tail_rows, 1, 1),
+                        shared_mem_bytes,
+                    };
+                    let mut launch = stream.launch_builder(&self.ctx.hist_fn);
+                    launch
+                        .arg(&bins_view)
+                        .arg(gpair)
+                        .arg(&rows_view)
+                        .arg(&n_rows_u32)
+                        .arg(&tile_n_feats)
+                        .arg(&offsets_view)
+                        .arg(&mut out_view);
+                    if self.ctx.bucket_profile {
+                        start_event
+                            .record(&stream)
+                            .context("记录 histogram tail bucket 起始 event")?;
+                    }
+                    unsafe { launch.launch(cfg) }.context("launch hist_build_shared tail")?;
+                    if self.ctx.bucket_profile {
+                        end_event
+                            .record(&stream)
+                            .context("计算 histogram tail bucket 结束 event")?;
+                        let ms = start_event
+                            .elapsed_ms(end_event)
+                            .context("计算 histogram tail bucket kernel 时间")?;
+                        self.timing.kernel_ms += ms;
+                        eprintln!(
                         "FB_HIST_BUCKET,depth={depth},node={node_index},node_rows={n_selected},kind=tail,tile={feature_tiles},node_tiles={feature_tile_count},tile_features={tile_n_feats},grid_blocks=1,launch_rows={tail_rows},shared_bytes={shared_mem_bytes},kernel_ms={ms:.6}"
                     );
+                    }
+                    self.timing.kernel_calls += 1;
                 }
-                self.timing.kernel_calls += 1;
+                feat_begin = feat_end;
+                feature_tiles += 1;
             }
-            feat_begin = feat_end;
-            feature_tiles += 1;
-        }
-        self.feature_tiles = feature_tiles;
+            self.feature_tiles = feature_tiles;
         }
         drop(core);
 
@@ -2761,14 +3131,20 @@ impl GpuBlockSession<'_> {
         outs: &mut [&mut Vec<GradPairFixed>],
     ) -> Result<()> {
         if spans.len() != outs.len() {
-            bail!("histogram batch:spans {} 与 outs {} 不等长", spans.len(), outs.len());
+            bail!(
+                "histogram batch:spans {} 与 outs {} 不等长",
+                spans.len(),
+                outs.len()
+            );
         }
         for out in outs.iter_mut() {
             out.clear();
         }
         self.produce_histogram_device_batch(spans)?;
         if !spans.is_empty() && spans.iter().all(|span| span.len == 0) {
-            for out in outs.iter_mut() { out.resize(self.n_hist, GradPairFixed::default()); }
+            for out in outs.iter_mut() {
+                out.resize(self.n_hist, GradPairFixed::default());
+            }
             return Ok(());
         }
         if self.n_hist > 0 && !spans.is_empty() {
@@ -2779,15 +3155,17 @@ impl GpuBlockSession<'_> {
 
     /// Enqueue one batched histogram build without copying the result to host.
     pub(super) fn produce_histogram_device_batch(&mut self, spans: &[GpuRowSpan]) -> Result<()> {
-        // 行主序 kernel 每线程一行(整行 32 B 一次向量取数进寄存器),
-        // 列主序 kernel 每线程四行。**每 block 覆盖的行数因此不同**,
-        // blk_ptr 必须按各自的 rows_per_block 算,否则批内节点边界会错位。
+        // Both layouts use the same R=4 launch geometry: each block covers
+        // threads_per_block * 4 rows. The packed-index ABI changes feature
+        // addressing, not node block boundaries.
         let row_major = self.ctx.rm_hist_fn.is_some();
         let batched_fn = if row_major {
-            self.ctx.rm_hist_fn.as_ref().expect("row_major 蕴含 kernel 已加载")
+            self.ctx
+                .rm_hist_fn
+                .as_ref()
+                .expect("row_major 蕴含 kernel 已加载")
         } else {
-            self
-                .ctx
+            self.ctx
                 .hist_batched_fn
                 .as_ref()
                 .context("histogram batch 需要 hist_nodes_per_batch > 1")?
@@ -2814,9 +3192,8 @@ impl GpuBlockSession<'_> {
         // 余数由 kernel 内的 `ok[r]` 边界判断吃掉 —— 所以不再需要
         // 单独的 remainder / tail launch,那 66 个装不满 SM 的小 launch
         // 一并消失。
-        // 列主序 kernel 每线程 4 行;行主序 kernel 两条 lane 一行,
-        // 所以每 block 只覆盖 threads/2 行。
-        // 行主序 R=4 和列主序同一个几何。
+        // Both row-major and column-major kernels process four rows per
+        // thread; packed-index metadata does not change rows_per_block.
         let rows_per_block = threads_per_block as usize * 4;
         let mut blk_ptr: Vec<u32> = Vec::with_capacity(n_nodes + 1);
         let mut node_off: Vec<u32> = Vec::with_capacity(n_nodes);
@@ -2845,7 +3222,9 @@ impl GpuBlockSession<'_> {
                 .clone();
             let slot = self.slot.as_mut().expect("histogram slot lease missing");
             let mut view = slot.hist_out.slice_mut(..hist_stride * n_nodes);
-            stream.memset_zeros(&mut view).context("清零空批直方图 buffer")?;
+            stream
+                .memset_zeros(&mut view)
+                .context("清零空批直方图 buffer")?;
             return Ok(());
         }
 
@@ -2862,7 +3241,9 @@ impl GpuBlockSession<'_> {
         {
             let slot = self.slot.as_mut().expect("histogram slot lease missing");
             let mut view = slot.hist_out.slice_mut(..hist_stride * n_nodes);
-            stream.memset_zeros(&mut view).context("清零批直方图 buffer")?;
+            stream
+                .memset_zeros(&mut view)
+                .context("清零批直方图 buffer")?;
         }
 
         if self.ctx.timing {
@@ -2879,15 +3260,15 @@ impl GpuBlockSession<'_> {
         let mut max_tile_slots = 0usize;
         let mut probe = 0usize;
         while probe < self.n_feats {
-            let hist_begin = self.feat_offsets[probe] as usize;
+            let hist_begin = self.feat_offsets()[probe] as usize;
             let mut end = probe;
             while end < self.n_feats
-                && self.feat_offsets[end + 1] as usize - hist_begin <= self.ctx.max_bins_per_tile
+                && self.feat_offsets()[end + 1] as usize - hist_begin <= self.ctx.max_bins_per_tile
             {
                 end += 1;
             }
             debug_assert!(end > probe, "单个特征的 bin 数超过 tile 上限");
-            max_tile_slots = max_tile_slots.max(self.feat_offsets[end] as usize - hist_begin);
+            max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
             probe = end;
         }
         let shared_mem_bytes = u32::try_from(max_tile_slots * bytes_per_bin)
@@ -2898,9 +3279,13 @@ impl GpuBlockSession<'_> {
         let n_nodes_u32 = u32::try_from(n_nodes).context("批节点数超过 u32")?;
         let hist_stride_u32 = u32::try_from(hist_stride).context("直方图 stride 超过 u32")?;
 
+        let core_wait_phase = crate::diagnostic::Phase::new(b"fb.lock.core_wait\0");
         let core = self.ctx.lock()?;
+        drop(core_wait_phase);
+        let core_hold_phase = crate::diagnostic::Phase::new(b"fb.lock.core_hold\0");
         {
             let slot = self.slot.as_mut().expect("histogram slot lease missing");
+            let metadata_phase = crate::diagnostic::Phase::new(b"fb.submit.hist_metadata\0");
             // [blk_ptr(n+1) | node_off(n) | node_len(n)],一次 H2D 打包上传。
             let mut idx_host: Vec<u32> = Vec::with_capacity(n_nodes * 3 + 1);
             idx_host.extend_from_slice(&blk_ptr);
@@ -2910,6 +3295,7 @@ impl GpuBlockSession<'_> {
             stream
                 .memcpy_htod(&idx_host, &mut idx_view)
                 .context("批 block->node 索引 H2D")?;
+            drop(metadata_phase);
 
             let GpuHistBuffers {
                 bins,
@@ -2923,9 +3309,10 @@ impl GpuBlockSession<'_> {
             let bins_view = bins.slice(0..self.physical_n_feats * self.ctx.n_rows);
             let offsets_view = offsets.slice(0..=self.n_feats);
             let feature_select_view = feature_select.slice(0..self.n_feats.max(1));
-            let blk_ptr_view = batch_idx.slice(0..n_nodes + 1);
-            let node_off_view = batch_idx.slice(n_nodes + 1..n_nodes * 2 + 1);
-            let node_len_view = batch_idx.slice(n_nodes * 2 + 1..n_nodes * 3 + 1);
+            // The kernel derives all three offsets from this packed allocation.
+            // Passing one tracked view keeps its write wait/read completion while
+            // avoiding duplicate events for aliases of the same allocation.
+            let batch_idx_view = batch_idx.slice(..n_nodes * 3 + 1);
             let rows_view = rows.slice(0..self.ctx.n_rows);
             let mut out_view = hist_out.slice_mut(..hist_stride * n_nodes);
 
@@ -2935,6 +3322,7 @@ impl GpuBlockSession<'_> {
                 shared_mem_bytes,
             };
             let selection_active_u32 = u32::from(self.selection_active);
+            let _launch_phase = crate::diagnostic::Phase::new(b"fb.submit.hist_launch\0");
             let mut launch = stream.launch_builder(batched_fn);
             launch
                 .arg(&bins_view)
@@ -2945,9 +3333,7 @@ impl GpuBlockSession<'_> {
                 .arg(&offsets_view)
                 .arg(&mut out_view)
                 .arg(&max_tile_bins)
-                .arg(&blk_ptr_view)
-                .arg(&node_off_view)
-                .arg(&node_len_view)
+                .arg(&batch_idx_view)
                 .arg(&n_nodes_u32)
                 .arg(&hist_stride_u32);
             if row_major {
@@ -2959,10 +3345,13 @@ impl GpuBlockSession<'_> {
             self.timing.kernel_calls += 1;
         }
         drop(core);
+        drop(core_hold_phase);
 
         if self.ctx.timing {
             let slot = self.slot.as_ref().expect("histogram slot lease missing");
-            slot.end_event.record(&stream).context("记录批 histogram 结束 event")?;
+            slot.end_event
+                .record(&stream)
+                .context("记录批 histogram 结束 event")?;
             stream.synchronize().context("等待批 histogram kernel")?;
             self.timing.kernel_ms += slot
                 .start_event
@@ -2992,7 +3381,11 @@ impl GpuBlockSession<'_> {
             // D2H overwrites the complete active staging slice. Reuse its
             // initialized storage; only growth needs initialization.
             slot.hist_host.resize(hist_stride * n_nodes, 0);
-            let GpuHistBuffers { hist_out, hist_host, .. } = &mut **slot;
+            let GpuHistBuffers {
+                hist_out,
+                hist_host,
+                ..
+            } = &mut **slot;
             let view = hist_out.slice(..hist_host.len());
             stream
                 .memcpy_dtoh(&view, hist_host.as_mut_slice())
@@ -3061,6 +3454,238 @@ pub struct GpuPartitionSession<'a> {
 }
 
 impl GpuPartitionSession<'_> {
+    /// Batch disjoint arena spans against different original-local features in
+    /// this resident physical block. Validation precedes every device write and
+    /// reservation. The bounded descriptors/scratch are reused on one stream.
+    pub fn partition_resident_batch(
+        &mut self,
+        requests: &[(GpuRowSpan, usize, u32, bool)],
+    ) -> Result<Vec<PartitionToken>> {
+        use crate::gpu_mem_plan::{PARTITION_BATCH_CAPACITY, PARTITION_DESCRIPTOR_WORDS};
+        ensure!(
+            requests.len() <= PARTITION_BATCH_CAPACITY,
+            "partition batch exceeds {PARTITION_BATCH_CAPACITY}"
+        );
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let feats = self
+            .resident
+            .as_ref()
+            .context("partition batch requires a resident block")?
+            .0
+            .resident_feats;
+        let n_feats = u32::try_from(feats).context("resident partition block width exceeds u32")?;
+        let first_slot = self.buf.part_pending.len();
+        ensure!(
+            first_slot + requests.len() <= MAX_LEVEL_NODES,
+            "partition level exceeds {MAX_LEVEL_NODES}"
+        );
+        let mut selected = 0usize;
+        for (i, &(span, feat, _, _)) in requests.iter().enumerate() {
+            ensure!(
+                span.offset <= self.ctx.n_rows && span.len <= self.ctx.n_rows - span.offset,
+                "partition device row span out of bounds: {span:?}"
+            );
+            ensure!(
+                feat < feats,
+                "resident feature {feat} exceeds block width {feats}"
+            );
+            selected = selected
+                .checked_add(span.len)
+                .context("partition row sum overflow")?;
+            for &(prior, _, _, _) in &requests[..i] {
+                ensure!(
+                    span.len == 0
+                        || prior.len == 0
+                        || span.offset >= prior.offset + prior.len
+                        || prior.offset >= span.offset + span.len,
+                    "overlapping partition spans"
+                );
+            }
+        }
+        ensure!(
+            selected <= self.ctx.n_rows - self.buf.next_rows_cursor,
+            "next partition row arena overflow"
+        );
+        if requests.len() == 1 {
+            let (span, feat, split, missing) = requests[0];
+            let previous_feat = self.resident.as_ref().expect("validated resident").1;
+            self.resident.as_mut().expect("validated resident").1 = feat;
+            let result = self.partition(span, split, missing);
+            self.resident.as_mut().expect("validated resident").1 = previous_feat;
+            return result.map(|token| vec![token]);
+        }
+        let threads = self.ctx.partition_threads;
+        let mut descriptors = [0u32; PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS];
+        let mut blocks = 0usize;
+        let mut offsets = 0usize;
+        let mut out = self.buf.next_rows_cursor;
+        for (i, &(span, feat, split, missing)) in requests.iter().enumerate() {
+            let nb = span.len.div_ceil(threads as usize);
+            descriptors[i * PARTITION_DESCRIPTOR_WORDS..(i + 1) * PARTITION_DESCRIPTOR_WORDS]
+                .copy_from_slice(&[
+                    span.offset as u32,
+                    span.len as u32,
+                    feat as u32,
+                    split,
+                    u32::from(missing),
+                    blocks as u32,
+                    offsets as u32,
+                    out as u32,
+                    (first_slot + i) as u32,
+                    (blocks + nb) as u32,
+                ]);
+            blocks += nb;
+            offsets += nb + 1;
+            out += span.len;
+        }
+        ensure!(
+            blocks <= self.buf.part_block_counts.len()
+                && offsets <= self.buf.part_left_offsets.len(),
+            "partition batch scratch capacity exceeded"
+        );
+        u32::try_from(offsets).context("partition offset index exceeds u32")?;
+        if blocks > 0 {
+            if self.ctx.timing {
+                self.ctx.start_event.record(&self.ctx.stream)?;
+            }
+            {
+                let _phase = crate::diagnostic::Phase::new(b"fb.gpu.partition_descriptors\0");
+                let mut dst = self
+                    .buf
+                    .part_descriptors
+                    .slice_mut(..requests.len() * PARTITION_DESCRIPTOR_WORDS);
+                self.ctx
+                    .stream
+                    .memcpy_htod(
+                        &descriptors[..requests.len() * PARTITION_DESCRIPTOR_WORDS],
+                        &mut dst,
+                    )
+                    .context("partition descriptors H2D")?;
+            }
+            let n_nodes = requests.len() as u32;
+            let n_rows = self.ctx.n_rows as u32;
+            let row_major = u32::from(self.ctx.rm_count_fn.is_some());
+            let slot = &self.resident.as_ref().expect("validated resident").0;
+            {
+                let GpuBuffers {
+                    rows,
+                    part_descriptors,
+                    part_flags,
+                    part_block_counts,
+                    ..
+                } = &mut *self.buf;
+                let bins = slot.bins.slice(..self.ctx.n_rows * feats);
+                let mut launch = self
+                    .ctx
+                    .stream
+                    .launch_builder(&self.ctx.partition_batch_count_fn);
+                launch
+                    .arg(&bins)
+                    .arg(&*rows)
+                    .arg(&*part_descriptors)
+                    .arg(&n_nodes)
+                    .arg(&n_rows)
+                    .arg(&n_feats)
+                    .arg(&row_major)
+                    .arg(part_flags)
+                    .arg(part_block_counts);
+                unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (blocks as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: threads * 4,
+                    })
+                }
+                .context("launch partition_count_batched")?;
+            }
+            {
+                let GpuBuffers {
+                    part_descriptors,
+                    part_block_counts,
+                    part_left_offsets,
+                    part_right_offsets,
+                    part_totals,
+                    ..
+                } = &mut *self.buf;
+                let mut launch = self
+                    .ctx
+                    .stream
+                    .launch_builder(&self.ctx.partition_batch_scan_fn);
+                launch
+                    .arg(&*part_block_counts)
+                    .arg(&*part_descriptors)
+                    .arg(&threads)
+                    .arg(part_left_offsets)
+                    .arg(part_right_offsets)
+                    .arg(part_totals);
+                unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (n_nodes, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 1024 * 2 * 4,
+                    })
+                }
+                .context("launch partition_scan_batched")?;
+            }
+            {
+                let GpuBuffers {
+                    rows,
+                    part_flags,
+                    part_descriptors,
+                    part_left_offsets,
+                    part_right_offsets,
+                    part_right_out,
+                    ..
+                } = &mut *self.buf;
+                let mut launch = self
+                    .ctx
+                    .stream
+                    .launch_builder(&self.ctx.partition_batch_scatter_fn);
+                launch
+                    .arg(&*rows)
+                    .arg(&*part_flags)
+                    .arg(&*part_descriptors)
+                    .arg(&n_nodes)
+                    .arg(&*part_left_offsets)
+                    .arg(&*part_right_offsets)
+                    .arg(part_right_out);
+                unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (blocks as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: threads * 2 * 4,
+                    })
+                }
+                .context("launch partition_scatter_batched")?;
+            }
+            self.timing.kernel_calls += 3;
+            if self.ctx.timing {
+                self.ctx.end_event.record(&self.ctx.stream)?;
+                self.timing.kernel_ms += self.ctx.start_event.elapsed_ms(&self.ctx.end_event)?;
+            }
+            if crate::train::prof::enabled()
+                && !self
+                    .ctx
+                    .echoed_partition_batch
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("PARTITION_BATCH_SOURCE=resident_block cap=32");
+            }
+        }
+        let mut tokens = Vec::with_capacity(requests.len());
+        for (i, &(span, _, _, _)) in requests.iter().enumerate() {
+            tokens.push(first_slot + i);
+            self.buf.part_pending.push(PendingPartition {
+                out_offset: descriptors[i * PARTITION_DESCRIPTOR_WORDS + 7] as usize,
+                n_selected: span.len,
+            });
+        }
+        self.buf.next_rows_cursor = out;
+        Ok(tokens)
+    }
+
     /// 稳定地把 device row span 分到下一层 arena；只把左右计数传回 host。
     pub fn partition(
         &mut self,
@@ -3118,18 +3743,21 @@ impl GpuPartitionSession<'_> {
                     // 用**这个块自己**的宽度,不是 buffer 容量反推的宽度。
                     let n_feats = slot.resident_feats;
                     debug_assert!(n_feats > 0 && *local_feat < n_feats);
-                    (slot.bins.slice(..n_rows_usize * n_feats), Some((n_feats, *local_feat)))
+                    (
+                        slot.bins.slice(..n_rows_usize * n_feats),
+                        Some((n_feats, *local_feat)),
+                    )
                 }
                 Some((slot, local_feat)) => (
-                    slot.bins.slice(local_feat * n_rows_usize..(local_feat + 1) * n_rows_usize),
+                    slot.bins
+                        .slice(local_feat * n_rows_usize..(local_feat + 1) * n_rows_usize),
                     None,
                 ),
                 None => (part_col.slice(..n_rows_usize), None),
             };
             let rows_view = rows_dev.slice(span.offset..span.offset + span.len);
-            // flags 按**绝对 arena 位置**切,而不是从 0 开始 —— 一层里各
-            // 节点的 span 互不相交,这样它们的 flags 也互不覆盖,可以一直
-            // 活到 scatter。以前是每个节点都用前缀,所以必须立刻消费掉。
+            // Scalar fallback immediately consumes prefix scratch. Batches use
+            // absolute arena positions instead, so delayed scatter is safe.
             let mut flags_view = part_flags.slice_mut(..span.len);
             let mut counts_view = part_block_counts.slice_mut(..n_blocks as usize);
             let cfg = LaunchConfig {

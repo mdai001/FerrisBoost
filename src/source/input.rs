@@ -79,8 +79,12 @@ pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
     // 格式必须一致:混着训没有合理语义。
     let mut format = None;
     for p in &paths {
-        let f = InputFormat::of(p)
-            .with_context(|| format!("认不出 {} 的格式,支持 .parquet / .csv / .csv.gz", p.display()))?;
+        let f = InputFormat::of(p).with_context(|| {
+            format!(
+                "认不出 {} 的格式,支持 .parquet / .csv / .csv.gz",
+                p.display()
+            )
+        })?;
         match format {
             None => format = Some(f),
             Some(prev) if prev != f => bail!(
@@ -91,7 +95,10 @@ pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
             _ => {}
         }
     }
-    Ok(ResolvedInput { paths, format: format.expect("非空") })
+    Ok(ResolvedInput {
+        paths,
+        format: format.expect("非空"),
+    })
 }
 
 /// 单个 spec:glob → 目录 → 普通文件。
@@ -118,7 +125,8 @@ fn expand_one(spec: &str) -> Result<Vec<PathBuf>> {
 /// 而那需要一套分区语义,不属于 v0.0.1。
 fn list_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))?
+    {
         let p = entry?.path();
         if p.is_file() && InputFormat::of(&p).is_some() {
             out.push(p);
@@ -135,7 +143,10 @@ fn expand_glob(spec: &str) -> Result<Vec<PathBuf>> {
         .file_name()
         .and_then(|n| n.to_str())
         .context("glob 的最后一段为空")?;
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     if dir.to_string_lossy().contains('*') || dir.to_string_lossy().contains('?') {
         bail!("只支持文件名部分带 glob(如 data/*.parquet),目录部分不支持:{spec}");
     }
@@ -143,7 +154,8 @@ fn expand_glob(spec: &str) -> Result<Vec<PathBuf>> {
         bail!("glob 的目录部分不存在:{}", dir.display());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))?
+    {
         let p = entry?.path();
         let name = match p.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
@@ -184,7 +196,6 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
     pi == p.len()
 }
-
 
 /// ⚠️ **投影只是"选哪些列",不是"按什么顺序给"。** Arrow 无论你传的下标
 /// 是什么顺序,返回的列都按文件里的物理顺序排。所以按名字绑定必须分两步:
@@ -233,10 +244,19 @@ mod tests {
 
     #[test]
     fn format_is_recognised_including_csv_gz() {
-        assert_eq!(InputFormat::of(Path::new("x.parquet")), Some(InputFormat::Parquet));
-        assert_eq!(InputFormat::of(Path::new("x.pq")), Some(InputFormat::Parquet));
+        assert_eq!(
+            InputFormat::of(Path::new("x.parquet")),
+            Some(InputFormat::Parquet)
+        );
+        assert_eq!(
+            InputFormat::of(Path::new("x.pq")),
+            Some(InputFormat::Parquet)
+        );
         assert_eq!(InputFormat::of(Path::new("x.csv")), Some(InputFormat::Csv));
-        assert_eq!(InputFormat::of(Path::new("x.CSV.GZ")), Some(InputFormat::Csv));
+        assert_eq!(
+            InputFormat::of(Path::new("x.CSV.GZ")),
+            Some(InputFormat::Csv)
+        );
         assert_eq!(InputFormat::of(Path::new("x.txt")), None);
         assert!(is_gzipped(Path::new("x.csv.gz")));
         assert!(!is_gzipped(Path::new("x.csv")));

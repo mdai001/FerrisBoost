@@ -25,16 +25,10 @@ impl RoundMetrics {
             .map(|(_, _, v)| *v)
     }
 
-    /// 最后一个 eval 的**第一个** metric —— XGBoost 的 early stopping
-    /// 默认盯这个。
-    ///
-    /// 别拿 `entries.last()` 顶替:entries 的排法是「eval 外层、metric
-    /// 内层」,`last()` 拿到的是最后一个 eval 的**最后一个** metric。
-    /// 只配一个 metric 时两者恰好相同,配了两个就悄悄盯错了指标 ——
-    /// 而且是那种"训得出来、只是停错地方"的错法。
+    /// 最后一个 eval 的**最后一个** metric,与 XGBoost 默认早停选择一致。
+    /// entries 按「eval 外层、metric 内层」保留配置顺序。
     pub fn watched(&self) -> Option<&(String, String, f32)> {
-        let (last_eval, _, _) = self.entries.last()?;
-        self.entries.iter().find(|(e, _, _)| e == last_eval)
+        self.entries.last()
     }
 
     /// 最后一条记录。日志用;early stopping 要用 `watched()`。
@@ -59,7 +53,7 @@ pub trait Callback: Send {
 
 /// 连续 rounds 轮没有改善就停。
 ///
-/// 语义对齐 XGBoost:盯最后一个 eval 的第一个 metric。
+/// 语义对齐 XGBoost:盯最后一个 eval 的最后一个 metric。
 pub struct EarlyStopping {
     pub rounds: usize,
     pub lower_is_better: bool,
@@ -119,6 +113,9 @@ pub struct VerboseEval {
 }
 
 impl Callback for VerboseEval {
+    // Keep the period > 0 guard before modulo so period == 0 stays harmless;
+    // avoid requiring the newer integer API until the supported MSRV is explicit.
+    #[allow(clippy::manual_is_multiple_of)]
     fn after_iteration(&mut self, m: &RoundMetrics) -> bool {
         if self.period > 0 && m.round % self.period == 0 {
             let line: Vec<String> = m
@@ -156,7 +153,100 @@ impl RecordHistory {
 
 impl Callback for RecordHistory {
     fn after_iteration(&mut self, m: &RoundMetrics) -> bool {
-        self.history.lock().expect("evals_result 的锁被毒化了").push(m.clone());
+        self.history
+            .lock()
+            .expect("evals_result 的锁被毒化了")
+            .push(m.clone());
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Callback, EarlyStopping, RoundMetrics};
+
+    #[test]
+    fn empty_metrics_do_not_stop_or_select_a_best_round() {
+        let empty = RoundMetrics {
+            round: 0,
+            entries: Vec::new(),
+        };
+        assert!(empty.watched().is_none());
+
+        let mut stopping = EarlyStopping::new(1, true);
+        assert!(stopping.after_iteration(&empty));
+        assert_eq!(stopping.best_iteration(), None);
+    }
+
+    #[test]
+    fn a_single_metric_is_both_watched_and_last() {
+        let metrics = RoundMetrics {
+            round: 0,
+            entries: vec![("valid".into(), "logloss".into(), 0.25)],
+        };
+        assert_eq!(metrics.watched(), metrics.last());
+    }
+
+    #[test]
+    fn watched_metric_is_last_metric_of_last_eval() {
+        let metrics = RoundMetrics {
+            round: 3,
+            entries: vec![
+                ("train".into(), "first".into(), 1.0),
+                ("train".into(), "last".into(), 2.0),
+                ("valid".into(), "first".into(), 3.0),
+                ("valid".into(), "last".into(), 4.0),
+            ],
+        };
+        let watched = metrics.watched().unwrap();
+        assert_eq!(watched.0, "valid");
+        assert_eq!(watched.1, "last");
+        assert_eq!(watched.2, 4.0);
+        assert_eq!(metrics.last(), Some(watched));
+    }
+
+    #[test]
+    fn early_stopping_tracks_last_metric_and_requires_strict_improvement() {
+        let mut lower_is_better = EarlyStopping::new(2, true);
+        let lower_trace = [4.0, 3.0, 3.0, 3.0];
+        let mut lower_results = Vec::new();
+        for (round, watched) in lower_trace.into_iter().enumerate() {
+            let metrics = RoundMetrics {
+                round,
+                entries: vec![
+                    ("train".into(), "earlier_eval".into(), 20.0 - round as f32),
+                    (
+                        "valid".into(),
+                        "earlier_improving".into(),
+                        10.0 - round as f32,
+                    ),
+                    ("valid".into(), "watched".into(), watched),
+                ],
+            };
+            lower_results.push(lower_is_better.after_iteration(&metrics));
+        }
+        assert_eq!(lower_results, [true, true, true, false]);
+        assert_eq!(lower_is_better.best_iteration(), Some((1, 3.0)));
+
+        let mut higher_is_better = EarlyStopping::new(2, false);
+        let higher_trace = [1.0, 2.0, 2.0, 2.0];
+        let mut higher_results = Vec::new();
+        for (round, watched) in higher_trace.into_iter().enumerate() {
+            let metrics = RoundMetrics {
+                round,
+                entries: vec![
+                    ("train".into(), "earlier_eval".into(), 2.0 + round as f32),
+                    (
+                        "valid".into(),
+                        "earlier_improving".into(),
+                        1.0 + round as f32,
+                    ),
+                    ("valid".into(), "watched".into(), watched),
+                ],
+            };
+            higher_results.push(higher_is_better.after_iteration(&metrics));
+        }
+        assert_eq!(higher_results, [true, true, true, false]);
+        assert_eq!(higher_is_better.best_iteration(), Some((1, 2.0)));
     }
 }

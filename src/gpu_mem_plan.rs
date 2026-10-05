@@ -13,6 +13,21 @@
 //! ⚠️ **块宽是训练初始化时定一次的物理布局**,不随每棵树的采样集变化 ——
 //! 否则块的身份和性能都会依赖 RNG。`colsample` 是叠在上面的逻辑筛选层。
 
+/// Resident partition descriptors and segmented scratch are bounded independently
+/// of layer width. Keep allocation and planning on the same geometry.
+pub(crate) const GPU_PARTITION_THREADS: u32 = 512;
+pub(crate) const PARTITION_BATCH_CAPACITY: usize = 32;
+pub(crate) const PARTITION_DESCRIPTOR_WORDS: usize = 10;
+/// Fixed packet staging window; independent of level width and dataset rows.
+pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
+
+pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usize, usize) {
+    // Disjoint nonempty spans: sum ceil(len/T) <= ceil(N/T) + K - 1,
+    // and never exceeds N. Every segment needs its own scan sentinel.
+    let blocks = n_rows.min(n_rows.div_ceil(threads) + PARTITION_BATCH_CAPACITY - 1);
+    (blocks, blocks + PARTITION_BATCH_CAPACITY)
+}
+
 /// 一次训练的 streaming 显存模型。所有单位都是字节。
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
@@ -35,6 +50,7 @@ impl StreamingMemModel {
     ///
     /// 参数刻意都是显式的 —— 这个模型必须能被单测用真实测到的数字校准,
     /// 而不是散在 `GpuTrainCtx::new` 里靠读代码推断。
+    #[allow(clippy::too_many_arguments)] // Allocation inputs mirror the runtime resource contract.
     pub fn new(
         n_rows: u64,
         max_bin: u64,
@@ -50,7 +66,14 @@ impl StreamingMemModel {
         let partition_out = n_rows * 4;
         let partition_col = n_rows;
         // flags(n_rows) + 每块的 counts/offsets + 整层 totals,取个稳的上界。
-        let partition_scratch = n_rows + 8 * 1024 * 1024;
+        let (blocks, offsets) =
+            partition_batch_capacities(n_rows as usize, GPU_PARTITION_THREADS as usize);
+        let partition_arrays = (blocks + offsets * 2) as u64 * 4
+            + (PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS) as u64 * 4
+            + 8192 * 2 * 4;
+        // Preserve the conservative allowance, but never let it undercount the
+        // actual bounded arrays for large row counts.
+        let partition_scratch = n_rows + partition_arrays.max(8 * 1024 * 1024);
         let prediction = n_rows * 4;
         let gpair_f32 = if device_quantize { n_rows * 2 * 4 } else { 0 };
         // fast 模式:常驻 prediction + label,各 4 B/行。
@@ -98,8 +121,9 @@ impl StreamingMemModel {
             .saturating_mul(2)
             .saturating_add(cap.saturating_mul(64))
             .saturating_add(8);
-        // 16 B node sum + 16 B metadata + 64 B result packet per slot.
-        self.resident_extra_fixed_bytes = cap.saturating_mul(96);
+        // 16 B node sum + 16 B metadata, plus a fixed packet collection window.
+        self.resident_extra_fixed_bytes =
+            cap.saturating_mul(32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
         self
     }
 
@@ -526,6 +550,66 @@ pub fn default_safety_reserve(free_vram: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partition_batch_geometry_bounds_disjoint_segments() {
+        for threads in [1, 2, 32, 512, 1024] {
+            for rows in [0usize, 1, 31, 32, 33, 511, 512, 513, 2049, 20000] {
+                let (capacity, offsets) = super::partition_batch_capacities(rows, threads);
+                assert_eq!(offsets, capacity + super::PARTITION_BATCH_CAPACITY);
+                for nodes in 1..=super::PARTITION_BATCH_CAPACITY {
+                    // Many one-row fragments maximize ceiling overhead; the
+                    // remaining rows form one tail segment. Also cover a
+                    // balanced segmentation and fewer active than total rows.
+                    for selected in [0, rows / 2, rows] {
+                        let active = nodes.min(selected);
+                        let fragmented = if active == 0 {
+                            0
+                        } else {
+                            active - 1 + (selected - active + 1).div_ceil(threads)
+                        };
+                        let balanced = (0..nodes)
+                            .map(|i| {
+                                (selected / nodes + usize::from(i < selected % nodes))
+                                    .div_ceil(threads)
+                            })
+                            .sum::<usize>();
+                        assert!(fragmented <= capacity);
+                        assert!(balanced <= capacity);
+                        assert!(fragmented + nodes <= offsets);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_planner_covers_large_row_scratch() {
+        let rows = u32::MAX as usize;
+        let (blocks, offsets) = super::partition_batch_capacities(rows, 512);
+        let scratch = rows as u64 + (blocks + 2 * offsets + 320) as u64 * 4 + 8192 * 2 * 4;
+        let model = super::StreamingMemModel::new(rows as u64, 255, 1, 16, false, false, false, 0);
+        let other_fixed = rows as u64 * (16 + 4 + 4 + 1 + 4);
+        assert!(model.fixed_bytes >= other_fixed + scratch);
+    }
+
+    #[test]
+    fn partition_u32_boundary_block_indices_fit() {
+        // No multi-gigabyte allocation: check the index arithmetic used by
+        // CUDA count/scatter and the final scan tile at the supported limit.
+        for threads in [1u64, 2, 32, 512, 1024] {
+            for rows in [u32::MAX as u64, u32::MAX as u64 - 1, 1024 * threads + 1] {
+                let blocks = rows.div_ceil(threads);
+                let last_start = (blocks - 1) * threads;
+                assert!(last_start < rows);
+                assert!(last_start + threads - 1 <= u32::MAX as u64);
+                let scan_base = (blocks - 1) / 1024 * 1024;
+                assert!((1..=1024).contains(&(blocks - scan_base)));
+                assert!(scan_base + 1023 <= u32::MAX as u64);
+                // CUDA stops after this final tile BEFORE adding 1024 again.
+                assert!(blocks - scan_base <= 1024);
+            }
+        }
+    }
     use super::*;
 
     /// 用**实测数字**校准模型,而不是让模型自说自话。
@@ -574,14 +658,20 @@ mod tests {
         let base = higgs_model();
         let two = base.with_resident_split_cache(255, 2);
         assert_eq!(two.resident_extra_col_bytes, 2 * 256 * 16 * 2 + 2 * 64 + 8);
-        assert_eq!(two.resident_extra_fixed_bytes, 2 * 96);
+        assert_eq!(
+            two.resident_extra_fixed_bytes,
+            2 * (32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
+        );
 
         let sixteen = base.with_resident_split_cache(255, 16);
         assert_eq!(
             sixteen.resident_extra_col_bytes,
             16 * 256 * 16 * 2 + 16 * 64 + 8
         );
-        assert_eq!(sixteen.resident_extra_fixed_bytes, 16 * 96);
+        assert_eq!(
+            sixteen.resident_extra_fixed_bytes,
+            16 * (32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
+        );
     }
 
     #[test]
@@ -606,6 +696,47 @@ mod tests {
             .map(|&budget| m.resident_capacity(budget, 2, 1, 8))
             .collect();
         assert!(capacities.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn cached_resident_capacity_transitions_at_exact_budget_boundaries() {
+        // A moderate real shape keeps the byte arithmetic representative while
+        // remaining a fast CPU-only planner test.
+        let model = StreamingMemModel::new(20_000, 255, 1, 16, true, false, false, 0)
+            .with_resident_split_cache(255, 16);
+        let cols = 64;
+        let streams = 1;
+        let total_blocks = 2;
+        let streaming_peak = model.peak_for_layout(cols, streams, 0);
+        let resident_slot_cost = cols * (model.slot_col_bytes + model.resident_extra_col_bytes)
+            + model.resident_extra_fixed_bytes;
+
+        for expected_capacity in 0..=total_blocks {
+            let budget = streaming_peak + resident_slot_cost * expected_capacity;
+            assert_eq!(
+                model.resident_capacity(budget, cols, streams, total_blocks),
+                expected_capacity,
+                "capacity at exact transition budget"
+            );
+
+            let peak = model.peak_for_layout(cols, streams, expected_capacity);
+            assert!(peak <= budget, "selected layout must fit its budget");
+            if expected_capacity < total_blocks {
+                assert!(
+                    model.peak_for_layout(cols, streams, expected_capacity + 1) > budget,
+                    "the next resident block must exceed the remaining budget"
+                );
+            }
+
+            if expected_capacity > 0 {
+                let below_transition = budget - 1;
+                assert_eq!(
+                    model.resident_capacity(below_transition, cols, streams, total_blocks),
+                    expected_capacity - 1,
+                    "one byte below a transition must select the previous capacity"
+                );
+            }
+        }
     }
 
     #[test]

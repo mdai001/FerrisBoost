@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ProjectionMask;
+use parquet::file::reader::ChunkReader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +28,8 @@ use crate::columns::{BinCuts, ColumnBlock};
 use crate::source::arrow_source::ArrowSource;
 use crate::train::BlockSource;
 use crate::types::{Bin, FeatId, MISSING_BIN};
+
+pub(crate) const PARQUET_READ_WINDOW_BYTES: usize = crate::source::parquet_io::READ_WINDOW_BYTES;
 
 /// 一份带标签的数据集:特征列进 `source`,标签列单独拎出来。
 /// Parquet 和 CSV 共用这个形状。
@@ -70,13 +76,7 @@ fn batch_reader(
     columns: &[usize],
     batch_size: usize,
 ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<RecordBatch>>> {
-    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mask = ProjectionMask::roots(builder.parquet_schema(), columns.to_vec());
-    let reader = builder
-        .with_projection(mask)
-        .with_batch_size(batch_size)
-        .build()?;
+    let reader = projected_reader(path, columns, batch_size, None)?;
     Ok(reader.map(|r| r.map_err(anyhow::Error::from)))
 }
 
@@ -86,15 +86,98 @@ fn batch_reader_row_group(
     batch_size: usize,
     row_group: usize,
 ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<RecordBatch>>> {
-    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mask = ProjectionMask::roots(builder.parquet_schema(), columns.to_vec());
-    let reader = builder
-        .with_projection(mask)
-        .with_row_groups(vec![row_group])
-        .with_batch_size(batch_size)
-        .build()?;
+    let reader = projected_reader(path, columns, batch_size, Some(row_group))?;
     Ok(reader.map(|r| r.map_err(anyhow::Error::from)))
+}
+
+fn projected_reader(
+    path: &Path,
+    columns: &[usize],
+    batch_size: usize,
+    row_group: Option<usize>,
+) -> anyhow::Result<ParquetRecordBatchReader> {
+    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    // Sparse projections (especially labels and streaming feature tiles) must
+    // not read unrelated columns just to fill a large lookahead window.
+    if coalesced_projection(&metadata, columns) {
+        build_projected_reader(
+            crate::source::parquet_io::CoalescedFile::new(file)?,
+            metadata,
+            columns,
+            batch_size,
+            row_group,
+        )
+    } else {
+        build_projected_reader(file, metadata, columns, batch_size, row_group)
+    }
+}
+
+fn coalesced_projection(metadata: &ArrowReaderMetadata, columns: &[usize]) -> bool {
+    let fields = metadata.schema().fields().len();
+    if columns.len() < 256 || columns.len().saturating_add(1) < fields {
+        return false;
+    }
+    // Nested roots do not map one-to-one to physical chunks. Keep them, sparse
+    // projections, and long multi-batch groups on the original File reader.
+    let schema = metadata.metadata().file_metadata().schema_descr();
+    if schema.num_columns() != fields
+        || schema
+            .root_schema()
+            .get_fields()
+            .iter()
+            .any(|field| !field.is_primitive())
+    {
+        return false;
+    }
+    let mut selected = vec![false; fields];
+    for &column in columns {
+        let Some(slot) = selected.get_mut(column) else {
+            return false;
+        };
+        *slot = true;
+    }
+    let selected_count = selected.iter().filter(|&&yes| yes).count();
+    if selected_count < 256 || selected_count.saturating_add(1) < fields {
+        return false;
+    }
+    for group in metadata.metadata().row_groups() {
+        if group.num_rows() < 0 || group.num_rows() as u64 > (2 * BATCH_SIZE) as u64 {
+            return false;
+        }
+        let mut all = 0u128;
+        let mut projected = 0u128;
+        for (i, column) in group.columns().iter().enumerate() {
+            let bytes = column.compressed_size();
+            if bytes < 0 {
+                return false;
+            }
+            all += bytes as u128;
+            if selected[i] {
+                projected += bytes as u128;
+            }
+        }
+        if all == 0 || projected * 100 < all * 95 {
+            return false;
+        }
+    }
+    true
+}
+
+fn build_projected_reader<T: ChunkReader + 'static>(
+    input: T,
+    metadata: ArrowReaderMetadata,
+    columns: &[usize],
+    batch_size: usize,
+    row_group: Option<usize>,
+) -> anyhow::Result<ParquetRecordBatchReader> {
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata);
+    let mask = ProjectionMask::roots(builder.parquet_schema(), columns.to_vec());
+    let mut builder = builder.with_projection(mask).with_batch_size(batch_size);
+    if let Some(row_group) = row_group {
+        builder = builder.with_row_groups(vec![row_group]);
+    }
+    Ok(builder.build()?)
 }
 
 fn parallel_row_groups(
@@ -224,6 +307,18 @@ pub(crate) fn peek_n_row_groups(path: impl AsRef<Path>) -> anyhow::Result<usize>
         .num_row_groups())
 }
 
+fn row_group_work(path: &Path) -> anyhow::Result<(usize, usize)> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let metadata = builder.metadata();
+    let max_rows = metadata
+        .row_groups()
+        .iter()
+        .map(|group| group.num_rows().max(0) as usize)
+        .max()
+        .unwrap_or(0);
+    Ok((metadata.num_row_groups(), max_rows.div_ceil(BATCH_SIZE)))
+}
+
 fn feature_columns(path: &Path, label: &str) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -269,9 +364,27 @@ pub fn cuts_only_with_nthread(
     max_bins: u32,
     nthread: usize,
 ) -> anyhow::Result<BinCuts> {
+    cuts_only_observed(path, label, max_bins, nthread, &mut |_, _, _| {})
+}
+
+fn cuts_only_observed(
+    path: impl AsRef<Path>,
+    label: &str,
+    max_bins: u32,
+    nthread: usize,
+    observe: &mut impl FnMut(&'static str, usize, usize),
+) -> anyhow::Result<BinCuts> {
     let path = path.as_ref().to_path_buf();
     let (feat_cols, _) = feature_columns(&path, label)?;
-    let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
+    let (tasks, batches_per_task) = row_group_work(&path)?;
+    let (reader_threads, transform_threads) = crate::source::parquet_pipeline_threads(
+        nthread,
+        tasks,
+        batches_per_task,
+        feat_cols.len(),
+        feat_cols.len(),
+    );
+    observe("cuts", reader_threads, transform_threads);
     crate::source::arrow_source::build_cuts_with_nthread(
         parallel_row_groups(path, feat_cols, BATCH_SIZE, reader_threads)?,
         max_bins as usize,
@@ -337,7 +450,28 @@ pub fn open_many_with_nthread(
     cols_per_block: usize,
     nthread: usize,
 ) -> anyhow::Result<Dataset> {
+    open_many_observed(
+        paths,
+        label,
+        cuts,
+        max_bins,
+        cols_per_block,
+        nthread,
+        |_, _, _| {},
+    )
+}
+
+pub(crate) fn open_many_observed(
+    paths: &[PathBuf],
+    label: &str,
+    cuts: Option<BinCuts>,
+    max_bins: u32,
+    cols_per_block: usize,
+    nthread: usize,
+    mut observe: impl FnMut(&'static str, usize, usize),
+) -> anyhow::Result<Dataset> {
     anyhow::ensure!(!paths.is_empty(), "没有输入文件");
+    let metadata_profile = crate::source::openprof::start("multi metadata");
     let (first_cols, feature_names) = feature_columns(&paths[0], label)?;
     let label_col_first = column_index(&paths[0], label)?;
 
@@ -366,9 +500,37 @@ pub fn open_many_with_nthread(
         label_proj.push(column_index(p, label)?);
     }
 
-    let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
+    let reader_tasks = paths.len();
+    let mut batches_per_task = 0usize;
+    for path in paths {
+        let rows = usize::try_from(peek_n_rows(path)?)
+            .map_err(|_| anyhow::anyhow!("Parquet rows exceed usize"))?;
+        batches_per_task = batches_per_task.max(rows.div_ceil(BATCH_SIZE));
+    }
+    // A single-file dataset reader remains inline; the single-file training
+    // route uses ParquetBlockSource and row-group-parallel cut construction.
+    let cuts_plan = crate::source::parquet_pipeline_threads(
+        nthread,
+        reader_tasks,
+        batches_per_task,
+        feature_names.len(),
+        feature_names.len(),
+    );
+    let bins_plan = crate::source::parquet_pipeline_threads(
+        nthread,
+        reader_tasks,
+        batches_per_task,
+        feature_names.len().div_ceil(cols_per_block.max(1)),
+        feature_names.len(),
+    );
+    drop(metadata_profile);
+    if cuts.is_none() {
+        observe("cuts", cuts_plan.0, cuts_plan.1);
+    }
+    observe("bins", bins_plan.0, bins_plan.1);
     let owned = paths.to_vec();
-    let feats = || {
+    let feats = |quantize: bool| {
+        let reader_threads = if quantize { bins_plan.0 } else { cuts_plan.0 };
         Ok(dataset_reader(
             owned.clone(),
             feat_proj.clone(),
@@ -377,10 +539,19 @@ pub fn open_many_with_nthread(
         ))
     };
     let source = match cuts {
-        Some(c) => ArrowSource::with_cuts_and_nthread(feats, c, cols_per_block, transform_threads)?,
-        None => ArrowSource::new_with_nthread(feats, max_bins, cols_per_block, transform_threads)?,
+        Some(c) => {
+            ArrowSource::with_cuts_and_nthread(|| feats(true), c, cols_per_block, bins_plan.1)?
+        }
+        None => ArrowSource::new_with_phase_threads(
+            feats,
+            max_bins,
+            cols_per_block,
+            cuts_plan.1,
+            bins_plan.1,
+        )?,
     };
 
+    let _label_profile = crate::source::openprof::start("multi labels");
     let mut labels = Vec::new();
     for batch in dataset_reader(
         paths.to_vec(),
@@ -634,6 +805,26 @@ impl ParquetBlockSource {
         options: QuantizedCacheOptions,
         nthread: usize,
     ) -> anyhow::Result<(Self, Vec<f32>)> {
+        Self::open_with_cache_observed(
+            path,
+            label,
+            max_bins,
+            cols_per_block,
+            options,
+            nthread,
+            |_, _, _| {},
+        )
+    }
+
+    pub(crate) fn open_with_cache_observed(
+        path: impl AsRef<Path>,
+        label: &str,
+        max_bins: u32,
+        cols_per_block: usize,
+        options: QuantizedCacheOptions,
+        nthread: usize,
+        mut observe: impl FnMut(&'static str, usize, usize),
+    ) -> anyhow::Result<(Self, Vec<f32>)> {
         let path = path.as_ref().to_path_buf();
         let (feat_cols, label_col) = {
             let _p = crate::source::openprof::start("metadata");
@@ -660,7 +851,7 @@ impl ParquetBlockSource {
         }
         let cuts = {
             let _p = crate::source::openprof::start("cuts");
-            cuts_only_with_nthread(&path, label, max_bins, nthread)?
+            cuts_only_observed(&path, label, max_bins, nthread, &mut observe)?
         };
         Self::with_cuts_inner(
             path,
@@ -773,6 +964,9 @@ impl ParquetBlockSource {
         )
     }
 
+    // Keep this private constructor seam explicit: collapsing its inputs into a
+    // config object would only add ownership/plumbing churn for a lint threshold.
+    #[allow(clippy::too_many_arguments)]
     fn with_cuts_inner(
         path: PathBuf,
         feat_cols: Vec<usize>,
@@ -1001,10 +1195,7 @@ impl ParquetBlockSource {
         }
         anyhow::ensure!(labels.len() == manifest.n_rows, "缓存行数不一致");
         for (i, group) in manifest.groups.iter().enumerate() {
-            let expected = group
-                .len()
-                .checked_mul(manifest.n_rows)
-                .unwrap_or(usize::MAX) as u64;
+            let expected = group.len().saturating_mul(manifest.n_rows) as u64;
             let actual = std::fs::metadata(cache_path.join(format!("block-{i}.bin")))?.len();
             anyhow::ensure!(actual == expected, "缓存块 {i} 长度不一致");
         }
@@ -1181,6 +1372,10 @@ impl BlockSource for ParquetBlockSource {
         Some(self.source_bytes.load(Ordering::Relaxed))
     }
 
+    fn source_block_reads(&self) -> Option<u64> {
+        Some(self.cache_reads.load(Ordering::Relaxed) as u64)
+    }
+
     fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
         self.cache_reads.fetch_add(1, Ordering::Relaxed);
         match &self.cache {
@@ -1326,7 +1521,6 @@ impl ParquetBlockSource {
 mod tests {
     use super::*;
     use crate::source::DenseSource;
-    use crate::train::BlockSource as _;
     use arrow::array::{Float32Array, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
@@ -1518,7 +1712,7 @@ mod tests {
         // 分两批写,顺带压 batch 边界
         for half in 0..2 {
             let mut cols: Vec<std::sync::Arc<dyn arrow::array::Array>> = Vec::new();
-            for c in 0..n_cols {
+            for _ in 0..n_cols {
                 let vals: Vec<Option<f64>> = (0..n_rows / 2)
                     .map(|r| {
                         let k = next() % 13;
@@ -1543,6 +1737,136 @@ mod tests {
         }
         w.close().unwrap();
         path
+    }
+
+    #[test]
+    fn coalesced_projection_routes_only_dense_small_groups() {
+        let path = write_wide_range("coalesced_routing", 64, 256);
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let features: Vec<_> = (0..256).collect();
+        assert!(coalesced_projection(&metadata, &features));
+        assert!(!coalesced_projection(&metadata, &features[..255]));
+        assert!(!coalesced_projection(&metadata, &[256]));
+        let mut duplicates = features.clone();
+        duplicates[255] = 0;
+        assert!(!coalesced_projection(&metadata, &duplicates));
+        let mut invalid = features.clone();
+        invalid[255] = 257;
+        assert!(!coalesced_projection(&metadata, &invalid));
+        // Compare actual decoded arrays with the ordinary File reader, not
+        // merely two thread counts that could both use the same cached path.
+        let ordinary = build_projected_reader(
+            File::open(&path).unwrap(),
+            metadata.clone(),
+            &features,
+            17,
+            None,
+        )
+        .unwrap();
+        let cached = projected_reader(&path, &features, 17, None).unwrap();
+        let a: Vec<_> = ordinary.map(Result::unwrap).collect();
+        let b: Vec<_> = cached.map(Result::unwrap).collect();
+        assert_eq!(a, b);
+        std::fs::remove_file(path).unwrap();
+
+        let path = write_wide_range("coalesced_sparse", 64, 512);
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        assert!(!coalesced_projection(&metadata, &features));
+        std::fs::remove_file(path).unwrap();
+
+        let path = write_wide_range("coalesced_long_group", 2 * BATCH_SIZE + 2, 256);
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        assert!(!coalesced_projection(&metadata, &features));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coalesced_projection_rejects_skewed_omitted_bytes() {
+        use arrow::array::{ArrayRef, BinaryArray};
+        let mut fields: Vec<_> = (0..256)
+            .map(|i| Field::new(format!("f{i}"), DataType::Float32, false))
+            .collect();
+        fields.push(Field::new("target", DataType::Binary, false));
+        let schema = Arc::new(Schema::new(fields));
+        let mut arrays: Vec<ArrayRef> = (0..256)
+            .map(|_| Arc::new(Float32Array::from(vec![0.0; 64])) as ArrayRef)
+            .collect();
+        let label: Vec<Vec<u8>> = (0..64)
+            .map(|row| (0..4096).map(|i| ((i * 17 + row) % 251) as u8).collect())
+            .collect();
+        arrays.push(Arc::new(BinaryArray::from_iter_values(
+            label.iter().map(Vec::as_slice),
+        )));
+        let path =
+            std::env::temp_dir().join(format!("fb-coalesced-skew-{}.parquet", std::process::id()));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, arrays).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        assert!(!coalesced_projection(
+            &metadata,
+            &(0..256).collect::<Vec<_>>()
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn coalesced_projection_rejects_one_leaf_nested_root() {
+        use arrow::array::{ArrayRef, StructArray};
+        let nested_field = Arc::new(Field::new("child", DataType::Float32, false));
+        let mut fields: Vec<_> = (0..256)
+            .map(|i| Field::new(format!("f{i}"), DataType::Float32, false))
+            .collect();
+        fields.push(Field::new(
+            "target",
+            DataType::Struct(vec![nested_field.clone()].into()),
+            false,
+        ));
+        let schema = Arc::new(Schema::new(fields));
+        let mut arrays: Vec<ArrayRef> = (0..256)
+            .map(|_| Arc::new(Float32Array::from(vec![0.0; 64])) as ArrayRef)
+            .collect();
+        arrays.push(Arc::new(StructArray::from(vec![(
+            nested_field,
+            Arc::new(Float32Array::from(vec![0.0; 64])) as ArrayRef,
+        )])));
+        let path = std::env::temp_dir().join(format!(
+            "fb-coalesced-nested-{}.parquet",
+            std::process::id()
+        ));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, arrays).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        assert_eq!(
+            metadata
+                .metadata()
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+            metadata.schema().fields().len()
+        );
+        assert!(!coalesced_projection(
+            &metadata,
+            &(0..256).collect::<Vec<_>>()
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 
     /// 单列读取和整块读取必须给出**逐字节相同**的 bin。

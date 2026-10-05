@@ -10,6 +10,7 @@ pub mod dense;
 pub mod input;
 pub mod openprof;
 pub(crate) mod parallel_reader;
+mod parquet_io;
 pub mod parquet_source;
 pub mod predict_input;
 
@@ -30,6 +31,103 @@ pub(crate) fn pipeline_threads(total: usize) -> (usize, usize) {
     match total.max(1) {
         1 => (1, 1),
         n => (n.div_ceil(2), n / 2),
+    }
+}
+
+/// Stable, metadata-adaptive Parquet allocation. Long ordered tasks cannot
+/// benefit from a large lookahead of blocked readers. Keep their reader window
+/// small, and reclaim unavailable reader/transform slots without adding workers
+/// or buffers beyond the original half-budget reader limit.
+/// A reader count of one means inline decoding, not a concurrent worker.
+pub(crate) fn parquet_pipeline_threads(
+    total: usize,
+    reader_tasks: usize,
+    batches_per_task: usize,
+    transform_units: usize,
+    feature_width: usize,
+) -> (usize, usize) {
+    let total = if total == 0 {
+        crate::threading::effective_threads(0)
+    } else {
+        total
+    }
+    .max(1);
+    let half = total.div_ceil(2);
+    // The reduced reader window paid off on dense wide scans, but did not
+    // improve the narrow regression workload. Preserve its existing split.
+    let lookahead = if feature_width >= 256 && batches_per_task > 2 {
+        2
+    } else {
+        half
+    };
+    let readers = half.min(reader_tasks.max(1)).min(lookahead).max(1);
+    let transform_budget = if readers == 1 { total } else { total - readers };
+    (readers, transform_budget.min(transform_units.max(1)).max(1))
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::parquet_pipeline_threads;
+
+    #[test]
+    fn parquet_allocation_respects_budget_work_and_reader_memory_bound() {
+        for total in 1usize..=64 {
+            for tasks in [0, 1, 2, 3, 17, 1000] {
+                for batches in [0, 1, 2, 3, 1000] {
+                    for units in [0, 1, 2, 3, 2000] {
+                        for width in [0, 1, 28, 255, 256, 2000] {
+                            let (readers, transforms) =
+                                parquet_pipeline_threads(total, tasks, batches, units, width);
+                            assert!(readers >= 1 && readers <= total.div_ceil(2));
+                            assert!(readers <= tasks.max(1));
+                            assert!(transforms >= 1 && transforms <= units.max(1));
+                            assert!(transforms <= total);
+                            if readers > 1 {
+                                assert!(readers + transforms <= total);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parquet_allocation_adapts_to_task_length_and_phase_work() {
+        assert_eq!(parquet_pipeline_threads(8, 21, 62, 28, 28), (4, 4));
+        assert_eq!(parquet_pipeline_threads(8, 38, 2, 2000, 2000), (4, 4));
+        assert_eq!(parquet_pipeline_threads(8, 19, 3, 2000, 2000), (2, 6));
+        assert_eq!(parquet_pipeline_threads(8, 19, 3, 16, 2000), (2, 6));
+        assert_eq!(parquet_pipeline_threads(8, 19, 3, 2000, 255), (4, 4));
+        assert_eq!(parquet_pipeline_threads(8, 19, 3, 2000, 256), (2, 6));
+        assert_eq!(parquet_pipeline_threads(8, 19, 2, 2000, 2000), (4, 4));
+        assert_eq!(parquet_pipeline_threads(8, 38, 2, 2, 2000), (4, 2));
+        assert_eq!(parquet_pipeline_threads(8, 1, 62, 28, 28), (1, 8));
+        assert_eq!(parquet_pipeline_threads(2, 38, 2, 2000, 2000), (1, 2));
+        assert_eq!(parquet_pipeline_threads(1, 38, 2, 2000, 2000), (1, 1));
+        let auto = parquet_pipeline_threads(0, 38, 2, 2000, 2000);
+        let resolved =
+            parquet_pipeline_threads(crate::threading::effective_threads(0), 38, 2, 2000, 2000);
+        assert_eq!(auto, resolved);
+    }
+
+    #[test]
+    fn parquet_allocation_arithmetic_handles_maximum_thread_budget() {
+        for (tasks, batches, units, width) in [
+            (usize::MAX, usize::MAX, usize::MAX, 255),
+            (usize::MAX, usize::MAX, usize::MAX, 256),
+            (0, 0, 0, 2000),
+        ] {
+            let (readers, transforms) =
+                parquet_pipeline_threads(usize::MAX, tasks, batches, units, width);
+            assert!(readers >= 1 && readers <= usize::MAX.div_ceil(2));
+            assert!(readers <= tasks.max(1));
+            assert!(transforms >= 1 && transforms <= units.max(1));
+            if readers > 1 {
+                assert!(readers.checked_add(transforms).is_some());
+                assert!(transforms <= usize::MAX - readers);
+            }
+        }
     }
 }
 

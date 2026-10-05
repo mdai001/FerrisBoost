@@ -18,7 +18,8 @@
 //! 未选中的行只是**贡献零统计**,不是"不参与这棵树"。
 //! 这条在两种 prediction authority 下都必须成立:
 //!
-//! - `gpu_math="exact"`:host 是权威副本,置零发生在 host 的定点 gpair 上;
+//! - `gpu_math="exact"`:prediction 的 host 副本仍是权威;device quantization
+//!   在 GPU max 扫描里置零工作 gpair,host quantization 则在 host 上置零;
 //! - `gpu_math="fast"`:device 是权威副本,置零发生在 device 的 gradient
 //!   kernel 里 —— 那里**必须只把 gpair 置零,绝不能跳过 `pred += delta`**。
 //!   跳过它就等于把采样掩码变成了预测掩码,树会漏掉一部分行的预测更新。
@@ -59,6 +60,7 @@ pub fn row_hash(row: u64, seed: u64, tree: u64) -> u64 {
 /// 取高 53 位是为了和 f64 尾数宽度对齐;折算只在 host 做一次,
 /// device 直接拿这个 u64 比较,**两边不做各自的浮点运算**。
 #[inline]
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN must retain the nonpositive fallback.
 pub fn threshold_for(rate: f32) -> u64 {
     if rate >= 1.0 {
         return u64::MAX; // 全选
@@ -99,8 +101,6 @@ pub fn zero_unselected(gpair: &mut [GradPairFixed], rate: f32, seed: u64, tree: 
     kept
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,7 +108,10 @@ mod tests {
     #[test]
     fn rate_one_is_bit_identical_to_no_sampling() {
         let mut g: Vec<GradPairFixed> = (0..64)
-            .map(|i| GradPairFixed { grad: i as i64, hess: i as i64 * 2 })
+            .map(|i| GradPairFixed {
+                grad: i as i64,
+                hess: i as i64 * 2,
+            })
             .collect();
         let orig = g.clone();
         assert_eq!(zero_unselected(&mut g, 1.0, 9, 5), 64);
@@ -127,8 +130,18 @@ mod tests {
     fn different_tree_or_seed_changes_the_sample() {
         let t = threshold_for(0.5);
         let a: Vec<bool> = (0..500).map(|r| row_selected(r, t, 11, 2)).collect();
-        assert_ne!(a, (0..500).map(|r| row_selected(r, t, 11, 3)).collect::<Vec<_>>());
-        assert_ne!(a, (0..500).map(|r| row_selected(r, t, 12, 2)).collect::<Vec<_>>());
+        assert_ne!(
+            a,
+            (0..500)
+                .map(|r| row_selected(r, t, 11, 3))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            a,
+            (0..500)
+                .map(|r| row_selected(r, t, 12, 2))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -147,7 +160,11 @@ mod tests {
         // 不同的树几乎不可能选出完全相同的条数。
         let t = threshold_for(0.5);
         let counts: Vec<usize> = (0..8u64)
-            .map(|tree| (0..10_000u64).filter(|&r| row_selected(r, t, 1, tree)).count())
+            .map(|tree| {
+                (0..10_000u64)
+                    .filter(|&r| row_selected(r, t, 1, tree))
+                    .count()
+            })
             .collect();
         assert!(
             counts.windows(2).any(|w| w[0] != w[1]),
@@ -166,14 +183,20 @@ mod tests {
             let n = 200_000u64;
             let kept = (0..n).filter(|&r| row_selected(r, t, 3, 0)).count() as f64;
             let frac = kept / n as f64;
-            assert!((frac - f64::from(rate)).abs() < 0.01, "rate={rate} 实际 {frac:.4}");
+            assert!(
+                (frac - f64::from(rate)).abs() < 0.01,
+                "rate={rate} 实际 {frac:.4}"
+            );
         }
     }
 
     #[test]
     fn unselected_rows_are_zeroed_and_selected_rows_untouched() {
         let mut g: Vec<GradPairFixed> = (0..200)
-            .map(|i| GradPairFixed { grad: i as i64 + 1, hess: 7 })
+            .map(|i| GradPairFixed {
+                grad: i as i64 + 1,
+                hess: 7,
+            })
             .collect();
         let orig = g.clone();
         let t = threshold_for(0.5);
@@ -188,4 +211,3 @@ mod tests {
         }
     }
 }
-

@@ -95,6 +95,7 @@ pub(crate) fn build_cuts_and_count_with_nthread(
     max_bins: usize,
     nthread: usize,
 ) -> anyhow::Result<(BinCuts, usize)> {
+    let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
         "max_bin 上限是 {MAX_BIN_LIMIT}(255 留给缺失哨兵),给的是 {max_bins}"
@@ -146,6 +147,8 @@ pub(crate) fn build_cuts_and_count_with_nthread(
             })?;
         }
     }
+    drop(scan_profile);
+    let _finalize_profile = crate::source::openprof::start("cuts finalize");
     let cuts = sketches
         .ok_or_else(|| anyhow::anyhow!("一个 batch 都没有,建不了分箱边界"))?
         .finalize();
@@ -251,6 +254,7 @@ fn quantize_with_nthread_known_rows(
     n_rows: usize,
     nthread: usize,
 ) -> anyhow::Result<Vec<ColumnBlock>> {
+    let allocation_profile = crate::source::openprof::start("bins allocate");
     assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
     let groups = partition_features(cuts.n_feats(), cols_per_block);
     let mut blocks = groups
@@ -267,11 +271,19 @@ fn quantize_with_nthread_known_rows(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    drop(allocation_profile);
+    let _scan_profile = crate::source::openprof::start("bins scan");
     let pool = crate::threading::build_pool(nthread)
         .map_err(|e| anyhow::anyhow!("Arrow quantize ingest 线程池创建失败:{e}"))?;
     let mut row_offset = 0usize;
 
-    for batch in batches {
+    let mut batches = batches;
+    loop {
+        let next = {
+            let _p = crate::source::openprof::sub("bins read+decode");
+            batches.next()
+        };
+        let Some(batch) = next else { break };
         let batch = batch?;
         anyhow::ensure!(
             batch.num_columns() == cuts.n_feats(),
@@ -288,6 +300,7 @@ fn quantize_with_nthread_known_rows(
             "第二遍扫描行数超过第一遍:{row_end} > {n_rows}"
         );
 
+        let _transform_profile = crate::source::openprof::sub("bins transform");
         pool.install(|| {
             blocks.par_iter_mut().zip(groups.par_iter()).try_for_each(
                 |(block, features)| -> anyhow::Result<()> {
@@ -360,10 +373,29 @@ impl ArrowSource {
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
         F: FnMut() -> anyhow::Result<I>,
     {
+        Self::new_with_phase_threads(|_| batches(), max_bins, cols_per_block, nthread, nthread)
+    }
+
+    pub(crate) fn new_with_phase_threads<I, F>(
+        mut batches: F,
+        max_bins: u32,
+        cols_per_block: usize,
+        cuts_threads: usize,
+        quantize_threads: usize,
+    ) -> anyhow::Result<Self>
+    where
+        I: Iterator<Item = anyhow::Result<RecordBatch>>,
+        F: FnMut(bool) -> anyhow::Result<I>,
+    {
         let (cuts, n_rows) =
-            build_cuts_and_count_with_nthread(batches()?, max_bins as usize, nthread)?;
-        let blocks =
-            quantize_with_nthread_known_rows(batches()?, &cuts, cols_per_block, n_rows, nthread)?;
+            build_cuts_and_count_with_nthread(batches(false)?, max_bins as usize, cuts_threads)?;
+        let blocks = quantize_with_nthread_known_rows(
+            batches(true)?,
+            &cuts,
+            cols_per_block,
+            n_rows,
+            quantize_threads,
+        )?;
         let n_features = cuts.n_feats();
         Ok(Self {
             cuts,

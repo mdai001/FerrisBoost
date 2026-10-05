@@ -33,6 +33,9 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+// Keep the explicit little-endian byte parser portable without depending on
+// slice::as_chunks, whose stabilization may exceed the crate's supported MSRV.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn read_f32(path: &Path) -> Vec<f32> {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("读不了 {}:{e}", path.display()));
     assert_eq!(bytes.len() % 4, 0, "{} 不是 f32 的整数倍", path.display());
@@ -40,6 +43,83 @@ fn read_f32(path: &Path) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Read the platform-specific XGBoost reference margin when one is required.
+/// The checked-in Linux float file remains the baseline everywhere except the
+/// native Windows deep-logistic comparison. Full SHA-256 validation is handled
+/// by the Python fixture contract and private release reference checks; this Rust
+/// reader validates the metadata and every sparse replacement before use.
+fn expected_margin(case: &Case) -> Vec<f32> {
+    let dir = fixtures_dir();
+    let base = read_f32(&dir.join(format!("{}.margin", case.name)));
+    if !cfg!(all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        target_env = "msvc"
+    )) || case.name != "deep_logistic"
+    {
+        return base;
+    }
+
+    let index_raw = fs::read_to_string(dir.join("index.json")).expect("fixture index 读不了");
+    let index: serde_json::Value = serde_json::from_str(&index_raw).unwrap();
+    let reference_raw = fs::read_to_string(dir.join("deep_logistic.windows.json"))
+        .expect("Windows deep-logistic reference 读不了");
+    let reference: serde_json::Value = serde_json::from_str(&reference_raw).unwrap();
+
+    assert_eq!(reference["case"].as_str(), Some(case.name.as_str()));
+    assert_eq!(reference["xgboost"].as_str(), Some("3.4.1"));
+    assert_eq!(reference["xgboost"], index["xgboost"]);
+    assert_eq!(index["xgboost"].as_str(), Some("3.4.1"));
+    assert_eq!(reference["platform"].as_str(), Some("win32-amd64"));
+    assert_eq!(reference["rows"].as_u64(), Some(case.n_rows as u64));
+    assert_eq!(reference["rows"].as_u64(), Some(base.len() as u64));
+
+    let replacements = reference["replacements"]
+        .as_array()
+        .expect("replacements 必须是数组");
+    assert_eq!(
+        replacements.len(),
+        13,
+        "Windows reference 应有 13 个 replacement"
+    );
+    let mut want = base.clone();
+    let mut previous_row = None;
+    for replacement in replacements {
+        let row = usize::try_from(
+            replacement["row"]
+                .as_u64()
+                .expect("replacement row 必须是无符号整数"),
+        )
+        .expect("replacement row 超出 usize 范围");
+        assert!(row < want.len(), "replacement row 越界: {row}");
+        if let Some(previous) = previous_row {
+            assert!(row > previous, "replacement rows 必须严格递增且唯一");
+        }
+        previous_row = Some(row);
+
+        let base_bits = u32::try_from(
+            replacement["base_bits"]
+                .as_u64()
+                .expect("replacement base_bits 必须是无符号整数"),
+        )
+        .expect("replacement base_bits 超出 u32 范围");
+        assert_eq!(
+            base[row].to_bits(),
+            base_bits,
+            "replacement base_bits 与 Linux 原始值不符: row={row}"
+        );
+        let bits = u32::try_from(
+            replacement["bits"]
+                .as_u64()
+                .expect("replacement bits 必须是无符号整数"),
+        )
+        .expect("replacement bits 超出 u32 范围");
+        assert_ne!(bits, base_bits, "replacement 必须改变 row={row}");
+        want[row] = f32::from_bits(bits);
+    }
+    want
 }
 
 struct Case {
@@ -110,7 +190,11 @@ fn margins_with(case: &Case, cols_per_block: usize, nthread: usize) -> Vec<f32> 
         case.params.max_bin,
         cols_per_block,
     );
-    let params = TrainParams { cols_per_block, nthread, ..case.params.clone() };
+    let params = TrainParams {
+        cols_per_block,
+        nthread,
+        ..case.params.clone()
+    };
     let cfg = TrainConfig {
         base_score: case.base_score,
         ..TrainConfig::new(params, case.objective)
@@ -124,7 +208,7 @@ fn margins_with(case: &Case, cols_per_block: usize, nthread: usize) -> Vec<f32> 
 /// 逐位比。**不要**换成 abs_diff < eps —— 这个测试的全部意义就在于
 /// 精确相等,用容差断言等于没锁。
 fn assert_bit_exact(case: &Case, got: &[f32]) {
-    let want = read_f32(&fixtures_dir().join(format!("{}.margin", case.name)));
+    let want = expected_margin(case);
     assert_eq!(got.len(), want.len(), "{}:行数对不上", case.name);
     for (row, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(
@@ -142,7 +226,10 @@ fn assert_bit_exact(case: &Case, got: &[f32]) {
 /// A 表:4 个 seed × 有无缺失 × 两个 objective,depth 3 / 10 轮。
 #[test]
 fn bit_exact_vs_xgboost_matrix() {
-    let cases: Vec<Case> = load_index().into_iter().filter(|c| c.n_rows == 200).collect();
+    let cases: Vec<Case> = load_index()
+        .into_iter()
+        .filter(|c| c.n_rows == 200)
+        .collect();
     assert_eq!(cases.len(), 16, "A 表应该有 16 个配置");
     for case in &cases {
         assert_bit_exact(case, &margins(case));
@@ -154,10 +241,41 @@ fn bit_exact_vs_xgboost_matrix() {
 /// 变了都会在某一轮翻掉某个近似并列的分裂,然后一路放大。
 #[test]
 fn bit_exact_vs_xgboost_deep_and_long() {
-    let cases: Vec<Case> = load_index().into_iter().filter(|c| c.n_rows == 5000).collect();
+    let cases: Vec<Case> = load_index()
+        .into_iter()
+        .filter(|c| c.n_rows == 5000)
+        .collect();
     assert_eq!(cases.len(), 2);
     for case in &cases {
         assert_bit_exact(case, &margins(case));
+    }
+}
+
+#[test]
+fn deep_logistic_platform_reference_is_sparse_and_exact() {
+    let case = load_index()
+        .into_iter()
+        .find(|c| c.name == "deep_logistic")
+        .expect("fixture 少了 deep_logistic");
+    let base = read_f32(&fixtures_dir().join("deep_logistic.margin"));
+    let want = expected_margin(&case);
+    let changed = want
+        .iter()
+        .zip(&base)
+        .filter(|(actual, original)| actual.to_bits() != original.to_bits())
+        .count();
+    if cfg!(all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        target_env = "msvc"
+    )) {
+        assert_eq!(changed, 13);
+    } else {
+        assert_eq!(changed, 0);
+        assert_eq!(
+            want.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            base.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -178,7 +296,9 @@ fn bit_exact_histogram_is_row_order_independent() {
     // 确定性的伪随机数据,不引入 rand 依赖
     let mut state = 0x243f_6a88_85a3_08d3u64;
     let mut next = move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     let mut block = vec![0u8; n_feats * n_rows];
@@ -210,8 +330,24 @@ fn bit_exact_histogram_is_row_order_independent() {
 
     let mut a = vec![GradPairFixed::default(); width];
     let mut b = vec![GradPairFixed::default(); width];
-    hist::build(&block, n_rows, n_feats, &feat_offsets, &gpair, Some(&ascending), &mut a);
-    hist::build(&block, n_rows, n_feats, &feat_offsets, &gpair, Some(&shuffled), &mut b);
+    hist::build(
+        &block,
+        n_rows,
+        n_feats,
+        &feat_offsets,
+        &gpair,
+        Some(&ascending),
+        &mut a,
+    );
+    hist::build(
+        &block,
+        n_rows,
+        n_feats,
+        &feat_offsets,
+        &gpair,
+        Some(&shuffled),
+        &mut b,
+    );
     assert_eq!(a, b, "换行顺序结果就变了 —— 累加不再是顺序无关的");
 
     assert_eq!(
@@ -242,7 +378,7 @@ fn bit_exact_vs_xgboost_across_column_block_sizes() {
     for case in cases.iter().filter(|c| c.n_rows == 200) {
         for &cols in &block_sizes {
             let got = margins_with_blocks(case, cols);
-            let want = read_f32(&fixtures_dir().join(format!("{}.margin", case.name)));
+            let want = expected_margin(case);
             for (row, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert_eq!(
                     g.to_bits(),
@@ -269,7 +405,11 @@ fn bit_exact_uneven_last_block() {
     let uneven = margins_with_blocks(&case, 3);
     let even = margins_with_blocks(&case, 5);
     for (row, (a, b)) in uneven.iter().zip(&even).enumerate() {
-        assert_eq!(a.to_bits(), b.to_bits(), "第 {row} 行:3+2 和 5 分块结果不同");
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "第 {row} 行:3+2 和 5 分块结果不同"
+        );
     }
 }
 
@@ -287,7 +427,7 @@ fn bit_exact_vs_xgboost_across_thread_counts() {
     let cases = load_index();
     // cols_per_block = 1 时 5 个特征 5 个块,线程数能真的用上
     for case in cases.iter().filter(|c| c.n_rows == 200) {
-        let want = read_f32(&fixtures_dir().join(format!("{}.margin", case.name)));
+        let want = expected_margin(case);
         for nthread in [1usize, 2, 4, 8] {
             let got = margins_with(case, 1, nthread);
             for (row, (g, w)) in got.iter().zip(&want).enumerate() {

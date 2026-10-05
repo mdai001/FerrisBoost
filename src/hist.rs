@@ -17,7 +17,9 @@ pub struct Histogram {
 
 impl Histogram {
     pub fn zeros(total_bins: usize) -> Self {
-        Self { bins: vec![GradPairFixed::default(); total_bins] }
+        Self {
+            bins: vec![GradPairFixed::default(); total_bins],
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -83,8 +85,10 @@ pub fn build(
     // 每「行 × 特征」一次累加。一次性加,不进内层循环。
     if crate::train::prof::enabled() {
         let rows = row_idx.map_or(block_n_rows, |r| r.len());
-        crate::train::prof::HIST_UPDATES
-            .fetch_add((rows * n_feats) as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::train::prof::HIST_UPDATES.fetch_add(
+            (rows * n_feats) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // ---- 外层**行分块**,块内再「外层特征、内层行」----
@@ -294,30 +298,65 @@ mod tests {
         let mut child = Histogram::zeros(64);
         for i in 0..64 {
             // 故意混进负数和大值,盖住模 2^64 回绕。
-            parent.bins[i] = GradPairFixed { grad: (i as i64) * 7 - 13, hess: i64::MAX - i as i64 };
-            child.bins[i] = GradPairFixed { grad: -(i as i64) * 3, hess: i as i64 };
+            parent.bins[i] = GradPairFixed {
+                grad: (i as i64) * 7 - 13,
+                hess: i64::MAX - i as i64,
+            };
+            child.bins[i] = GradPairFixed {
+                grad: -(i as i64) * 3,
+                hess: i as i64,
+            };
         }
         let mut three_way = Histogram::zeros(64);
         subtract(&parent, &child, &mut three_way);
 
-        let mut moved = Histogram { bins: parent.bins.clone() };
+        let mut moved = Histogram {
+            bins: parent.bins.clone(),
+        };
         subtract_in_place(&mut moved, &child);
         assert_eq!(moved.bins, three_way.bins, "原地相减必须逐位等于三方相减");
     }
 
-    use super::*;
     use crate::types::{GradPair, GradQuantizer};
 
     /// 3 个特征、每个 4 个 bin 的块,行数 8。
     /// feat 2 里塞了缺失。
-    fn fixture() -> (Vec<Bin>, usize, usize, Vec<u32>, Vec<GradPairFixed>, GradQuantizer) {
+    fn fixture() -> (
+        Vec<Bin>,
+        usize,
+        usize,
+        Vec<u32>,
+        Vec<GradPairFixed>,
+        GradQuantizer,
+    ) {
         let n_rows = 8;
         let n_feats = 3;
         // 列主序:data[local_feat * n_rows + row]
         let block: Vec<Bin> = vec![
-            0, 1, 2, 3, 0, 1, 2, 3, // feat 0
-            0, 0, 1, 1, 2, 2, 3, 3, // feat 1
-            MISSING_BIN, 1, MISSING_BIN, 2, 0, 0, 3, 1, // feat 2
+            0,
+            1,
+            2,
+            3,
+            0,
+            1,
+            2,
+            3, // feat 0
+            0,
+            0,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3, // feat 1
+            MISSING_BIN,
+            1,
+            MISSING_BIN,
+            2,
+            0,
+            0,
+            3,
+            1, // feat 2
         ];
         let feat_offsets = vec![0, 4, 8, 12];
         let float: Vec<GradPair> = (0..n_rows)
@@ -365,7 +404,10 @@ mod tests {
         build(&block, n_rows, n_feats, &offs, &gpair, None, &mut out);
 
         let all: Vec<RowId> = (0..n_rows as RowId).collect();
-        assert_same(&out, &reference(&block, n_rows, n_feats, &offs, &gpair, &all));
+        assert_same(
+            &out,
+            &reference(&block, n_rows, n_feats, &offs, &gpair, &all),
+        );
     }
 
     #[test]
@@ -373,7 +415,15 @@ mod tests {
         let (block, n_rows, n_feats, offs, gpair, _q) = fixture();
         let rows: Vec<RowId> = vec![1, 3, 4, 7];
         let mut out = vec![GradPairFixed::default(); 12];
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&rows), &mut out);
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&rows),
+            &mut out,
+        );
 
         assert_same(
             &out,
@@ -406,18 +456,45 @@ mod tests {
 
         let mut a = vec![GradPairFixed::default(); 12];
         let mut b = vec![GradPairFixed::default(); 12];
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&ascending), &mut a);
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&shuffled), &mut b);
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&ascending),
+            &mut a,
+        );
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&shuffled),
+            &mut b,
+        );
         assert_eq!(a, b, "换行顺序结果就变了,定点累加白做了");
 
         // 反着来也一样
         shuffled.reverse();
         let mut c = vec![GradPairFixed::default(); 12];
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&shuffled), &mut c);
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&shuffled),
+            &mut c,
+        );
         assert_eq!(a, c);
 
         // node_sum 同理
-        assert_eq!(node_sum(&gpair, Some(&ascending)), node_sum(&gpair, Some(&shuffled)));
+        assert_eq!(
+            node_sum(&gpair, Some(&ascending)),
+            node_sum(&gpair, Some(&shuffled))
+        );
     }
 
     /// 极端量级下既不能溢出,也不能把精度丢光。
@@ -554,7 +631,10 @@ mod tests {
             }
         }
         assert_eq!(got, want, "去掉清零之后直方图变了");
-        assert!(got.iter().any(|g| g.grad != 0), "参考数据太弱,全零测不出东西");
+        assert!(
+            got.iter().any(|g| g.grad != 0),
+            "参考数据太弱,全零测不出东西"
+        );
     }
 
     /// debug 断言真的会拦住违约的调用方(否则契约只是注释)。
@@ -576,9 +656,33 @@ mod tests {
         let mut parent = Histogram::zeros(12);
         let mut lh = Histogram::zeros(12);
         let mut rh = Histogram::zeros(12);
-        build(&block, n_rows, n_feats, &offs, &gpair, None, &mut parent.bins);
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&left), &mut lh.bins);
-        build(&block, n_rows, n_feats, &offs, &gpair, Some(&right), &mut rh.bins);
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            None,
+            &mut parent.bins,
+        );
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&left),
+            &mut lh.bins,
+        );
+        build(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            Some(&right),
+            &mut rh.bins,
+        );
 
         // 缺失行在两边都不进 bin,所以父 = 左 + 右 依然成立。
         // 定点之后是精确相等 —— 父子相减不再往下传误差。
@@ -593,11 +697,27 @@ mod tests {
         let node_rows: Vec<Vec<RowId>> = vec![vec![0, 1, 2], vec![3, 4], vec![5, 6, 7]];
 
         let mut batched: Vec<Histogram> = (0..3).map(|_| Histogram::zeros(12)).collect();
-        build_all_nodes(&block, n_rows, n_feats, &offs, &gpair, &node_rows, &mut batched);
+        build_all_nodes(
+            &block,
+            n_rows,
+            n_feats,
+            &offs,
+            &gpair,
+            &node_rows,
+            &mut batched,
+        );
 
         for (rows, got) in node_rows.iter().zip(&batched) {
             let mut want = vec![GradPairFixed::default(); 12];
-            build(&block, n_rows, n_feats, &offs, &gpair, Some(rows), &mut want);
+            build(
+                &block,
+                n_rows,
+                n_feats,
+                &offs,
+                &gpair,
+                Some(rows),
+                &mut want,
+            );
             assert_same(&got.bins, &want);
         }
     }

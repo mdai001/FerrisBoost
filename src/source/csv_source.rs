@@ -278,8 +278,8 @@ fn open_many_impl(
     let mut feature_names: Option<Vec<String>> = None;
 
     for (p, schema) in paths.iter().zip(&schemas) {
-        check_numeric(&schema, label)?;
-        let (cols, label_col, names) = columns(&schema, label)?;
+        check_numeric(schema, label)?;
+        let (cols, label_col, names) = columns(schema, label)?;
         match &feature_names {
             None => {
                 feature_names = Some(names);

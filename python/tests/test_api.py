@@ -1,5 +1,6 @@
 """API 表面:参数解析、early stopping、evals_result、模型互通、错误处理。"""
 import csv as csv_module
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import json
 import subprocess
@@ -174,6 +175,61 @@ def test_save_model_overwrites_existing_model_without_leaking_temp_files(tmp_pat
         x_new, output_margin=True
     ).tobytes()
     assert {child.name for child in tmp_path.iterdir() if child != path} == siblings_before
+
+
+def test_concurrent_model_loads_and_saves_match_immutable_cpu_model(tmp_path):
+    x, y = toy(n=120, m=5, seed=21)
+    model = fb.train({**BASE, "nthread": 1}, x, label=y, num_boost_round=2, quiet=True)
+    baseline_path = tmp_path / "immutable-baseline.json"
+    model.save_model(str(baseline_path), quiet=True, model_io_threads=0)
+    baseline_bytes = baseline_path.read_bytes()
+    expected_prediction = model.predict(x, output_margin=True, use_gpu=False).tobytes()
+
+    def load_predict_save(index):
+        loaded = fb.Model.load_model(
+            str(baseline_path), quiet=True, model_io_threads=0, ingest_threads=0
+        )
+        prediction = loaded.predict(x, output_margin=True, use_gpu=False).tobytes()
+        saved_path = tmp_path / f"immutable-worker-{index}.json"
+        loaded.save_model(str(saved_path), quiet=True, model_io_threads=0)
+        return prediction, saved_path.read_bytes()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(load_predict_save, range(4)))
+
+    assert all(prediction == expected_prediction for prediction, _ in results)
+    assert all(saved == baseline_bytes for _, saved in results)
+
+
+def test_concurrent_same_path_saves_commit_complete_models_without_temp_leaks(tmp_path):
+    x, y = toy(n=120, m=5, seed=22)
+    model_a = fb.train({**BASE, "nthread": 1}, x, label=y, num_boost_round=3, quiet=True)
+    model_b = fb.train({**BASE, "nthread": 1}, x, label=y, num_boost_round=5, quiet=True)
+    expected_a_path = tmp_path / "expected-a.json"
+    expected_b_path = tmp_path / "expected-b.json"
+    shared_path = tmp_path / "shared-model.json"
+    model_a.save_model(str(expected_a_path), quiet=True, model_io_threads=0)
+    model_b.save_model(str(expected_b_path), quiet=True, model_io_threads=0)
+    expected_a = expected_a_path.read_bytes()
+    expected_b = expected_b_path.read_bytes()
+    assert expected_a != expected_b
+
+    models = [model_a, model_b] * 4
+
+    def save_shared(model):
+        model.save_model(str(shared_path), quiet=True, model_io_threads=0)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(save_shared, models))
+
+    final_bytes = shared_path.read_bytes()
+    assert final_bytes in (expected_a, expected_b)
+    matching_model = model_a if final_bytes == expected_a else model_b
+    loaded = fb.Model.load_model(str(shared_path), quiet=True, model_io_threads=0, ingest_threads=0)
+    assert loaded.predict(x, output_margin=True, use_gpu=False).tobytes() == matching_model.predict(
+        x, output_margin=True, use_gpu=False
+    ).tobytes()
+    assert list(tmp_path.glob(".ferrisboost-save-*.tmp")) == []
 
 
 def test_model_io_progress_and_quiet(tmp_path, capfd):

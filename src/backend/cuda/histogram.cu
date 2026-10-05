@@ -54,6 +54,7 @@ extern "C" __global__ void split_cached_features(
     double ig, double ih, float lambda, float gamma, float mcw,
     SplitPacket* output) {
     __shared__ SplitPair prefix[256];
+    __shared__ SplitPair warp_totals[8];
     __shared__ double parent_gain;
     __shared__ SplitPacket winners[256];
     __shared__ uint32_t ordinals[256];
@@ -72,11 +73,32 @@ extern "C" __global__ void split_cached_features(
             next[(size_t)m[3] * cache_stride + lo + t] = v;
     }
     if (!t) parent_gain = split_gain(sums[n], ig, ih, lambda);
-    prefix[t] = v; __syncthreads();
-    for (uint32_t step = 1; step < 256; step *= 2) {
-        SplitPair prev{}; if (t >= step) prev = prefix[t - step];
-        __syncthreads(); prefix[t] = split_add(prefix[t], prev); __syncthreads();
+    // All 256 threads participate, including zero-padded bins. Integer addition
+    // is modulo 2^64, so this two-stage scan has exactly the serial prefix.
+    // Shuffle operands never cross a warp; shared cross-warp data is protected
+    // by full CTA barriers before publication and consumption.
+    uint32_t lane = t & 31u, warp = t >> 5;
+    SplitPair scanned = v;
+    for (uint32_t step = 1; step < 32; step *= 2) {
+        SplitPair prev{__shfl_up_sync(0xffffffffu, scanned.grad, step),
+                       __shfl_up_sync(0xffffffffu, scanned.hess, step)};
+        if (lane >= step) scanned = split_add(scanned, prev);
     }
+    if (lane == 31) warp_totals[warp] = scanned;
+    __syncthreads();
+    if (warp == 0) {
+        SplitPair total = lane < 8 ? warp_totals[lane] : SplitPair{};
+        for (uint32_t step = 1; step < 8; step *= 2) {
+            SplitPair prev{__shfl_up_sync(0xffffffffu, total.grad, step),
+                           __shfl_up_sync(0xffffffffu, total.hess, step)};
+            if (lane >= step) total = split_add(total, prev);
+        }
+        if (lane < 8) warp_totals[lane] = total;
+    }
+    __syncthreads();
+    if (warp) scanned = split_add(warp_totals[warp - 1], scanned);
+    prefix[t] = scanned;
+    __syncthreads();
     SplitPacket best{}; uint32_t ordinal = 0xffffffffu;
     if (t < count && enabled[f]) {
         SplitPair sum = sums[n], total = prefix[count - 1];
@@ -110,14 +132,9 @@ extern "C" __global__ void split_cached_nodes(const SplitPacket* features,
         SplitPacket p = features[(size_t)blockIdx.x * n_features + f];
         if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
     }
-    if (best.flags & 1u) {
-        double lh = split_value(best.left.hess, ih), rh = split_value(best.right.hess, ih);
-        best.left_weight = __double2float_rn(__ddiv_rn(-split_value(best.left.grad, ig),
-            __dadd_rn(lh, (double)lambda)));
-        best.right_weight = __double2float_rn(__ddiv_rn(-split_value(best.right.grad, ig),
-            __dadd_rn(rh, (double)lambda)));
-        best.left_hess = __double2float_rn(lh); best.right_hess = __double2float_rn(rh);
-    }
+    // The training consumer uses only winner metadata and fixed-point child
+    // sums. Leaf weights are computed once after the global block reduction;
+    // avoid repeating unused divisions for every block-local candidate.
     output[blockIdx.x] = best;
 }
 
@@ -211,9 +228,7 @@ extern "C" __global__ void hist_build_shared_planar32_batched_rm(
     const uint32_t* feat_offsets,
     int64_t* out_hist,
     uint32_t max_tile_bins,
-    const uint32_t* blk_ptr,
-    const uint32_t* node_off,
-    const uint32_t* node_len,
+    const uint32_t* batch_idx,
     uint32_t n_nodes,
     uint32_t hist_stride,
     // `colsample_bytree`:本列块里被选中的**局部**特征位图。
@@ -224,6 +239,10 @@ extern "C" __global__ void hist_build_shared_planar32_batched_rm(
     // 整行的 bins 也仍然一次读进寄存器。resident 下**不应该**为采样每棵树
     // 重新 compact / 上传 —— 那会把行主序常驻的优势直接抵消掉。
     uint32_t feat_mask) {
+    // One tracked allocation: [blk_ptr(n+1) | node_off(n) | node_len(n)].
+    const uint32_t* blk_ptr = batch_idx;
+    const uint32_t* node_off = batch_idx + n_nodes + 1;
+    const uint32_t* node_len = batch_idx + 2 * n_nodes + 1;
     extern __shared__ unsigned int fused_hist_rm[];
     __shared__ uint32_t s_node_rm;
 
@@ -494,9 +513,12 @@ extern "C" __global__ void apply_delta_and_gradient(
 
 
 extern "C" __global__ void gpair_max_abs(
-    const float* gpair,
+    float* gpair,
     uint32_t n_rows,
-    double* out_max) {
+    double* out_max,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
     extern __shared__ double red[];
     double* rg = red;
     double* rh = red + blockDim.x;
@@ -505,6 +527,21 @@ extern "C" __global__ void gpair_max_abs(
     double mh = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
+        // Exact objective stays on the host. Fuse only deterministic integer
+        // sampling into this existing pass, BEFORE max/scale selection. Each
+        // row has one writer; the subsequent quantization sees the masked pair.
+        // Prediction buffers are deliberately not involved in this operation.
+        if (subsample_threshold != ~0ULL) {
+            const unsigned long long hsh = fb_mix(
+                subsample_seed
+                ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
+                   | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
+                ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
+            if ((hsh >> 11) >= subsample_threshold) {
+                gpair[(uint64_t)i * 2] = 0.0f;
+                gpair[(uint64_t)i * 2 + 1] = 0.0f;
+            }
+        }
         mg = fmax(mg, fabs((double)gpair[(uint64_t)i * 2]));
         mh = fmax(mh, fabs((double)gpair[(uint64_t)i * 2 + 1]));
     }
@@ -920,13 +957,15 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
     const uint32_t* feat_offsets,
     int64_t* out_hist,
     uint32_t max_tile_bins,
-    const uint32_t* blk_ptr,
-    const uint32_t* node_off,
-    const uint32_t* node_len,
+    const uint32_t* batch_idx,
     uint32_t n_nodes,
     uint32_t hist_stride,
     const uint32_t* feature_select,
     uint32_t selection_active) {
+    // Match the row-major ABI and retain one safe dependency per allocation.
+    const uint32_t* blk_ptr = batch_idx;
+    const uint32_t* node_off = batch_idx + n_nodes + 1;
+    const uint32_t* node_len = batch_idx + 2 * n_nodes + 1;
     extern __shared__ unsigned int fused_hist_b[];
     __shared__ uint32_t s_node;
 
@@ -1229,7 +1268,7 @@ extern "C" __global__ void partition_count(
 // 可以照旧按节点复用,**不需要**整层留着。host 唯一需要活到本层结束的,
 // 就是每个节点的左右行数(用来构造下一层的 span)。把这两个数单独攒起来,
 // 就能把每节点两次阻塞 D2H 压成整层一次,而不用给 offsets 开一整层的 arena。
-extern "C" __global__ void partition_scan_blocks(
+__device__ __forceinline__ void partition_scan_segment(
     const uint32_t* block_left_counts,
     uint32_t* left_offsets,
     uint32_t* right_offsets,
@@ -1299,11 +1338,105 @@ extern "C" __global__ void partition_scan_blocks(
         __syncthreads();
         carry_l += tile_l;
         carry_r += tile_r;
+        // Avoid a u32 loop-counter wrap for the supported T=1 boundary when
+        // n_blocks approaches UINT32_MAX. The final tile is already complete.
+        if (n_blocks - base <= blockDim.x) break;
     }
 
     if (threadIdx.x == 0) {
         totals_out[slot * 2] = carry_l;
         totals_out[slot * 2 + 1] = carry_r;
+    }
+}
+
+extern "C" __global__ void partition_scan_blocks(
+    const uint32_t* counts, uint32_t* left, uint32_t* right,
+    uint32_t blocks, uint32_t selected, uint32_t threads,
+    uint32_t* totals, uint32_t slot) {
+    partition_scan_segment(counts, left, right, blocks, selected, threads, totals, slot);
+}
+
+// One fixed-size AoS descriptor per node:
+// input offset, length, original-local feature, split bin, missing-left,
+// count base, offset base, output offset, level-total slot, cumulative block end.
+// All pointers are ordinary tracked allocations; no per-node pointer table.
+enum { PART_DESC_WORDS = 10 };
+
+__device__ __forceinline__ uint32_t partition_batch_node(
+    const uint32_t* descriptors, uint32_t nodes, uint32_t block) {
+    uint32_t lo = 0, hi = nodes;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (block < descriptors[mid * PART_DESC_WORDS + 9]) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+extern "C" __global__ void partition_count_batched(
+    const uint8_t* bins, const uint32_t* rows, const uint32_t* descriptors,
+    uint32_t nodes, uint32_t n_rows, uint32_t n_feats, uint32_t row_major,
+    uint8_t* flags, uint32_t* counts) {
+    const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
+    const uint32_t* d = descriptors + node * PART_DESC_WORDS;
+    const uint32_t local_block = blockIdx.x - d[5];
+    const uint32_t idx = local_block * blockDim.x + threadIdx.x;
+    uint32_t left = 0;
+    if (idx < d[1]) {
+        const uint32_t arena = d[0] + idx;
+        const uint32_t row = rows[arena];
+        const uint64_t address = row_major ? (uint64_t)row * n_feats + d[2]
+                                          : (uint64_t)d[2] * n_rows + row;
+        const uint8_t bin = bins[address];
+        left = bin == UINT8_MAX ? d[4] : (uint32_t)(bin < d[3]);
+        flags[arena] = (uint8_t)left;
+    }
+    extern __shared__ uint32_t sums[];
+    sums[threadIdx.x] = left;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) counts[blockIdx.x] = sums[0];
+}
+
+extern "C" __global__ void partition_scan_batched(
+    const uint32_t* counts, const uint32_t* descriptors,
+    uint32_t row_block_size, uint32_t* left, uint32_t* right, uint32_t* totals) {
+    const uint32_t* d = descriptors + blockIdx.x * PART_DESC_WORDS;
+    partition_scan_segment(counts + d[5], left + d[6], right + d[6],
+                           d[9] - d[5], d[1], row_block_size, totals, d[8]);
+}
+
+extern "C" __global__ void partition_scatter_batched(
+    const uint32_t* rows, const uint8_t* flags, const uint32_t* descriptors,
+    uint32_t nodes, const uint32_t* left, const uint32_t* right, uint32_t* next_rows) {
+    const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
+    const uint32_t* d = descriptors + node * PART_DESC_WORDS;
+    const uint32_t block = blockIdx.x - d[5];
+    const uint32_t idx = block * blockDim.x + threadIdx.x;
+    const bool active = idx < d[1];
+    const uint32_t is_left = active ? flags[d[0] + idx] : 0;
+    extern __shared__ uint32_t scans[];
+    uint32_t* ls = scans;
+    uint32_t* rs = scans + blockDim.x;
+    ls[threadIdx.x] = is_left;
+    rs[threadIdx.x] = active ? 1u - is_left : 0;
+    __syncthreads();
+    for (uint32_t off = 1; off < blockDim.x; off <<= 1) {
+        const uint32_t al = threadIdx.x >= off ? ls[threadIdx.x - off] : 0;
+        const uint32_t ar = threadIdx.x >= off ? rs[threadIdx.x - off] : 0;
+        __syncthreads();
+        ls[threadIdx.x] += al;
+        rs[threadIdx.x] += ar;
+        __syncthreads();
+    }
+    if (active) {
+        const uint32_t total_left = left[d[6] + d[9] - d[5]];
+        const uint32_t dst = is_left ? left[d[6] + block] + ls[threadIdx.x] - is_left
+            : total_left + right[d[6] + block] + rs[threadIdx.x] - (1u - is_left);
+        next_rows[d[7] + dst] = rows[d[0] + idx];
     }
 }
 

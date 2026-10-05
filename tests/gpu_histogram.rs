@@ -3,15 +3,143 @@
 use ferrisboost::{
     backend::cuda::{
         build_histogram, build_histogram_shared, build_histogram_shared_with_config,
-        partition_rows_gpu, GpuRowSpan, GpuTrainCtx, SharedHistogramConfig,
-        SharedHistogramLayout,
+        partition_rows_gpu, GpuRowSpan, GpuTrainCtx, SharedHistogramConfig, SharedHistogramLayout,
     },
+    comm::Local,
     hist,
     source::DenseSource,
-    train::{train, train_gpu, train_gpu_one_tree, TrainConfig},
-    comm::Local,
+    train::{train, train_gpu, train_gpu_one_tree, BlockSource, TrainConfig},
     types::{GradPairFixed, RowId, MISSING_BIN},
 };
+
+/// Counts payload borrows while preserving DenseSource's metadata behavior.
+struct CountedDenseSource {
+    inner: DenseSource,
+    reads: std::sync::Mutex<Vec<usize>>,
+}
+
+impl CountedDenseSource {
+    fn new(inner: DenseSource) -> Self {
+        let reads = vec![0; inner.n_blocks()];
+        Self {
+            inner,
+            reads: std::sync::Mutex::new(reads),
+        }
+    }
+
+    fn read_counts(&self) -> Vec<usize> {
+        self.reads.lock().unwrap().clone()
+    }
+}
+
+impl BlockSource for CountedDenseSource {
+    fn n_blocks(&self) -> usize {
+        self.inner.n_blocks()
+    }
+
+    fn n_rows(&self) -> usize {
+        self.inner.n_rows()
+    }
+
+    fn n_features(&self) -> usize {
+        self.inner.n_features()
+    }
+
+    fn cuts(&self) -> &ferrisboost::columns::BinCuts {
+        self.inner.cuts()
+    }
+
+    fn with_block(
+        &self,
+        i: usize,
+        f: &mut dyn FnMut(&ferrisboost::columns::ColumnBlock),
+    ) -> anyhow::Result<()> {
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .get_mut(i)
+            .ok_or_else(|| anyhow::anyhow!("block index out of range: {i}"))? += 1;
+        self.inner.with_block(i, f)
+    }
+
+    fn feature_column(
+        &self,
+        feat: ferrisboost::types::FeatId,
+    ) -> anyhow::Result<Vec<ferrisboost::types::Bin>> {
+        self.inner.feature_column(feat)
+    }
+
+    fn block_features(&self, i: usize) -> anyhow::Result<Vec<ferrisboost::types::FeatId>> {
+        self.inner.block_features(i)
+    }
+}
+
+struct HistogramTestDir(std::path::PathBuf);
+
+impl HistogramTestDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "fb_gpu_resident_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for HistogramTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_parquet_resident_fixture(path: &std::path::Path, n_rows: usize, n_feats: usize) {
+    use arrow::array::Float32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let mut fields: Vec<Field> = (0..n_feats)
+        .map(|feat| Field::new(format!("f{feat}"), DataType::Float32, false))
+        .collect();
+    fields.push(Field::new("label", DataType::Float32, false));
+    let schema = Arc::new(Schema::new(fields));
+    let mut columns: Vec<arrow::array::ArrayRef> = (0..n_feats)
+        .map(|feat| {
+            Arc::new(Float32Array::from(
+                (0..n_rows)
+                    .map(|row| {
+                        if (row * 19 + feat * 31) % 97 == 0 {
+                            f32::NAN
+                        } else {
+                            ((row * 17 + feat * 29 + row * feat) % 251) as f32 / 251.0
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef
+        })
+        .collect();
+    columns.push(Arc::new(Float32Array::from(
+        (0..n_rows)
+            .map(|row| {
+                if (row * 11 + row / 5) % 23 < 11 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>(),
+    )));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
 
 fn assert_cpu_global_shared_equal(
     bins: &[u8],
@@ -28,6 +156,567 @@ fn assert_cpu_global_shared_equal(
     assert_eq!(global, cpu, "CPU/global-atomic GPU 必须逐位相同");
     assert_eq!(shared, cpu, "CPU/shared-memory GPU 必须逐位相同");
     assert_eq!(shared, global, "两个 GPU 实现必须逐位相同");
+}
+
+#[test]
+fn resident_block_reuse_preserves_training_and_avoids_repeated_source_reads() {
+    let n_rows = 640usize;
+    let n_feats = 70usize;
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 19 + feat * 31) % 97 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 17 + feat * 29 + row * feat) % 251) as f32 / 251.0
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| {
+            if (row * 11 + row / 5) % 23 < 11 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    // [24, 24, 22]: the final physical block is narrower than the others.
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 255, 24);
+    assert_eq!(source.n_blocks(), 3);
+    let bytes = |m: &ferrisboost::tree::Model| serde_json::to_vec(m).unwrap();
+
+    let cpu_params = ferrisboost::types::TrainParams {
+        n_rounds: 4,
+        max_depth: 5,
+        nthread: 1,
+        subsample: 0.6,
+        colsample_bytree: 0.6,
+        seed: 73,
+        gpu_math: ferrisboost::types::GpuMath::Exact,
+        ..Default::default()
+    };
+    let cpu_cfg = TrainConfig::new(cpu_params, ferrisboost::types::Objective::Logistic);
+    let cpu = train(&source, &labels, &[], &cpu_cfg, &mut [], &Local).unwrap();
+
+    // Rebuild the counted wrapper per run so every vector starts at zero.
+    for gpu_split_cache in [false, true] {
+        for resident_blocks in [0usize, 1, 3] {
+            let run_source = CountedDenseSource::new(DenseSource::from_row_major(
+                &data, n_rows, n_feats, 255, 24,
+            ));
+            let params = ferrisboost::types::TrainParams {
+                n_rounds: 4,
+                max_depth: 5,
+                nthread: 1,
+                subsample: 0.6,
+                colsample_bytree: 0.6,
+                seed: 73,
+                resident_blocks: Some(resident_blocks),
+                gpu_split_cache,
+                gpu_math: ferrisboost::types::GpuMath::Exact,
+                ..Default::default()
+            };
+            let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
+            let gpu = train_gpu(0, &run_source, &labels, &[], &cfg, &mut [], &Local).unwrap();
+            let reads = run_source.read_counts();
+            assert_eq!(
+                bytes(&gpu),
+                bytes(&cpu),
+                "resident_blocks={resident_blocks}, gpu_split_cache={gpu_split_cache} changed the exact GPU model"
+            );
+
+            match resident_blocks {
+                0 => assert!(
+                    reads.iter().all(|&count| count > 1),
+                    "streaming should reread each selected physical block across rounds: {reads:?}"
+                ),
+                1 => {
+                    assert!(reads[0] <= 1, "first resident block was reread: {reads:?}");
+                    assert!(
+                        reads[1..].iter().all(|&count| count > 1),
+                        "nonresident blocks should use the streaming path: {reads:?}"
+                    );
+                }
+                3 => assert!(
+                    reads.iter().all(|&count| count <= 1) && reads.iter().sum::<usize>() <= 3,
+                    "full residency should read each physical block only for initial upload: {reads:?}"
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn resident_block_session_reuses_bins_and_preserves_metadata_validation() {
+    let n_rows = 24usize;
+    let n_feats = 5usize;
+    let feat_offsets = [0u32, 3, 7, 10, 14, 19];
+    let bins: Vec<u8> = (0..n_feats)
+        .flat_map(|feat| {
+            let width = (feat_offsets[feat + 1] - feat_offsets[feat]) as usize;
+            (0..n_rows).map(move |row| ((row * 3 + feat * 5) % width) as u8)
+        })
+        .collect();
+    let gpair: Vec<GradPairFixed> = (0..n_rows)
+        .map(|row| GradPairFixed {
+            grad: (row as i64 % 7) - 3,
+            hess: (row as i64 % 5) + 1,
+        })
+        .collect();
+    let config = SharedHistogramConfig {
+        resident_blocks: Some(1),
+        ..Default::default()
+    };
+    let ctx = GpuTrainCtx::new(0, n_rows, n_feats, 19, 2, 8, config, false).unwrap();
+    ctx.upload_gpair(&gpair).unwrap();
+    let rows = ctx.begin_tree_rows().unwrap();
+
+    assert!(
+        ctx.block_session_resident(0, n_rows, n_feats, &feat_offsets, None)
+            .unwrap()
+            .is_none(),
+        "a resident lookup before the first payload upload must miss"
+    );
+    assert!(
+        ctx.block_session_resident(1, n_rows, n_feats, &feat_offsets, None)
+            .unwrap()
+            .is_none(),
+        "a physical block outside the resident range must miss"
+    );
+
+    let mut payload_hist = Vec::new();
+    {
+        let mut session = ctx
+            .block_session(0, &bins, n_rows, n_feats, &feat_offsets, None)
+            .unwrap();
+        session.histogram_device(rows, &mut payload_hist).unwrap();
+    }
+    let mut resident_hist = Vec::new();
+    let resident_timing;
+    {
+        let mut session = ctx
+            .block_session_resident(0, n_rows, n_feats, &feat_offsets, None)
+            .unwrap()
+            .expect("uploaded resident block should hit without host bins");
+        session.histogram_device(rows, &mut resident_hist).unwrap();
+        resident_timing = session.timing();
+    }
+    assert_eq!(
+        resident_hist, payload_hist,
+        "resident metadata lookup changed the histogram"
+    );
+    assert_eq!(resident_timing.block_h2d_calls, 0);
+    assert_eq!(resident_timing.block_h2d_bytes, 0);
+
+    let oversized_offsets = [0u32; 7];
+    let capacity_error = ctx
+        .block_session_resident(0, 0, n_feats + 1, &oversized_offsets, None)
+        .err()
+        .expect("warm resident lookup beyond its offsets capacity must be rejected");
+    assert!(
+        capacity_error.to_string().contains("metadata capacity"),
+        "unexpected oversized metadata error: {capacity_error}"
+    );
+
+    let row_error = ctx
+        .block_session_resident(0, n_rows - 1, n_feats, &feat_offsets, None)
+        .err()
+        .expect("resident row-count mismatch must be rejected");
+    assert!(row_error.to_string().contains("resident block shape"));
+    let short_offsets = &feat_offsets[..n_feats];
+    assert!(
+        ctx.block_session_resident(0, n_rows, n_feats - 1, short_offsets, None)
+            .is_err(),
+        "resident feature-count mismatch must be rejected"
+    );
+    assert!(
+        ctx.block_session_resident(0, n_rows, n_feats, &[0, 3, 7, 6, 14, 19], None)
+            .is_err(),
+        "resident lookup must retain monotonic-offset validation"
+    );
+    assert!(
+        ctx.block_session_resident(0, n_rows, n_feats, &feat_offsets, Some(&[0, 2, 2]))
+            .is_err(),
+        "resident lookup must retain selected-feature ordering validation"
+    );
+
+    let mut post_error_hist = Vec::new();
+    let post_error_timing;
+    {
+        let mut session = ctx
+            .block_session_resident(0, n_rows, n_feats, &feat_offsets, None)
+            .unwrap()
+            .expect("invalid metadata requests must not evict the warm resident payload");
+        session
+            .histogram_device(rows, &mut post_error_hist)
+            .unwrap();
+        post_error_timing = session.timing();
+    }
+    assert_eq!(post_error_hist, payload_hist);
+    assert_eq!(post_error_timing.block_h2d_calls, 0);
+    assert_eq!(post_error_timing.block_h2d_bytes, 0);
+}
+
+#[test]
+fn resident_block_session_reuses_exact_metadata_and_refreshes_selected_mapping() {
+    let n_rows = 24usize;
+    let n_feats = 5usize;
+    let offsets = [0u32, 2, 4, 6, 8, 10];
+    let bins: Vec<u8> = (0..n_feats)
+        .flat_map(|feat| {
+            (0..n_rows).map(move |row| match feat {
+                0 => 0,
+                1 => 1,
+                _ => ((row + feat) % 2) as u8,
+            })
+        })
+        .collect();
+    let gpair = vec![GradPairFixed { grad: 1, hess: 1 }; n_rows];
+    let config = SharedHistogramConfig {
+        resident_blocks: Some(1),
+        ..Default::default()
+    };
+    let ctx = GpuTrainCtx::new(0, n_rows, n_feats, 20, 2, 8, config, false).unwrap();
+    ctx.upload_gpair(&gpair).unwrap();
+    let rows = ctx.begin_tree_rows().unwrap();
+    let compact_column = ctx.supports_compact_column_histogram();
+    let row_major = ctx.path_summary().contains("layout_gpu=row_major");
+    let use_batched = compact_column || row_major;
+
+    let run = |selected: Option<&[usize]>, offsets: &[u32]| {
+        let mut histogram = Vec::new();
+        let timing;
+        {
+            let mut session = ctx
+                .block_session_resident(0, n_rows, n_feats, offsets, selected)
+                .unwrap()
+                .expect("resident payload should remain available");
+            if use_batched {
+                let spans = [rows];
+                let mut outputs = [&mut histogram];
+                session
+                    .histogram_device_batch(&spans, &mut outputs)
+                    .unwrap();
+            } else {
+                assert!(selected.is_none());
+                session.histogram_device(rows, &mut histogram).unwrap();
+            }
+            timing = session.timing();
+        }
+        (histogram, timing)
+    };
+
+    // Seed resident physical block 0 once with its full-width payload. Later
+    // sessions borrow these bins while varying only histogram metadata.
+    let mut initial_histogram = Vec::new();
+    let initial_timing;
+    {
+        let mut session = ctx
+            .block_session(0, &bins, n_rows, n_feats, &offsets, None)
+            .unwrap();
+        if use_batched {
+            let spans = [rows];
+            let mut outputs = [&mut initial_histogram];
+            session
+                .histogram_device_batch(&spans, &mut outputs)
+                .unwrap();
+        } else {
+            session
+                .histogram_device(rows, &mut initial_histogram)
+                .unwrap();
+        }
+        initial_timing = session.timing();
+    }
+    assert_eq!(initial_timing.block_h2d_calls, 2);
+    assert_eq!(
+        initial_timing.block_h2d_bytes,
+        (bins.len() + offsets.len() * 4) as u64
+    );
+
+    // Nonresident physical blocks can share a temporary streaming slot, but
+    // must each upload their own payload. This catches accidentally treating a
+    // reused slot's prior physical identity as a resident cache hit.
+    let mut streaming_results = Vec::new();
+    for block_index in [1usize, 2] {
+        let streaming_bins = if block_index == 1 {
+            bins.clone()
+        } else {
+            bins.iter().map(|bin| 1 - bin).collect::<Vec<_>>()
+        };
+        let mut histogram = Vec::new();
+        let timing;
+        {
+            let mut session = ctx
+                .block_session(
+                    block_index,
+                    &streaming_bins,
+                    n_rows,
+                    n_feats,
+                    &offsets,
+                    None,
+                )
+                .unwrap();
+            if use_batched {
+                let spans = [rows];
+                let mut outputs = [&mut histogram];
+                session
+                    .histogram_device_batch(&spans, &mut outputs)
+                    .unwrap();
+            } else {
+                session.histogram_device(rows, &mut histogram).unwrap();
+            }
+            timing = session.timing();
+        }
+        assert_eq!(timing.block_h2d_calls, 2);
+        assert_eq!(
+            timing.block_h2d_bytes,
+            (bins.len() + offsets.len() * 4) as u64
+        );
+        streaming_results.push(histogram);
+    }
+    assert_ne!(streaming_results[0], streaming_results[1]);
+
+    // An exact full-width metadata hit must issue no metadata copy in any
+    // supported histogram layout.
+    let (_, full_hit_timing) = run(None, &offsets);
+    assert_eq!(full_hit_timing.block_h2d_calls, 0);
+    assert_eq!(full_hit_timing.block_h2d_bytes, 0);
+
+    let selected_a = [0usize, 2];
+    let selected_b = [1usize, 3];
+    let expected_compact = |selected: &[usize]| {
+        let compact_bins: Vec<u8> = selected
+            .iter()
+            .flat_map(|&feat| bins[feat * n_rows..(feat + 1) * n_rows].iter().copied())
+            .collect();
+        let compact_offsets = [0u32, 2, 4];
+        let mut expected = vec![GradPairFixed::default(); 4];
+        hist::build(
+            &compact_bins,
+            n_rows,
+            selected.len(),
+            &compact_offsets,
+            &gpair,
+            None,
+            &mut expected,
+        );
+        expected
+    };
+    let expected_row_major_mask = |selected: &[usize]| {
+        let mut expected = vec![GradPairFixed::default(); offsets[n_feats] as usize];
+        for &feat in selected {
+            let feature_bins = &bins[feat * n_rows..(feat + 1) * n_rows];
+            let feature_offsets = [0u32, 2];
+            let mut feature_hist = vec![GradPairFixed::default(); 2];
+            hist::build(
+                feature_bins,
+                n_rows,
+                1,
+                &feature_offsets,
+                &gpair,
+                None,
+                &mut feature_hist,
+            );
+            expected[feat * 2..feat * 2 + 2].copy_from_slice(&feature_hist);
+        }
+        expected
+    };
+
+    if compact_column {
+        // First use uploads compact offsets and the selected-local map.
+        let (first, first_timing) = run(Some(&selected_a), &[0, 2, 4]);
+        assert_eq!(first_timing.block_h2d_calls, 2);
+        assert_eq!(first_timing.block_h2d_bytes, 3 * 4 + 2 * 4);
+        assert_eq!(first, expected_compact(&selected_a));
+        let (same, same_timing) = run(Some(&selected_a), &[0, 2, 4]);
+        assert_eq!(same, first);
+        assert_eq!(same_timing.block_h2d_calls, 0);
+        assert_eq!(same_timing.block_h2d_bytes, 0);
+
+        // Logical width and offsets stay identical, while physical selected IDs
+        // change. The map must refresh and produce a different histogram.
+        let (remapped, remap_timing) = run(Some(&selected_b), &[0, 2, 4]);
+        assert_eq!(remap_timing.block_h2d_calls, 1);
+        assert_eq!(remap_timing.block_h2d_bytes, 2 * 4);
+        assert_eq!(remapped, expected_compact(&selected_b));
+        assert_ne!(
+            remapped, first,
+            "changed selected features reused a stale map"
+        );
+
+        // A valid offset change uploads on a warm resident payload; returning
+        // to the sampled metadata covers sampled → full → sampled transitions.
+        let changed_offsets = [0u32, 3, 6, 9, 12, 15];
+        let (changed, changed_timing) = run(None, &changed_offsets);
+        assert_eq!(changed_timing.block_h2d_calls, 1);
+        assert_eq!(
+            changed_timing.block_h2d_bytes,
+            changed_offsets.len() as u64 * 4
+        );
+        assert_eq!(changed.len(), 15);
+        let (sampled_again, sampled_timing) = run(Some(&selected_b), &[0, 2, 4]);
+        assert_eq!(sampled_timing.block_h2d_calls, 2);
+        assert_eq!(sampled_timing.block_h2d_bytes, 3 * 4 + 2 * 4);
+        assert_eq!(sampled_again, remapped);
+    } else if row_major {
+        // Row-major consumes sampling as a per-call mask and keeps full-width
+        // offsets. Changing selected IDs changes the result without an index
+        // array upload.
+        let (first, first_timing) = run(Some(&selected_a), &offsets);
+        assert_eq!(first_timing.block_h2d_calls, 0);
+        assert_eq!(first_timing.block_h2d_bytes, 0);
+        assert_eq!(first, expected_row_major_mask(&selected_a));
+        let (same, same_timing) = run(Some(&selected_a), &offsets);
+        assert_eq!(same, first);
+        assert_eq!(same_timing.block_h2d_calls, 0);
+        assert_eq!(same_timing.block_h2d_bytes, 0);
+        let (remapped, remap_timing) = run(Some(&selected_b), &offsets);
+        assert_eq!(remap_timing.block_h2d_calls, 0);
+        assert_eq!(remap_timing.block_h2d_bytes, 0);
+        assert_eq!(remapped, expected_row_major_mask(&selected_b));
+        assert_ne!(
+            remapped, first,
+            "changed row-major feature mask was ignored"
+        );
+
+        // Valid full-width offsets refresh metadata while bins remain in range.
+        let changed_offsets = [0u32, 3, 6, 9, 12, 15];
+        let (changed, changed_timing) = run(None, &changed_offsets);
+        assert_eq!(changed_timing.block_h2d_calls, 1);
+        assert_eq!(
+            changed_timing.block_h2d_bytes,
+            changed_offsets.len() as u64 * 4
+        );
+        assert_eq!(changed.len(), 15);
+        let (_, restored_timing) = run(Some(&selected_a), &offsets);
+        assert_eq!(restored_timing.block_h2d_calls, 1);
+        assert_eq!(restored_timing.block_h2d_bytes, offsets.len() as u64 * 4);
+    } else {
+        // The legacy bucket-profile column-major ABI has no compact map and
+        // ignores selected-local, so cover full-width metadata only.
+        let changed_offsets = [0u32, 3, 6, 9, 12, 15];
+        let (changed, changed_timing) = run(None, &changed_offsets);
+        assert_eq!(changed_timing.block_h2d_calls, 1);
+        assert_eq!(
+            changed_timing.block_h2d_bytes,
+            changed_offsets.len() as u64 * 4
+        );
+        assert_eq!(changed.len(), 15);
+        let (restored, restored_timing) = run(None, &offsets);
+        assert_eq!(restored_timing.block_h2d_calls, 1);
+        assert_eq!(restored_timing.block_h2d_bytes, offsets.len() as u64 * 4);
+        assert_eq!(restored, initial_histogram);
+    }
+}
+
+#[test]
+fn resident_disk_blocks_are_read_once_and_corruption_fails_before_upload() {
+    let dir = HistogramTestDir::new();
+    let parquet_path = dir.0.join("training.parquet");
+    let cache_path = dir.0.join("quantized-cache");
+    let n_rows = 384usize;
+    let n_feats = 30usize;
+    write_parquet_resident_fixture(&parquet_path, n_rows, n_feats);
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| {
+            if (row * 11 + row / 5) % 23 < 11 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let options = ferrisboost::source::parquet_source::QuantizedCacheOptions {
+        budget_bytes: Some(0),
+        path: Some(cache_path.clone()),
+    };
+    let open_source = || {
+        ferrisboost::source::parquet_source::ParquetBlockSource::open_with_cache(
+            &parquet_path,
+            "label",
+            255,
+            16,
+            options.clone(),
+        )
+        .unwrap()
+        .0
+    };
+
+    let cpu_source = open_source();
+    assert_eq!(cpu_source.cache_kind(), "disk");
+    let params = ferrisboost::types::TrainParams {
+        n_rounds: 2,
+        max_depth: 5,
+        nthread: 1,
+        subsample: 0.6,
+        colsample_bytree: 0.6,
+        seed: 73,
+        gpu_math: ferrisboost::types::GpuMath::Exact,
+        ..Default::default()
+    };
+    let cpu_cfg = TrainConfig::new(params.clone(), ferrisboost::types::Objective::Logistic);
+    let cpu = train(&cpu_source, &labels, &[], &cpu_cfg, &mut [], &Local).unwrap();
+
+    let gpu_source = open_source();
+    let n_blocks = gpu_source.n_blocks();
+    assert_eq!(n_blocks, 2);
+    let gpu_params = ferrisboost::types::TrainParams {
+        resident_blocks: Some(n_blocks),
+        ..params.clone()
+    };
+    let gpu_cfg = TrainConfig::new(gpu_params, ferrisboost::types::Objective::Logistic);
+    let gpu = train_gpu(0, &gpu_source, &labels, &[], &gpu_cfg, &mut [], &Local).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&gpu).unwrap(),
+        serde_json::to_vec(&cpu).unwrap(),
+        "fully resident spill-cache training changed the exact model"
+    );
+    assert_eq!(
+        gpu_source.cache_read_count(),
+        n_blocks,
+        "each disk-backed resident block should be fetched only for its initial upload"
+    );
+    assert_eq!(
+        gpu_source.source_bytes(),
+        (n_rows * n_feats) as u64,
+        "resident partitioning should not read disk-backed feature payloads after the first histogram"
+    );
+
+    // Open the cache first, then mutate one payload without changing its length.
+    // The first resident upload must verify the checksum before handing bytes to CUDA.
+    let corrupt_source = open_source();
+    let payload_path = cache_path.join("block-0.bin");
+    let mut payload = std::fs::read(&payload_path).unwrap();
+    assert!(!payload.is_empty());
+    payload[0] ^= 1;
+    std::fs::write(&payload_path, &payload).unwrap();
+    assert_eq!(
+        std::fs::metadata(&payload_path).unwrap().len(),
+        payload.len() as u64
+    );
+
+    let corrupt_params = ferrisboost::types::TrainParams {
+        resident_blocks: Some(corrupt_source.n_blocks()),
+        ..params
+    };
+    let corrupt_cfg = TrainConfig::new(corrupt_params, ferrisboost::types::Objective::Logistic);
+    let error = train_gpu(
+        0,
+        &corrupt_source,
+        &labels,
+        &[],
+        &corrupt_cfg,
+        &mut [],
+        &Local,
+    )
+    .expect_err("corrupted first-use disk block must fail checksum validation");
+    assert!(
+        format!("{error:#}").contains("payload checksum 不一致"),
+        "unexpected corruption error: {error:#}"
+    );
 }
 
 #[test]
@@ -67,12 +756,15 @@ fn gpu_partition_scan_spans_multiple_scan_tiles() {
                 (bin as u32) < 3
             }
         };
-        let want_left: Vec<_> = rows.iter().filter(|r| goes_left(*r)).copied().collect();
-        let want_right: Vec<_> = rows.iter().filter(|r| !goes_left(*r)).copied().collect();
+        let want_left: Vec<_> = rows.iter().filter(|r| goes_left(r)).copied().collect();
+        let want_right: Vec<_> = rows.iter().filter(|r| !goes_left(r)).copied().collect();
         assert_eq!(left.len() + right.len(), n_rows, "行数必须守恒");
         assert!(left.len() > 1000 && right.len() > 1000, "两侧都要非平凡");
         assert_eq!(left, want_left, "跨 scan tile 的左侧顺序必须和串行参考一致");
-        assert_eq!(right, want_right, "跨 scan tile 的右侧顺序必须和串行参考一致");
+        assert_eq!(
+            right, want_right,
+            "跨 scan tile 的右侧顺序必须和串行参考一致"
+        );
     }
 }
 
@@ -93,10 +785,8 @@ fn gpu_partition_matches_stable_cpu_order() {
         })
         .collect();
     for missing_left in [false, true] {
-        let (left, right) = partition_rows_gpu(
-            0, &bins, n_rows, 1, &rows, 3, missing_left, 8,
-        )
-        .unwrap();
+        let (left, right) =
+            partition_rows_gpu(0, &bins, n_rows, 1, &rows, 3, missing_left, 8).unwrap();
         let goes_left = |&row: &RowId| {
             let bin = bins[n_rows + row as usize];
             if bin == MISSING_BIN {
@@ -105,14 +795,12 @@ fn gpu_partition_matches_stable_cpu_order() {
                 (bin as u32) < 3
             }
         };
-        let want_left: Vec<_> = rows.iter().filter(|row| goes_left(*row)).copied().collect();
-        let want_right: Vec<_> = rows.iter().filter(|row| !goes_left(*row)).copied().collect();
+        let want_left: Vec<_> = rows.iter().filter(|row| goes_left(row)).copied().collect();
+        let want_right: Vec<_> = rows.iter().filter(|row| !goes_left(row)).copied().collect();
         assert_eq!(left, want_left);
         assert_eq!(right, want_right);
-        let (left_again, right_again) = partition_rows_gpu(
-            0, &bins, n_rows, 1, &rows, 3, missing_left, 8,
-        )
-        .unwrap();
+        let (left_again, right_again) =
+            partition_rows_gpu(0, &bins, n_rows, 1, &rows, 3, missing_left, 8).unwrap();
         assert_eq!(left_again, left);
         assert_eq!(right_again, right);
     }
@@ -122,7 +810,13 @@ fn gpu_partition_matches_stable_cpu_order() {
 fn training_partition_keeps_stable_rows_on_device() {
     let n_rows = 1_037usize;
     let col: Vec<u8> = (0..n_rows)
-        .map(|row| if row % 17 == 0 { MISSING_BIN } else { (row % 7) as u8 })
+        .map(|row| {
+            if row % 17 == 0 {
+                MISSING_BIN
+            } else {
+                (row % 7) as u8
+            }
+        })
         .collect();
     let ctx = GpuTrainCtx::new(
         0,
@@ -202,7 +896,10 @@ fn gpu_multilevel_training_matches_cpu_model() {
     let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
     let cpu = train(&source, &labels, &[], &cfg, &mut [], &Local).unwrap();
     let gpu = train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap();
-    assert_eq!(serde_json::to_vec(&gpu).unwrap(), serde_json::to_vec(&cpu).unwrap());
+    assert_eq!(
+        serde_json::to_vec(&gpu).unwrap(),
+        serde_json::to_vec(&cpu).unwrap()
+    );
 }
 
 /// 训练级资源复用的验收:多轮 × 多层 × 多列块 × 带缺失值。
@@ -246,7 +943,10 @@ fn gpu_training_reuses_resources_without_changing_the_model() {
     let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
     let cpu = train(&source, &labels, &[], &cfg, &mut [], &Local).unwrap();
     let gpu = train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap();
-    assert!(gpu.trees.iter().any(|t| t.nodes.len() > 1), "这个夹具应该真的分裂");
+    assert!(
+        gpu.trees.iter().any(|t| t.nodes.len() > 1),
+        "这个夹具应该真的分裂"
+    );
     assert_eq!(
         gpu.to_xgboost_json().unwrap(),
         cpu.to_xgboost_json().unwrap(),
@@ -371,7 +1071,15 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
         let bins = make_bins(offsets);
         let n_feats = offsets.len() - 1;
         let mut outputs: Vec<Vec<GradPairFixed>> = (0..spans.len())
-            .map(|_| vec![GradPairFixed { grad: 91, hess: -37 }; 9])
+            .map(|_| {
+                vec![
+                    GradPairFixed {
+                        grad: 91,
+                        hess: -37
+                    };
+                    9
+                ]
+            })
             .collect();
         let (batched, timing) = {
             let mut batched = false;
@@ -383,7 +1091,9 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
                 if session.hist_nodes_batch_capacity() > 1 || session.requires_batched_hist() {
                     batched = true;
                     let mut out_refs: Vec<_> = outputs.iter_mut().collect();
-                    session.histogram_device_batch(spans, &mut out_refs).unwrap();
+                    session
+                        .histogram_device_batch(spans, &mut out_refs)
+                        .unwrap();
                 } else {
                     // Bucket profiling disables the batched kernel; exercise the
                     // same slot sequence through the single-node fallback there.
@@ -432,7 +1142,10 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
     check_batch(
         &[0, 2, 4, 6],
         &[
-            GpuRowSpan { offset: 0, len: 128 },
+            GpuRowSpan {
+                offset: 0,
+                len: 128,
+            },
             GpuRowSpan { offset: 0, len: 0 },
             GpuRowSpan { offset: 0, len: 64 },
             GpuRowSpan { offset: 64, len: 0 },
@@ -447,14 +1160,26 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
             GpuRowSpan { offset: 96, len: 0 },
         ],
     );
-    check_batch(&[0, 1], &[GpuRowSpan { offset: 0, len: 128 }]);
+    check_batch(
+        &[0, 1],
+        &[GpuRowSpan {
+            offset: 0,
+            len: 128,
+        }],
+    );
     check_batch(
         &[0, 1, 3],
         &[
             GpuRowSpan { offset: 0, len: 32 },
             GpuRowSpan { offset: 32, len: 0 },
-            GpuRowSpan { offset: 32, len: 32 },
-            GpuRowSpan { offset: 64, len: 64 },
+            GpuRowSpan {
+                offset: 32,
+                len: 32,
+            },
+            GpuRowSpan {
+                offset: 64,
+                len: 64,
+            },
         ],
     );
 
@@ -462,8 +1187,17 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
     for offsets in [&[0, 2, 4, 6][..], &[0, 1][..], &[0, 1, 3][..]] {
         let bins = make_bins(offsets);
         let n_feats = offsets.len() - 1;
-        let span = GpuRowSpan { offset: 0, len: n_rows };
-        let mut got = vec![GradPairFixed { grad: 91, hess: -37 }; 9];
+        let span = GpuRowSpan {
+            offset: 0,
+            len: n_rows,
+        };
+        let mut got = vec![
+            GradPairFixed {
+                grad: 91,
+                hess: -37
+            };
+            9
+        ];
         let timing;
         {
             let mut session = ctx
@@ -491,11 +1225,21 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
     // correctly sized zero histogram before the next reuse of this slot.
     let offsets = [0, 2, 4];
     let bins = make_bins(&offsets);
-    let mut got = vec![GradPairFixed { grad: 91, hess: -37 }; 9];
+    let mut got = vec![
+        GradPairFixed {
+            grad: 91,
+            hess: -37
+        };
+        9
+    ];
     let timing;
     {
-        let mut session = ctx.block_session(0, &bins, n_rows, 2, &offsets, None).unwrap();
-        session.histogram_device(GpuRowSpan { offset: 0, len: 0 }, &mut got).unwrap();
+        let mut session = ctx
+            .block_session(0, &bins, n_rows, 2, &offsets, None)
+            .unwrap();
+        session
+            .histogram_device(GpuRowSpan { offset: 0, len: 0 }, &mut got)
+            .unwrap();
         timing = session.timing();
     }
     assert_eq!(got, vec![GradPairFixed::default(); 4]);
@@ -601,16 +1345,19 @@ fn atomic32_layout_is_bit_exact_when_low_word_overflows() {
                 2 => 0xFFFF_FFF0i64 - (row as i64 % 8), // 低位贴着 u32 上界
                 _ => -(0xFFFF_FFFFi64) + row as i64,
             };
-            GradPairFixed { grad, hess: big + (row as i64 * 7) }
+            GradPairFixed {
+                grad,
+                hess: big + (row as i64 * 7),
+            }
         })
         .collect();
 
     let mut cpu = vec![GradPairFixed::default(); offsets[n_feats] as usize];
     hist::build(&bins, n_rows, n_feats, &offsets, &gpair, None, &mut cpu);
     // 先确认夹具真的会溢出低 32 位,否则这个测试等于没测。
-    let overflowed = cpu.iter().any(|g| {
-        (g.grad as u64) > u32::MAX as u64 || (g.hess as u64) > u32::MAX as u64
-    });
+    let overflowed = cpu
+        .iter()
+        .any(|g| (g.grad as u64) > u32::MAX as u64 || (g.hess as u64) > u32::MAX as u64);
     assert!(overflowed, "夹具没有让低 32 位溢出,进位分支没被覆盖");
 
     for layout in SharedHistogramLayout::ALL {
@@ -679,10 +1426,8 @@ fn gpu_multi_node_batching_crosses_the_batch_boundary() {
         ..Default::default()
     };
     let cpu_cfg = TrainConfig::new(cpu_params, ferrisboost::types::Objective::Logistic);
-    let cpu = serde_json::to_vec(
-        &train(&source, &labels, &[], &cpu_cfg, &mut [], &Local).unwrap(),
-    )
-    .unwrap();
+    let cpu = serde_json::to_vec(&train(&source, &labels, &[], &cpu_cfg, &mut [], &Local).unwrap())
+        .unwrap();
 
     let off = build(Some(1));
     let split = build(Some(4)); // 16 个节点 / 4 = 4 批,跨边界
@@ -983,8 +1728,14 @@ fn streaming_block_width_changes_timing_not_the_model() {
         let a = run(narrow, rate);
         let b = run(auto_w, rate);
         let c = run(wider, rate);
-        assert_eq!(a, b, "colsample={rate}:窄({narrow}) 与 auto({auto_w}) 必须逐字节相同");
-        assert_eq!(a, c, "colsample={rate}:窄({narrow}) 与宽({wider}) 必须逐字节相同");
+        assert_eq!(
+            a, b,
+            "colsample={rate}:窄({narrow}) 与 auto({auto_w}) 必须逐字节相同"
+        );
+        assert_eq!(
+            a, c,
+            "colsample={rate}:窄({narrow}) 与宽({wider}) 必须逐字节相同"
+        );
     }
 }
 
@@ -1041,7 +1792,11 @@ fn subsample_shapes_the_tree_without_masking_predictions() {
     };
     let default_cfg = TrainConfig::new(default_params, ferrisboost::types::Objective::Logistic);
     let untouched = train(&source, &labels, &[], &default_cfg, &mut [], &Local).unwrap();
-    assert_eq!(bytes(&base), bytes(&untouched), "subsample=1.0 必须是原来的路径");
+    assert_eq!(
+        bytes(&base),
+        bytes(&untouched),
+        "subsample=1.0 必须是原来的路径"
+    );
 
     for rate in [0.5f32, 0.25] {
         // 2. CPU 与 GPU 必须选出同一批行 → 模型逐字节相同。
@@ -1181,17 +1936,23 @@ fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {
                     if (row * 17 + feat * 29) % 89 == 0 {
                         f32::NAN
                     } else {
-                        ((row * 13 + feat * 31 + row * feat) % 127) as f32 / 127.0
+                        ((row * 13 + feat * 31 + row * feat) % 251) as f32 / 251.0
                     }
                 })
             })
             .collect();
-        let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, cols_per_block);
+        let source = DenseSource::from_row_major(&data, n_rows, n_feats, 255, cols_per_block);
         let objectives = [
             (
                 ferrisboost::types::Objective::Logistic,
                 (0..n_rows)
-                    .map(|row| if (row * 11 + row / 7) % 23 < 11 { 1.0 } else { 0.0 })
+                    .map(|row| {
+                        if (row * 11 + row / 7) % 23 < 11 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect::<Vec<f32>>(),
             ),
             (
@@ -1206,21 +1967,72 @@ fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {
             let cpu = run(&source, &labels, objective, false, false, Some(2), 0.6, 0.6);
             let baseline_gpu = run(&source, &labels, objective, true, false, Some(2), 0.6, 0.6);
             let cached_gpu = run(&source, &labels, objective, true, true, Some(2), 0.6, 0.6);
-            assert_eq!(bytes(&baseline_gpu), bytes(&cpu), "uncached GPU mismatch: {n_feats} features, {objective:?}");
-            assert_eq!(bytes(&cached_gpu), bytes(&cpu), "cached GPU mismatch: {n_feats} features, {objective:?}");
-            assert_eq!(bytes(&cached_gpu), bytes(&baseline_gpu), "cache changed model: {n_feats} features, {objective:?}");
+            assert_eq!(
+                bytes(&baseline_gpu),
+                bytes(&cpu),
+                "uncached GPU mismatch: {n_feats} features, {objective:?}"
+            );
+            assert_eq!(
+                bytes(&cached_gpu),
+                bytes(&cpu),
+                "cached GPU mismatch: {n_feats} features, {objective:?}"
+            );
+            assert_eq!(
+                bytes(&cached_gpu),
+                bytes(&baseline_gpu),
+                "cache changed model: {n_feats} features, {objective:?}"
+            );
 
             // None selects the production default cap (16). At least two
             // nodes are eligible together in this fixed, grown tree shape.
             for (subsample, colsample_bytree) in [(0.6, 0.6), (1.0, 1.0)] {
-                let cpu = run(&source, &labels, objective, false, false, None, subsample, colsample_bytree);
-                let baseline_gpu = run(&source, &labels, objective, true, false, None, subsample, colsample_bytree);
-                let cached_gpu = run(&source, &labels, objective, true, true, None, subsample, colsample_bytree);
+                let cpu = run(
+                    &source,
+                    &labels,
+                    objective,
+                    false,
+                    false,
+                    None,
+                    subsample,
+                    colsample_bytree,
+                );
+                let baseline_gpu = run(
+                    &source,
+                    &labels,
+                    objective,
+                    true,
+                    false,
+                    None,
+                    subsample,
+                    colsample_bytree,
+                );
+                let cached_gpu = run(
+                    &source,
+                    &labels,
+                    objective,
+                    true,
+                    true,
+                    None,
+                    subsample,
+                    colsample_bytree,
+                );
                 assert!(max_nonleaf_width(&cached_gpu) > 1,
                     "default cap must exercise multi-node levels: features={n_feats}, {objective:?}, sampling=({subsample}, {colsample_bytree})");
-                assert_eq!(bytes(&baseline_gpu), bytes(&cpu), "uncached default-cap GPU mismatch: {n_feats} features, {objective:?}");
-                assert_eq!(bytes(&cached_gpu), bytes(&cpu), "cached default-cap GPU mismatch: {n_feats} features, {objective:?}");
-                assert_eq!(bytes(&cached_gpu), bytes(&baseline_gpu), "default-cap cache changed model: {n_feats} features, {objective:?}");
+                assert_eq!(
+                    bytes(&baseline_gpu),
+                    bytes(&cpu),
+                    "uncached default-cap GPU mismatch: {n_feats} features, {objective:?}"
+                );
+                assert_eq!(
+                    bytes(&cached_gpu),
+                    bytes(&cpu),
+                    "cached default-cap GPU mismatch: {n_feats} features, {objective:?}"
+                );
+                assert_eq!(
+                    bytes(&cached_gpu),
+                    bytes(&baseline_gpu),
+                    "default-cap cache changed model: {n_feats} features, {objective:?}"
+                );
             }
         }
     }
@@ -1256,6 +2068,8 @@ fn max_nonleaf_width(model: &ferrisboost::tree::Model) -> usize {
 /// Capacity pressure, residency choices, and host fallbacks must preserve the
 /// same exact model. Depth 8 grows past the cache's two-node capacity; cap 1
 /// disables cache storage, and zero residency exercises the streaming path.
+// Preserve the deterministic hash mask used to seed missing values.
+#[allow(clippy::manual_is_multiple_of)]
 #[test]
 fn gpu_split_cache_capacity_and_residency_fallbacks_are_exact() {
     let n_rows = 768usize;
@@ -1267,15 +2081,21 @@ fn gpu_split_cache_capacity_and_residency_fallbacks_are_exact() {
                 if (row * 19 + feat * 23) % 83 == 0 {
                     f32::NAN
                 } else {
-                    ((row * 11 + feat * 37 + row * feat) % 113) as f32 / 113.0
+                    ((row * 11 + feat * 37 + row * feat) % 251) as f32 / 251.0
                 }
             })
         })
         .collect();
     let labels: Vec<f32> = (0..n_rows)
-        .map(|row| if (row * 5 + row / 9) % 29 < 14 { 1.0 } else { 0.0 })
+        .map(|row| {
+            if (row * 5 + row / 9) % 29 < 14 {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect();
-    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, cols_per_block);
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 255, cols_per_block);
     let bytes = |m: &ferrisboost::tree::Model| serde_json::to_vec(m).unwrap();
 
     let run = |cache: bool,
@@ -1311,18 +2131,182 @@ fn gpu_split_cache_capacity_and_residency_fallbacks_are_exact() {
     let full_resident = bytes(&run(true, 2, Some(2), 1, exact));
     let cap_one_fallback = bytes(&run(true, 2, Some(1), 1, exact));
     let four_threads = bytes(&run(true, 2, Some(2), 4, exact));
-    assert_eq!(no_resident, baseline, "cache enabled with no resident blocks changed the model");
-    assert_eq!(partial_resident, baseline, "partial residency changed the model");
-    assert_eq!(full_resident, baseline, "full residency or capacity overflow changed the model");
-    assert_eq!(cap_one_fallback, bytes(&run(false, 2, Some(1), 1, exact)), "capacity-one fallback changed the model");
+    assert_eq!(
+        no_resident, baseline,
+        "cache enabled with no resident blocks changed the model"
+    );
+    assert_eq!(
+        partial_resident, baseline,
+        "partial residency changed the model"
+    );
+    assert_eq!(
+        full_resident, baseline,
+        "full residency or capacity overflow changed the model"
+    );
+    assert_eq!(
+        cap_one_fallback,
+        bytes(&run(false, 2, Some(1), 1, exact)),
+        "capacity-one fallback changed the model"
+    );
     assert_eq!(four_threads, baseline, "nthread=4 changed the cached model");
+
+    // Exercise overflow of the production default (16-node) cache with every
+    // row and column eligible. This tree shape must produce a level wider than
+    // the cache; beyond that capacity the existing host split path remains the
+    // exact fallback.
+    let full_n_rows = 4_096usize;
+    let full_n_feats = 30usize;
+    let full_data: Vec<f32> = (0..full_n_rows)
+        .flat_map(|row| {
+            (0..full_n_feats).map(move |feat| {
+                let mut hash = (row as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add((feat as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+                hash ^= hash >> 30;
+                hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                hash ^= hash >> 27;
+                hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+                hash ^= hash >> 31;
+                if hash % 83 == 0 {
+                    f32::NAN
+                } else {
+                    ((hash >> 32) % 251) as f32
+                }
+            })
+        })
+        .collect();
+    let full_labels: Vec<f32> = (0..full_n_rows)
+        .map(|row| {
+            let mut hash = (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            hash ^= hash >> 30;
+            hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            hash ^= hash >> 27;
+            hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+            hash ^= hash >> 31;
+            (hash & 1) as f32
+        })
+        .collect();
+    let full_source = DenseSource::from_row_major(&full_data, full_n_rows, full_n_feats, 255, 16);
+    let full_sample = |cache: bool| {
+        let params = ferrisboost::types::TrainParams {
+            n_rounds: 3,
+            max_depth: 8,
+            min_child_weight: 1.0,
+            nthread: 1,
+            subsample: 1.0,
+            colsample_bytree: 1.0,
+            seed: 147,
+            resident_blocks: Some(2),
+            gpu_split_cache: cache,
+            ..Default::default()
+        };
+        let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
+        train_gpu(0, &full_source, &full_labels, &[], &cfg, &mut [], &Local).unwrap()
+    };
+    let default_cap_baseline = full_sample(false);
+    let default_cap_cached = full_sample(true);
+    assert!(
+        max_nonleaf_width(&default_cap_cached) > 16,
+        "full-sample fallback fixture must exceed the default 16-node cache"
+    );
+    assert_eq!(
+        bytes(&default_cap_cached),
+        bytes(&default_cap_baseline),
+        "default-capacity overflow fallback changed the full-sample model"
+    );
 
     let fast = ferrisboost::types::GpuMath::Fast;
     let fast_baseline = bytes(&run(false, 2, None, 1, fast));
     let fast_cached = bytes(&run(true, 2, None, 1, fast));
     let fast_cached_repeat = bytes(&run(true, 2, None, 1, fast));
-    assert_eq!(fast_cached, fast_baseline, "fast cached path changed the baseline model");
-    assert_eq!(fast_cached_repeat, fast_cached, "fast cached path must remain deterministic");
+    assert_eq!(
+        fast_cached, fast_baseline,
+        "fast cached path changed the baseline model"
+    );
+    assert_eq!(
+        fast_cached_repeat, fast_cached,
+        "fast cached path must remain deterministic"
+    );
+}
+
+/// Enabling the resident split cache by default must preserve the established
+/// uncached model for the same deterministic sampled training fixture.
+#[test]
+fn gpu_split_cache_default_preserves_exact_and_fast_models() {
+    use ferrisboost::types::{GpuMath, Objective, TrainParams};
+
+    assert!(
+        TrainParams::default().gpu_split_cache,
+        "the untouched training parameter default must enable the split cache"
+    );
+
+    let n_rows = 768usize;
+    let n_feats = 30usize;
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 19 + feat * 23) % 83 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 11 + feat * 37 + row * feat) % 251) as f32 / 251.0
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| {
+            if (row * 5 + row / 9) % 29 < 14 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 255, 16);
+    assert_eq!(
+        source.n_blocks(),
+        2,
+        "fixture should use physical blocks [16, 14]"
+    );
+
+    let run = |gpu: bool, gpu_math: GpuMath, cache: Option<bool>| {
+        let mut params = TrainParams {
+            n_rounds: 3,
+            max_depth: 8,
+            nthread: 1,
+            subsample: 0.6,
+            colsample_bytree: 0.6,
+            seed: 91,
+            resident_blocks: Some(2),
+            gpu_math,
+            ..Default::default()
+        };
+        if let Some(enabled) = cache {
+            params.gpu_split_cache = enabled;
+        }
+        let cfg = TrainConfig::new(params, Objective::Logistic);
+        if gpu {
+            train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap()
+        } else {
+            train(&source, &labels, &[], &cfg, &mut [], &Local).unwrap()
+        }
+    };
+    let bytes = |model: &ferrisboost::tree::Model| serde_json::to_vec(model).unwrap();
+
+    let exact_default = run(true, GpuMath::Exact, None);
+    let exact_uncached_gpu = run(true, GpuMath::Exact, Some(false));
+    let exact_cpu = run(false, GpuMath::Exact, None);
+    assert_eq!(bytes(&exact_default), bytes(&exact_uncached_gpu));
+    assert_eq!(bytes(&exact_default), bytes(&exact_cpu));
+
+    let fast_default = bytes(&run(true, GpuMath::Fast, None));
+    let fast_default_repeat = bytes(&run(true, GpuMath::Fast, None));
+    let fast_uncached = bytes(&run(true, GpuMath::Fast, Some(false)));
+    assert_eq!(fast_default, fast_uncached);
+    assert_eq!(
+        fast_default, fast_default_repeat,
+        "fast default path must remain deterministic"
+    );
 }
 
 /// Cache accounting follows the allocations actually enabled by a resident
@@ -1357,14 +2341,53 @@ fn gpu_split_cache_bytes_match_allocations_and_activation_rules() {
         .unwrap()
     };
 
+    let make_default_ctx = |resident: usize, cap: usize| {
+        GpuTrainCtx::new(
+            0,
+            n_rows,
+            max_feats,
+            max_hist_bins,
+            n_blocks,
+            128,
+            SharedHistogramConfig {
+                runtime_log: false,
+                resident_blocks: Some(resident),
+                hist_nodes_per_batch: Some(cap),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap()
+    };
+
     assert_eq!(make_ctx(true, 0, 2).budget().split_cache_bytes, 0);
     assert_eq!(make_ctx(true, 2, 1).budget().split_cache_bytes, 0);
-    let expected_per_slot = max_hist_bins * 16 * 2 * 2
-        + max_feats * (2 * 64 + 8)
-        + 2 * 96;
-    assert_eq!(
-        make_ctx(true, 2, 2).budget().split_cache_bytes,
-        2 * expected_per_slot,
-        "budget must include two histogram generations, feature candidates, packets, sums, metadata, and feature masks"
+    assert!(SharedHistogramConfig::default().gpu_split_cache);
+    assert_eq!(make_default_ctx(0, 2).budget().split_cache_bytes, 0);
+    assert_eq!(make_default_ctx(2, 1).budget().split_cache_bytes, 0);
+    let expected_per_slot =
+        max_hist_bins * 16 * 2 * 2 + max_feats * (2 * 64 + 8) + 2 * (32 + 64 * 2);
+    let bucket_profile = matches!(
+        std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
+        Ok("1") | Ok("true")
     );
+    if bucket_profile {
+        assert_eq!(
+            make_ctx(true, 2, 2).budget().split_cache_bytes,
+            0,
+            "bucket profiling deliberately disables the split cache to isolate histogram buckets"
+        );
+        assert_eq!(make_default_ctx(2, 2).budget().split_cache_bytes, 0);
+    } else {
+        assert_eq!(
+            make_ctx(true, 2, 2).budget().split_cache_bytes,
+            2 * expected_per_slot,
+            "budget must include two histogram generations, feature candidates, packets, sums, metadata, and feature masks"
+        );
+        assert_eq!(
+            make_default_ctx(2, 2).budget().split_cache_bytes,
+            2 * expected_per_slot,
+            "default config budget must account for the same enabled split-cache allocations"
+        );
+    }
 }

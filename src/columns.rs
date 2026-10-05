@@ -61,8 +61,14 @@ impl BinCuts {
             Some(values.len()),
             "cuts offsets 末尾必须等于 values 长度"
         );
-        assert!(offsets.windows(2).all(|w| w[0] <= w[1]), "cuts offsets 必须单调不减");
-        assert!(values.iter().all(|v| v.is_finite()), "cuts 必须全部是有限值");
+        assert!(
+            offsets.windows(2).all(|w| w[0] <= w[1]),
+            "cuts offsets 必须单调不减"
+        );
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "cuts 必须全部是有限值"
+        );
         let n_feats = offsets.len().saturating_sub(1);
         let mut hist_offsets = Vec::with_capacity(n_feats + 1);
         let mut acc = 0u32;
@@ -71,11 +77,20 @@ impl BinCuts {
             // 该特征的 bin 数 = 切分点数 + 1
             let n_cuts = offsets[f + 1] - offsets[f];
             let cuts = &values[offsets[f] as usize..offsets[f + 1] as usize];
-            assert!(cuts.windows(2).all(|w| w[0] < w[1]), "每个特征的 cuts 必须严格递增");
-            acc = acc.checked_add(n_cuts + 1).expect("直方图总 bin 数超过 u32");
+            assert!(
+                cuts.windows(2).all(|w| w[0] < w[1]),
+                "每个特征的 cuts 必须严格递增"
+            );
+            acc = acc
+                .checked_add(n_cuts + 1)
+                .expect("直方图总 bin 数超过 u32");
             hist_offsets.push(acc);
         }
-        Self { values, offsets, hist_offsets }
+        Self {
+            values,
+            offsets,
+            hist_offsets,
+        }
     }
 
     /// 直方图的总长度(所有特征的 bin 数之和)。
@@ -121,7 +136,7 @@ impl BinCuts {
         offsets
     }
 
-        /// 从 XGBoost 的 `QuantileDMatrix.get_quantile_cut()` 转过来。
+    /// 从 XGBoost 的 `QuantileDMatrix.get_quantile_cut()` 转过来。
     ///
     /// **两边的表示不一样,别直接塞。** XGBoost 给的是 bin **边界**:
     /// 每个特征前面有一个 `-inf`,后面有一个比最大值还大的哨兵。
@@ -259,8 +274,8 @@ mod auto_block_tests {
     #[test]
     fn cache_bound_wins_when_alignment_would_make_blocks_too_wide() {
         let cols = auto_cols_per_block(300, 1, 255);
+        assert!(cols > 0, "column blocking must produce nonempty blocks");
         assert!(cols <= 64, "300 列一块的直方图有 1.2 MB,不能选它:{cols}");
-        assert_eq!(300_usize.div_ceil(cols) % 1, 0);
     }
 
     /// 窄数据:28 列 8 线程,应当切得足够细才能喂满线程。

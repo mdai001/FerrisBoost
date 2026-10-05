@@ -104,9 +104,13 @@ impl Callback for PyCallback {
 /// 否则自动选择一旦选错,现场根本看不出来是谁定的。
 #[derive(Clone, Copy, Debug)]
 struct BlockingPlan {
+    #[allow(dead_code)]
+    // Retain requested/resolved diagnostic metadata alongside execution geometry.
     requested: Option<usize>,
     effective: usize,
+    #[allow(dead_code)] // Retained plan metadata; not every path consumes it yet.
     n_blocks: usize,
+    #[allow(dead_code)] // Retained plan metadata; not every path consumes it yet.
     nthread: usize,
     /// 显存规划器解出来的 stream 数 / 常驻块数。
     ///
@@ -241,11 +245,19 @@ fn resolve_blocking(
                         true,
                         32 * 1024 * 1024,
                     );
-                    if cfg.params.gpu_split_cache && !matches!(
-                        std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(), Ok("1") | Ok("true")) {
-                        model.with_resident_split_cache(max_bin,
-                            cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64)
-                    } else { model }
+                    if cfg.params.gpu_split_cache
+                        && !matches!(
+                            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
+                            Ok("1") | Ok("true")
+                        )
+                    {
+                        model.with_resident_split_cache(
+                            max_bin,
+                            cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
+                        )
+                    } else {
+                        model
+                    }
                 },
             )
             .map_err(to_py_err)?;
@@ -326,11 +338,17 @@ fn resolved_ingest_workers(
         paths.len().max(feature_blocks)
     };
     let bytes_per_worker = if fmt == "parquet" {
-        // One decoded Arrow batch plus conversion/quantization scratch.
+        // One decoded Arrow batch, conversion scratch, and the maximum bounded
+        // dense-projection Parquet read window. Sparse readers do not allocate it.
         n_features
             .saturating_mul(8192)
             .saturating_mul(8)
             .saturating_add(16 * 1024 * 1024)
+            .saturating_add(if n_features >= 256 {
+                crate::source::parquet_source::PARQUET_READ_WINDOW_BYTES
+            } else {
+                0
+            })
     } else {
         // Bounded record chunk, parsed Arrow arrays, and channel slack.
         crate::source::csv_source::CSV_CHUNK_BYTES
@@ -734,6 +752,26 @@ fn parallel_model_read(path: &str, requested: usize, quiet: bool) -> anyhow::Res
     })?;
     reporter.complete();
     Ok(bytes)
+}
+
+// Detached model I/O carries native errors only. Python exceptions are built
+// after reattachment, preserving the existing exception classes/messages.
+enum ModelIoError {
+    Runtime(String),
+    Value(String),
+    FileNotFound(String),
+}
+
+impl From<ModelIoError> for PyErr {
+    fn from(error: ModelIoError) -> Self {
+        match error {
+            ModelIoError::Runtime(message) => PyRuntimeError::new_err(message),
+            ModelIoError::Value(message) => PyValueError::new_err(message),
+            ModelIoError::FileNotFound(message) => {
+                pyo3::exceptions::PyFileNotFoundError::new_err(message)
+            }
+        }
+    }
 }
 
 /// 启发式必须按**真正会起来的线程数**算,所以直接复用建线程池那一套
@@ -1436,6 +1474,7 @@ impl PyModel {
     /// * 二维 f32 numpy 数组 —— 仍然支持,小数据方便。
     ///
     /// 两条都返回一维 `numpy.ndarray`。
+    #[allow(clippy::too_many_arguments)] // Public Python keyword API must remain unchanged.
     fn predict<'py>(
         &self,
         py: Python<'py>,
@@ -1581,6 +1620,7 @@ impl PyModel {
     /// 因为选列是按模型的特征名单来的,不是"除某列外全要"。
     #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, use_gpu=false))]
+    #[allow(clippy::too_many_arguments)] // Keep the installed public keyword API stable.
     fn predict_files<'py>(
         &self,
         py: Python<'py>,
@@ -1760,6 +1800,7 @@ impl PyModel {
     /// Parquet encoding/output with the next ingest/score batch.
     #[pyo3(signature = (data, output_path, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, prediction_column="prediction"))]
+    #[allow(clippy::too_many_arguments)] // Public output/lifecycle options are independently specified.
     fn predict_to_parquet(
         &self,
         py: Python<'_>,
@@ -1794,19 +1835,23 @@ impl PyModel {
     #[pyo3(signature = (path, quiet=None, model_io_threads=None))]
     fn save_model(
         &self,
+        py: Python<'_>,
         path: &str,
         quiet: Option<bool>,
         model_io_threads: Option<usize>,
     ) -> PyResult<()> {
         let quiet = quiet.unwrap_or(self.quiet);
         let requested = model_io_threads.unwrap_or(self.model_io_threads);
+        let inner = &self.inner;
         guard(|| {
-            let json = self
-                .inner
-                .to_xgboost_json_with_threads(requested)
-                .map_err(|e| PyRuntimeError::new_err(format!("导出失败:{e}")))?;
-            parallel_model_write(path, json.as_bytes(), requested, quiet)
-                .map_err(|e| PyValueError::new_err(format!("写不了 {path}:{e}")))
+            py.detach(|| -> Result<(), ModelIoError> {
+                let json = inner
+                    .to_xgboost_json_with_threads(requested)
+                    .map_err(|e| ModelIoError::Runtime(format!("导出失败:{e}")))?;
+                parallel_model_write(path, json.as_bytes(), requested, quiet)
+                    .map_err(|e| ModelIoError::Value(format!("写不了 {path}:{e}")))
+            })
+            .map_err(PyErr::from)
         })
     }
 
@@ -1814,25 +1859,30 @@ impl PyModel {
     #[staticmethod]
     #[pyo3(signature = (path, quiet=false, model_io_threads=0, ingest_threads=0))]
     fn load_model(
+        py: Python<'_>,
         path: &str,
         quiet: bool,
         model_io_threads: usize,
         ingest_threads: usize,
     ) -> PyResult<Self> {
         guard(|| {
-            let raw = parallel_model_read(path, model_io_threads, quiet).map_err(|e| {
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                {
-                    pyo3::exceptions::PyFileNotFoundError::new_err(format!("{path} 不存在"))
-                } else {
-                    PyValueError::new_err(format!("读不了 {path}:{e}"))
-                }
-            })?;
-            let raw = String::from_utf8(raw)
-                .map_err(|e| PyValueError::new_err(format!("{path} 不是 UTF-8 JSON:{e}")))?;
-            let inner = Model::from_xgboost_json_with_threads(&raw, model_io_threads)
-                .map_err(|e| PyValueError::new_err(format!("{path} 解析失败:{e}")))?;
+            let inner = py
+                .detach(|| -> Result<Model, ModelIoError> {
+                    let raw = parallel_model_read(path, model_io_threads, quiet).map_err(|e| {
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            ModelIoError::FileNotFound(format!("{path} 不存在"))
+                        } else {
+                            ModelIoError::Value(format!("读不了 {path}:{e}"))
+                        }
+                    })?;
+                    let raw = String::from_utf8(raw)
+                        .map_err(|e| ModelIoError::Value(format!("{path} 不是 UTF-8 JSON:{e}")))?;
+                    Model::from_xgboost_json_with_threads(&raw, model_io_threads)
+                        .map_err(|e| ModelIoError::Value(format!("{path} 解析失败:{e}")))
+                })
+                .map_err(PyErr::from)?;
             Ok(Self {
                 inner,
                 history: Vec::new(),
@@ -1951,14 +2001,21 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         let cap = match requested_hist_cap {
             Some(cap) => cap,
             None => match std::env::var("FB_HIST_NODES_PER_BATCH") {
-                Ok(v) => v.trim().parse::<usize>().map_err(|_| PyValueError::new_err(
-                    "FB_HIST_NODES_PER_BATCH must be an integer"))?,
+                Ok(v) => v.trim().parse::<usize>().map_err(|_| {
+                    PyValueError::new_err("FB_HIST_NODES_PER_BATCH must be an integer")
+                })?,
                 Err(_) => 16,
             },
         };
-        if !(1..=32).contains(&cap) { return Err(PyValueError::new_err("hist_nodes_per_batch must be in 1..=32")); }
+        if !(1..=32).contains(&cap) {
+            return Err(PyValueError::new_err(
+                "hist_nodes_per_batch must be in 1..=32",
+            ));
+        }
         Some(cap)
-    } else { requested_hist_cap };
+    } else {
+        requested_hist_cap
+    };
     let objective = match objective.as_str() {
         "binary:logistic" => Objective::Logistic,
         "reg:squarederror" => Objective::SquaredError,
@@ -1987,9 +2044,13 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             hist_streams: get!("hist_streams"),
             resident_blocks: get!("resident_blocks"),
             hist_nodes_per_batch: hist_cap,
-            // Resolve once: planner and runtime must see the same opt-in.
+            // Resolve once: planner and runtime must see the same default and
+            // explicit override. An unset variable enables the bounded cache;
+            // a present non-true value (including empty) disables it.
             gpu_split_cache: std::env::var("FB_GPU_SPLIT_CACHE")
-                .is_ok_and(|v| matches!(v.trim(), "1" | "true")),
+                .map_or(crate::types::DEFAULT_GPU_SPLIT_CACHE, |v| {
+                    matches!(v.trim(), "1" | "true")
+                }),
             gpu_memory_budget: get!("gpu_memory_budget"),
             gpu_math: {
                 let raw: Option<String> = get!("gpu_math");
@@ -2031,6 +2092,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
 }
 
 /// 组装 callbacks:早停和 verbose 在 Rust 侧,用户的函数包一层。
+#[allow(clippy::type_complexity)] // Callback ownership and the shared history handle are returned together.
 fn build_callbacks(
     early_stopping_rounds: Option<usize>,
     verbose_eval: Option<usize>,
@@ -2429,18 +2491,24 @@ fn train_file(
     // 一个入口同时吃单文件和多文件:调用方给的是**已经解析好的路径列表**,
     // 单文件只是 `len() == 1` 的退化情况,不需要第二条代码路径。
     let max_bin = cfg.params.max_bin;
+    let ingest_quiet = cfg.quiet;
     let open_paths = |ps: &[std::path::PathBuf],
                       cuts: Option<crate::columns::BinCuts>,
                       first_csv_schema: Option<arrow::datatypes::SchemaRef>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         match fmt {
-            "parquet" => parquet_source::open_many_with_nthread(
+            "parquet" => parquet_source::open_many_observed(
                 ps,
                 label,
                 cuts,
                 max_bin,
                 cols_per_block,
                 ingest_threads,
+                |phase, readers, transforms| {
+                    if !ingest_quiet {
+                        eprintln!("INGEST_PLAN phase={phase} reader_slots={readers} transform_threads={transforms} inline_reader={} total_budget={ingest_threads}", readers == 1);
+                    }
+                },
             ),
             "csv" => match first_csv_schema {
                 Some(schema) => csv_source::open_many_with_header_and_nthread_prepared(
@@ -2508,13 +2576,18 @@ fn train_file(
             budget_bytes: cfg.cache_budget_bytes,
             path: cfg.cache_path.as_ref().map(std::path::PathBuf::from),
         };
-        let (src, labels) = ParquetBlockSource::open_with_cache_and_nthread(
+        let (src, labels) = ParquetBlockSource::open_with_cache_observed(
             path,
             label,
             cfg.params.max_bin,
             cfg.params.cols_per_block,
             cache_options,
             ingest_threads,
+            |phase, readers, transforms| {
+                if !ingest_quiet {
+                    eprintln!("INGEST_PLAN phase={phase} reader_slots={readers} transform_threads={transforms} inline_reader={} total_budget={ingest_threads}", readers == 1);
+                }
+            },
         )
         .map_err(to_py_err)?;
         ingest_reporter.complete(src.n_rows());

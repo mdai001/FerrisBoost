@@ -26,7 +26,14 @@ class Model:
         predict_threads: int = 0,
         use_gpu: bool = False,
     ) -> NDArray[np.float32]:
-        """从二维数组或文件路径预测；无表头 CSV 传 header=False。"""
+        """Return ordered 1-D float32 predictions from an array or path specs.
+
+        File inputs accept PathLike, lists, directories, and globs. Pass
+        header=False for headerless CSV. All trees are used unless n_trees is
+        set; output_margin=True returns raw scores. predict_threads=0 selects
+        auto CPU workers. use_gpu=True permits GPU 0 scoring in CUDA builds,
+        with CPU selection for batches where GPU overhead is not worthwhile.
+        """
         ...
     def predict_to_parquet(
         self,
@@ -38,15 +45,28 @@ class Model:
         *,
         predict_threads: int = 0,
         prediction_column: str = "prediction",
-    ) -> int: ...
+    ) -> int:
+        """CPU-score file inputs and write ordered float32 predictions to Parquet.
+
+        The target must not exist. Return the number of rows written.
+        """
+        ...
     def save_model(
         self, path: str, quiet: bool | None = None, model_io_threads: int | None = None
-    ) -> None: ...
+    ) -> None:
+        """Save XGBoost-compatible JSON using the model's thread setting by default.
+
+        model_io_threads=None inherits the model setting; zero selects auto
+        workers. JSON serialization remains serial.
+        """
+        ...
     @staticmethod
     def load_model(
         path: str, quiet: bool = False, model_io_threads: int = 0,
         ingest_threads: int = 0,
-    ) -> Model: ...
+    ) -> Model:
+        """Load XGBoost-compatible JSON; zero thread counts select auto workers, while JSON parsing remains serial."""
+        ...
     def evals_result(self) -> dict[str, dict[str, list[float]]]: ...
 
 def train_dense(
@@ -57,7 +77,9 @@ def train_dense(
     early_stopping_rounds: int | None = ...,
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
-) -> Model: ...
+) -> Model:
+    """Train a dense model; early stopping needs evals and retains all trained trees."""
+    ...
 def train_file(
     path: Sequence[str],
     label: str | int,
@@ -67,4 +89,6 @@ def train_file(
     early_stopping_rounds: int | None = ...,
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
-) -> Model: ...
+) -> Model:
+    """Train from files; early stopping needs evals and retains all trained trees."""
+    ...

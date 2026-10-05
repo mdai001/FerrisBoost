@@ -166,7 +166,7 @@ fn sibling_groups() -> Option<usize> {
         let list = std::fs::read_to_string(path.join("topology/thread_siblings_list")).ok()?;
         groups.insert(list.trim().to_owned());
     }
-    (!groups.is_empty()).then(|| groups.len())
+    (!groups.is_empty()).then_some(groups.len())
 }
 
 /// 兜底:`/proc/cpuinfo` 里按 `(physical id, core id)` 去重。
@@ -194,7 +194,7 @@ fn cpuinfo_core_ids() -> Option<usize> {
     if let (Some(p), Some(c)) = (pkg, core) {
         seen.insert((p, c));
     }
-    (!seen.is_empty()).then(|| seen.len())
+    (!seen.is_empty()).then_some(seen.len())
 }
 
 pub(crate) fn build_pool(nthread: usize) -> anyhow::Result<rayon::ThreadPool> {

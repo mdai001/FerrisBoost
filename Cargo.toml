@@ -1,6 +1,6 @@
 [package]
 name = "ferrisboost"
-version = "0.0.2-post2"
+version = "0.0.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Column-blocked gradient boosted trees that train directly from Arrow / Parquet / CSV"
@@ -31,6 +31,7 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 blake3 = "1"
+bytes = "1"
 # `.csv.gz` 输入。parquet 已经把它拉进依赖树了,所以这里是零新增编译成本。
 flate2 = "1"
 pyo3 = { version = "0.29.2", default-features = false, features = ["abi3-py39", "macros"], optional = true }

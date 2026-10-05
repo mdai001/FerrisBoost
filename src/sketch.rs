@@ -170,6 +170,8 @@ impl FeatureSketch {
     ///
     /// 语义和 XGBoost 一致:cut 是**上界**,值 v 落入的 bin 是第一个
     /// 满足 v < cuts[i] 的 i;都不满足则落入最后一个 bin。
+    // Keep the current closure form until the crate's supported Rust version is explicit.
+    #[allow(clippy::unnecessary_map_or)]
     pub fn cuts(&mut self, max_bins: usize) -> Vec<f32> {
         let n_cuts = max_bins.saturating_sub(1);
         if n_cuts == 0 {
@@ -380,7 +382,11 @@ impl SketchSet {
     }
 
     pub fn push_row(&mut self, row: &[f32], weight: f32) {
-        assert_eq!(row.len(), self.per_feat.len(), "row 的特征数和 sketch 不一致");
+        assert_eq!(
+            row.len(),
+            self.per_feat.len(),
+            "row 的特征数和 sketch 不一致"
+        );
         for (sk, &v) in self.per_feat.iter_mut().zip(row) {
             sk.push(v, weight);
         }
@@ -405,7 +411,11 @@ impl SketchSet {
     }
 
     pub fn merge(&mut self, other: &SketchSet) {
-        assert_eq!(self.per_feat.len(), other.per_feat.len(), "合并的 sketch 特征数不一致");
+        assert_eq!(
+            self.per_feat.len(),
+            other.per_feat.len(),
+            "合并的 sketch 特征数不一致"
+        );
         for (a, b) in self.per_feat.iter_mut().zip(&other.per_feat) {
             a.merge(b);
         }
@@ -470,7 +480,7 @@ mod tests {
             sk.push(i as f32 / n as f32, 1.0);
         }
         let cuts = sk.cuts(max_bins);
-        assert!(cuts.len() <= max_bins - 1);
+        assert!(cuts.len() < max_bins);
         let e = max_quantile_err(&cuts, max_bins);
         assert!(e < 0.02, "有序输入分位误差 {e}");
     }
@@ -542,7 +552,12 @@ mod tests {
         }
         let cu = unweighted.cuts(8);
         let cw = weighted.cuts(8);
-        assert!(cw[3] > cu[3], "加权后中位数应该更大: {} vs {}", cw[3], cu[3]);
+        assert!(
+            cw[3] > cu[3],
+            "加权后中位数应该更大: {} vs {}",
+            cw[3],
+            cu[3]
+        );
     }
 
     #[test]

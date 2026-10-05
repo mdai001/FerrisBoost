@@ -1,7 +1,12 @@
 //! Bounded, per-resident-block split state. No device allocations occur at a level.
 use super::*;
+use crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES;
 use crate::split::SplitCandidate;
 use crate::types::{FeatId, TrainParams};
+
+#[cfg(test)]
+#[path = "packet_tests.rs"]
+mod packet_tests;
 
 pub(super) struct ResidentSplitBuffers {
     previous: CudaSlice<i64>,
@@ -18,6 +23,7 @@ pub(super) struct ResidentSplitBuffers {
     next_ids: Vec<(usize, usize)>,
     depth: Option<u32>,
     layout: Vec<u32>,
+    features_ready: bool,
 }
 
 impl ResidentSplitBuffers {
@@ -31,7 +37,7 @@ impl ResidentSplitBuffers {
             previous: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             next: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             candidates: stream.alloc_zeros::<u8>((feats * cap * 64).max(1))?,
-            packets: stream.alloc_zeros::<u8>(cap * 64)?,
+            packets: stream.alloc_zeros::<u8>(cap * 64 * SPLIT_PACKET_WINDOW_BATCHES)?,
             sums: stream.alloc_zeros::<i64>(cap * 2)?,
             metadata: stream.alloc_zeros::<u32>(cap * 4)?,
             feats: stream.alloc_zeros::<u32>(feats.max(1))?,
@@ -42,6 +48,7 @@ impl ResidentSplitBuffers {
             next_ids: Vec::with_capacity(cap),
             depth: None,
             layout: Vec::new(),
+            features_ready: false,
         })
     }
 }
@@ -55,25 +62,37 @@ pub(crate) struct GpuSplitGroup {
 }
 pub(crate) type GpuSplitResult = (usize, Option<SplitCandidate>, Option<Vec<GradPairFixed>>);
 
+struct PendingSplitBatch {
+    indices: Vec<usize>,
+    working_slots: Vec<usize>,
+    cached: Vec<bool>,
+}
+
 impl GpuBlockSession<'_> {
     pub(crate) fn begin_split_level(&mut self, depth: u32) -> Result<bool> {
         if self.n_feats == 0 || self.n_hist == 0 {
             return Ok(false);
         }
         let slot = self.slot.as_mut().expect("histogram slot lease missing");
-        let Some(cache) = slot.split_cache.as_mut() else {
+        let super::GpuHistBuffers {
+            split_cache,
+            offsets_host,
+            ..
+        } = &mut **slot;
+        let Some(cache) = split_cache.as_mut() else {
             return Ok(false);
         };
         if depth == 0 {
             cache.previous_ids.clear();
-            cache.layout.clone_from(&self.feat_offsets);
+            cache.layout.clone_from(offsets_host);
+            cache.features_ready = false;
         } else {
             anyhow::ensure!(
                 cache.depth == Some(depth - 1),
                 "GPU split cache generation mismatch"
             );
             anyhow::ensure!(
-                cache.layout == self.feat_offsets,
+                cache.layout == *offsets_host,
                 "GPU split cache layout changed within a tree"
             );
         }
@@ -81,15 +100,22 @@ impl GpuBlockSession<'_> {
         Ok(true)
     }
 
-    pub(crate) fn cached_parent_slot(&self, parent: usize) -> Option<usize> {
-        self.slot
+    pub(crate) fn cached_parent_slot(&mut self, parent: usize) -> Option<usize> {
+        let found = self
+            .slot
             .as_ref()?
             .split_cache
             .as_ref()?
             .previous_ids
             .iter()
             .find(|(id, _)| *id == parent)
-            .map(|(_, slot)| *slot)
+            .map(|(_, slot)| *slot);
+        if found.is_some() {
+            self.timing.cache_parent_hits += 1;
+        } else {
+            self.timing.cache_parent_misses += 1;
+        }
+        found
     }
 
     pub(crate) fn finish_split_level(&mut self, depth: u32) {
@@ -116,13 +142,68 @@ impl GpuBlockSession<'_> {
         p: &TrainParams,
         keep_next: bool,
     ) -> Result<Vec<GpuSplitResult>> {
+        let cap = self.ctx.hist_nodes_per_batch;
+        let mut pending = Vec::with_capacity(SPLIT_PACKET_WINDOW_BATCHES);
+        let mut packet_nodes = 0;
+        let mut results = Vec::new();
+        for chunk in groups.chunks((cap / 2).max(1)) {
+            let nodes: usize = chunk
+                .iter()
+                .map(|g| 1 + usize::from(g.large.is_some()))
+                .sum();
+            let cache = self
+                .slot
+                .as_ref()
+                .and_then(|s| s.split_cache.as_ref())
+                .context("resident split cache unavailable")?;
+            let spills = keep_next && cache.next_ids.len() + nodes > cache.capacity;
+            // An uncached histogram lives in reusable hist_out: collect before
+            // another producer can overwrite it. Cached winners need only packets.
+            if spills && !pending.is_empty() {
+                results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
+                pending.clear();
+                packet_nodes = 0;
+            }
+            pending.push(self.submit_split_cached_batch(
+                chunk,
+                feats,
+                sampled,
+                q,
+                p,
+                keep_next,
+                packet_nodes,
+            )?);
+            packet_nodes += nodes;
+            if spills || pending.len() == SPLIT_PACKET_WINDOW_BATCHES {
+                results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
+                pending.clear();
+                packet_nodes = 0;
+            }
+        }
+        if !pending.is_empty() {
+            results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
+        }
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit packet offsets and feature identities prevent routing ambiguity.
+    fn submit_split_cached_batch(
+        &mut self,
+        groups: &[GpuSplitGroup],
+        feats: &[FeatId],
+        sampled: Option<&[FeatId]>,
+        q: &GradQuantizer,
+        p: &TrainParams,
+        keep_next: bool,
+        packet_offset: usize,
+    ) -> Result<PendingSplitBatch> {
         anyhow::ensure!(!groups.is_empty(), "empty GPU split batch");
         anyhow::ensure!(
             feats.len() == self.n_feats,
             "GPU split feature shape mismatch"
         );
         anyhow::ensure!(
-            self.feat_offsets.windows(2).all(|x| x[1] - x[0] <= 255),
+            self.feat_offsets().windows(2).all(|x| x[1] - x[0] <= 255),
             "GPU split requires at most 255 bins per feature"
         );
         let nodes = groups
@@ -132,6 +213,10 @@ impl GpuBlockSession<'_> {
         anyhow::ensure!(
             nodes <= self.ctx.hist_nodes_per_batch,
             "GPU split batch exceeds capacity"
+        );
+        anyhow::ensure!(
+            packet_offset + nodes <= self.ctx.hist_nodes_per_batch * SPLIT_PACKET_WINDOW_BATCHES,
+            "GPU split packet window exceeds capacity"
         );
         let spans: Vec<_> = groups.iter().map(|g| g.span).collect();
         self.produce_histogram_device_batch(&spans)?;
@@ -181,21 +266,32 @@ impl GpuBlockSession<'_> {
                 large_slot += 1;
             }
         }
-        let enabled: Vec<u32> = feats
-            .iter()
-            .map(|f| u32::from(sampled.is_none_or(|s| s.binary_search(f).is_ok())))
-            .collect();
         if self.ctx.timing {
             stream.synchronize()?;
         }
         let metadata_start = std::time::Instant::now();
-        stream.memcpy_htod(feats, &mut cache.feats.slice_mut(..feats.len()))?;
-        stream.memcpy_htod(&enabled, &mut cache.enabled.slice_mut(..enabled.len()))?;
+        // Feature IDs and sampling are immutable within one tree's physical
+        // block. Reset at depth zero, then reuse across batches and levels.
+        if !cache.features_ready {
+            let enabled: Vec<u32> = feats
+                .iter()
+                .map(|f| u32::from(sampled.is_none_or(|s| s.binary_search(f).is_ok())))
+                .collect();
+            stream.memcpy_htod(feats, &mut cache.feats.slice_mut(..feats.len()))?;
+            stream.memcpy_htod(&enabled, &mut cache.enabled.slice_mut(..enabled.len()))?;
+            self.timing.split_metadata_h2d_calls += 2;
+            self.timing.split_metadata_h2d_bytes += (feats.len() * 8) as u64;
+            cache.features_ready = true;
+        }
         stream.memcpy_htod(&sums, &mut cache.sums.slice_mut(..sums.len()))?;
         stream.memcpy_htod(&metadata, &mut cache.metadata.slice_mut(..metadata.len()))?;
-        self.timing.split_metadata_h2d_calls += 4;
-        self.timing.split_metadata_h2d_bytes +=
-            ((feats.len() + enabled.len() + metadata.len()) * 4 + sums.len() * 8) as u64;
+        self.timing.split_metadata_h2d_calls += 2;
+        self.timing.split_metadata_h2d_bytes += (metadata.len() * 4 + sums.len() * 8) as u64;
+        self.timing.split_evaluated_nodes += nodes as u64;
+        self.timing.cache_admitted_nodes += cached.iter().filter(|x| **x).count() as u64;
+        if keep_next {
+            self.timing.cache_spilled_nodes += cached.iter().filter(|x| !**x).count() as u64;
+        }
         if self.ctx.timing {
             stream.synchronize()?;
             self.timing.split_metadata_h2d_ms += metadata_start.elapsed().as_secs_f32() * 1e3;
@@ -241,6 +337,10 @@ impl GpuBlockSession<'_> {
                 shared_mem_bytes: 0,
             })
         }?;
+        let _submit_phase = crate::diagnostic::Phase::new(b"fb.host.packet_submit\0");
+        let mut packet_output = cache
+            .packets
+            .slice_mut(packet_offset * 64..(packet_offset + nodes) * 64);
         let mut launch = stream.launch_builder(
             self.ctx
                 .split_nodes_fn
@@ -253,7 +353,7 @@ impl GpuBlockSession<'_> {
             .arg(&ig)
             .arg(&ih)
             .arg(&p.lambda)
-            .arg(&mut cache.packets);
+            .arg(&mut packet_output);
         unsafe {
             launch.launch(LaunchConfig {
                 grid_dim: (nodes as u32, 1, 1),
@@ -270,13 +370,51 @@ impl GpuBlockSession<'_> {
             self.timing.kernel_ms += ms;
             self.timing.split_kernel_ms += ms;
         }
+        Ok(PendingSplitBatch {
+            indices,
+            working_slots,
+            cached,
+        })
+    }
+
+    fn collect_split_packets(
+        &mut self,
+        pending: &[PendingSplitBatch],
+        nodes: usize,
+        keep_next: bool,
+    ) -> Result<Vec<GpuSplitResult>> {
+        let slot = self.slot.as_mut().expect("histogram slot lease missing");
+        let stream = slot.stream.clone();
+        let GpuHistBuffers {
+            split_cache,
+            hist_out,
+            ..
+        } = &mut **slot;
+        let cache = split_cache
+            .as_ref()
+            .context("resident split cache unavailable")?;
+        anyhow::ensure!(
+            pending.len() <= SPLIT_PACKET_WINDOW_BATCHES
+                && pending.iter().map(|b| b.indices.len()).sum::<usize>() == nodes,
+            "GPU split packet collection shape mismatch"
+        );
+        anyhow::ensure!(
+            !keep_next
+                || pending.len() == 1
+                || pending
+                    .iter()
+                    .all(|b| b.cached.iter().all(|&cached| cached)),
+            "uncached histograms cannot outlive their producer batch"
+        );
         let start = std::time::Instant::now();
+        let packet_ready_phase = crate::diagnostic::Phase::new(b"fb.host.packet_ready\0");
         let mut packets = vec![0u8; nodes * 64];
         stream.memcpy_dtoh(
             &cache.packets.slice(..packets.len()),
             packets.as_mut_slice(),
         )?;
         stream.synchronize()?;
+        drop(packet_ready_phase);
         self.timing.d2h_calls += 1;
         self.timing.d2h_bytes += packets.len() as u64;
         self.timing.split_d2h_calls += 1;
@@ -286,45 +424,52 @@ impl GpuBlockSession<'_> {
             self.timing.d2h_ms += ms;
             self.timing.split_d2h_ms += ms;
         }
+        let _decode_phase = crate::diagnostic::Phase::new(b"fb.host.packet_decode\0");
         let mut results = Vec::with_capacity(nodes);
-        for n in 0..nodes {
-            let packet = &packets[n * 64..(n + 1) * 64];
-            let u32_at = |i| u32::from_ne_bytes(packet[i..i + 4].try_into().unwrap());
-            let i64_at = |i| i64::from_ne_bytes(packet[i..i + 8].try_into().unwrap());
-            let flags = u32_at(12);
-            let candidate = (flags & 1 != 0).then(|| SplitCandidate {
-                feat: u32_at(0),
-                bin: u32_at(4),
-                gain: f32::from_bits(u32_at(8)),
-                left: GradPairFixed {
-                    grad: i64_at(16),
-                    hess: i64_at(24),
-                },
-                right: GradPairFixed {
-                    grad: i64_at(32),
-                    hess: i64_at(40),
-                },
-                missing_left: flags & 2 != 0,
-            });
-            let hist = if keep_next && !cached[n] {
-                let start = std::time::Instant::now();
-                let mut out = vec![GradPairFixed::default(); self.n_hist];
-                let lo = working_slots[n] * self.n_hist * 2;
-                stream.memcpy_dtoh(
-                    &hist_out.slice(lo..lo + self.n_hist * 2),
-                    GradPairFixed::flatten_mut(&mut out),
-                )?;
-                stream.synchronize()?;
-                self.timing.d2h_calls += 1;
-                self.timing.d2h_bytes += (self.n_hist * 16) as u64;
-                if self.ctx.timing {
-                    self.timing.d2h_ms += start.elapsed().as_secs_f32() * 1e3;
-                }
-                Some(out)
-            } else {
-                None
-            };
-            results.push((indices[n], candidate, hist));
+        let mut n = 0;
+        for batch in pending {
+            for local in 0..batch.indices.len() {
+                let packet = &packets[n * 64..(n + 1) * 64];
+                let u32_at = |i| u32::from_ne_bytes(packet[i..i + 4].try_into().unwrap());
+                let i64_at = |i| i64::from_ne_bytes(packet[i..i + 8].try_into().unwrap());
+                let flags = u32_at(12);
+                let candidate = (flags & 1 != 0).then(|| SplitCandidate {
+                    feat: u32_at(0),
+                    bin: u32_at(4),
+                    gain: f32::from_bits(u32_at(8)),
+                    left: GradPairFixed {
+                        grad: i64_at(16),
+                        hess: i64_at(24),
+                    },
+                    right: GradPairFixed {
+                        grad: i64_at(32),
+                        hess: i64_at(40),
+                    },
+                    missing_left: flags & 2 != 0,
+                });
+                let hist = if keep_next && !batch.cached[local] {
+                    let _fallback_phase =
+                        crate::diagnostic::Phase::new(b"fb.host.packet_fallback\0");
+                    let start = std::time::Instant::now();
+                    let mut out = vec![GradPairFixed::default(); self.n_hist];
+                    let lo = batch.working_slots[local] * self.n_hist * 2;
+                    stream.memcpy_dtoh(
+                        &hist_out.slice(lo..lo + self.n_hist * 2),
+                        GradPairFixed::flatten_mut(&mut out),
+                    )?;
+                    stream.synchronize()?;
+                    self.timing.d2h_calls += 1;
+                    self.timing.d2h_bytes += (self.n_hist * 16) as u64;
+                    if self.ctx.timing {
+                        self.timing.d2h_ms += start.elapsed().as_secs_f32() * 1e3;
+                    }
+                    Some(out)
+                } else {
+                    None
+                };
+                results.push((batch.indices[local], candidate, hist));
+                n += 1;
+            }
         }
         Ok(results)
     }

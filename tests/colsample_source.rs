@@ -53,7 +53,9 @@ fn spilled_source(dir: &std::path::Path) -> ParquetBlockSource {
         let mut cols: Vec<arrow::array::ArrayRef> = (0..n_feats)
             .map(|f| {
                 Arc::new(Float32Array::from(
-                    (0..n_rows).map(|r| ((r * 7 + f * 13) % 29) as f32).collect::<Vec<_>>(),
+                    (0..n_rows)
+                        .map(|r| ((r * 7 + f * 13) % 29) as f32)
+                        .collect::<Vec<_>>(),
                 )) as arrow::array::ArrayRef
             })
             .collect();
@@ -70,7 +72,9 @@ fn spilled_source(dir: &std::path::Path) -> ParquetBlockSource {
         budget_bytes: Some(0), // 强制 spill 到磁盘
         path: Some(dir.join("cache")),
     };
-    ParquetBlockSource::open_with_cache(&path, "label", 32, 4, opts).unwrap().0
+    ParquetBlockSource::open_with_cache(&path, "label", 32, 4, opts)
+        .unwrap()
+        .0
 }
 
 #[test]
@@ -84,7 +88,9 @@ fn partial_column_read_matches_full_block_and_reads_fewer_bytes() {
     let feats: Vec<_> = src.block_features(0).unwrap();
     let n_rows = src.n_rows();
 
-    let before = src.source_bytes_read().expect("spill source 必须统计读入字节");
+    let before = src
+        .source_bytes_read()
+        .expect("spill source 必须统计读入字节");
     // 只读第 1 列(局部下标 1)。
     let cols = vec![1usize];
     let (got, got_feats) = src
@@ -122,7 +128,8 @@ fn selecting_every_column_is_equivalent_to_a_full_read() {
     let full: Vec<u8> = src.with_block_ret(0, |b| b.data.clone()).unwrap();
     let all: Vec<usize> = (0..src.block_features(0).unwrap().len()).collect();
     let mut got = Vec::new();
-    src.with_block_cols(0, &all, &mut |b| got = b.data.clone()).unwrap();
+    src.with_block_cols(0, &all, &mut |b| got = b.data.clone())
+        .unwrap();
     assert_eq!(got, full);
 }
 
@@ -133,8 +140,8 @@ fn selecting_every_column_is_equivalent_to_a_full_read() {
 /// 如果只在 H2D 之前挑列,这个断言会失败。
 #[test]
 fn colsample_reduces_source_bytes_on_a_spilled_cache() {
-    use ferrisboost::train::{train, TrainConfig};
     use ferrisboost::comm::Local;
+    use ferrisboost::train::{train, TrainConfig};
 
     let measure = |rate: f32| -> (u64, usize) {
         let dir = TmpDir::new("bytes");
@@ -163,10 +170,11 @@ fn colsample_reduces_source_bytes_on_a_spilled_cache() {
         "colsample 必须真的减少 source 读入字节:full {full} vs sampled {sampled}"
     );
     // 打印出来,方便人工核对稀释程度(块粒度决定它达不到理想比例)。
-    println!("source bytes: colsample=1.0 -> {full}, colsample=0.25 -> {sampled} ({:.0}%)",
-        100.0 * sampled as f64 / full as f64);
+    println!(
+        "source bytes: colsample=1.0 -> {full}, colsample=0.25 -> {sampled} ({:.0}%)",
+        100.0 * sampled as f64 / full as f64
+    );
 }
-
 
 /// 多轮摊薄曲线:checksum 首触的整块读是**一次性**的,轮数越多摊得越薄。
 ///

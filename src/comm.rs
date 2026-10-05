@@ -4,8 +4,8 @@
 //! 只依赖这个接口,后端可以是单线程(空操作)、共享内存、NCCL、
 //! 或者将来的 MPI/gloo。阶段 1 只需要 Local。
 
-use crate::types::{GradPair, RowId};
 use crate::split::SplitCandidate;
+use crate::types::GradPair;
 
 pub trait Comm: Send + Sync {
     fn rank(&self) -> usize;
@@ -27,9 +27,15 @@ pub trait Comm: Send + Sync {
 pub struct Local;
 
 impl Comm for Local {
-    fn rank(&self) -> usize { 0 }
-    fn size(&self) -> usize { 1 }
-    fn allreduce_best_split(&self, local: Option<SplitCandidate>) -> Option<SplitCandidate> { local }
+    fn rank(&self) -> usize {
+        0
+    }
+    fn size(&self) -> usize {
+        1
+    }
+    fn allreduce_best_split(&self, local: Option<SplitCandidate>) -> Option<SplitCandidate> {
+        local
+    }
     fn broadcast_partition(&self, _root: usize, _bits: &mut [u8]) {}
     fn allreduce_gpair(&self, _local: &mut [GradPair]) {}
 }

@@ -2,6 +2,8 @@
 
 use rayon::prelude::*;
 
+pub(crate) const DEFAULT_GPU_SPLIT_CACHE: bool = true;
+
 /// 训练期间 raw-margin prediction 的**权威副本**在哪一侧。
 ///
 /// 这不是一个性能旋钮,而是一条所有权约定:
@@ -41,7 +43,9 @@ impl std::str::FromStr for GpuMath {
         match s {
             "exact" => Ok(Self::Exact),
             "fast" => Ok(Self::Fast),
-            other => Err(format!("gpu_math 只支持 \"exact\" 或 \"fast\",收到 {other:?}")),
+            other => Err(format!(
+                "gpu_math 只支持 \"exact\" 或 \"fast\",收到 {other:?}"
+            )),
         }
     }
 }
@@ -53,6 +57,12 @@ pub struct GradPair {
     pub grad: f32,
     pub hess: f32,
 }
+
+// Device quantization borrows this slice as interleaved f32 values.
+const _: () = {
+    assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
+    assert!(std::mem::align_of::<GradPair>() == std::mem::align_of::<f32>());
+};
 
 impl std::ops::AddAssign for GradPair {
     fn add_assign(&mut self, rhs: Self) {
@@ -66,7 +76,10 @@ impl std::ops::AddAssign for GradPair {
 impl std::ops::Sub for GradPair {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
-        Self { grad: self.grad - rhs.grad, hess: self.hess - rhs.hess }
+        Self {
+            grad: self.grad - rhs.grad,
+            hess: self.hess - rhs.hess,
+        }
     }
 }
 
@@ -158,12 +171,14 @@ impl std::ops::AddAssign for GradPairFixed {
 impl std::ops::Sub for GradPairFixed {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
-        Self { grad: self.grad - rhs.grad, hess: self.hess - rhs.hess }
+        Self {
+            grad: self.grad - rhs.grad,
+            hess: self.hess - rhs.hess,
+        }
     }
 }
 
-const OVERFLOW_MSG: &str =
-    "定点梯度累加溢出。GradQuantizer 的 scale 留的 headroom 不够 —— \
+const OVERFLOW_MSG: &str = "定点梯度累加溢出。GradQuantizer 的 scale 留的 headroom 不够 —— \
      它是按 n_rows × max|g| 算的,喂进来的行数或梯度量级和建 quantizer \
      时不是同一批就会这样。见 types.rs::GradQuantizer::new";
 
@@ -188,7 +203,10 @@ impl GradQuantizer {
             .fold(
                 || (0.0f64, 0.0f64),
                 |(g_acc, h_acc), g| {
-                    (g_acc.max((g.grad as f64).abs()), h_acc.max((g.hess as f64).abs()))
+                    (
+                        g_acc.max((g.grad as f64).abs()),
+                        h_acc.max((g.hess as f64).abs()),
+                    )
                 },
             )
             .reduce(|| (0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
@@ -226,13 +244,19 @@ impl GradQuantizer {
         // exactly representable and normal, so multiplying by it has the
         // same exact real result and IEEE rounding as division by the scale.
         // Cache it once per round instead of dividing for every split bin.
-        (g.grad as f64 * self.grad_inverse_scale, g.hess as f64 * self.hess_inverse_scale)
+        (
+            g.grad as f64 * self.grad_inverse_scale,
+            g.hess as f64 * self.hess_inverse_scale,
+        )
     }
 
     /// 反量化成 f32。存进树里的 sum_hess 之类走这条。
     pub fn to_float(&self, g: GradPairFixed) -> GradPair {
         let (grad, hess) = self.to_f64(g);
-        GradPair { grad: grad as f32, hess: hess as f32 }
+        GradPair {
+            grad: grad as f32,
+            hess: hess as f32,
+        }
     }
 
     pub fn grad_scale(&self) -> f64 {
@@ -399,7 +423,9 @@ pub struct TrainParams {
     ///
     /// `1` 表示关闭,回到逐节点 launch。
     pub hist_nodes_per_batch: Option<usize>,
-    /// Experimental bounded resident histogram/split cache. Off by default.
+    /// Bounded resident histogram/split cache, enabled by default.
+    /// Cache storage is included in the GPU memory plan. Unsupported paths
+    /// and nodes beyond cache capacity retain the exact host fallback.
     pub gpu_split_cache: bool,
     /// GPU streaming 可以使用的显存上限(字节)。`None` = 从运行时空闲显存推断。
     ///
@@ -461,7 +487,7 @@ impl Default for TrainParams {
             hist_streams: None,
             resident_blocks: None,
             hist_nodes_per_batch: None,
-            gpu_split_cache: false,
+            gpu_split_cache: DEFAULT_GPU_SPLIT_CACHE,
             gpu_memory_budget: None,
             gpu_math: GpuMath::default(),
             device_quantize: None,
@@ -490,7 +516,10 @@ mod layout_tests {
         let pairs = vec![
             GradPairFixed { grad: 1, hess: 2 },
             GradPairFixed { grad: -3, hess: 4 },
-            GradPairFixed { grad: i64::MIN, hess: i64::MAX },
+            GradPairFixed {
+                grad: i64::MIN,
+                hess: i64::MAX,
+            },
         ];
         // 这正是旧代码那个循环干的事;新路径必须逐位等价。
         let mut manual = Vec::with_capacity(pairs.len() * 2);
@@ -510,13 +539,22 @@ mod layout_tests {
         let mut pairs = vec![
             GradPairFixed { grad: 1, hess: 2 },
             GradPairFixed { grad: -3, hess: 4 },
-            GradPairFixed { grad: i64::MIN, hess: i64::MAX },
+            GradPairFixed {
+                grad: i64::MIN,
+                hess: i64::MAX,
+            },
         ];
         let flat = GradPairFixed::flatten_mut(&mut pairs);
         assert_eq!(flat, &[1, 2, -3, 4, i64::MIN, i64::MAX]);
         flat[0] = i64::MAX;
         flat[1] = i64::MIN;
-        assert_eq!(pairs[0], GradPairFixed { grad: i64::MAX, hess: i64::MIN });
+        assert_eq!(
+            pairs[0],
+            GradPairFixed {
+                grad: i64::MAX,
+                hess: i64::MIN
+            }
+        );
     }
 
     #[test]
@@ -540,7 +578,10 @@ mod layout_tests {
             pairs,
             vec![
                 GradPairFixed { grad: 10, hess: 20 },
-                GradPairFixed { grad: i64::MIN, hess: i64::MAX },
+                GradPairFixed {
+                    grad: i64::MIN,
+                    hess: i64::MAX
+                },
                 GradPairFixed { grad: 50, hess: 60 },
             ]
         );
@@ -553,8 +594,16 @@ mod inverse_scale_tests {
 
     #[test]
     fn cached_inverse_matches_division_for_every_scale_exponent() {
-        let mut values = vec![i64::MIN, i64::MAX, 0, 1, -1, (1i64 << 53) - 1,
-                              (1i64 << 53) + 1, -(1i64 << 53) - 1];
+        let mut values = vec![
+            i64::MIN,
+            i64::MAX,
+            0,
+            1,
+            -1,
+            (1i64 << 53) - 1,
+            (1i64 << 53) + 1,
+            -(1i64 << 53) - 1,
+        ];
         let mut state = 37u64;
         for _ in 0..128 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -570,11 +619,20 @@ mod inverse_scale_tests {
                 hess_inverse_scale: hess_scale.recip(),
             };
             for &value in &values {
-                let got = q.to_f64(GradPairFixed { grad: value, hess: value });
-                assert_eq!(got.0.to_bits(), (value as f64 / grad_scale).to_bits(),
-                           "gradient exponent={exponent} value={value}");
-                assert_eq!(got.1.to_bits(), (value as f64 / hess_scale).to_bits(),
-                           "hessian exponent={exponent} value={value}");
+                let got = q.to_f64(GradPairFixed {
+                    grad: value,
+                    hess: value,
+                });
+                assert_eq!(
+                    got.0.to_bits(),
+                    (value as f64 / grad_scale).to_bits(),
+                    "gradient exponent={exponent} value={value}"
+                );
+                assert_eq!(
+                    got.1.to_bits(),
+                    (value as f64 / hess_scale).to_bits(),
+                    "hessian exponent={exponent} value={value}"
+                );
             }
         }
     }
@@ -582,17 +640,42 @@ mod inverse_scale_tests {
     #[test]
     fn constructors_keep_inverse_scales_in_sync() {
         for rows in [0, 1, 100, 10_500_000, usize::MAX] {
-            for bound in [0.0, f32::from_bits(1) as f64, 0.25, 1.0,
-                          f32::MAX as f64, f64::NAN, f64::INFINITY] {
+            for bound in [
+                0.0,
+                f32::from_bits(1) as f64,
+                0.25,
+                1.0,
+                f32::MAX as f64,
+                f64::NAN,
+                f64::INFINITY,
+            ] {
                 let q = GradQuantizer::from_bounds(bound, 0.25, rows);
-                let value = GradPairFixed { grad: -123456789, hess: 987654321 };
+                let value = GradPairFixed {
+                    grad: -123456789,
+                    hess: 987654321,
+                };
                 let got = q.to_f64(value);
-                assert_eq!(got.0.to_bits(), (value.grad as f64 / q.grad_scale()).to_bits());
-                assert_eq!(got.1.to_bits(), (value.hess as f64 / q.hess_scale()).to_bits());
+                assert_eq!(
+                    got.0.to_bits(),
+                    (value.grad as f64 / q.grad_scale()).to_bits()
+                );
+                assert_eq!(
+                    got.1.to_bits(),
+                    (value.hess as f64 / q.hess_scale()).to_bits()
+                );
             }
         }
-        let q = GradQuantizer::new(&[GradPair { grad: -0.75, hess: 0.25 }], 1);
-        let got = q.to_f64(q.to_fixed(GradPair { grad: -0.75, hess: 0.25 }));
+        let q = GradQuantizer::new(
+            &[GradPair {
+                grad: -0.75,
+                hess: 0.25,
+            }],
+            1,
+        );
+        let got = q.to_f64(q.to_fixed(GradPair {
+            grad: -0.75,
+            hess: 0.25,
+        }));
         assert_eq!(got, (-0.75, 0.25));
 
         // Exercise the constructor's upper clamp without taking its nonfinite
@@ -606,5 +689,36 @@ mod inverse_scale_tests {
             assert_eq!(lower.grad_scale(), 2.0f64.powi(-1000));
             assert_eq!(lower.grad_inverse_scale, 2.0f64.powi(1000));
         }
+    }
+}
+
+#[cfg(test)]
+mod optimization_default_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_cache_defaults_on_without_relaxing_exact_math() {
+        let params = TrainParams::default();
+        let backend = crate::backend::cuda::SharedHistogramConfig::default();
+        assert!(params.gpu_split_cache);
+        assert!(backend.gpu_split_cache);
+        assert_eq!(params.gpu_math, GpuMath::Exact);
+        assert_eq!(backend.gpu_math, GpuMath::Exact);
+        assert!(params.gpu_memory_budget.is_none());
+        assert!(params.resident_blocks.is_none());
+        assert!(
+            !TrainParams {
+                gpu_split_cache: false,
+                ..params
+            }
+            .gpu_split_cache
+        );
+        assert!(
+            !crate::backend::cuda::SharedHistogramConfig {
+                gpu_split_cache: false,
+                ..backend
+            }
+            .gpu_split_cache
+        );
     }
 }

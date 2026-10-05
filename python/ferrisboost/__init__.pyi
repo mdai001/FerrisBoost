@@ -17,5 +17,11 @@ def train(
     header: bool = ...,
     quiet: bool = ...,
 ) -> Model:
-    """训一个模型。data 收 numpy 二维数组、.parquet / .csv 路径,或 pyarrow Table。"""
+    """Train a model from arrays, file paths, or a PyArrow table.
+
+    Early stopping takes effect with validation data and retains all trees
+    trained through the stopping round; best_iteration identifies the best
+    round. The Python API currently uses the objective's one default metric and
+    has no eval_metric parameter.
+    """
     ...

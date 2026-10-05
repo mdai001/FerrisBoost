@@ -1,0 +1,76 @@
+{
+  "case": "deep_logistic",
+  "xgboost": "3.4.1",
+  "rows": 5000,
+  "platform": "win32-amd64",
+  "note": "Exact native Windows XGBoost 3.4.1 CPU hist reference; Linux fixture remains unchanged. No numerical tolerance.",
+  "base_sha256": "974e76568b1ae6dbe92a9a18fde9c269fe802498549f781a1ba732d3bedaf565",
+  "expected_sha256": "84eb6bfb906051d330ec6ab9f8d3f0476d214d30bfcce1604698a0988044d760",
+  "replacements": [
+    {
+      "row": 29,
+      "base_bits": 3204287750,
+      "bits": 3204287751
+    },
+    {
+      "row": 744,
+      "base_bits": 1048516222,
+      "bits": 1048516223
+    },
+    {
+      "row": 1600,
+      "base_bits": 1041139985,
+      "bits": 1041139984
+    },
+    {
+      "row": 1625,
+      "base_bits": 3212367860,
+      "bits": 3212367862
+    },
+    {
+      "row": 1750,
+      "base_bits": 3185554225,
+      "bits": 3185554228
+    },
+    {
+      "row": 2109,
+      "base_bits": 3192048880,
+      "bits": 3192048881
+    },
+    {
+      "row": 2941,
+      "base_bits": 3228268763,
+      "bits": 3228268764
+    },
+    {
+      "row": 3571,
+      "base_bits": 3197773708,
+      "bits": 3197773707
+    },
+    {
+      "row": 3703,
+      "base_bits": 3210133863,
+      "bits": 3210133864
+    },
+    {
+      "row": 4161,
+      "base_bits": 1016931030,
+      "bits": 1016931026
+    },
+    {
+      "row": 4215,
+      "base_bits": 1049874246,
+      "bits": 1049874247
+    },
+    {
+      "row": 4368,
+      "base_bits": 3211978818,
+      "bits": 3211978816
+    },
+    {
+      "row": 4435,
+      "base_bits": 1016931030,
+      "bits": 1016931026
+    }
+  ]
+}
