@@ -1594,6 +1594,18 @@ fn checked_in_ptx_is_not_older_than_its_source() {
         Some(".target sm_75"),
         "发布 PTX 必须继续支持 Turing / RTX 20 系列"
     );
+    // PTX 经 include_str! 进入发布二进制:`.file` 不得带构建机的绝对路径
+    // (曾经泄漏 CUDA toolkit 的临时解压目录)。
+    for line in ptx.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(".file") {
+            let path = rest.split('"').nth(1).unwrap_or("");
+            assert!(
+                !path.starts_with('/') && !path.contains(":\\") && !path.contains(":/"),
+                "histogram.ptx 含绝对 .file 路径: {trimmed}。请运行 scripts/build_ptx.sh"
+            );
+        }
+    }
 }
 
 /// `colsample_bytree` 的跨后端契约。

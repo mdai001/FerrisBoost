@@ -29,7 +29,10 @@ CHECKS = [
     # dirname, not cwd: the leak-prone part is the directory tree above the
     # project. Matching on the project name itself would flag the module name.
     ("checkout path",         [cwd.encode(), os.path.dirname(cwd).encode()]),
-    ("temp dirs",             [b"/tmp/claude", b"/var/tmp/", b"TMPDIR"]),
+    ("temp dirs",             [b"/tmp/", b"/var/tmp/", b"TMPDIR"]),
+    # nvcc canonicalises header `.file` directives to the toolkit's absolute
+    # install/extract directory; scripts/build_ptx.sh must relativise them.
+    ("CUDA toolkit paths",    [b"/usr/local/cuda", b"fb-cuda", b"targets/x86_64-linux"]),
     ("benchmark scratch",     [b"scratchpad", b"full.log"]),
     # An embedded dataset path is absolute, so it is already caught by the
     # home / checkout / cargo-registry checks. Matching bare extensions here

@@ -9929,9 +9929,9 @@ $L__BB24_13:
 
 }
 	.file	1 "src/backend/cuda/histogram.cu"
-	.file	2 "/tmp/fb-cuda12-toolkit/usr/local/cuda-12.0/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp"
-	.file	3 "/tmp/fb-cuda12-toolkit/usr/local/cuda-12.0/bin/../targets/x86_64-linux/include/device_atomic_functions.hpp"
-	.file	4 "/tmp/fb-cuda12-toolkit/usr/local/cuda-12.0/bin/../targets/x86_64-linux/include/crt/math_functions.hpp"
+	.file	2 "cuda/include/sm_30_intrinsics.hpp"
+	.file	3 "cuda/include/device_atomic_functions.hpp"
+	.file	4 "cuda/include/crt/math_functions.hpp"
 	.section	.debug_str
 	{
 $L__info_string0:
