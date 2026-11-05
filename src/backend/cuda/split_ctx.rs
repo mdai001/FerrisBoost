@@ -17,6 +17,10 @@ pub(super) struct ResidentSplitBuffers {
     metadata: CudaSlice<u32>,
     feats: CudaSlice<u32>,
     enabled: CudaSlice<u32>,
+    /// 单调约束:每节点 `[lower, upper]`(和 `sums` 同序),每个块内特征的方向。
+    /// 只在有约束时上传和读取。
+    bounds: CudaSlice<f32>,
+    monotone: CudaSlice<i32>,
     stride: usize,
     capacity: usize,
     previous_ids: Vec<(usize, usize)>,
@@ -42,6 +46,8 @@ impl ResidentSplitBuffers {
             metadata: stream.alloc_zeros::<u32>(cap * 4)?,
             feats: stream.alloc_zeros::<u32>(feats.max(1))?,
             enabled: stream.alloc_zeros::<u32>(feats.max(1))?,
+            bounds: stream.alloc_zeros::<f32>(cap * 2)?,
+            monotone: stream.alloc_zeros::<i32>(feats.max(1))?,
             stride: bins,
             capacity: cap,
             previous_ids: Vec::with_capacity(cap),
@@ -57,8 +63,10 @@ pub(crate) struct GpuSplitGroup {
     pub small: usize,
     pub span: GpuRowSpan,
     pub sum: GradPairFixed,
-    /// (large child index, cached parent slot, large child sum).
-    pub large: Option<(usize, usize, GradPairFixed)>,
+    /// 单调约束下 small 节点的权重界(无约束时不读)。
+    pub bounds: crate::split::NodeBounds,
+    /// (large child index, cached parent slot, large child sum, large child bounds).
+    pub large: Option<(usize, usize, GradPairFixed, crate::split::NodeBounds)>,
 }
 pub(crate) type GpuSplitResult = (usize, Option<SplitCandidate>, Option<Vec<GradPairFixed>>);
 
@@ -235,18 +243,23 @@ impl GpuBlockSession<'_> {
             .context("resident split cache unavailable")?;
         let mut metadata = Vec::with_capacity(nodes * 4);
         let mut sums = Vec::with_capacity(nodes * 2);
+        let mut bounds = Vec::with_capacity(nodes * 2);
         let mut indices = Vec::with_capacity(nodes);
         let mut working_slots = Vec::with_capacity(nodes);
         let mut cached = Vec::with_capacity(nodes);
         let mut large_slot = groups.len();
         for (small_slot, g) in groups.iter().enumerate() {
-            if let Some((_, parent, _)) = g.large {
+            if let Some((_, parent, _, _)) = g.large {
                 anyhow::ensure!(
                     parent < cache.capacity,
                     "GPU parent cache slot out of range"
                 );
             }
-            let mut append = |index: usize, work: usize, sum: GradPairFixed, parent: u32| {
+            let mut append = |index: usize,
+                              work: usize,
+                              sum: GradPairFixed,
+                              node_bounds: crate::split::NodeBounds,
+                              parent: u32| {
                 let destination = if keep_next && cache.next_ids.len() < cache.capacity {
                     let dest = cache.next_ids.len();
                     cache.next_ids.push((index, dest));
@@ -256,13 +269,14 @@ impl GpuBlockSession<'_> {
                 };
                 metadata.extend_from_slice(&[work as u32, small_slot as u32, parent, destination]);
                 sums.extend_from_slice(&[sum.grad, sum.hess]);
+                bounds.extend_from_slice(&[node_bounds.lower, node_bounds.upper]);
                 indices.push(index);
                 working_slots.push(work);
                 cached.push(destination != u32::MAX);
             };
-            append(g.small, small_slot, g.sum, u32::MAX);
-            if let Some((index, parent, sum)) = g.large {
-                append(index, large_slot, sum, parent as u32);
+            append(g.small, small_slot, g.sum, g.bounds, u32::MAX);
+            if let Some((index, parent, sum, large_bounds)) = g.large {
+                append(index, large_slot, sum, large_bounds, parent as u32);
                 large_slot += 1;
             }
         }
@@ -281,7 +295,19 @@ impl GpuBlockSession<'_> {
             stream.memcpy_htod(&enabled, &mut cache.enabled.slice_mut(..enabled.len()))?;
             self.timing.split_metadata_h2d_calls += 2;
             self.timing.split_metadata_h2d_bytes += (feats.len() * 8) as u64;
+            if p.has_monotone() {
+                let monotone: Vec<i32> = feats.iter().map(|&f| p.monotone_of(f) as i32).collect();
+                stream.memcpy_htod(&monotone, &mut cache.monotone.slice_mut(..monotone.len()))?;
+                self.timing.split_metadata_h2d_calls += 1;
+                self.timing.split_metadata_h2d_bytes += (monotone.len() * 4) as u64;
+            }
             cache.features_ready = true;
+        }
+        let has_monotone = u32::from(p.has_monotone());
+        if has_monotone != 0 {
+            stream.memcpy_htod(&bounds, &mut cache.bounds.slice_mut(..bounds.len()))?;
+            self.timing.split_metadata_h2d_calls += 1;
+            self.timing.split_metadata_h2d_bytes += (bounds.len() * 4) as u64;
         }
         stream.memcpy_htod(&sums, &mut cache.sums.slice_mut(..sums.len()))?;
         stream.memcpy_htod(&metadata, &mut cache.metadata.slice_mut(..metadata.len()))?;
@@ -327,6 +353,9 @@ impl GpuBlockSession<'_> {
             .arg(&p.lambda)
             .arg(&p.gamma)
             .arg(&p.min_child_weight)
+            .arg(&cache.bounds)
+            .arg(&cache.monotone)
+            .arg(&has_monotone)
             .arg(&mut cache.candidates);
         // Bounds above cover all CTA loads/stores; previous/next/work allocations
         // are disjoint and feature CTAs own disjoint histogram ranges.

@@ -27,7 +27,8 @@ def train(
     training label and weight columns.
 
     params["eval_metric"] takes a metric name or list of names: rmse, logloss,
-    error, auc. Early stopping takes effect with validation data, watches the
+    error, auc. params["monotone_constraints"] takes 1 / -1 / 0 per feature as
+    a tuple, list, "(1,-1,0)" string, or {feature_name: direction} dict. Early stopping takes effect with validation data, watches the
     last metric of the last eval set, and retains all trees trained through the
     stopping round; best_iteration identifies the best round. Weights also
     shape the quantile sketch that sets bin boundaries, as in XGBoost.

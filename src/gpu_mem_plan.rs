@@ -128,10 +128,12 @@ impl StreamingMemModel {
             .saturating_mul(16)
             .saturating_mul(2)
             .saturating_add(cap.saturating_mul(64))
-            .saturating_add(8);
-        // 16 B node sum + 16 B metadata, plus a fixed packet collection window.
+            // feats + enabled + monotone direction (4 B each) per column.
+            .saturating_add(12);
+        // 16 B node sum + 16 B metadata + 8 B monotone bounds, plus a fixed
+        // packet collection window.
         self.resident_extra_fixed_bytes =
-            cap.saturating_mul(32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
+            cap.saturating_mul(40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
         self
     }
 
@@ -665,20 +667,20 @@ mod tests {
     fn resident_split_cache_prices_exact_two_and_sixteen_node_caps() {
         let base = higgs_model();
         let two = base.with_resident_split_cache(255, 2);
-        assert_eq!(two.resident_extra_col_bytes, 2 * 256 * 16 * 2 + 2 * 64 + 8);
+        assert_eq!(two.resident_extra_col_bytes, 2 * 256 * 16 * 2 + 2 * 64 + 12);
         assert_eq!(
             two.resident_extra_fixed_bytes,
-            2 * (32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
+            2 * (40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
         );
 
         let sixteen = base.with_resident_split_cache(255, 16);
         assert_eq!(
             sixteen.resident_extra_col_bytes,
-            16 * 256 * 16 * 2 + 16 * 64 + 8
+            16 * 256 * 16 * 2 + 16 * 64 + 12
         );
         assert_eq!(
             sixteen.resident_extra_fixed_bytes,
-            16 * (32 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
+            16 * (40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
         );
     }
 

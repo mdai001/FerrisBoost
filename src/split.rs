@@ -78,6 +78,144 @@ fn split_gain(parent_gain: f64, left: (f64, f64), right: (f64, f64), p: &TrainPa
     g as f32
 }
 
+// ---------------------------------------------------------------- 单调约束
+//
+// 语义逐条照搬 XGBoost 3.4.1 单输出 hist 路径(`split_evaluator.h` 的
+// `TreeEvaluator::SplitEvaluator` + `evaluate_splits.h` 的 `ApplyTreeSplit`):
+//
+// - 每个节点有 `[lower, upper]`,根节点是 `±f32::MAX`。
+// - 候选的左右权重 `w = clamp(f32(-G/(H+λ)), lower, upper)`(当前节点的界)。
+// - 约束 `c > 0` 而 `wl > wr`、或 `c < 0` 而 `wl < wr` 的候选直接作废。
+// - 增益用**给定权重**的形式 `-(2·G·w + (H+λ)·w²)`,每侧算完截成 f32,
+//   两侧 f32 相加,再减父节点同一形式的增益(f32)。权重被夹过时它和
+//   `G²/(H+λ)` 是两个数,所以约束模式下**所有**特征都走这个形式 ——
+//   和 XGBoost 一样:有约束时它整棵树都用 `CalcGainGivenWeight`。
+// - 分裂后左右孩子继承父节点的界,`mid = (wl + wr) / 2`(f32):
+//   `c > 0` 时左孩子上界、右孩子下界取 `mid`;`c < 0` 反过来。
+// - 叶子值就是夹过的孩子权重 × learning_rate。
+//
+// 没有任何非 0 约束时完全不走这里:无约束路径的数值一位不动。
+
+/// 节点权重的上下界(XGBoost `TreeEvaluator` 的 lower/upper)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeBounds {
+    pub lower: f32,
+    pub upper: f32,
+}
+
+impl NodeBounds {
+    pub const UNBOUNDED: Self = Self {
+        lower: -f32::MAX,
+        upper: f32::MAX,
+    };
+
+    /// XGBoost `ApplyBounds`:先比下界,再比上界。
+    pub fn apply(&self, w: f32) -> f32 {
+        if w < self.lower {
+            self.lower
+        } else if w > self.upper {
+            self.upper
+        } else {
+            w
+        }
+    }
+
+    /// XGBoost `TreeEvaluator::AddSplit`:按分裂特征的约束方向给两个孩子定界。
+    /// `wl` / `wr` 是**夹过的**孩子权重(不含 learning_rate)。
+    pub fn children(&self, constraint: i8, wl: f32, wr: f32) -> (NodeBounds, NodeBounds) {
+        let mid = (wl + wr) / 2.0;
+        let (mut left, mut right) = (*self, *self);
+        if constraint < 0 {
+            left.lower = mid;
+            right.upper = mid;
+        } else if constraint > 0 {
+            left.upper = mid;
+            right.lower = mid;
+        }
+        (left, right)
+    }
+}
+
+/// 约束模式下一次枚举需要的上下文:全局特征 id → 约束方向,以及当前节点的界。
+#[derive(Clone, Copy, Debug)]
+pub struct Monotone<'a> {
+    pub constraints: &'a [i8],
+    pub bounds: NodeBounds,
+}
+
+impl Monotone<'_> {
+    fn of(&self, feat: FeatId) -> i8 {
+        self.constraints.get(feat as usize).copied().unwrap_or(0)
+    }
+}
+
+/// XGBoost `CalcWeight`(α = 0、max_delta_step = 0):f64 算完截成 f32。
+fn xgb_weight(grad: f64, hess: f64, p: &TrainParams) -> f32 {
+    if hess <= 0.0 {
+        return 0.0;
+    }
+    (-grad / (hess + p.lambda as f64)) as f32
+}
+
+/// 约束模式下节点(或孩子)的权重:`ApplyBounds(CalcWeight(sum))`。
+/// 叶子值 = 它 × learning_rate。
+pub fn bounded_weight(
+    sum: GradPairFixed,
+    q: &GradQuantizer,
+    p: &TrainParams,
+    bounds: NodeBounds,
+) -> f32 {
+    let (grad, hess) = q.to_f64(sum);
+    bounds.apply(xgb_weight(grad, hess, p))
+}
+
+/// XGBoost `CalcGainGivenWeight`:`-(2·G·w + (H+λ)·w² + 2α|w|)`。
+///
+/// ⚠️ `w²` 是 **f32 里的平方**(XGBoost `common::Sqr(float)`),再提升到 f64;
+/// 返回值截成 f32(evaluator 的标量版本返回 float)。α = 0 那一项保留成
+/// `+ 0.0`,和 XGBoost 的求值顺序一致。
+fn gain_given_weight(grad: f64, hess: f64, w: f32, p: &TrainParams) -> f32 {
+    if hess <= 0.0 {
+        return 0.0;
+    }
+    let square = (w * w) as f64;
+    (-((2.0 * grad * w as f64 + (hess + p.lambda as f64) * square) + 0.0)) as f32
+}
+
+/// 约束模式下节点自身的增益(父节点那一项),用节点自己的界。
+fn bounded_node_gain(node: (f64, f64), p: &TrainParams, bounds: NodeBounds) -> f32 {
+    let w = bounds.apply(xgb_weight(node.0, node.1, p));
+    gain_given_weight(node.0, node.1, w, p)
+}
+
+/// 约束模式下一个候选的增益;`None` = 不合法(Hessian 不够或违反单调方向)。
+///
+/// 和无约束的 `split_gain` 一样最后减 γ 再截成 f32(γ = 0 时这一步是恒等)。
+/// CUDA `split_candidate` 的约束分支逐步对应这里的每一次舍入。
+fn bounded_split_gain(
+    parent: f32,
+    left: (f64, f64),
+    right: (f64, f64),
+    constraint: i8,
+    bounds: NodeBounds,
+    p: &TrainParams,
+) -> Option<f32> {
+    let mcw = p.min_child_weight as f64;
+    // XGBoost `IsValidSplit`:两侧 Hessian 都要 > 0 且 >= min_child_weight。
+    if !(left.1 > 0.0 && right.1 > 0.0 && left.1 >= mcw && right.1 >= mcw) {
+        return None;
+    }
+    let wl = bounds.apply(xgb_weight(left.0, left.1, p));
+    let wr = bounds.apply(xgb_weight(right.0, right.1, p));
+    if (constraint > 0 && wl > wr) || (constraint < 0 && wl < wr) {
+        return None;
+    }
+    let gain =
+        gain_given_weight(left.0, left.1, wl, p) + gain_given_weight(right.0, right.1, wr, p);
+    let loss = gain - parent;
+    Some((loss as f64 - p.gamma as f64) as f32)
+}
+
 /// 候选择优。并列时保留**先遇到的**那个。
 ///
 /// 严格大于是刻意的:枚举顺序是「特征升序 → 正向 → 反向」,并列时
@@ -117,13 +255,45 @@ pub fn best_split_in_block(
     p: &TrainParams,
     sampled: Option<&[FeatId]>,
 ) -> Option<SplitCandidate> {
+    best_split_in_block_constrained(hist, feat_ids, feat_offsets, node_sum, q, p, sampled, None)
+}
+
+/// `best_split_in_block`,带单调约束。`monotone = None` 就是无约束路径,
+/// 和 `best_split_in_block` 逐位相同。约束语义见本文件「单调约束」一节。
+#[allow(clippy::too_many_arguments)] // `best_split_in_block` plus the constraint context.
+pub fn best_split_in_block_constrained(
+    hist: &Histogram,
+    feat_ids: &[FeatId],
+    feat_offsets: &[u32],
+    node_sum: GradPairFixed,
+    q: &GradQuantizer,
+    p: &TrainParams,
+    sampled: Option<&[FeatId]>,
+    monotone: Option<Monotone<'_>>,
+) -> Option<SplitCandidate> {
     debug_assert_eq!(feat_offsets.len(), feat_ids.len() + 1);
     debug_assert_eq!(hist.len(), feat_offsets[feat_ids.len()] as usize);
 
     let node = q.to_f64(node_sum);
     let parent_gain = gain(node.0, node.1, p);
+    let bounded_parent = monotone.map(|m| bounded_node_gain(node, p, m.bounds));
     let mcw = p.min_child_weight as f64;
     let mut best: Option<SplitCandidate> = None;
+    // 一个候选的增益:无约束走原公式;约束模式走 XGBoost 的给定权重形式。
+    let candidate_gain = |feat: FeatId, lf: (f64, f64), rf: (f64, f64)| -> Option<f32> {
+        match (monotone, bounded_parent) {
+            (Some(m), Some(parent)) => bounded_split_gain(parent, lf, rf, m.of(feat), m.bounds, p),
+            _ => {
+                // min_child_weight 的剪枝必须在比较增益**之前**做,
+                // 不是先挑出最优再回头检查 —— 那样会把一个本来合法的
+                // 次优分裂给挤掉。
+                if lf.1 < mcw || rf.1 < mcw {
+                    return None;
+                }
+                Some(split_gain(parent_gain, lf, rf, p))
+            }
+        }
+    };
 
     for (local, &feat) in feat_ids.iter().enumerate() {
         // colsample:没被选中的特征直接跳过,不参与枚举。
@@ -146,18 +316,15 @@ pub fn best_split_in_block(
             left += b;
             let right = node_sum - left;
             let (lf, rf) = (q.to_f64(left), q.to_f64(right));
-            // min_child_weight 的剪枝必须在比较增益**之前**做,
-            // 不是先挑出最优再回头检查 —— 那样会把一个本来合法的
-            // 次优分裂给挤掉。
-            if lf.1 < mcw || rf.1 < mcw {
+            let Some(gain) = candidate_gain(feat, lf, rf) else {
                 continue;
-            }
+            };
             update_best(
                 &mut best,
                 SplitCandidate {
                     feat,
                     bin: (i + 1) as u32,
-                    gain: split_gain(parent_gain, lf, rf, p),
+                    gain,
                     left,
                     right,
                     missing_left: false,
@@ -198,15 +365,15 @@ pub fn best_split_in_block(
             right += bins[i];
             let left = node_sum - right;
             let (lf, rf) = (q.to_f64(left), q.to_f64(right));
-            if lf.1 < mcw || rf.1 < mcw {
+            let Some(gain) = candidate_gain(feat, lf, rf) else {
                 continue;
-            }
+            };
             update_best(
                 &mut best,
                 SplitCandidate {
                     feat,
                     bin: i as u32,
-                    gain: split_gain(parent_gain, lf, rf, p),
+                    gain,
                     left,
                     right,
                     missing_left: true,

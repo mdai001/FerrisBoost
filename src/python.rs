@@ -1995,6 +1995,55 @@ struct Parsed {
     eval_metrics: Vec<String>,
     /// 训练集带样本权重。由入口在规划**之前**设上:fast 模式的显存计划要算它。
     weighted: bool,
+    /// XGBoost `monotone_constraints`,还没按 schema 解析。见 `resolve_monotone`。
+    monotone: Option<MonotoneSpec>,
+}
+
+/// Python 层归一后的单调约束:按位置,或按列名(要等拿到列名才能解析)。
+enum MonotoneSpec {
+    Positional(Vec<i8>),
+    Named(Vec<(String, i8)>),
+}
+
+impl Parsed {
+    /// 按 schema 解析单调约束,写进 `params.monotone_constraints`。
+    ///
+    /// `feature_names` 为空 = 位置模式(numpy、无表头 CSV),此时按列名给的
+    /// 约束没法解析,直接报错而不是悄悄忽略。
+    fn resolve_monotone(&mut self, n_features: usize, feature_names: &[String]) -> PyResult<()> {
+        let resolved = match &self.monotone {
+            None => return Ok(()),
+            Some(MonotoneSpec::Positional(v)) => {
+                if v.len() > n_features {
+                    return Err(PyValueError::new_err(format!(
+                        "monotone_constraints 有 {} 个,但只有 {n_features} 个特征",
+                        v.len()
+                    )));
+                }
+                v.clone()
+            }
+            Some(MonotoneSpec::Named(pairs)) => {
+                if feature_names.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "按列名给的 monotone_constraints 需要列名:这个输入是位置模式\
+                         (numpy 或无表头 CSV),请改用按位置的元组",
+                    ));
+                }
+                let mut out = vec![0i8; feature_names.len()];
+                for (name, dir) in pairs {
+                    let at = feature_names.iter().position(|n| n == name).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "monotone_constraints 里的列 {name:?} 不是特征列;特征列有 {feature_names:?}"
+                        ))
+                    })?;
+                    out[at] = *dir;
+                }
+                out
+            }
+        };
+        self.params.monotone_constraints = resolved;
+        Ok(())
+    }
 }
 
 impl Parsed {
@@ -2100,6 +2149,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             },
             device_quantize: get!("device_quantize"),
             seed: get!("seed"),
+            // 占位:按名字给的约束要等拿到 schema 才能解析,见 `MonotoneSpec`。
+            monotone_constraints: Vec::new(),
         },
         requested_cols_per_block: get!("cols_per_block"),
         device: {
@@ -2137,6 +2188,29 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             names
         },
         weighted: false,
+        monotone: {
+            match d.get_item("monotone_constraints")? {
+                None => None,
+                Some(v) if v.is_none() => None,
+                Some(v) => {
+                    if let Ok(dict) = v.cast::<PyDict>() {
+                        let mut pairs = Vec::with_capacity(dict.len());
+                        for (k, val) in dict.iter() {
+                            pairs.push((
+                                k.extract::<String>()?,
+                                val.extract::<i64>()?.signum() as i8,
+                            ));
+                        }
+                        Some(MonotoneSpec::Named(pairs))
+                    } else {
+                        let values: Vec<i64> = v.extract()?;
+                        Some(MonotoneSpec::Positional(
+                            values.into_iter().map(|x| x.signum() as i8).collect(),
+                        ))
+                    }
+                }
+            }
+        },
     })
 }
 
@@ -2357,6 +2431,8 @@ fn train_dense(
     }
 
     let device = cfg.device;
+    // numpy 入口没有列名:只接受按位置的约束(Python 层已把 pyarrow 列名解析掉)。
+    cfg.resolve_monotone(n_features, &[])?;
     let (train_cfg, lower_is_better) = cfg.train_config()?;
     let (mut cbs, handle) = build_callbacks(
         lower_is_better,
@@ -2679,6 +2755,8 @@ fn train_file(
     // ⚠️ 代价要说清楚:多文件走的是量化后常驻内存的 `Dataset` 路径,
     // 和单文件的按需加载不是同一条内存曲线。
     if fmt == "parquet" && paths.len() == 1 {
+        let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
+        cfg.resolve_monotone(n_features, &names)?;
         let (train_cfg, lower_is_better) = cfg.train_config()?;
         let (mut cbs, handle) = build_callbacks(
             lower_is_better,
@@ -2805,8 +2883,7 @@ fn train_file(
         if PyErr::occurred(py) {
             return Err(PyErr::fetch(py));
         }
-        // 命名模式:列名取自 parquet schema,标签列已排除。
-        let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
+        // 命名模式:列名取自 parquet schema,标签列已排除(分支开头已读出)。
         return Ok(finish(
             model,
             handle,
@@ -2834,6 +2911,7 @@ fn train_file(
         cfg.params.cols_per_block = completed.effective;
         apply_resolved_geometry(&mut cfg, &completed);
     }
+    cfg.resolve_monotone(n_features, &ds.feature_names)?;
     let (train_cfg, lower_is_better) = cfg.train_config()?;
     let (mut cbs, handle) = build_callbacks(
         lower_is_better,

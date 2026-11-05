@@ -282,6 +282,47 @@ For continuous features, FerrisBoost and XGBoost use different quantile-sketch
 implementations, with or without weights, so individual bin boundaries can sit
 slightly apart; both are accurate weighted quantiles.
 
+## Monotone constraints
+
+`params["monotone_constraints"]` forces the model's prediction to move in one
+direction along chosen features, as XGBoost's parameter of the same name does:
+`1` means non-decreasing, `-1` non-increasing, `0` unconstrained.
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "monotone_constraints": (1, -1, 0)},
+    X_train,
+    label=y_train,
+    num_boost_round=200,
+)
+```
+
+Accepted forms, all with the same meaning:
+
+- a tuple or list by feature position, e.g. `(1, -1, 0)`; a shorter list
+  leaves the remaining features unconstrained, a longer one is an error;
+- a string `"(1,-1,0)"`;
+- a dict by feature name, e.g. `{"age": 1, "debt_ratio": -1}`, for Parquet,
+  CSV with a header, or a PyArrow table. NumPy arrays and headerless CSV have
+  no feature names, so use the positional form there.
+
+Only the sign of each value matters (`2` behaves like `1`). All-zero
+constraints are the same as no constraints, byte for byte.
+
+The constraint applies to the whole model: for any fixed values of the other
+features, predictions never decrease (or never increase) as a constrained
+feature grows. Missing values follow each split's learned default direction
+and are not ordered relative to real values.
+
+The rules are XGBoost's (`hist`, single output): each node keeps lower and
+upper bounds on its weight, candidate splits whose child weights go the wrong
+way are discarded, and children inherit bounds split at the midpoint of
+their weights. Constrained models match XGBoost exactly when every feature has
+fewer distinct values than `max_bin`, on CPU and GPU, with or without
+weights. CPU and `gpu_math="exact"` GPU models stay byte-identical. The
+constraints are not stored in the saved model, as in XGBoost; prediction does
+not need them.
+
 ## Custom callbacks
 
 A callback receives the zero-based round index and the metrics for that round.
@@ -678,6 +719,7 @@ empty `evals_result()`.
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |
 | `cache_path` | `None` | Persistent Parquet cache directory |
 | `eval_metric` | objective default | One name or a list: `rmse`, `logloss`, `error`, `auc`; early stopping watches the last one |
+| `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
 

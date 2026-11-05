@@ -2584,3 +2584,99 @@ fn fast_math_weights_are_deterministic_and_effective() {
         }
     }
 }
+
+/// 单调约束:CPU 与 GPU(exact)模型逐字节相同,覆盖 GPU 缓存 split kernel
+/// (`hist_nodes_per_batch = 16`)、host 回退(缓存关、streaming)、采样和权重。
+#[test]
+fn monotone_training_is_cpu_gpu_byte_identical() {
+    let n_rows = 1_211usize;
+    let n_feats = 9usize;
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 5 + feat) % 23 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 13 + feat * 7) % 37) as f32
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| {
+            let x0 = ((row * 13) % 37) as f32;
+            let x1 = ((row * 13 + 7) % 37) as f32;
+            if x0 - 0.6 * x1 + ((row * 31) % 11) as f32 > 12.0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let weights: Vec<f32> = (0..n_rows)
+        .map(|row| [0.5, 1.0, 2.0, 0.0, 3.0][(row * 3) % 5])
+        .collect();
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, 3);
+    let constraints = vec![1i8, -1, 0, 1, 0, 0, -1, 0, 1];
+    for objective in [
+        ferrisboost::types::Objective::Logistic,
+        ferrisboost::types::Objective::SquaredError,
+    ] {
+        for (resident_blocks, split_cache, nodes, subsample, colsample, weighted) in [
+            (None, true, Some(16), 1.0, 1.0, false),
+            (None, true, Some(16), 0.8, 0.7, true),
+            (Some(0), true, Some(16), 1.0, 1.0, true),
+            (None, false, Some(16), 1.0, 1.0, false),
+            (None, true, Some(2), 1.0, 0.7, false),
+            (None, true, Some(1), 0.8, 1.0, true),
+        ] {
+            let params = ferrisboost::types::TrainParams {
+                n_rounds: 4,
+                max_depth: 6,
+                max_bin: 32,
+                cols_per_block: 3,
+                nthread: 1,
+                subsample,
+                colsample_bytree: colsample,
+                seed: 5,
+                resident_blocks,
+                hist_nodes_per_batch: nodes,
+                gpu_split_cache: split_cache,
+                monotone_constraints: constraints.clone(),
+                ..Default::default()
+            };
+            let cfg = TrainConfig::new(params.clone(), objective);
+            let w = weighted.then_some(weights.as_slice());
+            let what = format!(
+                "{objective:?} resident={resident_blocks:?} cache={split_cache} nodes={nodes:?} \
+                 subsample={subsample} colsample={colsample} weighted={weighted}"
+            );
+            let cpu = train_weighted(&source, &labels, w, &[], &cfg, &mut [], &Local).unwrap();
+            let gpu =
+                train_gpu_weighted(0, &source, &labels, w, &[], &cfg, &mut [], &Local).unwrap();
+            assert!(
+                cpu.trees.iter().any(|t| t.nodes.len() > 3),
+                "{what}: 夹具应该长出多层"
+            );
+            assert_eq!(
+                gpu.to_xgboost_json().unwrap(),
+                cpu.to_xgboost_json().unwrap(),
+                "{what}: 带约束模型必须 CPU/GPU 逐字节相同"
+            );
+            let free = TrainConfig::new(
+                ferrisboost::types::TrainParams {
+                    monotone_constraints: Vec::new(),
+                    ..params
+                },
+                objective,
+            );
+            let unconstrained =
+                train_weighted(&source, &labels, w, &[], &free, &mut [], &Local).unwrap();
+            assert_ne!(
+                unconstrained.to_xgboost_json().unwrap(),
+                cpu.to_xgboost_json().unwrap(),
+                "{what}: 约束应该真的改变模型"
+            );
+        }
+    }
+}

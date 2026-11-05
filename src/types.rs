@@ -468,6 +468,27 @@ pub struct TrainParams {
     /// 而 FB 的 device 侧工作已经比 XGBoost 的整轮快约 33%。
     pub gpu_math: GpuMath,
     pub seed: u64,
+    /// XGBoost `monotone_constraints`,按**全局特征 id** 排列:`1` 递增、
+    /// `-1` 递减、`0` 不约束。空 = 没有约束;比特征数短的部分视为 0。
+    ///
+    /// 全 0 和空完全等价(XGBoost `HasMonotone()` 同样只看有没有非 0),
+    /// 走原来的无约束路径,模型逐字节不变。
+    pub monotone_constraints: Vec<i8>,
+}
+
+impl TrainParams {
+    /// 有没有任何一个非 0 约束。全 0 等价于没有约束。
+    pub fn has_monotone(&self) -> bool {
+        self.monotone_constraints.iter().any(|&c| c != 0)
+    }
+
+    /// 某个特征的约束方向;超出列表长度的特征不约束。
+    pub fn monotone_of(&self, feat: FeatId) -> i8 {
+        self.monotone_constraints
+            .get(feat as usize)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl Default for TrainParams {
@@ -492,6 +513,7 @@ impl Default for TrainParams {
             gpu_math: GpuMath::default(),
             device_quantize: None,
             seed: 0,
+            monotone_constraints: Vec::new(),
         }
     }
 }

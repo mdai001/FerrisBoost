@@ -234,6 +234,7 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
             small: parent,
             span,
             sum: row_sum(&gpair, span),
+            bounds: crate::split::NodeBounds::UNBOUNDED,
             large: None,
         })
         .collect();
@@ -301,7 +302,13 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
             small: small_id,
             span: small_span,
             sum: row_sum(&gpair, small_span),
-            large: Some((large_id, parent_slot, row_sum(&gpair, large_span))),
+            bounds: crate::split::NodeBounds::UNBOUNDED,
+            large: Some((
+                large_id,
+                parent_slot,
+                row_sum(&gpair, large_span),
+                crate::split::NodeBounds::UNBOUNDED,
+            )),
         });
         child_spans.push((small_id, small_span));
         child_spans.push((large_id, large_span));
@@ -398,6 +405,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
             small: parent,
             span,
             sum: row_sum(&gpair, span),
+            bounds: crate::split::NodeBounds::UNBOUNDED,
             large: None,
         })
         .collect();
@@ -442,7 +450,13 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
             small: small_id,
             span: small_span,
             sum: row_sum(&gpair, small_span),
-            large: Some((large_id, parent_slot, row_sum(&gpair, large_span))),
+            bounds: crate::split::NodeBounds::UNBOUNDED,
+            large: Some((
+                large_id,
+                parent_slot,
+                row_sum(&gpair, large_span),
+                crate::split::NodeBounds::UNBOUNDED,
+            )),
         });
         child_spans.push((small_id, small_span));
         child_spans.push((large_id, large_span));
@@ -597,4 +611,115 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
             );
         }
     }
+}
+
+/// Monotone branch of `split_cached_features` vs the Rust constrained evaluator:
+/// every constraint pattern × node bounds (unbounded, loose, binding), all
+/// candidates bit-identical including "no valid split" outcomes.
+#[test]
+fn constrained_kernel_matches_cpu_evaluator() {
+    use crate::split::{best_split_in_block_constrained, Monotone, NodeBounds};
+    let (bins, raw_gpair) = fixture();
+    let feats: Vec<FeatId> = (0..N_FEATURES as FeatId).collect();
+    let q = GradQuantizer::from_bounds(3.0, 1.0, N_ROWS);
+    let gpair: Vec<GradPairFixed> = raw_gpair.iter().map(|pair| q.to_fixed(*pair)).collect();
+    let spans = [
+        GpuRowSpan { offset: 0, len: 32 },
+        GpuRowSpan {
+            offset: 32,
+            len: 32,
+        },
+        GpuRowSpan {
+            offset: 64,
+            len: 32,
+        },
+    ];
+    let bounds_cases = [
+        NodeBounds::UNBOUNDED,
+        NodeBounds {
+            lower: -0.5,
+            upper: 0.5,
+        },
+        NodeBounds {
+            lower: -0.05,
+            upper: 0.02,
+        },
+        NodeBounds {
+            lower: 0.1,
+            upper: 0.1,
+        },
+    ];
+    let mut constrained_differs = false;
+    for constraints in [
+        vec![1i8, 1, 1],
+        vec![-1, -1, -1],
+        vec![1, -1, 0],
+        vec![0, 0, -1],
+    ] {
+        for bounds in bounds_cases {
+            let params = TrainParams {
+                lambda: 1.0,
+                gamma: 0.0,
+                min_child_weight: 1.0,
+                hist_nodes_per_batch: Some(3),
+                monotone_constraints: constraints.clone(),
+                ..Default::default()
+            };
+            let ctx = context();
+            ctx.upload_gpair(&gpair).unwrap();
+            ctx.begin_tree_rows().unwrap();
+            let mut session = ctx
+                .block_session(0, &bins, N_ROWS, N_FEATURES, &HIST_OFFSETS, None)
+                .unwrap();
+            let groups: Vec<_> = spans
+                .iter()
+                .enumerate()
+                .map(|(node, &span)| GpuSplitGroup {
+                    small: node,
+                    span,
+                    sum: row_sum(&gpair, span),
+                    bounds,
+                    large: None,
+                })
+                .collect();
+            session.begin_split_level(0).unwrap();
+            let got = session
+                .split_cached_batch(&groups, &feats, None, &q, &params, false)
+                .unwrap();
+            session.finish_split_level(0);
+            for (node, span) in spans.iter().copied().enumerate() {
+                let hist = cpu_histogram(&bins, &gpair, span);
+                let sum = row_sum(&gpair, span);
+                let expected = best_split_in_block_constrained(
+                    &hist,
+                    &feats,
+                    &HIST_OFFSETS,
+                    sum,
+                    &q,
+                    &params,
+                    None,
+                    Some(Monotone {
+                        constraints: &constraints,
+                        bounds,
+                    }),
+                );
+                let unconstrained =
+                    best_split_in_block(&hist, &feats, &HIST_OFFSETS, sum, &q, &params, None);
+                if expected.map(|c| (c.feat, c.bin, c.gain.to_bits()))
+                    != unconstrained.map(|c| (c.feat, c.bin, c.gain.to_bits()))
+                {
+                    constrained_differs = true;
+                }
+                assert_candidate_eq(
+                    got[node].1,
+                    expected,
+                    &format!("constraints={constraints:?} bounds={bounds:?} node {node}"),
+                );
+            }
+        }
+    }
+    assert!(
+        constrained_differs,
+        "fixture must exercise constraints that change the chosen split"
+    );
 }

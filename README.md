@@ -242,6 +242,7 @@ logging, and the complete parameter reference.
 
 - Added per-row sample weights (`weight=`), including weighted validation sets. Weights apply to gradients, metrics, and bin boundaries, as in XGBoost.
 - Added `params["eval_metric"]` with `rmse`, `logloss`, `error`, and `auc`.
+- Added `params["monotone_constraints"]` (XGBoost semantics; tuple, string, or by feature name), on CPU and GPU.
 
 ### 0.0.3
 

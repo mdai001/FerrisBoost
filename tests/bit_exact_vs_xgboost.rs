@@ -495,3 +495,60 @@ fn bit_exact_vs_xgboost_with_sample_weights() {
         }
     }
 }
+
+/// 单调约束:XGBoost `monotone_constraints` 训出来的 margin,位精确。
+///
+/// 三种约束形状(混合 / 全递增 / 稀疏)× 两个 objective × 两个 seed(seed 1
+/// 带重尾样本权重),外加一个深树长跑。锁住的是 XGBoost 3.4.1 单输出 hist 的
+/// 约束语义:节点上下界、夹权重、违反方向的候选作废、给定权重形式的增益、
+/// 孩子界从 `(wl + wr) / 2` 切开、叶子值 = 夹过的权重 × eta。
+#[test]
+fn bit_exact_vs_xgboost_with_monotone_constraints() {
+    let cases = load_index_from("monotone_index.json");
+    assert_eq!(cases.len(), 13, "单调约束 fixture 应该有 13 个配置");
+    let raw = fs::read_to_string(fixtures_dir().join("monotone_index.json")).unwrap();
+    let index: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let dir = fixtures_dir();
+    for (case, meta) in cases.iter().zip(index["cases"].as_array().unwrap()) {
+        assert_eq!(meta["name"].as_str(), Some(case.name.as_str()));
+        let constraints: Vec<i8> = meta["monotone_constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i8)
+            .collect();
+        let x = read_f32(&dir.join(format!("{}.x", case.name)));
+        let y = read_f32(&dir.join(format!("{}.y", case.name)));
+        let w =
+            (!meta["weights"].is_null()).then(|| read_f32(&dir.join(format!("{}.w", case.name))));
+        for nthread in [1, 4] {
+            let src = DenseSource::new_weighted_with_nthread(
+                &x,
+                case.n_rows,
+                case.n_features,
+                BinningStrategy::Sketch {
+                    max_bins: case.params.max_bin as usize,
+                },
+                case.params.cols_per_block,
+                nthread,
+                w.as_deref(),
+            );
+            let cfg = TrainConfig {
+                base_score: case.base_score,
+                ..TrainConfig::new(
+                    TrainParams {
+                        nthread,
+                        monotone_constraints: constraints.clone(),
+                        ..case.params.clone()
+                    },
+                    case.objective,
+                )
+            };
+            let model = train_weighted(&src, &y, w.as_deref(), &[], &cfg, &mut [], &Local).unwrap();
+            let got: Vec<f32> = (0..case.n_rows)
+                .map(|r| model.predict_margin(&x[r * case.n_features..(r + 1) * case.n_features]))
+                .collect();
+            assert_bit_exact(case, &got);
+        }
+    }
+}

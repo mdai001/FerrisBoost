@@ -964,6 +964,17 @@ fn train_with_backend(
         p.max_depth
     );
     anyhow::ensure!(p.cols_per_block > 0, "cols_per_block 必须 > 0");
+    // XGBoost:约束比特征多是错误;比特征少的部分视为 0。
+    anyhow::ensure!(
+        p.monotone_constraints.len() <= source.n_features(),
+        "monotone_constraints 有 {} 个,但只有 {} 个特征",
+        p.monotone_constraints.len(),
+        source.n_features()
+    );
+    anyhow::ensure!(
+        p.monotone_constraints.iter().all(|c| (-1..=1).contains(c)),
+        "monotone_constraints 只接受 -1 / 0 / 1(按符号归一后)"
+    );
     anyhow::ensure!(
         p.learning_rate.is_finite() && p.learning_rate >= 0.0,
         "learning_rate 必须是非负有限值"
@@ -1522,7 +1533,7 @@ pub fn train_gpu_one_tree(
                 &fixed,
                 None,
             )?;
-            Ok::<_, anyhow::Error>(split::best_split_in_block(
+            Ok::<_, anyhow::Error>(split::best_split_in_block_constrained(
                 &Histogram { bins: hist },
                 &block.feat_ids,
                 &offsets,
@@ -1530,6 +1541,7 @@ pub fn train_gpu_one_tree(
                 &quantizer,
                 &cfg.params,
                 None,
+                monotone_at(&cfg.params, split::NodeBounds::UNBOUNDED),
             ))
         })??;
         best = split::reduce_best(&[best, block_best]);
@@ -1548,15 +1560,21 @@ pub fn train_gpu_one_tree(
             best_score: None,
         });
     };
+    let children = child_leaves(
+        &chosen,
+        &quantizer,
+        &cfg.params,
+        split::NodeBounds::UNBOUNDED,
+    );
     let (left_node, right_node) = tree.split_leaf(
         root,
         chosen.feat,
         tree::split_threshold(cuts, chosen.feat, chosen.bin),
         chosen.missing_left,
         chosen.gain,
-        leaf_of(chosen.left, &quantizer, &cfg.params),
+        children.left_value,
         hess_of(chosen.left, &quantizer),
-        leaf_of(chosen.right, &quantizer, &cfg.params),
+        children.right_value,
         hess_of(chosen.right, &quantizer),
     );
     // 选中的列也按需读取;GPU partition 只接收这一个 column,不把整块
@@ -1769,6 +1787,8 @@ struct LevelNode {
     /// 梯度总和,**含缺失行** —— split.rs 靠它反推缺失部分
     sum: GradPairFixed,
     hist_from: HistFrom,
+    /// 单调约束下这个节点的权重上下界。无约束时恒为 `UNBOUNDED`、不被读取。
+    bounds: split::NodeBounds,
 }
 
 enum NodeRows {
@@ -1940,6 +1960,7 @@ fn build_tree(
         rows: root_rows,
         sum: root_sum,
         hist_from: HistFrom::Accumulate,
+        bounds: split::NodeBounds::UNBOUNDED,
     }];
     // 上一层的直方图,[列块][槽位]。兄弟相减要用,所以整层都得留着。
     let mut parent_hists: Vec<Vec<Histogram>> = Vec::new();
@@ -2068,6 +2089,7 @@ fn build_tree(
                                     small: 0,
                                     span: level[0].rows.device(),
                                     sum: level[0].sum,
+                                    bounds: level[0].bounds,
                                     large: None,
                                 });
                             } else {
@@ -2079,7 +2101,8 @@ fn build_tree(
                                                 small: sibling,
                                                 span: level[sibling].rows.device(),
                                                 sum: level[sibling].sum,
-                                                large: Some((i, cache_slot, ln.sum)),
+                                                bounds: level[sibling].bounds,
+                                                large: Some((i, cache_slot, ln.sum, ln.bounds)),
                                             });
                                         }
                                     }
@@ -2212,7 +2235,7 @@ fn build_tree(
                             if gpu_done[i] {
                                 return gpu_candidates[i];
                             }
-                            split::best_split_in_block(
+                            split::best_split_in_block_constrained(
                                 &per_node[i],
                                 &plan.hist_feats,
                                 &plan.hist_offsets,
@@ -2220,6 +2243,7 @@ fn build_tree(
                                 q,
                                 p,
                                 sampled,
+                                monotone_at(p, ln.bounds),
                             )
                         })
                         .collect();
@@ -2450,15 +2474,16 @@ fn build_tree(
                 continue; // 分不动就留成叶子,值在 push_leaf 时就写好了
             };
 
+            let children = child_leaves(&c, q, p, ln.bounds);
             let (left_node, right_node) = t.split_leaf(
                 ln.node,
                 c.feat,
                 tree::split_threshold(cuts, c.feat, c.bin),
                 c.missing_left,
                 c.gain,
-                leaf_of(c.left, q, p),
+                children.left_value,
                 hess_of(c.left, q),
-                leaf_of(c.right, q, p),
+                children.right_value,
                 hess_of(c.right, q),
             );
 
@@ -2478,12 +2503,14 @@ fn build_tree(
                     rows: left_rows,
                     sum: c.left,
                     hist_from: HistFrom::Accumulate,
+                    bounds: children.left_bounds,
                 },
                 LevelNode {
                     node: right_node,
                     rows: right_rows,
                     sum: c.right,
                     hist_from: HistFrom::Accumulate,
+                    bounds: children.right_bounds,
                 },
             ];
             pair[big].hist_from = HistFrom::Subtract {
@@ -2549,6 +2576,51 @@ fn build_tree(
 
 /// 叶子权重 × learning_rate。收缩在这里做,不在预测时 ——
 /// 见 tree.rs 里 `Node::leaf_value` 的说明。
+/// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
+fn monotone_at(p: &TrainParams, bounds: split::NodeBounds) -> Option<split::Monotone<'_>> {
+    p.has_monotone().then_some(split::Monotone {
+        constraints: &p.monotone_constraints,
+        bounds,
+    })
+}
+
+/// 一次分裂落地后两个孩子的叶子值和权重界。
+struct ChildLeaves {
+    left_value: f32,
+    right_value: f32,
+    left_bounds: split::NodeBounds,
+    right_bounds: split::NodeBounds,
+}
+
+/// 无约束:叶子值就是 `leaf_of`,界保持 `UNBOUNDED`(一位不动)。
+/// 有约束:孩子权重先夹进**父节点**的界(XGBoost `ApplyTreeSplit` 用
+/// `candidate.nid` 的界),叶子值 = 夹过的权重 × learning_rate;孩子的界按
+/// 分裂特征的约束方向从 `(wl + wr) / 2` 处切开。
+fn child_leaves(
+    c: &SplitCandidate,
+    q: &GradQuantizer,
+    p: &TrainParams,
+    parent: split::NodeBounds,
+) -> ChildLeaves {
+    if !p.has_monotone() {
+        return ChildLeaves {
+            left_value: leaf_of(c.left, q, p),
+            right_value: leaf_of(c.right, q, p),
+            left_bounds: split::NodeBounds::UNBOUNDED,
+            right_bounds: split::NodeBounds::UNBOUNDED,
+        };
+    }
+    let wl = split::bounded_weight(c.left, q, p, parent);
+    let wr = split::bounded_weight(c.right, q, p, parent);
+    let (left_bounds, right_bounds) = parent.children(p.monotone_of(c.feat), wl, wr);
+    ChildLeaves {
+        left_value: wl * p.learning_rate,
+        right_value: wr * p.learning_rate,
+        left_bounds,
+        right_bounds,
+    }
+}
+
 fn leaf_of(sum: GradPairFixed, q: &GradQuantizer, p: &TrainParams) -> f32 {
     split::leaf_weight(sum, q, p) * p.learning_rate
 }
@@ -3913,5 +3985,189 @@ mod tests {
             LogLoss.eval_weighted(&pred, &label, Some(&w)),
             (ll / wsum) as f32
         );
+    }
+
+    // ------------------------------------------------------------ 单调约束
+
+    /// 非单调的真实关系(x0 上先升后降、x1 上锯齿),约束才会真的起作用。
+    fn wiggly_data(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>, usize) {
+        let nf = 5;
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32) / (1u64 << 24) as f32
+        };
+        let mut x = Vec::with_capacity(n * nf);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let row: Vec<f32> = (0..nf).map(|_| next() * 4.0 - 2.0).collect();
+            let signal =
+                (row[0] * 1.7).sin() + 0.8 * (row[1] * 3.0).cos() - 0.5 * row[2] + 0.3 * next();
+            for (f, v) in row.iter().enumerate() {
+                x.push(if (i + f) % 13 == 0 { MISSING } else { *v });
+            }
+            y.push(signal);
+        }
+        (x, y, nf)
+    }
+
+    fn assert_monotone(model: &Model, x: &[f32], nf: usize, constraints: &[i8], what: &str) {
+        let grid: Vec<f32> = (0..61).map(|k| -2.2 + k as f32 * (4.4 / 60.0)).collect();
+        for base in (0..x.len() / nf).step_by(7).take(40) {
+            let mut row = x[base * nf..(base + 1) * nf].to_vec();
+            for (f, &c) in constraints.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let original = row[f];
+                let preds: Vec<f32> = grid
+                    .iter()
+                    .map(|&v| {
+                        row[f] = v;
+                        model.predict_margin(&row)
+                    })
+                    .collect();
+                row[f] = original;
+                for pair in preds.windows(2) {
+                    let ok = if c > 0 {
+                        pair[1] >= pair[0]
+                    } else {
+                        pair[1] <= pair[0]
+                    };
+                    assert!(
+                        ok,
+                        "{what}: feature {f} (c={c}) row {base} not monotone: {preds:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monotone_unset_and_all_zero_are_byte_identical() {
+        let (x, y, nf) = wiggly_data(300, 1);
+        for obj in [Objective::Logistic, Objective::SquaredError] {
+            let labels: Vec<f32> = match obj {
+                Objective::Logistic => y.iter().map(|&v| f32::from(v > 0.0)).collect(),
+                _ => y.clone(),
+            };
+            let p = params(5, 4);
+            let src =
+                DenseSource::from_row_major(&x, labels.len(), nf, p.max_bin, p.cols_per_block);
+            let plain = train(
+                &src,
+                &labels,
+                &[],
+                &TrainConfig::new(p.clone(), obj),
+                &mut [],
+                &Local,
+            )
+            .unwrap();
+            for zeros in [vec![0i8; nf], vec![0i8; 2]] {
+                let mut q = p.clone();
+                q.monotone_constraints = zeros;
+                let m = train(
+                    &src,
+                    &labels,
+                    &[],
+                    &TrainConfig::new(q, obj),
+                    &mut [],
+                    &Local,
+                )
+                .unwrap();
+                assert_eq!(json(&plain), json(&m), "{obj:?}: 全 0 约束必须等价于不约束");
+            }
+        }
+    }
+
+    #[test]
+    fn monotone_predictions_are_monotone_and_thread_invariant() {
+        for (seed, constraints) in [
+            (2u64, vec![1i8, -1, 0, 0, 0]),
+            (3, vec![-1, 1, 1, 0, 0]),
+            (4, vec![1, 1, -1, -1, 1]),
+        ] {
+            let (x, y, nf) = wiggly_data(600, seed);
+            for obj in [Objective::Logistic, Objective::SquaredError] {
+                let labels: Vec<f32> = match obj {
+                    Objective::Logistic => y.iter().map(|&v| f32::from(v > 0.0)).collect(),
+                    _ => y.clone(),
+                };
+                for (depth, subsample, colsample) in [(6, 1.0, 1.0), (8, 0.7, 0.8), (0, 1.0, 1.0)] {
+                    let mut p = params(depth, 6);
+                    p.subsample = subsample;
+                    p.colsample_bytree = colsample;
+                    p.seed = seed;
+                    p.monotone_constraints = constraints.clone();
+                    let src = DenseSource::from_row_major(
+                        &x,
+                        labels.len(),
+                        nf,
+                        p.max_bin,
+                        p.cols_per_block,
+                    );
+                    let cfg = TrainConfig::new(p.clone(), obj);
+                    let m = train(&src, &labels, &[], &cfg, &mut [], &Local).unwrap();
+                    let what =
+                        format!("seed={seed} {obj:?} depth={depth} ss={subsample} cs={colsample}");
+                    assert_monotone(&m, &x, nf, &constraints, &what);
+                    let mut q = p.clone();
+                    q.nthread = 3;
+                    q.cols_per_block = 1;
+                    let s2 = DenseSource::from_row_major(&x, labels.len(), nf, q.max_bin, 1);
+                    let m2 = train(
+                        &s2,
+                        &labels,
+                        &[],
+                        &TrainConfig::new(q, obj),
+                        &mut [],
+                        &Local,
+                    )
+                    .unwrap();
+                    assert_eq!(json(&m), json(&m2), "{what}: 线程数/块宽不能改变约束模型");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unconstrained_wiggly_model_is_not_monotone() {
+        // 反证夹具:不加约束时同样的检查必须失败,否则上面的测试什么也没证明。
+        let (x, y, nf) = wiggly_data(600, 2);
+        let p = params(6, 6);
+        let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+        let m = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(p, Objective::SquaredError),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_monotone(&m, &x, nf, &[1, -1, 0, 0, 0], "unconstrained");
+        }));
+        assert!(caught.is_err(), "夹具必须在不加约束时违反单调性");
+    }
+
+    #[test]
+    fn rejects_too_many_monotone_constraints() {
+        let (x, y, nf) = step_data(50);
+        let mut p = params(2, 1);
+        p.monotone_constraints = vec![1; nf + 1];
+        let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+        let err = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(p, Objective::Logistic),
+            &mut [],
+            &Local,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("monotone_constraints"), "{err}");
     }
 }

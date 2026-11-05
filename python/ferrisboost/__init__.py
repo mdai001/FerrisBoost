@@ -80,6 +80,9 @@ _DEFAULTS: dict[str, Any] = {
     # XGBoost 同名参数:字符串或字符串列表。None = objective 的默认指标。
     # 多个时 early stopping 盯最后一个(和 XGBoost 一致)。
     "eval_metric": None,
+    # XGBoost 同名参数:元组/列表(按特征位置)、"(1,0,-1)" 字符串,或
+    # {特征名: 方向} 字典(需要列名)。1 递增、-1 递减、0 不约束;只看符号。
+    "monotone_constraints": None,
 }
 
 # XGBoost 的别名,两种写法都收
@@ -218,7 +221,58 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             )
         # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
         out["eval_metric"] = names
+    out["monotone_constraints"] = _normalize_monotone(out["monotone_constraints"])
     return out
+
+
+def _monotone_sign(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"monotone_constraints 的{where}要是整数(1 / 0 / -1),给的是 {value!r}")
+    # XGBoost 只看符号:2 等价于 1,-3 等价于 -1。
+    return int(np.sign(int(value)))
+
+
+def _normalize_monotone(mc: Any) -> list[int] | dict[str, int] | None:
+    """归一成按位置的整数列表,或 {列名: 方向}。全 0 / 空等价于不约束。"""
+    if mc is None:
+        return None
+    if isinstance(mc, str):
+        text = mc.strip()
+        if not (text.startswith("(") and text.endswith(")")):
+            raise ValueError(f'monotone_constraints 字符串要写成 "(1,0,-1)",给的是 {mc!r}')
+        body = text[1:-1].strip()
+        try:
+            values = [int(v) for v in body.split(",")] if body else []
+        except ValueError:
+            raise ValueError(f"monotone_constraints 字符串里有非整数:{mc!r}") from None
+        return [_monotone_sign(v, "元素") for v in values]
+    if isinstance(mc, Mapping):
+        out = {}
+        for name, value in mc.items():
+            if not isinstance(name, str):
+                raise ValueError(f"monotone_constraints 字典的键要是列名字符串,给的是 {name!r}")
+            out[name] = _monotone_sign(value, f"列 {name!r} 的值")
+        return out
+    if isinstance(mc, (list, tuple, np.ndarray)):
+        return [_monotone_sign(v, "元素") for v in np.asarray(mc, dtype=object).ravel()]
+    raise ValueError(
+        "monotone_constraints 要是元组/列表、\"(1,0,-1)\" 字符串或 {列名: 方向} 字典,"
+        f"给的是 {type(mc).__name__}"
+    )
+
+
+def _arrow_column_names(obj: Any) -> list[str] | None:
+    mod = type(obj).__module__ or ""
+    if mod.startswith("pyarrow") and hasattr(obj, "column_names"):
+        return list(obj.column_names)
+    return None
+
+
+def _resolve_named_monotone(mc: dict[str, int], names: list[str]) -> list[int]:
+    unknown = [k for k in mc if k not in names]
+    if unknown:
+        raise ValueError(f"monotone_constraints 里的列 {unknown} 不是特征列;特征列有 {names}")
+    return [mc.get(n, 0) for n in names]
 
 
 def _as_matrix(x: Any, name: str = "data") -> np.ndarray:
@@ -369,6 +423,14 @@ def train(
                                  weight=weight)
     else:
         arrow = _from_pyarrow(data)
+        if isinstance(p["monotone_constraints"], dict):
+            names = _arrow_column_names(data)
+            if names is None:
+                raise ValueError(
+                    "按列名给的 monotone_constraints 需要列名:numpy 数组没有列名,"
+                    "请改用按位置的元组,或用 pyarrow Table / 带表头的文件"
+                )
+            p["monotone_constraints"] = _resolve_named_monotone(p["monotone_constraints"], names)
         x = _as_matrix(arrow if arrow is not None else data)
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):

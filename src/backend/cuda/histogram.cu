@@ -38,6 +38,51 @@ __device__ SplitPacket split_candidate(SplitPair l, SplitPair r,
     p.flags = 1u | (missing ? 2u : 0u); p.left = l; p.right = r;
     return p;
 }
+// Monotone constraints (XGBoost 3.4.1 single-output hist semantics). Each
+// rounding step mirrors src/split.rs `bounded_split_gain` exactly; explicit
+// _rn intrinsics forbid FMA contraction. Unused when has_monotone == 0.
+__device__ float mono_weight(double g, double h, float lambda) {
+    if (h <= 0.0) return 0.0f;
+    return __double2float_rn(__ddiv_rn(-g, __dadd_rn(h, (double)lambda)));
+}
+__device__ float mono_apply(float w, float lower, float upper) {
+    if (w < lower) return lower;
+    if (w > upper) return upper;
+    return w;
+}
+__device__ float mono_gain_given_weight(double g, double h, float w, float lambda) {
+    if (h <= 0.0) return 0.0f;
+    double square = (double)__fmul_rn(w, w);
+    double a = __dmul_rn(__dmul_rn(2.0, g), (double)w);
+    double b = __dmul_rn(__dadd_rn(h, (double)lambda), square);
+    return __double2float_rn(-__dadd_rn(__dadd_rn(a, b), 0.0));
+}
+__device__ float mono_node_gain(SplitPair s, double ig, double ih, float lambda,
+    float lower, float upper) {
+    double g = split_value(s.grad, ig), h = split_value(s.hess, ih);
+    return mono_gain_given_weight(g, h, mono_apply(mono_weight(g, h, lambda), lower, upper),
+        lambda);
+}
+__device__ SplitPacket mono_candidate(SplitPair l, SplitPair r,
+    uint32_t feat, uint32_t bin, bool missing, float parent,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    int32_t constraint, float lower, float upper) {
+    SplitPacket p{};
+    double hl = split_value(l.hess, ih), hr = split_value(r.hess, ih);
+    if (!(hl > 0.0 && hr > 0.0 && hl >= (double)mcw && hr >= (double)mcw)) return p;
+    double gl = split_value(l.grad, ig), gr = split_value(r.grad, ig);
+    float wl = mono_apply(mono_weight(gl, hl, lambda), lower, upper);
+    float wr = mono_apply(mono_weight(gr, hr, lambda), lower, upper);
+    if ((constraint > 0 && wl > wr) || (constraint < 0 && wl < wr)) return p;
+    float gain = __fadd_rn(mono_gain_given_weight(gl, hl, wl, lambda),
+        mono_gain_given_weight(gr, hr, wr, lambda));
+    float loss = __fsub_rn(gain, parent);
+    float result = __double2float_rn(__dsub_rn((double)loss, (double)gamma));
+    if (!(result > 1.e-6f)) return p;
+    p.feat = feat; p.bin = bin; p.gain = result;
+    p.flags = 1u | (missing ? 2u : 0u); p.left = l; p.right = r;
+    return p;
+}
 __device__ bool split_better(SplitPacket a, uint32_t ao, SplitPacket b, uint32_t bo) {
     return (a.flags & 1u) && (!(b.flags & 1u) || a.gain > b.gain ||
         (a.gain == b.gain && ao < bo));
@@ -46,16 +91,20 @@ __device__ bool split_better(SplitPacket a, uint32_t ao, SplitPacket b, uint32_t
 // Per-node metadata: working output slot, small-input slot, previous-cache
 // parent slot (UINT32_MAX = direct), next-cache slot (UINT32_MAX = uncached).
 // Cache generations are disjoint; no CTA writes an input used by another CTA.
+// Monotone: `bounds[n*2..]` = node [lower, upper], `monotone[f]` = direction of
+// block-local feature f; both read only when has_monotone != 0 (uniform).
 extern "C" __global__ void split_cached_features(
     SplitPair* hist, const SplitPair* previous, SplitPair* next,
     const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
     const SplitPair* sums, const uint32_t* metadata, uint32_t features,
     uint32_t hist_stride, uint32_t cache_stride,
     double ig, double ih, float lambda, float gamma, float mcw,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
     SplitPacket* output) {
     __shared__ SplitPair prefix[256];
     __shared__ SplitPair warp_totals[8];
     __shared__ double parent_gain;
+    __shared__ float mono_parent;
     __shared__ SplitPacket winners[256];
     __shared__ uint32_t ordinals[256];
     uint32_t t = threadIdx.x, f = blockIdx.x, n = blockIdx.y;
@@ -72,7 +121,18 @@ extern "C" __global__ void split_cached_features(
         if (m[3] != 0xffffffffu)
             next[(size_t)m[3] * cache_stride + lo + t] = v;
     }
-    if (!t) parent_gain = split_gain(sums[n], ig, ih, lambda);
+    float lower = 0.0f, upper = 0.0f;
+    int32_t constraint = 0;
+    if (has_monotone) {
+        lower = bounds[(size_t)n * 2];
+        upper = bounds[(size_t)n * 2 + 1];
+        constraint = monotone[f];
+    }
+    if (!t) {
+        parent_gain = split_gain(sums[n], ig, ih, lambda);
+        if (has_monotone)
+            mono_parent = mono_node_gain(sums[n], ig, ih, lambda, lower, upper);
+    }
     // All 256 threads participate, including zero-padded bins. Integer addition
     // is modulo 2^64, so this two-stage scan has exactly the serial prefix.
     // Shuffle operands never cross a warp; shared cross-warp data is protected
@@ -102,14 +162,20 @@ extern "C" __global__ void split_cached_features(
     SplitPacket best{}; uint32_t ordinal = 0xffffffffu;
     if (t < count && enabled[f]) {
         SplitPair sum = sums[n], total = prefix[count - 1];
-        best = split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
-            false, parent_gain, ig, ih, lambda, gamma, mcw);
+        best = has_monotone
+            ? mono_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1, false,
+                mono_parent, ig, ih, lambda, gamma, mcw, constraint, lower, upper)
+            : split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
+                false, parent_gain, ig, ih, lambda, gamma, mcw);
         ordinal = t;
         if (total.grad != sum.grad || total.hess != sum.hess) {
             SplitPair before = t ? prefix[t - 1] : SplitPair{};
             SplitPair right = split_sub(total, before);
-            SplitPacket reverse = split_candidate(split_sub(sum, right), right, feats[f], t,
-                true, parent_gain, ig, ih, lambda, gamma, mcw);
+            SplitPacket reverse = has_monotone
+                ? mono_candidate(split_sub(sum, right), right, feats[f], t, true,
+                    mono_parent, ig, ih, lambda, gamma, mcw, constraint, lower, upper)
+                : split_candidate(split_sub(sum, right), right, feats[f], t,
+                    true, parent_gain, ig, ih, lambda, gamma, mcw);
             uint32_t ro = count + count - 1 - t;
             if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
         }
