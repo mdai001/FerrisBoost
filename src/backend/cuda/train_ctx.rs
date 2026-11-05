@@ -367,6 +367,8 @@ struct GpuBuffers {
     pred_resident: Option<CudaSlice<f32>>,
     /// `gpu_math = "fast"`:label 常驻 device,整个训练只上传一次。
     label_resident: Option<CudaSlice<f32>>,
+    /// `gpu_math = "fast"` 且带样本权重:权重常驻 device,只上传一次。
+    weight_resident: Option<CudaSlice<f32>>,
     /// 当前节点的行索引。
     rows: CudaSlice<u32>,
     part_col: CudaSlice<u8>,
@@ -1275,9 +1277,19 @@ impl GpuTrainCtx {
         } else {
             (None, None)
         };
+        let fast_weight_bytes = if fast_math && config.fast_weights { n_rows * 4 } else { 0 };
+        let weight_resident = if fast_weight_bytes > 0 {
+            Some(
+                stream
+                    .alloc_zeros::<f32>(n_rows.max(1))
+                    .context("fast weight 分配")?,
+            )
+        } else {
+            None
+        };
         // 行主序转置的落地区:H2D 先进这里(列主序),转置后写进 slot.bins
         let budget = GpuMemoryBudget {
-            fast_math_bytes: if fast_math { n_rows * 4 * 2 } else { 0 },
+            fast_math_bytes: if fast_math { n_rows * 4 * 2 } else { 0 } + fast_weight_bytes,
             rm_stage_bytes: if row_major {
                 rm_stage_len * rm_bufs * rm_slot_count
             } else {
@@ -1398,6 +1410,7 @@ impl GpuTrainCtx {
             buf: Mutex::new(GpuBuffers {
                 pred_resident,
                 label_resident,
+                weight_resident,
                 gpair,
                 rows,
                 part_col,
@@ -1924,6 +1937,7 @@ impl GpuTrainCtx {
             let GpuBuffers {
                 pred_resident,
                 label_resident,
+                weight_resident,
                 prediction_delta,
                 gpair_f32,
                 ..
@@ -1933,6 +1947,9 @@ impl GpuTrainCtx {
                 .as_ref()
                 .context("fast label buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            // 无权重时传 label 作占位指针:kernel 只在 has_weight 时读它。
+            let has_weight: u32 = weight_resident.is_some().into();
+            let weight = weight_resident.as_ref().unwrap_or(label);
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (threads, 1, 1),
@@ -1943,6 +1960,8 @@ impl GpuTrainCtx {
                 .arg(pred)
                 .arg(&*prediction_delta)
                 .arg(label)
+                .arg(weight)
+                .arg(&has_weight)
                 .arg(&n_rows_u32)
                 .arg(&obj_code)
                 .arg(out)
@@ -1995,7 +2014,12 @@ impl GpuTrainCtx {
         Ok(())
     }
 
-    pub fn init_fast_math(&self, labels: &[f32], margin: f32) -> Result<()> {
+    pub fn init_fast_math(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        margin: f32,
+    ) -> Result<()> {
         if labels.len() != self.n_rows {
             bail!(
                 "label 长度 {} 与训练行数 {} 不符",
@@ -2007,8 +2031,21 @@ impl GpuTrainCtx {
         let GpuBuffers {
             pred_resident,
             label_resident,
+            weight_resident,
             ..
         } = &mut *buf;
+        match (weights, weight_resident.as_mut()) {
+            (None, None) => {}
+            (Some(w), Some(dev)) => {
+                if w.len() != self.n_rows {
+                    bail!("权重长度 {} 与训练行数 {} 不符", w.len(), self.n_rows);
+                }
+                self.stream.memcpy_htod(w, dev).context("weight H2D")?;
+            }
+            // 分配与否必须由同一个 resolved 配置决定;不一致就是接线错误。
+            (Some(_), None) => bail!("带权重的 fast 训练没有分配 device 权重 buffer"),
+            (None, Some(_)) => bail!("分配了 device 权重 buffer 但没有传入权重"),
+        }
         let label = label_resident
             .as_mut()
             .context("fast label buffer 未分配")?;

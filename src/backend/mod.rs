@@ -31,6 +31,7 @@ pub mod cuda {
         pub hist_nodes_per_batch: Option<usize>,
         pub gpu_split_cache: bool,
         pub gpu_math: crate::types::GpuMath,
+        pub fast_weights: bool,
     }
     impl Default for SharedHistogramConfig {
         fn default() -> Self {
@@ -43,6 +44,7 @@ pub mod cuda {
                 hist_nodes_per_batch: None,
                 gpu_split_cache: crate::types::DEFAULT_GPU_SPLIT_CACHE,
                 gpu_math: crate::types::GpuMath::Exact,
+                fast_weights: false,
             }
         }
     }
@@ -132,7 +134,12 @@ pub mod cuda {
         pub fn prediction_authority(&self) -> crate::types::PredictionAuthority {
             match self.0 {}
         }
-        pub fn init_fast_math(&self, _labels: &[f32], _margin: f32) -> Result<()> {
+        pub fn init_fast_math(
+            &self,
+            _labels: &[f32],
+            _weights: Option<&[f32]>,
+            _margin: f32,
+        ) -> Result<()> {
             match self.0 {}
         }
         pub fn fast_gradient_and_quantize(

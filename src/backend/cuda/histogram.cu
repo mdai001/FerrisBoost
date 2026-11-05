@@ -464,6 +464,10 @@ extern "C" __global__ void apply_delta_and_gradient(
     float* pred,
     const float* delta,
     const float* label,
+    // 样本权重(XGBoost:grad、hess 同乘 w,hess 下限在乘之前)。
+    // has_weight == 0 时 weight 是占位指针,不读。
+    const float* weight,
+    uint32_t has_weight,
     uint32_t n_rows,
     uint32_t objective,
     float* gpair_out,
@@ -493,6 +497,11 @@ extern "C" __global__ void apply_delta_and_gradient(
             const float s = 1.0f / (1.0f + expf(-p));
             g = s - y;
             h = fmaxf(s * (1.0f - s), 1e-16f);
+        }
+        if (has_weight) {
+            const float w = weight[i];
+            g = __fmul_rn(g, w);
+            h = __fmul_rn(h, w);
         }
         // 未选中的行:**只把工作 gpair 置零**(上面的 prediction 已经更新过了)。
         if (subsample_threshold != ~0ULL) {

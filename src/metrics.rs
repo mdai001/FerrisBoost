@@ -12,6 +12,23 @@ pub trait Metric: Send + Sync {
 
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32;
 
+    /// 能否做加权评估。自定义 metric 默认不支持;训练入口在验证集带权重时
+    /// 先检查这一项,不会把权重静默丢掉。
+    fn supports_weights(&self) -> bool {
+        false
+    }
+
+    /// 加权评估(XGBoost:`sum(w·loss) / sum(w)`)。`None` 走 `eval`。
+    ///
+    /// 默认实现只接受 `None`;支持权重的 metric 必须同时覆盖这个方法和
+    /// `supports_weights`。
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        match weight {
+            None => self.eval(pred, label),
+            Some(_) => panic!("metric {:?} 不支持样本权重", self.name()),
+        }
+    }
+
     /// 值越小越好?early stopping 靠这个判断方向。
     fn lower_is_better(&self) -> bool {
         true
@@ -38,6 +55,39 @@ impl Metric for Rmse {
             .sum();
         (sum / pred.len() as f64).sqrt() as f32
     }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        let Some(w) = weight else {
+            return self.eval(pred, label);
+        };
+        assert_eq!(pred.len(), w.len(), "rmse 的预测和权重长度必须一致");
+        let (sum, wsum) = weighted_sums(pred, label, w, |p, y| {
+            let d = (p - y) as f64;
+            d * d
+        });
+        (sum / wsum).sqrt() as f32
+    }
+}
+
+/// `(sum(w·loss), sum(w))`,f64 累加。
+fn weighted_sums(
+    pred: &[f32],
+    label: &[f32],
+    weight: &[f32],
+    loss: impl Fn(f32, f32) -> f64,
+) -> (f64, f64) {
+    assert_eq!(pred.len(), label.len(), "预测和标签长度必须一致");
+    assert!(!pred.is_empty(), "不能评估空数据");
+    pred.iter()
+        .zip(label)
+        .zip(weight)
+        .fold((0.0, 0.0), |(s, ws), ((&p, &y), &w)| {
+            (s + w as f64 * loss(p, y), ws + w as f64)
+        })
 }
 
 pub struct LogLoss;
@@ -63,6 +113,26 @@ impl Metric for LogLoss {
             .sum();
         (sum / pred.len() as f64) as f32
     }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        let Some(w) = weight else {
+            return self.eval(pred, label);
+        };
+        assert_eq!(pred.len(), w.len(), "logloss 的预测和权重长度必须一致");
+        let (sum, wsum) = weighted_sums(pred, label, w, logloss_row);
+        (sum / wsum) as f32
+    }
+}
+
+fn logloss_row(raw: f32, y: f32) -> f64 {
+    const EPS: f64 = 1e-15;
+    let p = (1.0 / (1.0 + (-raw as f64).exp())).clamp(EPS, 1.0 - EPS);
+    let y = y as f64;
+    -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
 }
 
 /// objective 决定的默认指标,和 XGBoost 一致。

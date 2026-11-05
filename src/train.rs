@@ -654,6 +654,9 @@ pub struct EvalSet<'a> {
     pub name: String,
     pub source: &'a dyn BlockSource,
     pub labels: &'a [f32],
+    /// 每行样本权重,`None` 等价于全 1(XGBoost 的 DMatrix `weight`)。
+    /// 加权 metric 是 `sum(w·loss) / sum(w)`。
+    pub weights: Option<&'a [f32]>,
 }
 
 /// 让 `with_block` 能带返回值。
@@ -792,7 +795,23 @@ pub fn train(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
 ) -> anyhow::Result<Model> {
-    train_with_backend(source, labels, evals, cfg, callbacks, comm, None)
+    train_with_backend(source, labels, None, evals, cfg, callbacks, comm, None)
+}
+
+/// `train` 加每行样本权重(XGBoost 的 DMatrix `weight`)。
+///
+/// 语义与 XGBoost 一致:objective 算出 grad / hess 之后**两者同乘 w**
+/// (f32),再进入采样掩码和定点量化。`None` 与全 1 权重逐字节相同。
+pub fn train_weighted(
+    source: &dyn BlockSource,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    evals: &[EvalSet],
+    cfg: &TrainConfig,
+    callbacks: &mut [Box<dyn Callback>],
+    comm: &dyn Comm,
+) -> anyhow::Result<Model> {
+    train_with_backend(source, labels, weights, evals, cfg, callbacks, comm, None)
 }
 
 /// 完整多轮/多层 GPU 训练入口。量化列块仍按 `BlockSource::with_block`
@@ -811,12 +830,51 @@ pub fn train_gpu(
     train_with_backend(
         source,
         labels,
+        None,
         evals,
         cfg,
         callbacks,
         comm,
         Some(device_ordinal),
     )
+}
+
+/// `train_gpu` 加每行样本权重。语义见 [`train_weighted`]。
+#[cfg(feature = "cuda")]
+pub fn train_gpu_weighted(
+    device_ordinal: usize,
+    source: &dyn BlockSource,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    evals: &[EvalSet],
+    cfg: &TrainConfig,
+    callbacks: &mut [Box<dyn Callback>],
+    comm: &dyn Comm,
+) -> anyhow::Result<Model> {
+    train_with_backend(
+        source,
+        labels,
+        weights,
+        evals,
+        cfg,
+        callbacks,
+        comm,
+        Some(device_ordinal),
+    )
+}
+
+/// 权重校验:长度一致、有限、非负。XGBoost 同样拒绝负权重。
+fn validate_weights(weights: &[f32], n: usize, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        weights.len() == n,
+        "{name}的权重有 {} 行,数据有 {n} 行",
+        weights.len()
+    );
+    anyhow::ensure!(
+        weights.iter().all(|w| w.is_finite() && *w >= 0.0),
+        "{name}的权重必须全部是有限的非负值"
+    );
+    Ok(())
 }
 
 fn validate_source_metadata(source: &dyn BlockSource, name: &str) -> anyhow::Result<()> {
@@ -848,9 +906,11 @@ fn validate_source_metadata(source: &dyn BlockSource, name: &str) -> anyhow::Res
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn train_with_backend(
     source: &dyn BlockSource,
     labels: &[f32],
+    weights: Option<&[f32]>,
     evals: &[EvalSet],
     cfg: &TrainConfig,
     callbacks: &mut [Box<dyn Callback>],
@@ -867,6 +927,9 @@ fn train_with_backend(
         labels.len()
     );
     anyhow::ensure!(labels.iter().all(|v| v.is_finite()), "标签必须全部是有限值");
+    if let Some(w) = weights {
+        validate_weights(w, n, "训练集")?;
+    }
     if cfg.objective == Objective::Logistic {
         anyhow::ensure!(
             labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
@@ -953,6 +1016,17 @@ fn train_with_backend(
                 ev.name
             );
         }
+        if let Some(w) = ev.weights {
+            validate_weights(w, ev.source.n_rows(), &format!("验证集 {:?} ", ev.name))?;
+            for m in &cfg.eval_metrics {
+                anyhow::ensure!(
+                    m.supports_weights(),
+                    "metric {:?} 不支持加权评估,但验证集 {:?} 带了权重",
+                    m.name(),
+                    ev.name
+                );
+            }
+        }
         validate_source_metadata(ev.source, &format!("验证集 {:?}", ev.name))?;
         anyhow::ensure!(
             ev.source.cuts().offsets == source.cuts().offsets
@@ -1023,6 +1097,7 @@ fn train_with_backend(
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
                     gpu_split_cache: cfg.params.gpu_split_cache,
                     gpu_math: cfg.params.gpu_math,
+                    fast_weights: weights.is_some(),
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
                 },
@@ -1066,7 +1141,7 @@ fn train_with_backend(
     if fast_math {
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
-            .init_fast_math(labels, margin)?;
+            .init_fast_math(labels, weights, margin)?;
     }
 
     // 融合路径把「施加 delta」推迟到下一轮开头,所以要记着是否欠一次。
@@ -1117,15 +1192,26 @@ fn train_with_backend(
             pool.install(|| -> anyhow::Result<()> {
                 let _t = prof::Timer::new(&prof::GRAD);
                 ctx.with_prediction_delta(&mut |delta| {
-                    out = predictions
-                        .par_iter_mut()
-                        .zip(delta.par_iter())
-                        .zip(labels.par_iter())
-                        .map(|((p, d), &y)| {
-                            *p += *d;
-                            gradient_of(*p, y, obj)
-                        })
-                        .collect();
+                    out = match weights {
+                        None => predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .zip(labels.par_iter())
+                            .map(|((p, d), &y)| {
+                                *p += *d;
+                                gradient_of(*p, y, obj)
+                            })
+                            .collect(),
+                        Some(w) => predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .zip(labels.par_iter().zip(w.par_iter()))
+                            .map(|((p, d), (&y, &w))| {
+                                *p += *d;
+                                weighted(gradient_of(*p, y, obj), w)
+                            })
+                            .collect(),
+                    };
                 })
             })?;
             pending_delta = false;
@@ -1133,7 +1219,10 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
-                compute_gradients(&predictions, labels, cfg.objective)
+                match weights {
+                    None => compute_gradients(&predictions, labels, cfg.objective),
+                    Some(w) => compute_gradients_weighted(&predictions, labels, w, cfg.objective),
+                }
             })
         };
         drop(exact_gradient_phase);
@@ -1515,7 +1604,7 @@ fn evaluate(
             entries.push((
                 ev.name.clone(),
                 m.name().to_string(),
-                m.eval(pred, ev.labels),
+                m.eval_weighted(pred, ev.labels, ev.weights),
             ));
         }
     }
@@ -2715,6 +2804,28 @@ fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
 /// 它们只随行数走、完全不进列块那一维,所以以前无论开多少线程都是单线程跑。
 /// GPU 路径上尤其明显 —— HIGGS 1050 万行时 GRAD + QUANTIZE 合计约
 /// 145 ms/轮,占整轮 0.345 s 的四成以上,而那时 GPU 在干等。
+/// XGBoost `RegLossObj::GetGradient`:`GradientPair(grad * w, hess * w)`,
+/// hess 的 `max(.., 1e-16)` 在乘权重**之前**。f32 乘法,与 XGBoost 同。
+#[inline]
+fn weighted(g: GradPair, w: f32) -> GradPair {
+    GradPair {
+        grad: g.grad * w,
+        hess: g.hess * w,
+    }
+}
+
+fn compute_gradients_weighted(
+    pred: &[f32],
+    label: &[f32],
+    weight: &[f32],
+    obj: Objective,
+) -> Vec<GradPair> {
+    pred.par_iter()
+        .zip(label.par_iter().zip(weight.par_iter()))
+        .map(|(&p, (&y, &w))| weighted(gradient_of(p, y, obj), w))
+        .collect()
+}
+
 fn compute_gradients(pred: &[f32], label: &[f32], obj: Objective) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter())
@@ -3008,6 +3119,7 @@ mod tests {
             name: "valid".into(),
             source: &src,
             labels: &y[..18],
+            weights: None,
         };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local)
             .expect_err("验证标签长度不一致必须报错");
@@ -3145,6 +3257,7 @@ mod tests {
             name: "valid".into(),
             source: &valid_src,
             labels: &flipped,
+            weights: None,
         }];
 
         let mut cbs: Vec<Box<dyn Callback>> = vec![
@@ -3214,6 +3327,7 @@ mod tests {
             name: "valid".into(),
             source: &valid_src,
             labels: &y,
+            weights: None,
         }];
 
         let recorder = RecordHistory::new();
@@ -3278,6 +3392,7 @@ mod tests {
             name: "valid".into(),
             source: &valid,
             labels: &y,
+            weights: None,
         }];
         let recorder = RecordHistory::new();
         let history = recorder.handle();
@@ -3329,6 +3444,7 @@ mod tests {
             name: "valid".into(),
             source: &valid,
             labels: &y,
+            weights: None,
         }];
         let recorder = RecordHistory::new();
         let history = recorder.handle();
@@ -3493,6 +3609,7 @@ mod tests {
             name: "valid".into(),
             source: &valid_src,
             labels: &y,
+            weights: None,
         }];
         let model = train(&train_src, &y, &evals, &cfg, &mut [], &Local).unwrap();
 
@@ -3592,5 +3709,147 @@ mod tests {
 
         let empty = DenseSource::from_row_major(&[], 0, 3, 32, 1);
         assert!(leaf_values(&tree, &empty).unwrap().is_empty());
+    }
+
+    // ---- 样本权重 ----
+
+    fn weight_fixture(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, usize) {
+        let (x, y, nf) = step_data(n);
+        // 非平凡权重:含 0、小数和大于 1 的值,与标签不相关。
+        let w = (0..n)
+            .map(|i| match i % 6 {
+                0 => 0.0,
+                1 => 0.25,
+                2 => 1.0,
+                3 => 2.5,
+                4 => 1.75,
+                _ => 4.0,
+            })
+            .collect();
+        (x, y, w, nf)
+    }
+
+    fn json(m: &Model) -> String {
+        m.to_xgboost_json().unwrap()
+    }
+
+    #[test]
+    fn weights_none_and_all_ones_are_byte_identical() {
+        let (x, y, nf) = step_data(97);
+        let ones = vec![1.0f32; y.len()];
+        for obj in [Objective::Logistic, Objective::SquaredError] {
+            for subsample in [1.0, 0.7] {
+                let mut p = params(3, 4);
+                p.subsample = subsample;
+                p.seed = 7;
+                let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+                let cfg = TrainConfig::new(p, obj);
+                let plain = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+                let none = train_weighted(&src, &y, None, &[], &cfg, &mut [], &Local).unwrap();
+                let one =
+                    train_weighted(&src, &y, Some(&ones), &[], &cfg, &mut [], &Local).unwrap();
+                assert_eq!(json(&plain), json(&none), "{obj:?} subsample={subsample}");
+                assert_eq!(json(&plain), json(&one), "{obj:?} subsample={subsample}");
+            }
+        }
+    }
+
+    #[test]
+    fn weights_change_the_model_and_are_thread_invariant() {
+        let (x, y, w, nf) = weight_fixture(150);
+        let p = params(3, 3);
+        let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+        let cfg = TrainConfig::new(p.clone(), Objective::Logistic);
+        let plain = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+        let weighted = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local).unwrap();
+        assert_ne!(json(&plain), json(&weighted), "权重必须真的生效");
+        for nthread in [1, 3] {
+            for cols_per_block in [1, 4] {
+                let mut q = p.clone();
+                q.nthread = nthread;
+                q.cols_per_block = cols_per_block;
+                let s2 = DenseSource::from_row_major(&x, y.len(), nf, q.max_bin, cols_per_block);
+                let c2 = TrainConfig::new(q, Objective::Logistic);
+                let m = train_weighted(&s2, &y, Some(&w), &[], &c2, &mut [], &Local).unwrap();
+                assert_eq!(json(&weighted), json(&m), "nthread={nthread} cpb={cols_per_block}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_weight_rows_do_not_shape_the_tree() {
+        // 零权重行 ≡ 从梯度里拿掉:同一份 cuts 下,与删掉这些行的数据集
+        // 应得到相同的树结构。定点 scale 依赖行数,所以叶子值只比近似。
+        let (x, y, w, nf) = weight_fixture(180);
+        let keep: Vec<usize> = (0..y.len()).filter(|&i| w[i] != 0.0).collect();
+        let p = params(3, 2);
+        let full = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+        let cuts = full.cuts().clone();
+        let xk: Vec<f32> = keep.iter().flat_map(|&i| x[i * nf..(i + 1) * nf].to_vec()).collect();
+        let yk: Vec<f32> = keep.iter().map(|&i| y[i]).collect();
+        let wk: Vec<f32> = keep.iter().map(|&i| w[i]).collect();
+        let reduced = DenseSource::with_cuts(&xk, keep.len(), nf, cuts, p.cols_per_block);
+        let cfg = TrainConfig::new(p, Objective::Logistic);
+        let a = train_weighted(&full, &y, Some(&w), &[], &cfg, &mut [], &Local).unwrap();
+        let b = train_weighted(&reduced, &yk, Some(&wk), &[], &cfg, &mut [], &Local).unwrap();
+        assert_eq!(a.trees.len(), b.trees.len());
+        for (ta, tb) in a.trees.iter().zip(&b.trees) {
+            assert_eq!(ta.nodes.len(), tb.nodes.len());
+            for (na, nb) in ta.nodes.iter().zip(&tb.nodes) {
+                assert_eq!(
+                    (na.is_leaf, na.feat, na.split_cond.to_bits(), na.default_left),
+                    (nb.is_leaf, nb.feat, nb.split_cond.to_bits(), nb.default_left)
+                );
+                let tol = 1e-5 * na.leaf_value.abs().max(1e-3);
+                assert!((na.leaf_value - nb.leaf_value).abs() <= tol, "{na:?} vs {nb:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_weights() {
+        let (x, y, nf) = step_data(20);
+        let src = DenseSource::from_row_major(&x, 20, nf, 16, 2);
+        let cfg = TrainConfig::new(params(2, 2), Objective::Logistic);
+        for (w, msg) in [
+            (vec![1.0f32; 19], "权重有 19 行"),
+            ({ let mut v = vec![1.0f32; 20]; v[3] = -0.5; v }, "非负"),
+            ({ let mut v = vec![1.0f32; 20]; v[4] = f32::NAN; v }, "非负"),
+            ({ let mut v = vec![1.0f32; 20]; v[5] = f32::INFINITY; v }, "非负"),
+        ] {
+            let err = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local)
+                .expect_err("非法权重必须报错");
+            assert!(err.to_string().contains(msg), "{err:#}");
+        }
+        let bad = vec![-1.0f32; 20];
+        let eval = EvalSet { name: "valid".into(), source: &src, labels: &y, weights: Some(&bad) };
+        let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).expect_err("验证集权重也要校验");
+        assert!(err.to_string().contains("验证集 \"valid\""), "{err:#}");
+    }
+
+    #[test]
+    fn weighted_eval_metrics_follow_xgboost_formula() {
+        use crate::metrics::{LogLoss, Metric, Rmse};
+        let pred = [0.5f32, -1.0, 2.0, 0.0];
+        let label = [1.0f32, 0.0, 1.0, 0.0];
+        let w = [1.0f32, 3.0, 0.5, 0.0];
+        let ones = [1.0f32; 4];
+        for m in [&Rmse as &dyn Metric, &LogLoss] {
+            assert_eq!(
+                m.eval_weighted(&pred, &label, Some(&ones)).to_bits(),
+                m.eval(&pred, &label).to_bits(),
+                "{} 全 1 权重必须等于不加权",
+                m.name()
+            );
+        }
+        let wsum: f64 = w.iter().map(|&v| v as f64).sum();
+        let se: f64 = pred.iter().zip(&label).zip(&w)
+            .map(|((&p, &y), &w)| w as f64 * ((p - y) as f64).powi(2)).sum();
+        assert_eq!(Rmse.eval_weighted(&pred, &label, Some(&w)), (se / wsum).sqrt() as f32);
+        let ll: f64 = pred.iter().zip(&label).zip(&w).map(|((&r, &y), &w)| {
+            let p = (1.0 / (1.0 + (-r as f64).exp())).clamp(1e-15, 1.0 - 1e-15);
+            w as f64 * -((y as f64) * p.ln() + (1.0 - y as f64) * (1.0 - p).ln())
+        }).sum();
+        assert_eq!(LogLoss.eval_weighted(&pred, &label, Some(&w)), (ll / wsum) as f32);
     }
 }

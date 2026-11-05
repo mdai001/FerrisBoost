@@ -148,6 +148,10 @@ pub struct SharedHistogramConfig {
     /// 同一个内存模型里一起解出来的,运行时不得自己再改一个,
     /// 否则预算就和实际分配对不上。
     pub resident_blocks: Option<usize>,
+    /// 训练带样本权重。只在 `gpu_math = Fast` 时有内存代价:权重常驻
+    /// device(+4 B/行),由 objective kernel 直接乘进 grad/hess。
+    /// exact 路径在 host 加权,不分配任何 device buffer。
+    pub fast_weights: bool,
 }
 
 impl Default for SharedHistogramConfig {
@@ -166,6 +170,7 @@ impl Default for SharedHistogramConfig {
             gpu_memory_budget: None,
             resident_blocks: None,
             gpu_math: crate::types::GpuMath::Exact,
+            fast_weights: false,
         }
     }
 }

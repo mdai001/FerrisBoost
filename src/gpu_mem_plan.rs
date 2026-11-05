@@ -106,6 +106,14 @@ impl StreamingMemModel {
         }
     }
 
+    /// `gpu_math = "fast"` 且带样本权重:权重常驻 device,+4 B/行。
+    /// 与 `GpuTrainCtx` 的 `weight_resident` 分配一一对应;exact 路径在
+    /// host 加权,调用方不得在 exact 下调用它(memory model = 实际路径)。
+    pub fn with_fast_weights(mut self, n_rows: u64) -> Self {
+        self.fixed_bytes += n_rows * 4;
+        self
+    }
+
     /// Add the bounded resident split/cache allocation to this model.
     ///
     /// `hist_nodes_per_batch` is the cache capacity. Capacities below two
@@ -989,6 +997,15 @@ mod resolve_tests {
             "不该塌成 1 块:{} 块",
             p.physical_blocks
         );
+    }
+
+    #[test]
+    fn fast_weights_add_exactly_four_bytes_per_row() {
+        let base = StreamingMemModel::new(1_000_000, 255, 1, 16, true, true, true, 0);
+        let weighted = base.with_fast_weights(1_000_000);
+        assert_eq!(weighted.fixed_bytes, base.fixed_bytes + 4_000_000);
+        assert_eq!(weighted.per_col_bytes, base.per_col_bytes);
+        assert_eq!(weighted.slot_col_bytes, base.slot_col_bytes);
     }
 
     #[test]

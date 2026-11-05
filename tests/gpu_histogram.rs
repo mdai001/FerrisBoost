@@ -8,7 +8,10 @@ use ferrisboost::{
     comm::Local,
     hist,
     source::DenseSource,
-    train::{train, train_gpu, train_gpu_one_tree, BlockSource, TrainConfig},
+    train::{
+        train, train_gpu, train_gpu_one_tree, train_gpu_weighted, train_weighted, BlockSource,
+        TrainConfig,
+    },
     types::{GradPairFixed, RowId, MISSING_BIN},
 };
 
@@ -1288,6 +1291,7 @@ fn shared_histogram_tiles_features_and_rows() {
             hist_nodes_per_batch: None,
             gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
+            fast_weights: false,
             threads_per_block: 64,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -1370,6 +1374,7 @@ fn atomic32_layout_is_bit_exact_when_low_word_overflows() {
             hist_nodes_per_batch: None,
             gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
+            fast_weights: false,
             threads_per_block: 256,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -2401,5 +2406,165 @@ fn gpu_split_cache_bytes_match_allocations_and_activation_rules() {
             2 * expected_per_slot,
             "default config budget must account for the same enabled split-cache allocations"
         );
+    }
+}
+
+/// 样本权重的跨后端契约:`gpu_math="exact"` 下 CPU 与 GPU 模型逐字节相同,
+/// 覆盖 resident / streaming、host / device 量化、split cache 开关、行采样、
+/// 列采样和两个 objective。权重含 0、小数和大于 1 的值。
+#[test]
+fn weighted_training_is_cpu_gpu_byte_identical() {
+    let n_rows = 1_037usize;
+    let n_feats = 13usize;
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 7 + feat) % 17 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 11 + feat * 5) % 41) as f32
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| if (row * 19) % 37 < 15 { 1.0 } else { 0.0 })
+        .collect();
+    let weights: Vec<f32> = (0..n_rows)
+        .map(|row| [0.0, 0.25, 1.0, 2.5, 1.75, 4.0][(row * 5) % 6])
+        .collect();
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, 4);
+    for objective in [
+        ferrisboost::types::Objective::Logistic,
+        ferrisboost::types::Objective::SquaredError,
+    ] {
+        for (resident_blocks, device_quantize, split_cache, subsample, colsample) in [
+            (None, None, true, 1.0, 1.0),
+            (Some(0), None, true, 1.0, 1.0),
+            (None, Some(false), true, 0.7, 1.0),
+            (None, Some(true), false, 0.7, 0.6),
+            (Some(0), Some(true), true, 0.8, 0.6),
+        ] {
+            let params = ferrisboost::types::TrainParams {
+                n_rounds: 3,
+                max_depth: 4,
+                max_bin: 32,
+                cols_per_block: 4,
+                nthread: 1,
+                subsample,
+                colsample_bytree: colsample,
+                seed: 11,
+                resident_blocks,
+                device_quantize,
+                gpu_split_cache: split_cache,
+                ..Default::default()
+            };
+            let cfg = TrainConfig::new(params, objective);
+            let what = format!(
+                "{objective:?} resident={resident_blocks:?} dq={device_quantize:?} \
+                 cache={split_cache} subsample={subsample} colsample={colsample}"
+            );
+            let cpu = train_weighted(&source, &labels, Some(&weights), &[], &cfg, &mut [], &Local)
+                .unwrap();
+            let gpu = train_gpu_weighted(
+                0, &source, &labels, Some(&weights), &[], &cfg, &mut [], &Local,
+            )
+            .unwrap();
+            assert!(cpu.trees.iter().any(|t| t.nodes.len() > 1), "{what}: 夹具应该真的分裂");
+            assert_eq!(
+                gpu.to_xgboost_json().unwrap(),
+                cpu.to_xgboost_json().unwrap(),
+                "{what}: 加权模型必须 CPU/GPU 逐字节相同"
+            );
+            let unweighted = train(&source, &labels, &[], &cfg, &mut [], &Local).unwrap();
+            assert_ne!(
+                unweighted.to_xgboost_json().unwrap(),
+                cpu.to_xgboost_json().unwrap(),
+                "{what}: 权重必须真的生效"
+            );
+        }
+    }
+}
+
+/// all-ones 权重在 GPU 上也必须与不加权逐字节相同(含 fast 之外的默认路径)。
+#[test]
+fn gpu_all_ones_weights_match_unweighted() {
+    let n_rows = 600usize;
+    let n_feats = 6usize;
+    let data: Vec<f32> = (0..n_rows * n_feats).map(|i| ((i * 31) % 97) as f32).collect();
+    let labels: Vec<f32> = (0..n_rows).map(|r| ((r * 13) % 7 < 3) as u8 as f32).collect();
+    let ones = vec![1.0f32; n_rows];
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, 3);
+    let params = ferrisboost::types::TrainParams {
+        n_rounds: 3,
+        max_depth: 3,
+        max_bin: 32,
+        cols_per_block: 3,
+        ..Default::default()
+    };
+    let cfg = TrainConfig::new(params, ferrisboost::types::Objective::Logistic);
+    let plain = train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap();
+    let ones_model =
+        train_gpu_weighted(0, &source, &labels, Some(&ones), &[], &cfg, &mut [], &Local).unwrap();
+    assert_eq!(plain.to_xgboost_json().unwrap(), ones_model.to_xgboost_json().unwrap());
+}
+
+
+/// `gpu_math="fast"` + 样本权重:权重常驻 device,由 objective kernel 乘进
+/// grad/hess。fast 不承诺 CPU/GPU 逐字节相同,但必须:全 1 权重 ≡ 不加权、
+/// 重复运行逐字节相同、权重真的生效。resident 与 streaming 两条路径都覆盖。
+#[test]
+fn fast_math_weights_are_deterministic_and_effective() {
+    let n_rows = 1_037usize;
+    let n_feats = 13usize;
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 7 + feat) % 17 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 11 + feat * 5) % 41) as f32
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| if (row * 19) % 37 < 15 { 1.0 } else { 0.0 })
+        .collect();
+    let weights: Vec<f32> = (0..n_rows)
+        .map(|row| [0.0, 0.25, 1.0, 2.5, 1.75, 4.0][(row * 5) % 6])
+        .collect();
+    let ones = vec![1.0f32; n_rows];
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, 4);
+    for objective in [
+        ferrisboost::types::Objective::Logistic,
+        ferrisboost::types::Objective::SquaredError,
+    ] {
+        for (resident_blocks, subsample) in [(None, 1.0), (Some(0), 0.7)] {
+            let params = ferrisboost::types::TrainParams {
+                n_rounds: 3,
+                max_depth: 4,
+                max_bin: 32,
+                cols_per_block: 4,
+                subsample,
+                seed: 5,
+                resident_blocks,
+                gpu_math: ferrisboost::types::GpuMath::Fast,
+                ..Default::default()
+            };
+            let cfg = TrainConfig::new(params, objective);
+            let what = format!("{objective:?} resident={resident_blocks:?} subsample={subsample}");
+            let run = |w: Option<&[f32]>| {
+                train_gpu_weighted(0, &source, &labels, w, &[], &cfg, &mut [], &Local)
+                    .unwrap()
+                    .to_xgboost_json()
+                    .unwrap()
+            };
+            let plain = run(None);
+            assert_eq!(plain, run(Some(&ones)), "{what}: 全 1 权重必须等于不加权");
+            let a = run(Some(&weights));
+            assert_eq!(a, run(Some(&weights)), "{what}: fast 加权必须逐次确定");
+            assert_ne!(a, plain, "{what}: 权重必须真的生效");
+        }
     }
 }

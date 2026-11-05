@@ -2308,6 +2308,7 @@ fn train_dense(
             name: name.clone(),
             source: src,
             labels,
+            weights: None,
         })
         .collect();
 
@@ -2619,6 +2620,7 @@ fn train_file(
                 name: name.clone(),
                 source: s,
                 labels: l,
+                weights: None,
             })
             .collect();
         if !cfg.quiet {
@@ -2710,6 +2712,7 @@ fn train_file(
             name: name.clone(),
             source: &d.source,
             labels: &d.labels,
+            weights: None,
         })
         .collect();
 
