@@ -20,7 +20,15 @@ EXPECTED_PTX_VERSION=8.0
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
-"$NVCC" --ptx -std=c++14 -arch=compute_75 -lineinfo "$SRC" -o "$TMP"
+# nvcc preprocesses with the host C++ compiler even for --ptx, and the CUDA
+# release that produces the required PTX ISA accepts only older GCC releases.
+# NVCC_CCBIN selects that host compiler without hard-coding a machine path.
+CCBIN_ARGS=()
+if [ -n "${NVCC_CCBIN:-}" ]; then
+  CCBIN_ARGS=(-ccbin "$NVCC_CCBIN")
+fi
+
+"$NVCC" "${CCBIN_ARGS[@]}" --ptx -std=c++14 -arch=compute_75 -lineinfo "$SRC" -o "$TMP"
 
 # Relativise .file paths, drop the nvcc banner, embed the source hash.
 python3 scripts/sanitize_ptx.py "$TMP" "$SRC" "$EXPECTED_PTX_VERSION"
