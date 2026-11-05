@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use crate::columns::BinCuts;
 use crate::source::arrow_source::ArrowSource;
 use crate::source::parquet_source::Dataset;
+use crate::source::Targets;
 
 /// 推断 schema 时最多看多少行。
 ///
@@ -65,8 +66,11 @@ pub fn peek_n_features(
     n_features_from_schema(&schema, label)
 }
 
-pub(crate) fn n_features_from_schema(schema: &Schema, label: &str) -> anyhow::Result<usize> {
-    columns(schema, label).map(|(features, _, _)| features.len())
+pub(crate) fn n_features_from_schema<'a>(
+    schema: &Schema,
+    targets: impl Into<Targets<'a>>,
+) -> anyhow::Result<usize> {
+    columns(schema, targets.into()).map(|c| c.features.len())
 }
 
 /// Resolve a positional label against the inferred CSV schema.  Arrow assigns
@@ -127,19 +131,39 @@ fn batch_reader(
     Ok(reader.map(|r| r.map_err(anyhow::Error::from)))
 }
 
-fn columns(schema: &Schema, label: &str) -> anyhow::Result<(Vec<usize>, usize, Vec<String>)> {
+/// 一个 CSV schema 里各列的角色:特征 / 标签 / 可选权重。
+struct ColumnRoles {
+    features: Vec<usize>,
+    label: usize,
+    weight: Option<usize>,
+    names: Vec<String>,
+}
+
+fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    let label_col = names
-        .iter()
-        .position(|n| *n == label)
-        .ok_or_else(|| anyhow::anyhow!("文件里没有列 {label:?},只有 {names:?}"))?;
-    let feat_cols: Vec<usize> = (0..names.len()).filter(|i| *i != label_col).collect();
+    let find = |want: &str| {
+        names
+            .iter()
+            .position(|n| *n == want)
+            .ok_or_else(|| anyhow::anyhow!("文件里没有列 {want:?},只有 {names:?}"))
+    };
+    let label_col = find(targets.label)?;
+    let weight_col = targets.weight.map(find).transpose()?;
+    let feat_cols: Vec<usize> = (0..names.len())
+        .filter(|i| *i != label_col && Some(*i) != weight_col)
+        .collect();
     anyhow::ensure!(
         !feat_cols.is_empty(),
-        "除了标签列 {label:?} 之外没有别的列了"
+        "除了标签列 {:?} 之外没有别的列了",
+        targets.label
     );
     let feat_names = feat_cols.iter().map(|&i| names[i].to_string()).collect();
-    Ok((feat_cols, label_col, feat_names))
+    Ok(ColumnRoles {
+        features: feat_cols,
+        label: label_col,
+        weight: weight_col,
+        names: feat_names,
+    })
 }
 
 /// 打开一个 CSV 文件,自己建分箱边界。第一行必须是表头(要靠列名找标签)。
@@ -203,9 +227,9 @@ pub fn open_many_with_header(
     )
 }
 
-pub fn open_many_with_header_and_nthread(
+pub fn open_many_with_header_and_nthread<'a>(
     paths: &[PathBuf],
-    label: &str,
+    label: impl Into<Targets<'a>>,
     cuts: Option<BinCuts>,
     max_bins: u32,
     cols_per_block: usize,
@@ -214,7 +238,7 @@ pub fn open_many_with_header_and_nthread(
 ) -> anyhow::Result<Dataset> {
     open_many_impl(
         paths,
-        label,
+        label.into(),
         cuts,
         max_bins,
         cols_per_block,
@@ -225,9 +249,9 @@ pub fn open_many_with_header_and_nthread(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn open_many_with_header_and_nthread_prepared(
+pub(crate) fn open_many_with_header_and_nthread_prepared<'a>(
     paths: &[PathBuf],
-    label: &str,
+    label: impl Into<Targets<'a>>,
     cuts: Option<BinCuts>,
     max_bins: u32,
     cols_per_block: usize,
@@ -237,7 +261,7 @@ pub(crate) fn open_many_with_header_and_nthread_prepared(
 ) -> anyhow::Result<Dataset> {
     open_many_impl(
         paths,
-        label,
+        label.into(),
         cuts,
         max_bins,
         cols_per_block,
@@ -250,7 +274,7 @@ pub(crate) fn open_many_with_header_and_nthread_prepared(
 #[allow(clippy::too_many_arguments)]
 fn open_many_impl(
     paths: &[PathBuf],
-    label: &str,
+    targets: Targets<'_>,
     cuts: Option<BinCuts>,
     max_bins: u32,
     cols_per_block: usize,
@@ -259,6 +283,7 @@ fn open_many_impl(
     first_schema: Option<SchemaRef>,
 ) -> anyhow::Result<Dataset> {
     anyhow::ensure!(!paths.is_empty(), "没有输入文件");
+    let label = targets.label;
     let schema_pool = crate::threading::build_pool(nthread)
         .map_err(|e| anyhow::anyhow!("CSV schema ingest 线程池创建失败:{e}"))?;
     let schema_profile = crate::source::openprof::start("schema");
@@ -275,11 +300,16 @@ fn open_many_impl(
     drop(schema_profile);
     let mut feat_proj = Vec::with_capacity(paths.len());
     let mut label_proj = Vec::with_capacity(paths.len());
+    let mut weight_proj = Vec::with_capacity(paths.len());
     let mut feature_names: Option<Vec<String>> = None;
 
     for (p, schema) in paths.iter().zip(&schemas) {
         check_numeric(schema, label)?;
-        let (cols, label_col, names) = columns(schema, label)?;
+        let roles = columns(schema, targets)?;
+        let (cols, label_col, names) = (roles.features, roles.label, roles.names);
+        if let Some(w) = roles.weight {
+            weight_proj.push(w);
+        }
         match &feature_names {
             None => {
                 feature_names = Some(names);
@@ -333,6 +363,26 @@ fn open_many_impl(
     };
     let (cuts, known_rows) = match cuts {
         Some(cuts) => (cuts, None),
+        None if targets.weight.is_some() => {
+            // 加权分箱:权重列接在特征后面一起扫(CSV 本来就要读完整记录)。
+            let _profile = crate::source::openprof::start("cuts");
+            let proj = fp
+                .iter()
+                .zip(&weight_proj)
+                .map(|(f, &w)| {
+                    let mut cols = f.clone();
+                    cols.push(w);
+                    cols
+                })
+                .collect();
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_weighted(
+                dataset_reader(owned.clone(), sc.clone(), proj, has_header, reader_threads),
+                max_bins as usize,
+                transform_threads,
+                true,
+            )?;
+            (cuts, Some(n_rows))
+        }
         None => {
             let _profile = crate::source::openprof::start("cuts");
             let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_with_nthread(
@@ -348,15 +398,21 @@ fn open_many_impl(
     // the label beside features during the quantization pass, then expose a
     // cheap feature-only RecordBatch view to ArrowSource. This removes the
     // former third full-file scan without changing canonical feature order.
+    // 权重列(若有)跟在标签后面,同一遍扫描里读出来。
     let combined_proj = feat_proj
         .into_iter()
         .zip(label_proj)
-        .map(|(mut features, label)| {
+        .enumerate()
+        .map(|(i, (mut features, label))| {
             features.push(label);
+            if let Some(&w) = weight_proj.get(i) {
+                features.push(w);
+            }
             features
         })
         .collect::<Vec<_>>();
     let mut labels = Vec::new();
+    let mut weight_values = Vec::new();
     let batches = FeatureLabelBatches::new(
         dataset_reader(
             paths.to_vec(),
@@ -367,6 +423,7 @@ fn open_many_impl(
         ),
         feature_names.len(),
         &mut labels,
+        targets.weight.map(|_| &mut weight_values),
     );
     let source = {
         let _profile = crate::source::openprof::start("quantize+label");
@@ -395,6 +452,7 @@ fn open_many_impl(
             Vec::new()
         },
         label,
+        targets.weight.map(|w| (weight_values, w)),
     )
 }
 
@@ -446,6 +504,8 @@ struct FeatureLabelBatches<'a> {
     n_features: usize,
     feature_projection: Vec<usize>,
     labels: &'a mut Vec<f32>,
+    /// `Some` = 标签后面还跟着一列权重。
+    weights: Option<&'a mut Vec<f32>>,
 }
 
 impl<'a> FeatureLabelBatches<'a> {
@@ -453,12 +513,14 @@ impl<'a> FeatureLabelBatches<'a> {
         batches: crate::source::parallel_reader::BatchIter,
         n_features: usize,
         labels: &'a mut Vec<f32>,
+        weights: Option<&'a mut Vec<f32>>,
     ) -> Self {
         Self {
             batches,
             n_features,
             feature_projection: (0..n_features).collect(),
             labels,
+            weights,
         }
     }
 }
@@ -471,9 +533,10 @@ impl Iterator for FeatureLabelBatches<'_> {
             Ok(batch) => batch,
             Err(error) => return Some(Err(error)),
         };
-        if batch.num_columns() != self.n_features + 1 {
+        let extra = 1 + usize::from(self.weights.is_some());
+        if batch.num_columns() != self.n_features + extra {
             return Some(Err(anyhow::anyhow!(
-                "CSV combined batch 有 {} 列,预期 {} 个特征 + 1 个标签",
+                "CSV combined batch 有 {} 列,预期 {} 个特征 + {extra} 个标签/权重列",
                 batch.num_columns(),
                 self.n_features,
             )));
@@ -485,6 +548,16 @@ impl Iterator for FeatureLabelBatches<'_> {
             })
         {
             return Some(Err(error));
+        }
+        if let Some(weights) = self.weights.as_deref_mut() {
+            weights.reserve(batch.num_rows());
+            if let Err(error) = crate::source::arrow_source::for_each_column_f32(
+                &batch,
+                self.n_features + 1,
+                |value| weights.push(value),
+            ) {
+                return Some(Err(error));
+            }
         }
         Some(batch.project(&self.feature_projection).map_err(Into::into))
     }

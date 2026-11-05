@@ -22,7 +22,15 @@ use crate::columns::BinningStrategy;
 use crate::comm::Local;
 use crate::source::parquet_source::{ParquetBlockSource, QuantizedCacheOptions};
 use crate::source::{csv_source, parquet_source, DenseSource};
-use crate::train::{train as rust_train, BlockSource, EvalSet, TrainConfig};
+use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
+
+fn on_off(flag: bool) -> &'static str {
+    if flag {
+        "on"
+    } else {
+        "off"
+    }
+}
 use crate::tree::Model;
 use crate::types::{Objective, TrainParams};
 
@@ -245,6 +253,12 @@ fn resolve_blocking(
                         true,
                         32 * 1024 * 1024,
                     );
+                    // fast 模式下权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
+                    let model = if fast && cfg.weighted {
+                        model.with_fast_weights(rows)
+                    } else {
+                        model
+                    };
                     if cfg.params.gpu_split_cache
                         && !matches!(
                             std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
@@ -1977,6 +1991,31 @@ struct Parsed {
     ingest_threads: usize,
     model_io_threads: usize,
     quiet: bool,
+    /// XGBoost `eval_metric`,已按 objective 解析。空 = objective 默认指标。
+    eval_metrics: Vec<String>,
+    /// 训练集带样本权重。由入口在规划**之前**设上:fast 模式的显存计划要算它。
+    weighted: bool,
+}
+
+impl Parsed {
+    /// 组装 TrainConfig,同时返回 early stopping 的方向(看最后一个 metric)。
+    fn train_config(&self) -> PyResult<(TrainConfig, bool)> {
+        let mut cfg = TrainConfig {
+            base_score: self.base_score,
+            quiet: self.quiet,
+            ..TrainConfig::new(self.params.clone(), self.objective)
+        };
+        if !self.eval_metrics.is_empty() {
+            cfg.eval_metrics = self
+                .eval_metrics
+                .iter()
+                .map(|name| crate::metrics::for_objective(name, self.objective))
+                .collect::<Result<_, _>>()
+                .map_err(PyValueError::new_err)?;
+        }
+        let lower_is_better = cfg.eval_metrics.last().is_none_or(|m| m.lower_is_better());
+        Ok((cfg, lower_is_better))
+    }
 }
 
 fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
@@ -2088,12 +2127,23 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         ingest_threads: get!("ingest_threads"),
         model_io_threads: get!("model_io_threads"),
         quiet: get!("_quiet"),
+        eval_metrics: {
+            let raw: Option<Vec<String>> = get!("eval_metric");
+            let names = raw.unwrap_or_default();
+            // 提前校验名字和 objective 组合:错了在读数据之前就报。
+            for name in &names {
+                crate::metrics::for_objective(name, objective).map_err(PyValueError::new_err)?;
+            }
+            names
+        },
+        weighted: false,
     })
 }
 
 /// 组装 callbacks:早停和 verbose 在 Rust 侧,用户的函数包一层。
 #[allow(clippy::type_complexity)] // Callback ownership and the shared history handle are returned together.
 fn build_callbacks(
+    lower_is_better: bool,
     early_stopping_rounds: Option<usize>,
     verbose_eval: Option<usize>,
     user: Option<&Bound<'_, PyList>>,
@@ -2102,8 +2152,8 @@ fn build_callbacks(
     let handle = recorder.handle();
     let mut cbs: Vec<Box<dyn Callback>> = Vec::new();
     if let Some(rounds) = early_stopping_rounds {
-        // 目前两个 metric 都是越小越好
-        cbs.push(Box::new(EarlyStopping::new(rounds, true)));
+        // 方向跟被盯的那个 metric 走(最后一个 metric;auc 越大越好)。
+        cbs.push(Box::new(EarlyStopping::new(rounds, lower_is_better)));
     }
     if let Some(period) = verbose_eval {
         if period > 0 {
@@ -2210,7 +2260,7 @@ fn finish(
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None))]
+                    verbose_eval=None, callbacks=None, weight=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_dense(
     py: Python<'_>,
@@ -2221,9 +2271,14 @@ fn train_dense(
     early_stopping_rounds: Option<usize>,
     verbose_eval: Option<usize>,
     callbacks: Option<&Bound<'_, PyList>>,
+    weight: Option<PyReadonlyArray1<'_, f32>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
+    let weights: Option<Vec<f32>> = weight
+        .map(|w| w.as_slice().map(<[f32]>::to_vec))
+        .transpose()?;
+    cfg.weighted = weights.is_some();
     let shape = x.shape();
     let (n_rows, n_features) = (shape[0], shape[1]);
     let labels = y.as_slice()?.to_vec();
@@ -2245,7 +2300,19 @@ fn train_dense(
     cfg.params.cols_per_block = plan.effective;
     // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
     apply_resolved_geometry(&mut cfg, &plan);
-    let train_src = DenseSource::new_with_nthread(
+    if let Some(w) = &weights {
+        if w.len() != n_rows {
+            return Err(PyValueError::new_err(format!(
+                "weight 有 {} 个,特征矩阵有 {n_rows} 行",
+                w.len()
+            )));
+        }
+        if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(PyValueError::new_err("样本权重必须是有限的非负数"));
+        }
+    }
+    // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
+    let train_src = DenseSource::new_weighted_with_nthread(
         x.as_slice()?,
         n_rows,
         n_features,
@@ -2254,14 +2321,22 @@ fn train_dense(
         },
         plan.effective,
         cfg.params.nthread,
+        weights.as_deref(),
     );
 
     // 验证集必须复用训练集的 cuts,否则同一个值会落进不同的 bin
-    let mut eval_data: Vec<(String, DenseSource, Vec<f32>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut eval_data: Vec<(String, DenseSource, Vec<f32>, Option<Vec<f32>>)> = Vec::new();
     if let Some(list) = evals {
         for item in list.iter() {
-            let (ex, ey, name): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>, String) =
-                item.extract()?;
+            // Python 层统一成 (data, label, weight-or-None, name)。
+            #[allow(clippy::type_complexity)]
+            let (ex, ey, ew, name): (
+                PyReadonlyArray2<f32>,
+                PyReadonlyArray1<f32>,
+                Option<PyReadonlyArray1<f32>>,
+                String,
+            ) = item.extract()?;
             let eshape = ex.shape();
             if eshape[1] != n_features {
                 return Err(PyValueError::new_err(format!(
@@ -2276,18 +2351,19 @@ fn train_dense(
                 BinningStrategy::Provided(train_src.cuts()),
                 cfg.params.cols_per_block,
             );
-            eval_data.push((name, src, ey.as_slice()?.to_vec()));
+            let ew = ew.map(|w| w.as_slice().map(<[f32]>::to_vec)).transpose()?;
+            eval_data.push((name, src, ey.as_slice()?.to_vec(), ew));
         }
     }
 
-    let (mut cbs, handle) = build_callbacks(early_stopping_rounds, verbose_eval, callbacks)?;
-    // `cfg.params` 下一行就被移进 TrainConfig,所以先把 device 取出来。
     let device = cfg.device;
-    let train_cfg = TrainConfig {
-        base_score: cfg.base_score,
-        quiet: cfg.quiet,
-        ..TrainConfig::new(cfg.params, cfg.objective)
-    };
+    let (train_cfg, lower_is_better) = cfg.train_config()?;
+    let (mut cbs, handle) = build_callbacks(
+        lower_is_better,
+        early_stopping_rounds,
+        verbose_eval,
+        callbacks,
+    )?;
     if !cfg.quiet && device.is_none() {
         eprintln!(
             "CPU_THREADS requested={} resolved={}",
@@ -2297,18 +2373,19 @@ fn train_dense(
     }
     if !cfg.quiet {
         eprintln!(
-            "SETUP input=dense rows={n_rows} features={n_features} seconds={:.3}",
+            "SETUP input=dense rows={n_rows} features={n_features} weights={} seconds={:.3}",
+            on_off(weights.is_some()),
             overall_started.elapsed().as_secs_f64()
         );
     }
 
     let evals_ref: Vec<EvalSet> = eval_data
         .iter()
-        .map(|(name, src, labels)| EvalSet {
+        .map(|(name, src, labels, w)| EvalSet {
             name: name.clone(),
             source: src,
             labels,
-            weights: None,
+            weights: w.as_deref(),
         })
         .collect();
 
@@ -2318,13 +2395,26 @@ fn train_dense(
     let model = py
         .detach(|| match device {
             #[cfg(feature = "cuda")]
-            Some(ord) => crate::train::train_gpu(
-                ord, &train_src, &labels, &evals_ref, &train_cfg, &mut cbs, &Local,
+            Some(ord) => crate::train::train_gpu_weighted(
+                ord,
+                &train_src,
+                &labels,
+                weights.as_deref(),
+                &evals_ref,
+                &train_cfg,
+                &mut cbs,
+                &Local,
             ),
             #[cfg(not(feature = "cuda"))]
             Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
-            None => rust_train(
-                &train_src, &labels, &evals_ref, &train_cfg, &mut cbs, &Local,
+            None => train_weighted(
+                &train_src,
+                &labels,
+                weights.as_deref(),
+                &evals_ref,
+                &train_cfg,
+                &mut cbs,
+                &Local,
             ),
         })
         .map_err(to_py_err)?;
@@ -2359,7 +2449,7 @@ fn train_dense(
 /// 文件入口。**格式由 Rust 从解析出的文件判定**,不再由 Python 按后缀猜。
 #[pyfunction]
 #[pyo3(signature = (path_specs, label, params, header=true, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None))]
+                    verbose_eval=None, callbacks=None, weight=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_file(
     py: Python<'_>,
@@ -2374,9 +2464,11 @@ fn train_file(
     early_stopping_rounds: Option<usize>,
     verbose_eval: Option<usize>,
     callbacks: Option<&Bound<'_, PyList>>,
+    weight: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
+    cfg.weighted = weight.is_some();
     // 先把输入规格解成确定顺序的文件列表。格式也由它判定 ——
     // Python 那边不再靠后缀猜。
     // ⚠️ 输入规格的问题是**用户输入错误**,不是运行时故障 —— 映射成
@@ -2422,15 +2514,42 @@ fn train_file(
         _ => unreachable!(),
     };
     let label = label_owned.as_str();
+    // 权重列和标签列同样的写法:有表头给列名,无表头 CSV 给列下标。
+    let weight_owned: Option<String> = match weight {
+        None => None,
+        Some(w) if header => Some(
+            w.extract::<String>()
+                .map_err(|_| PyValueError::new_err("header=True 时 weight 必须是列名字符串"))?,
+        ),
+        Some(w) => {
+            let index = w.extract::<isize>().map_err(|_| {
+                PyValueError::new_err("header=False 时 weight 必须是从 0 开始的列下标")
+            })?;
+            if index < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "weight 列下标不能是负数,给的是 {index}"
+                )));
+            }
+            Some(
+                csv_source::positional_label_name_from_schema(
+                    csv_preflight.as_deref().expect("CSV preflight exists"),
+                    index as usize,
+                )
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?,
+            )
+        }
+    };
+    let targets = crate::source::Targets::new(label, weight_owned.as_deref())
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     // **peek schema → 定 blocking → 才真正 open**。Parquet / CSV 在 open
     // 之前不知道特征数,而自动选块宽需要它;单独 peek 一次(只读 footer /
     // 只推断 schema,不解压数据)就能把策略决定留在这一层,
     // 不必把 `nthread` 传进底层的 `partition_features`。
     let n_features = match fmt {
-        "parquet" => parquet_source::peek_n_features(path, label),
+        "parquet" => parquet_source::peek_n_features(path, targets),
         "csv" => csv_source::n_features_from_schema(
             csv_preflight.as_deref().expect("CSV preflight exists"),
-            label,
+            targets,
         ),
         other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
     }
@@ -2500,7 +2619,7 @@ fn train_file(
         match fmt {
             "parquet" => parquet_source::open_many_observed(
                 ps,
-                label,
+                targets,
                 cuts,
                 max_bin,
                 cols_per_block,
@@ -2514,7 +2633,7 @@ fn train_file(
             "csv" => match first_csv_schema {
                 Some(schema) => csv_source::open_many_with_header_and_nthread_prepared(
                     ps,
-                    label,
+                    targets,
                     cuts,
                     max_bin,
                     cols_per_block,
@@ -2524,7 +2643,7 @@ fn train_file(
                 ),
                 None => csv_source::open_many_with_header_and_nthread(
                     ps,
-                    label,
+                    targets,
                     cuts,
                     max_bin,
                     cols_per_block,
@@ -2549,7 +2668,6 @@ fn train_file(
         open_paths(&r.paths, cuts, None)
     };
 
-    let (mut cbs, handle) = build_callbacks(early_stopping_rounds, verbose_eval, callbacks)?;
     let device = cfg.device;
 
     // Parquet 走**按需加载**:列块用时才读,读完就还回去。
@@ -2561,11 +2679,13 @@ fn train_file(
     // ⚠️ 代价要说清楚:多文件走的是量化后常驻内存的 `Dataset` 路径,
     // 和单文件的按需加载不是同一条内存曲线。
     if fmt == "parquet" && paths.len() == 1 {
-        let train_cfg = TrainConfig {
-            base_score: cfg.base_score,
-            quiet: cfg.quiet,
-            ..TrainConfig::new(cfg.params.clone(), cfg.objective)
-        };
+        let (train_cfg, lower_is_better) = cfg.train_config()?;
+        let (mut cbs, handle) = build_callbacks(
+            lower_is_better,
+            early_stopping_rounds,
+            verbose_eval,
+            callbacks,
+        )?;
         if !cfg.quiet && device.is_none() {
             eprintln!(
                 "CPU_THREADS requested={} resolved={}",
@@ -2579,7 +2699,7 @@ fn train_file(
         };
         let (src, labels) = ParquetBlockSource::open_with_cache_observed(
             path,
-            label,
+            targets,
             cfg.params.max_bin,
             cfg.params.cols_per_block,
             cache_options,
@@ -2591,6 +2711,17 @@ fn train_file(
             },
         )
         .map_err(to_py_err)?;
+        // 权重是单独一列,不进量化缓存;每次 open 都从源文件读。
+        let read_weights = |p: &str| -> PyResult<Option<Vec<f32>>> {
+            let Some(w) = targets.weight else {
+                return Ok(None);
+            };
+            let values = parquet_source::read_f32_column(p, w).map_err(to_py_err)?;
+            crate::source::check_weight_column(&values, w)
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            Ok(Some(values))
+        };
+        let weights = read_weights(path)?;
         ingest_reporter.complete(src.n_rows());
         let mut eval_data = Vec::new();
         if let Some(list) = evals {
@@ -2601,7 +2732,7 @@ fn train_file(
                 // 时校验会直接报错)。给它自己的路径要用户显式指定。
                 let d = ParquetBlockSource::with_cuts_and_cache_and_nthread(
                     &p,
-                    label,
+                    targets,
                     src.cuts().clone(),
                     cfg.params.cols_per_block,
                     QuantizedCacheOptions {
@@ -2611,22 +2742,24 @@ fn train_file(
                     ingest_threads,
                 )
                 .map_err(to_py_err)?;
-                eval_data.push((name, d));
+                let ew = read_weights(&p)?;
+                eval_data.push((name, d, ew));
             }
         }
         let evals_ref: Vec<EvalSet> = eval_data
             .iter()
-            .map(|(name, (s, l))| EvalSet {
+            .map(|(name, (s, l), w)| EvalSet {
                 name: name.clone(),
                 source: s,
                 labels: l,
-                weights: None,
+                weights: w.as_deref(),
             })
             .collect();
         if !cfg.quiet {
             eprintln!(
-                "SETUP input=parquet files=1 rows={} features={n_features} seconds={:.3}",
+                "SETUP input=parquet files=1 rows={} features={n_features} weights={} seconds={:.3}",
                 src.n_rows(),
+                on_off(weights.is_some()),
                 overall_started.elapsed().as_secs_f64()
             );
         }
@@ -2634,12 +2767,27 @@ fn train_file(
         let model = py
             .detach(|| match device {
                 #[cfg(feature = "cuda")]
-                Some(ord) => crate::train::train_gpu(
-                    ord, &src, &labels, &evals_ref, &train_cfg, &mut cbs, &Local,
+                Some(ord) => crate::train::train_gpu_weighted(
+                    ord,
+                    &src,
+                    &labels,
+                    weights.as_deref(),
+                    &evals_ref,
+                    &train_cfg,
+                    &mut cbs,
+                    &Local,
                 ),
                 #[cfg(not(feature = "cuda"))]
                 Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
-                None => rust_train(&src, &labels, &evals_ref, &train_cfg, &mut cbs, &Local),
+                None => train_weighted(
+                    &src,
+                    &labels,
+                    weights.as_deref(),
+                    &evals_ref,
+                    &train_cfg,
+                    &mut cbs,
+                    &Local,
+                ),
             })
             .map_err(to_py_err)?;
         if !cfg.quiet {
@@ -2658,7 +2806,7 @@ fn train_file(
             return Err(PyErr::fetch(py));
         }
         // 命名模式:列名取自 parquet schema,标签列已排除。
-        let names = parquet_source::feature_names_of(&paths[0], label).map_err(to_py_err)?;
+        let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         return Ok(finish(
             model,
             handle,
@@ -2686,11 +2834,13 @@ fn train_file(
         cfg.params.cols_per_block = completed.effective;
         apply_resolved_geometry(&mut cfg, &completed);
     }
-    let train_cfg = TrainConfig {
-        base_score: cfg.base_score,
-        quiet: cfg.quiet,
-        ..TrainConfig::new(cfg.params.clone(), cfg.objective)
-    };
+    let (train_cfg, lower_is_better) = cfg.train_config()?;
+    let (mut cbs, handle) = build_callbacks(
+        lower_is_better,
+        early_stopping_rounds,
+        verbose_eval,
+        callbacks,
+    )?;
     if !cfg.quiet && device.is_none() {
         eprintln!(
             "CPU_THREADS requested={} resolved={}",
@@ -2712,15 +2862,16 @@ fn train_file(
             name: name.clone(),
             source: &d.source,
             labels: &d.labels,
-            weights: None,
+            weights: d.weights.as_deref(),
         })
         .collect();
 
     if !cfg.quiet {
         eprintln!(
-            "SETUP input={fmt} files={} rows={} features={n_features} seconds={:.3}",
+            "SETUP input={fmt} files={} rows={} features={n_features} weights={} seconds={:.3}",
             paths.len(),
             ds.source.n_rows(),
+            on_off(ds.weights.is_some()),
             overall_started.elapsed().as_secs_f64()
         );
     }
@@ -2729,13 +2880,26 @@ fn train_file(
     let model = py
         .detach(|| match device {
             #[cfg(feature = "cuda")]
-            Some(ord) => crate::train::train_gpu(
-                ord, &ds.source, &ds.labels, &evals_ref, &train_cfg, &mut cbs, &Local,
+            Some(ord) => crate::train::train_gpu_weighted(
+                ord,
+                &ds.source,
+                &ds.labels,
+                ds.weights.as_deref(),
+                &evals_ref,
+                &train_cfg,
+                &mut cbs,
+                &Local,
             ),
             #[cfg(not(feature = "cuda"))]
             Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
-            None => rust_train(
-                &ds.source, &ds.labels, &evals_ref, &train_cfg, &mut cbs, &Local,
+            None => train_weighted(
+                &ds.source,
+                &ds.labels,
+                ds.weights.as_deref(),
+                &evals_ref,
+                &train_cfg,
+                &mut cbs,
+                &Local,
             ),
         })
         .map_err(to_py_err)?;

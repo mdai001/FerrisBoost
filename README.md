@@ -238,7 +238,12 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
-### 0.0.3 (unreleased)
+### 0.0.4 (unreleased)
+
+- Added per-row sample weights (`weight=`), including weighted validation sets. Weights apply to gradients, metrics, and bin boundaries, as in XGBoost.
+- Added `params["eval_metric"]` with `rmse`, `logloss`, `error`, and `auc`.
+
+### 0.0.3
 
 - Improved data-loading and model I/O performance.
 - Reduced prediction overhead and improved throughput.

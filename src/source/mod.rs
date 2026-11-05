@@ -16,6 +16,63 @@ pub mod predict_input;
 
 pub use dense::DenseSource;
 
+/// 文件里不当特征用的列:标签,以及可选的样本权重列(XGBoost `weight`)。
+///
+/// 两者都从特征里排除 —— 拿权重当特征训练,树会照着它分裂。
+/// `&str` 自动转成「只有标签」,所以只认标签的老调用点不用改。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Targets<'a> {
+    pub label: &'a str,
+    pub weight: Option<&'a str>,
+}
+
+impl<'a> Targets<'a> {
+    pub fn new(label: &'a str, weight: Option<&'a str>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            weight != Some(label),
+            "weight 列和 label 列不能是同一列 {label:?}"
+        );
+        Ok(Self { label, weight })
+    }
+
+    /// 这一列是标签或权重(不进特征)。
+    pub fn excludes(&self, name: &str) -> bool {
+        name == self.label || self.weight == Some(name)
+    }
+}
+
+impl<'a> From<&'a str> for Targets<'a> {
+    fn from(label: &'a str) -> Self {
+        Self {
+            label,
+            weight: None,
+        }
+    }
+}
+
+impl<'a> From<&'a String> for Targets<'a> {
+    fn from(label: &'a String) -> Self {
+        Self {
+            label: label.as_str(),
+            weight: None,
+        }
+    }
+}
+
+/// 校验从文件读出的权重列:不能有缺失、不能是负数(XGBoost 同样拒绝)。
+pub(crate) fn check_weight_column(weights: &[f32], name: &str) -> anyhow::Result<()> {
+    if let Some(i) = weights.iter().position(|w| w.is_nan()) {
+        anyhow::bail!("权重列 {name:?} 第 {i} 行是缺失值;样本权重不能缺失");
+    }
+    if let Some(i) = weights.iter().position(|w| !w.is_finite() || *w < 0.0) {
+        anyhow::bail!(
+            "权重列 {name:?} 第 {i} 行是 {};样本权重必须是有限的非负数",
+            weights[i]
+        );
+    }
+    Ok(())
+}
+
 /// Public file-ingest concurrency default: zero means system-adaptive auto.
 /// It remains independent of training `nthread`.
 pub const DEFAULT_INGEST_THREADS: usize = 0;

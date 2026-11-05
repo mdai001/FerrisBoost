@@ -73,10 +73,13 @@ def train_dense(
     x: NDArray[np.float32],
     y: NDArray[np.float32],
     params: dict[str, Any],
-    evals: Sequence[tuple[NDArray[np.float32], NDArray[np.float32], str]] | None = ...,
+    evals: Sequence[
+        tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32] | None, str]
+    ] | None = ...,
     early_stopping_rounds: int | None = ...,
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
+    weight: NDArray[np.float32] | None = ...,
 ) -> Model:
     """Train a dense model; early stopping needs evals and retains all trained trees."""
     ...
@@ -89,6 +92,7 @@ def train_file(
     early_stopping_rounds: int | None = ...,
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
+    weight: str | int | None = ...,
 ) -> Model:
     """Train from files; early stopping needs evals and retains all trained trees."""
     ...

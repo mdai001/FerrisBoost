@@ -841,6 +841,7 @@ pub fn train_gpu(
 
 /// `train_gpu` 加每行样本权重。语义见 [`train_weighted`]。
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)] // Mirrors train_gpu plus the weight slice.
 pub fn train_gpu_weighted(
     device_ordinal: usize,
     source: &dyn BlockSource,
@@ -3771,7 +3772,11 @@ mod tests {
                 let s2 = DenseSource::from_row_major(&x, y.len(), nf, q.max_bin, cols_per_block);
                 let c2 = TrainConfig::new(q, Objective::Logistic);
                 let m = train_weighted(&s2, &y, Some(&w), &[], &c2, &mut [], &Local).unwrap();
-                assert_eq!(json(&weighted), json(&m), "nthread={nthread} cpb={cols_per_block}");
+                assert_eq!(
+                    json(&weighted),
+                    json(&m),
+                    "nthread={nthread} cpb={cols_per_block}"
+                );
             }
         }
     }
@@ -3785,7 +3790,10 @@ mod tests {
         let p = params(3, 2);
         let full = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
         let cuts = full.cuts().clone();
-        let xk: Vec<f32> = keep.iter().flat_map(|&i| x[i * nf..(i + 1) * nf].to_vec()).collect();
+        let xk: Vec<f32> = keep
+            .iter()
+            .flat_map(|&i| x[i * nf..(i + 1) * nf].to_vec())
+            .collect();
         let yk: Vec<f32> = keep.iter().map(|&i| y[i]).collect();
         let wk: Vec<f32> = keep.iter().map(|&i| w[i]).collect();
         let reduced = DenseSource::with_cuts(&xk, keep.len(), nf, cuts, p.cols_per_block);
@@ -3797,11 +3805,24 @@ mod tests {
             assert_eq!(ta.nodes.len(), tb.nodes.len());
             for (na, nb) in ta.nodes.iter().zip(&tb.nodes) {
                 assert_eq!(
-                    (na.is_leaf, na.feat, na.split_cond.to_bits(), na.default_left),
-                    (nb.is_leaf, nb.feat, nb.split_cond.to_bits(), nb.default_left)
+                    (
+                        na.is_leaf,
+                        na.feat,
+                        na.split_cond.to_bits(),
+                        na.default_left
+                    ),
+                    (
+                        nb.is_leaf,
+                        nb.feat,
+                        nb.split_cond.to_bits(),
+                        nb.default_left
+                    )
                 );
                 let tol = 1e-5 * na.leaf_value.abs().max(1e-3);
-                assert!((na.leaf_value - nb.leaf_value).abs() <= tol, "{na:?} vs {nb:?}");
+                assert!(
+                    (na.leaf_value - nb.leaf_value).abs() <= tol,
+                    "{na:?} vs {nb:?}"
+                );
             }
         }
     }
@@ -3813,16 +3834,42 @@ mod tests {
         let cfg = TrainConfig::new(params(2, 2), Objective::Logistic);
         for (w, msg) in [
             (vec![1.0f32; 19], "权重有 19 行"),
-            ({ let mut v = vec![1.0f32; 20]; v[3] = -0.5; v }, "非负"),
-            ({ let mut v = vec![1.0f32; 20]; v[4] = f32::NAN; v }, "非负"),
-            ({ let mut v = vec![1.0f32; 20]; v[5] = f32::INFINITY; v }, "非负"),
+            (
+                {
+                    let mut v = vec![1.0f32; 20];
+                    v[3] = -0.5;
+                    v
+                },
+                "非负",
+            ),
+            (
+                {
+                    let mut v = vec![1.0f32; 20];
+                    v[4] = f32::NAN;
+                    v
+                },
+                "非负",
+            ),
+            (
+                {
+                    let mut v = vec![1.0f32; 20];
+                    v[5] = f32::INFINITY;
+                    v
+                },
+                "非负",
+            ),
         ] {
             let err = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local)
                 .expect_err("非法权重必须报错");
             assert!(err.to_string().contains(msg), "{err:#}");
         }
         let bad = vec![-1.0f32; 20];
-        let eval = EvalSet { name: "valid".into(), source: &src, labels: &y, weights: Some(&bad) };
+        let eval = EvalSet {
+            name: "valid".into(),
+            source: &src,
+            labels: &y,
+            weights: Some(&bad),
+        };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).expect_err("验证集权重也要校验");
         assert!(err.to_string().contains("验证集 \"valid\""), "{err:#}");
     }
@@ -3843,13 +3890,28 @@ mod tests {
             );
         }
         let wsum: f64 = w.iter().map(|&v| v as f64).sum();
-        let se: f64 = pred.iter().zip(&label).zip(&w)
-            .map(|((&p, &y), &w)| w as f64 * ((p - y) as f64).powi(2)).sum();
-        assert_eq!(Rmse.eval_weighted(&pred, &label, Some(&w)), (se / wsum).sqrt() as f32);
-        let ll: f64 = pred.iter().zip(&label).zip(&w).map(|((&r, &y), &w)| {
-            let p = (1.0 / (1.0 + (-r as f64).exp())).clamp(1e-15, 1.0 - 1e-15);
-            w as f64 * -((y as f64) * p.ln() + (1.0 - y as f64) * (1.0 - p).ln())
-        }).sum();
-        assert_eq!(LogLoss.eval_weighted(&pred, &label, Some(&w)), (ll / wsum) as f32);
+        let se: f64 = pred
+            .iter()
+            .zip(&label)
+            .zip(&w)
+            .map(|((&p, &y), &w)| w as f64 * ((p - y) as f64).powi(2))
+            .sum();
+        assert_eq!(
+            Rmse.eval_weighted(&pred, &label, Some(&w)),
+            (se / wsum).sqrt() as f32
+        );
+        let ll: f64 = pred
+            .iter()
+            .zip(&label)
+            .zip(&w)
+            .map(|((&r, &y), &w)| {
+                let p = (1.0 / (1.0 + (-r as f64).exp())).clamp(1e-15, 1.0 - 1e-15);
+                w as f64 * -((y as f64) * p.ln() + (1.0 - y as f64) * (1.0 - p).ln())
+            })
+            .sum();
+        assert_eq!(
+            LogLoss.eval_weighted(&pred, &label, Some(&w)),
+            (ll / wsum) as f32
+        );
     }
 }

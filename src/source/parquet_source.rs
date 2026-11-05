@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::columns::{BinCuts, ColumnBlock};
 use crate::source::arrow_source::ArrowSource;
+use crate::source::Targets;
 use crate::train::BlockSource;
 use crate::types::{Bin, FeatId, MISSING_BIN};
 
@@ -39,6 +40,8 @@ pub(crate) const PARQUET_READ_WINDOW_BYTES: usize = crate::source::parquet_io::R
 pub struct Dataset {
     pub source: ArrowSource,
     pub labels: Vec<f32>,
+    /// 样本权重列(给了 `weight` 才有),和 `labels` 同行序。
+    pub weights: Option<Vec<f32>>,
     /// 特征列名,顺序和 `feat_id` 一致。导出模型时能填进 feature_names。
     pub feature_names: Vec<String>,
 }
@@ -50,6 +53,7 @@ impl Dataset {
         labels: Vec<f32>,
         feature_names: Vec<String>,
         label_name: &str,
+        weights: Option<(Vec<f32>, &str)>,
     ) -> anyhow::Result<Self> {
         use crate::train::BlockSource as _;
         anyhow::ensure!(
@@ -63,9 +67,23 @@ impl Dataset {
             "标签列 {label_name:?} 里有缺失值。缺失的标签得在上游处理掉 —— \
              填 0 会被当成一个真实标签学进去"
         );
+        let weights = match weights {
+            None => None,
+            Some((w, name)) => {
+                anyhow::ensure!(
+                    w.len() == source.n_rows(),
+                    "权重有 {} 行,特征有 {} 行",
+                    w.len(),
+                    source.n_rows()
+                );
+                crate::source::check_weight_column(&w, name)?;
+                Some(w)
+            }
+        };
         Ok(Self {
             source,
             labels,
+            weights,
             feature_names,
         })
     }
@@ -306,7 +324,10 @@ fn column_index(path: &Path, name: &str) -> anyhow::Result<usize> {
 /// `cols_per_block` 的自动选择需要 `n_features`,而 Parquet 在 open 之前
 /// 是不知道的。把这一步单独拿出来,就不必把 `nthread` 一路传进
 /// `partition_features`(那会让底层分块知道训练的线程策略)。
-pub fn peek_n_features(path: impl AsRef<Path>, label: &str) -> anyhow::Result<usize> {
+pub fn peek_n_features<'a>(
+    path: impl AsRef<Path>,
+    label: impl Into<Targets<'a>>,
+) -> anyhow::Result<usize> {
     let (idx, _) = feature_columns(path.as_ref(), label)?;
     Ok(idx.len())
 }
@@ -349,7 +370,10 @@ pub(crate) fn raw_batches_with_nthread(
 ///
 /// 模型要靠它做命名模式的预测绑定,所以这里必须和训练用的顺序完全一致 ——
 /// 两边各推一遍就会有漂移的风险,故只此一处。
-pub fn feature_names_of(path: impl AsRef<Path>, label: &str) -> anyhow::Result<Vec<String>> {
+pub fn feature_names_of<'a>(
+    path: impl AsRef<Path>,
+    label: impl Into<Targets<'a>>,
+) -> anyhow::Result<Vec<String>> {
     let (_, names) = feature_columns(path.as_ref(), label)?;
     Ok(names)
 }
@@ -386,20 +410,44 @@ fn row_group_work(path: &Path) -> anyhow::Result<(usize, usize)> {
     Ok((metadata.num_row_groups(), max_rows.div_ceil(BATCH_SIZE)))
 }
 
-fn feature_columns(path: &Path, label: &str) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
+fn feature_columns<'a>(
+    path: &Path,
+    targets: impl Into<Targets<'a>>,
+) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
+    let targets = targets.into();
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let schema = builder.schema();
+    if let Some(w) = targets.weight {
+        // 权重列找不到要报错,不能静默当成「没给权重」。
+        column_index(path, w)?;
+    }
     let mut idx = Vec::new();
     let mut names = Vec::new();
     for (i, f) in schema.fields().iter().enumerate() {
-        if f.name() != label {
+        if !targets.excludes(f.name()) {
             idx.push(i);
             names.push(f.name().clone());
         }
     }
-    anyhow::ensure!(!idx.is_empty(), "除了标签列 {label:?} 之外没有别的列了");
+    anyhow::ensure!(
+        !idx.is_empty(),
+        "除了标签列 {:?} 之外没有别的列了",
+        targets.label
+    );
     Ok((idx, names))
+}
+
+/// 读一整列 f32(单文件 parquet 的权重列用)。不量化、不留其它列。
+#[cfg_attr(not(feature = "python"), allow(dead_code))] // Called from the Python ingest path.
+pub(crate) fn read_f32_column(path: impl AsRef<Path>, name: &str) -> anyhow::Result<Vec<f32>> {
+    let path = path.as_ref();
+    let col = column_index(path, name)?;
+    let mut out = Vec::new();
+    for batch in batch_reader(path, &[col], BATCH_SIZE)? {
+        out.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+    }
+    Ok(out)
 }
 
 /// 默认的读取批大小。够摊薄每批的固定开销,又不至于一批就把内存吃满。
@@ -434,15 +482,16 @@ pub fn cuts_only_with_nthread(
     cuts_only_observed(path, label, max_bins, nthread, &mut |_, _, _| {})
 }
 
-fn cuts_only_observed(
+fn cuts_only_observed<'a>(
     path: impl AsRef<Path>,
-    label: &str,
+    label: impl Into<Targets<'a>>,
     max_bins: u32,
     nthread: usize,
     observe: &mut impl FnMut(&'static str, usize, usize),
 ) -> anyhow::Result<BinCuts> {
     let path = path.as_ref().to_path_buf();
-    let (feat_cols, _) = feature_columns(&path, label)?;
+    let targets = label.into();
+    let (feat_cols, _) = feature_columns(&path, targets)?;
     let (tasks, batches_per_task) = row_group_work(&path)?;
     let (reader_threads, transform_threads) = crate::source::parquet_pipeline_threads(
         nthread,
@@ -452,11 +501,27 @@ fn cuts_only_observed(
         feat_cols.len(),
     );
     observe("cuts", reader_threads, transform_threads);
-    crate::source::arrow_source::build_cuts_with_nthread(
-        parallel_row_groups(path, feat_cols, BATCH_SIZE, reader_threads)?,
+    let Some(weight) = targets.weight else {
+        return crate::source::arrow_source::build_cuts_with_nthread(
+            parallel_row_groups(path, feat_cols, BATCH_SIZE, reader_threads)?,
+            max_bins as usize,
+            transform_threads,
+        );
+    };
+    // 加权分箱:权重列跟在特征后面一起读。Parquet 投影按文件物理顺序
+    // 返回,所以要投影后重排,保证权重是最后一列。
+    let mut cols = feat_cols;
+    cols.push(column_index(&path, weight)?);
+    let (mask, order) = crate::source::input::projection_and_order(&cols);
+    let batches = parallel_row_groups(path, mask, BATCH_SIZE, reader_threads)?
+        .map(move |b| b.map(|b| crate::source::input::reorder(&b, &order)));
+    crate::source::arrow_source::build_cuts_and_count_weighted(
+        batches,
         max_bins as usize,
         transform_threads,
+        true,
     )
+    .map(|(cuts, _)| cuts)
 }
 
 /// 打开一个 Parquet 文件,**复用给定的分箱边界**。
@@ -528,9 +593,9 @@ pub fn open_many_with_nthread(
     )
 }
 
-pub(crate) fn open_many_observed(
+pub(crate) fn open_many_observed<'a>(
     paths: &[PathBuf],
-    label: &str,
+    targets: impl Into<Targets<'a>>,
     cuts: Option<BinCuts>,
     max_bins: u32,
     cols_per_block: usize,
@@ -538,15 +603,21 @@ pub(crate) fn open_many_observed(
     mut observe: impl FnMut(&'static str, usize, usize),
 ) -> anyhow::Result<Dataset> {
     anyhow::ensure!(!paths.is_empty(), "没有输入文件");
+    let targets = targets.into();
+    let label = targets.label;
     let metadata_profile = crate::source::openprof::start("multi metadata");
-    let (first_cols, feature_names) = feature_columns(&paths[0], label)?;
+    let (first_cols, feature_names) = feature_columns(&paths[0], targets)?;
     let label_col_first = column_index(&paths[0], label)?;
+    let mut weight_proj: Vec<usize> = Vec::new();
+    if let Some(w) = targets.weight {
+        weight_proj.push(column_index(&paths[0], w)?);
+    }
 
     // 每个文件各自解投影:列名相同、物理顺序不同也能一起训。
     let mut feat_proj: Vec<Vec<usize>> = vec![first_cols];
     let mut label_proj: Vec<usize> = vec![label_col_first];
     for p in &paths[1..] {
-        let (cols, names) = feature_columns(p, label)?;
+        let (cols, names) = feature_columns(p, targets)?;
         anyhow::ensure!(
             names.len() == feature_names.len(),
             "多文件 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
@@ -565,6 +636,9 @@ pub(crate) fn open_many_observed(
         }
         feat_proj.push(mapped);
         label_proj.push(column_index(p, label)?);
+        if let Some(w) = targets.weight {
+            weight_proj.push(column_index(p, w)?);
+        }
     }
 
     let reader_tasks = paths.len();
@@ -605,6 +679,29 @@ pub(crate) fn open_many_observed(
             reader_threads,
         ))
     };
+    // 加权分箱:先单独扫一遍「特征 + 权重列」建 cuts,再走给定 cuts 的量化。
+    // 验证集(`cuts` 已给)沿用训练集的 cuts,不重建。
+    let cuts = match (cuts, targets.weight) {
+        (None, Some(_)) => {
+            let proj: Vec<Vec<usize>> = feat_proj
+                .iter()
+                .zip(&weight_proj)
+                .map(|(f, &w)| {
+                    let mut cols = f.clone();
+                    cols.push(w);
+                    cols
+                })
+                .collect();
+            let (c, _) = crate::source::arrow_source::build_cuts_and_count_weighted(
+                dataset_reader(owned.clone(), proj, BATCH_SIZE, cuts_plan.0),
+                max_bins as usize,
+                cuts_plan.1,
+                true,
+            )?;
+            Some(c)
+        }
+        (c, _) => c,
+    };
     let source = match cuts {
         Some(c) => {
             ArrowSource::with_cuts_and_nthread(|| feats(true), c, cols_per_block, bins_plan.1)?
@@ -629,7 +726,23 @@ pub(crate) fn open_many_observed(
         let batch = batch?;
         labels.extend(crate::source::arrow_source::column_as_f32(&batch, 0)?);
     }
-    Dataset::assemble(source, labels, feature_names, label)
+    let weights = match targets.weight {
+        None => None,
+        Some(w) => {
+            let _p = crate::source::openprof::start("multi weights");
+            let mut values = Vec::new();
+            for batch in dataset_reader(
+                paths.to_vec(),
+                weight_proj.iter().map(|c| vec![*c]).collect(),
+                BATCH_SIZE,
+                nthread,
+            ) {
+                values.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+            }
+            Some((values, w))
+        }
+    };
+    Dataset::assemble(source, labels, feature_names, label, weights)
 }
 
 fn dataset_reader(
@@ -702,6 +815,10 @@ struct CacheManifest {
     source_len: u64,
     source_mtime_ns: u64,
     label: String,
+    /// 被排除出特征的权重列。旧缓存没有这个字段 = 没有权重列。
+    /// 必须进身份校验:换一个权重列,特征集合就变了,而特征**数**可能不变。
+    #[serde(default)]
+    weight: Option<String>,
     max_bins: u32,
     cols_per_block: usize,
     n_rows: usize,
@@ -883,9 +1000,9 @@ impl ParquetBlockSource {
         )
     }
 
-    pub(crate) fn open_with_cache_observed(
+    pub(crate) fn open_with_cache_observed<'a>(
         path: impl AsRef<Path>,
-        label: &str,
+        targets: impl Into<Targets<'a>>,
         max_bins: u32,
         cols_per_block: usize,
         options: QuantizedCacheOptions,
@@ -893,9 +1010,11 @@ impl ParquetBlockSource {
         mut observe: impl FnMut(&'static str, usize, usize),
     ) -> anyhow::Result<(Self, Vec<f32>)> {
         let path = path.as_ref().to_path_buf();
+        let targets = targets.into();
+        let label = targets.label;
         let (feat_cols, label_col) = {
             let _p = crate::source::openprof::start("metadata");
-            let (feat_cols, _) = feature_columns(&path, label)?;
+            let (feat_cols, _) = feature_columns(&path, targets)?;
             (feat_cols, column_index(&path, label)?)
         };
         if let Some(cache_path) = options.path.as_ref() {
@@ -904,7 +1023,7 @@ impl ParquetBlockSource {
                     path,
                     feat_cols,
                     label_col,
-                    label,
+                    targets,
                     max_bins,
                     cols_per_block,
                     cache_path,
@@ -918,7 +1037,7 @@ impl ParquetBlockSource {
         }
         let cuts = {
             let _p = crate::source::openprof::start("cuts");
-            cuts_only_observed(&path, label, max_bins, nthread, &mut observe)?
+            cuts_only_observed(&path, targets, max_bins, nthread, &mut observe)?
         };
         Self::with_cuts_inner(
             path,
@@ -927,7 +1046,7 @@ impl ParquetBlockSource {
             cuts,
             max_bins,
             cols_per_block,
-            label,
+            targets,
             options,
             nthread,
         )
@@ -984,24 +1103,25 @@ impl ParquetBlockSource {
         )
     }
 
-    pub fn with_cuts_and_cache_and_nthread(
+    pub fn with_cuts_and_cache_and_nthread<'a>(
         path: impl AsRef<Path>,
-        label: &str,
+        targets: impl Into<Targets<'a>>,
         cuts: BinCuts,
         cols_per_block: usize,
         options: QuantizedCacheOptions,
         nthread: usize,
     ) -> anyhow::Result<(Self, Vec<f32>)> {
         let path = path.as_ref().to_path_buf();
-        let (feat_cols, _) = feature_columns(&path, label)?;
-        let label_col = column_index(&path, label)?;
+        let targets = targets.into();
+        let (feat_cols, _) = feature_columns(&path, targets)?;
+        let label_col = column_index(&path, targets.label)?;
         if let Some(cache_path) = options.path.as_ref() {
             if cache_path.join("manifest.json").exists() {
                 let (src, labels) = Self::reuse_cache(
                     path,
                     feat_cols,
                     label_col,
-                    label,
+                    targets,
                     0,
                     cols_per_block,
                     cache_path,
@@ -1025,7 +1145,7 @@ impl ParquetBlockSource {
             cuts,
             0,
             cols_per_block,
-            label,
+            targets,
             options,
             nthread,
         )
@@ -1041,10 +1161,11 @@ impl ParquetBlockSource {
         cuts: BinCuts,
         max_bins: u32,
         cols_per_block: usize,
-        label: &str,
+        targets: Targets<'_>,
         options: QuantizedCacheOptions,
         nthread: usize,
     ) -> anyhow::Result<(Self, Vec<f32>)> {
+        let label = targets.label;
         let n_features = feat_cols.len();
         anyhow::ensure!(
             cuts.n_feats() == n_features,
@@ -1086,13 +1207,13 @@ impl ParquetBlockSource {
             parquet_loads: AtomicUsize::new(0),
         };
         crate::source::openprof::shape(source.n_rows, source.n_features, source.groups.len());
-        source.build_cache(label, max_bins, cols_per_block, options, nthread)?;
+        source.build_cache(targets, max_bins, cols_per_block, options, nthread)?;
         Ok((source, labels))
     }
 
     fn build_cache(
         &mut self,
-        label: &str,
+        targets: Targets<'_>,
         max_bins: u32,
         cols_per_block: usize,
         options: QuantizedCacheOptions,
@@ -1149,7 +1270,7 @@ impl ParquetBlockSource {
             })?
         };
         let _p = crate::source::openprof::start("cache commit");
-        let manifest = self.manifest(label, max_bins, cols_per_block, block_hashes.clone())?;
+        let manifest = self.manifest(targets, max_bins, cols_per_block, block_hashes.clone())?;
         let tmp = dir.join("manifest.json.tmp");
         File::create(&tmp)?.write_all(&serde_json::to_vec(&manifest)?)?;
         std::fs::rename(tmp, dir.join("manifest.json"))?;
@@ -1167,7 +1288,7 @@ impl ParquetBlockSource {
 
     fn manifest(
         &self,
-        label: &str,
+        targets: Targets<'_>,
         max_bins: u32,
         cols_per_block: usize,
         block_hashes: Vec<String>,
@@ -1178,7 +1299,8 @@ impl ParquetBlockSource {
             source_path,
             source_len,
             source_mtime_ns,
-            label: label.to_string(),
+            label: targets.label.to_string(),
+            weight: targets.weight.map(str::to_string),
             max_bins,
             cols_per_block,
             n_rows: self.n_rows,
@@ -1195,11 +1317,12 @@ impl ParquetBlockSource {
         path: PathBuf,
         feat_cols: Vec<usize>,
         label_col: usize,
-        label: &str,
+        targets: Targets<'_>,
         max_bins: u32,
         cols_per_block: usize,
         cache_path: &Path,
     ) -> anyhow::Result<(Self, Vec<f32>)> {
+        let label = targets.label;
         let raw = std::fs::read(cache_path.join("manifest.json"))?;
         let manifest: CacheManifest = serde_json::from_slice(&raw)?;
         anyhow::ensure!(
@@ -1217,6 +1340,12 @@ impl ParquetBlockSource {
             "缓存对应的 Parquet 文件已经变化或不是当前文件"
         );
         anyhow::ensure!(manifest.label == label, "缓存标签列不一致");
+        anyhow::ensure!(
+            manifest.weight.as_deref() == targets.weight,
+            "缓存权重列不一致(缓存 {:?},本次 {:?})",
+            manifest.weight,
+            targets.weight
+        );
         anyhow::ensure!(
             manifest.cols_per_block == cols_per_block,
             "缓存列块宽度不一致"

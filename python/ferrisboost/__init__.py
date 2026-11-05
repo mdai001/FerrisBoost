@@ -6,9 +6,10 @@
     import ferrisboost as fb
     import numpy as np
 
-    model = fb.train({"max_depth": 6, "eta": 0.3, "objective": "binary:logistic"},
-                     X, label=y, num_boost_round=100,
-                     evals=[(Xv, yv, "valid")], early_stopping_rounds=10)
+    model = fb.train({"max_depth": 6, "eta": 0.3, "objective": "binary:logistic",
+                      "eval_metric": ["logloss", "auc"]},
+                     X, label=y, weight=w, num_boost_round=100,
+                     evals=[(Xv, yv, wv, "valid")], early_stopping_rounds=10)
     model.save_model("m.json")     # XGBoost 能加载
     fb.Model.load_model("m.json")  # 也能读 XGBoost 训的
 
@@ -76,6 +77,9 @@ _DEFAULTS: dict[str, Any] = {
     "base_score": 0.5,
     "cache_budget_bytes": None,
     "cache_path": None,
+    # XGBoost 同名参数:字符串或字符串列表。None = objective 的默认指标。
+    # 多个时 early stopping 盯最后一个(和 XGBoost 一致)。
+    "eval_metric": None,
 }
 
 # XGBoost 的别名,两种写法都收
@@ -203,6 +207,17 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             raise ValueError("cache_budget_bytes 不能是负数")
     if out["cache_path"] is not None:
         out["cache_path"] = os.fspath(out["cache_path"])
+    if out["eval_metric"] is not None:
+        m = out["eval_metric"]
+        names = [m] if isinstance(m, str) else (
+            list(m) if isinstance(m, (list, tuple)) else None
+        )
+        if not names or not all(isinstance(n, str) for n in names):
+            raise ValueError(
+                f"eval_metric 要是字符串或字符串列表,给的是 {m!r}"
+            )
+        # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
+        out["eval_metric"] = names
     return out
 
 
@@ -229,6 +244,18 @@ def _as_labels(y: Any, n_rows: int) -> np.ndarray:
     if np.isnan(arr).any():
         raise ValueError("标签里有 NaN。缺失的标签要在上游处理掉 —— "
                          "填 0 会被当成一个真实标签学进去")
+    return arr
+
+
+def _as_weights(w: Any, n_rows: int, name: str = "weight") -> np.ndarray:
+    """样本权重 -> C 连续 f32 一维数组。规则和 XGBoost 一致:有限、非负。"""
+    arr = np.ascontiguousarray(np.asarray(w, dtype=np.float32).ravel())
+    if arr.size != n_rows:
+        raise ValueError(f"{name} 有 {arr.size} 个,数据有 {n_rows} 行")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} 里有 NaN 或 inf;样本权重必须是有限值")
+    if (arr < 0).any():
+        raise ValueError(f"{name} 里有负数;样本权重必须非负")
     return arr
 
 
@@ -282,6 +309,7 @@ def train(
     callbacks: Iterable[Callable[[int, dict], bool]] | None = None,
     header: bool = True,
     quiet: bool = False,
+    weight: Any = None,
 ) -> Model:
     """训一个模型。
 
@@ -292,9 +320,16 @@ def train(
     * 无表头 `.csv` 路径传 `header=False`,`label` 给从 0 开始的列下标
     * pyarrow Table / RecordBatchReader,`label` 给 numpy 一维数组
 
-    `evals` 是 `[(data, label, name)]`;数据是路径时写 `[(path, name)]`,
-    标签列名和训练集共用。**验证集会自动复用训练集的分箱边界** ——
-    各自建边界会让同一个值落进不同的 bin,模型直接失效。
+    `weight` 是每行样本权重(XGBoost 的 DMatrix `weight`):数组入口给
+    一维数组,文件入口给**列名**(无表头 CSV 给列下标),该列不进特征。
+
+    `evals` 是 `[(data, label, name)]` 或带权重的 `[(data, label, weight, name)]`;
+    数据是路径时写 `[(path, name)]`,标签列名和权重列名都和训练集共用。
+    **验证集会自动复用训练集的分箱边界** —— 各自建边界会让同一个值落进
+    不同的 bin,模型直接失效。
+
+    权重同时作用于梯度、指标和分箱边界(quantile sketch 按权重加权),
+    语义和 XGBoost 一致。
     """
     p = _normalize_params(params, num_boost_round)
     # Private wire field: quiet is a public call option, not a tree parameter.
@@ -314,25 +349,49 @@ def train(
             raise ValueError("header=True 时文件 label 要给列名字符串")
         if not header and (not isinstance(label, int) or isinstance(label, bool)):
             raise ValueError("header=False 时文件 label 要给从 0 开始的列下标")
-        eval_specs = [(os.fspath(d), name) for d, name in evals]
+        if weight is not None:
+            if header and not isinstance(weight, str):
+                raise ValueError("文件入口的 weight 要给列名字符串(header=True)")
+            if not header and (not isinstance(weight, int) or isinstance(weight, bool)):
+                raise ValueError("header=False 时文件 weight 要给从 0 开始的列下标")
+        eval_specs = []
+        for item in evals:
+            if len(item) != 2:
+                raise ValueError(
+                    "文件入口的 evals 元素要是 (path, name);"
+                    "标签列和权重列沿用训练集的列名"
+                )
+            eval_specs.append((os.fspath(item[0]), item[1]))
         # 格式由 Rust 从解析出的文件判定 —— Python 不再按后缀猜,也不做
         # 文件系统判断(目录/glob 展开、排序、schema 一致性全在 Rust)。
         model = _core.train_file(specs, label, p, header, eval_specs,
-                                 early_stopping_rounds, verbose, cb_list)
+                                 early_stopping_rounds, verbose, cb_list,
+                                 weight=weight)
     else:
         arrow = _from_pyarrow(data)
         x = _as_matrix(arrow if arrow is not None else data)
         y = _as_labels(label, x.shape[0])
+        if isinstance(weight, str):
+            raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
+        w = None if weight is None else _as_weights(weight, x.shape[0])
         eval_specs = []
         for item in evals:
-            if len(item) != 3:
-                raise ValueError("evals 的元素要是 (data, label, name)")
-            ed, el, name = item
+            if len(item) == 3:
+                ed, el, name = item
+                ew = None
+            elif len(item) == 4:
+                ed, el, ew, name = item
+            else:
+                raise ValueError(
+                    "evals 的元素要是 (data, label, name) 或 (data, label, weight, name)"
+                )
             ea = _from_pyarrow(ed)
             ex = _as_matrix(ea if ea is not None else ed, f"evals[{name}]")
-            eval_specs.append((ex, _as_labels(el, ex.shape[0]), str(name)))
+            if ew is not None:
+                ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")
+            eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name)))
         model = _core.train_dense(x, y, p, eval_specs, early_stopping_rounds,
-                                  verbose, cb_list)
+                                  verbose, cb_list, weight=w)
 
     if evals_result is not None:
         evals_result.clear()

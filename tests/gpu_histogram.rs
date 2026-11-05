@@ -2467,10 +2467,20 @@ fn weighted_training_is_cpu_gpu_byte_identical() {
             let cpu = train_weighted(&source, &labels, Some(&weights), &[], &cfg, &mut [], &Local)
                 .unwrap();
             let gpu = train_gpu_weighted(
-                0, &source, &labels, Some(&weights), &[], &cfg, &mut [], &Local,
+                0,
+                &source,
+                &labels,
+                Some(&weights),
+                &[],
+                &cfg,
+                &mut [],
+                &Local,
             )
             .unwrap();
-            assert!(cpu.trees.iter().any(|t| t.nodes.len() > 1), "{what}: 夹具应该真的分裂");
+            assert!(
+                cpu.trees.iter().any(|t| t.nodes.len() > 1),
+                "{what}: 夹具应该真的分裂"
+            );
             assert_eq!(
                 gpu.to_xgboost_json().unwrap(),
                 cpu.to_xgboost_json().unwrap(),
@@ -2491,8 +2501,12 @@ fn weighted_training_is_cpu_gpu_byte_identical() {
 fn gpu_all_ones_weights_match_unweighted() {
     let n_rows = 600usize;
     let n_feats = 6usize;
-    let data: Vec<f32> = (0..n_rows * n_feats).map(|i| ((i * 31) % 97) as f32).collect();
-    let labels: Vec<f32> = (0..n_rows).map(|r| ((r * 13) % 7 < 3) as u8 as f32).collect();
+    let data: Vec<f32> = (0..n_rows * n_feats)
+        .map(|i| ((i * 31) % 97) as f32)
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|r| ((r * 13) % 7 < 3) as u8 as f32)
+        .collect();
     let ones = vec![1.0f32; n_rows];
     let source = DenseSource::from_row_major(&data, n_rows, n_feats, 32, 3);
     let params = ferrisboost::types::TrainParams {
@@ -2506,9 +2520,11 @@ fn gpu_all_ones_weights_match_unweighted() {
     let plain = train_gpu(0, &source, &labels, &[], &cfg, &mut [], &Local).unwrap();
     let ones_model =
         train_gpu_weighted(0, &source, &labels, Some(&ones), &[], &cfg, &mut [], &Local).unwrap();
-    assert_eq!(plain.to_xgboost_json().unwrap(), ones_model.to_xgboost_json().unwrap());
+    assert_eq!(
+        plain.to_xgboost_json().unwrap(),
+        ones_model.to_xgboost_json().unwrap()
+    );
 }
-
 
 /// `gpu_math="fast"` + 样本权重:权重常驻 device,由 objective kernel 乘进
 /// grad/hess。fast 不承诺 CPU/GPU 逐字节相同,但必须:全 1 权重 ≡ 不加权、

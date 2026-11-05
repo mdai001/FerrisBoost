@@ -1277,7 +1277,11 @@ impl GpuTrainCtx {
         } else {
             (None, None)
         };
-        let fast_weight_bytes = if fast_math && config.fast_weights { n_rows * 4 } else { 0 };
+        let fast_weight_bytes = if fast_math && config.fast_weights {
+            n_rows * 4
+        } else {
+            0
+        };
         let weight_resident = if fast_weight_bytes > 0 {
             Some(
                 stream

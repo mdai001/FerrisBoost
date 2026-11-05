@@ -78,6 +78,39 @@ impl DenseSource {
         cols_per_block: usize,
         nthread: usize,
     ) -> Self {
+        Self::new_weighted_with_nthread(
+            data,
+            n_rows,
+            n_features,
+            binning,
+            cols_per_block,
+            nthread,
+            None,
+        )
+    }
+
+    /// 带样本权重建分箱边界(XGBoost hist 的 quantile sketch 按权重加权)。
+    ///
+    /// 只影响 `BinningStrategy::Sketch`;`Provided` 的 cuts 原样使用。
+    /// 训练时还要把**同一份**权重传给 `train_weighted` —— 这里只管分箱。
+    /// `None` 和全 1 权重得到逐位相同的 cuts。
+    #[allow(clippy::too_many_arguments)] // `new_with_nthread` plus the weight slice.
+    pub fn new_weighted_with_nthread(
+        data: &[f32],
+        n_rows: usize,
+        n_features: usize,
+        binning: BinningStrategy,
+        cols_per_block: usize,
+        nthread: usize,
+        weights: Option<&[f32]>,
+    ) -> Self {
+        if let Some(w) = weights {
+            assert_eq!(w.len(), n_rows, "权重长度应为 n_rows");
+            assert!(
+                w.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "样本权重必须是有限的非负数"
+            );
+        }
         assert_eq!(
             data.len(),
             n_rows * n_features,
@@ -110,8 +143,17 @@ impl DenseSource {
                         .into_par_iter()
                         .map(|f| {
                             let mut sk = FeatureSketch::new(max_bins);
-                            for r in 0..n_rows {
-                                sk.push(data[r * n_features + f], 1.0);
+                            match weights {
+                                None => {
+                                    for r in 0..n_rows {
+                                        sk.push(data[r * n_features + f], 1.0);
+                                    }
+                                }
+                                Some(w) => {
+                                    for r in 0..n_rows {
+                                        sk.push(data[r * n_features + f], w[r]);
+                                    }
+                                }
                             }
                             sk.cuts(max_bins)
                         })
@@ -480,5 +522,107 @@ mod tests {
     fn rejects_max_bin_above_limit() {
         let (data, n_rows, n_feats) = toy();
         DenseSource::from_row_major(&data, n_rows, n_feats, 256, 8);
+    }
+
+    fn continuous(n: usize, m: usize, seed: u64) -> Vec<f32> {
+        // 简单 LCG:测试只需要可复现的连续值,不需要好的随机性。
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n * m)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / (1u64 << 24) as f32
+            })
+            .collect()
+    }
+
+    fn weighted_cuts(
+        data: &[f32],
+        n: usize,
+        m: usize,
+        w: Option<&[f32]>,
+        nthread: usize,
+    ) -> BinCuts {
+        use crate::train::BlockSource as _;
+        DenseSource::new_weighted_with_nthread(
+            data,
+            n,
+            m,
+            BinningStrategy::Sketch { max_bins: 32 },
+            2,
+            nthread,
+            w,
+        )
+        .cuts()
+        .clone()
+    }
+
+    #[test]
+    fn all_ones_weights_give_identical_cuts() {
+        let (n, m) = (5000, 3);
+        let data = continuous(n, m, 1);
+        let ones = vec![1.0f32; n];
+        let a = weighted_cuts(&data, n, m, None, 1);
+        let b = weighted_cuts(&data, n, m, Some(&ones), 1);
+        assert_eq!(a.values, b.values);
+        assert_eq!(a.offsets, b.offsets);
+    }
+
+    #[test]
+    fn zero_weight_rows_are_invisible_to_the_sketch() {
+        let (n, m) = (5000, 3);
+        let data = continuous(n, m, 2);
+        let w: Vec<f32> = (0..n)
+            .map(|r| {
+                if r % 3 == 0 {
+                    0.0
+                } else {
+                    1.0 + (r % 7) as f32
+                }
+            })
+            .collect();
+        let kept: Vec<usize> = (0..n).filter(|r| r % 3 != 0).collect();
+        let kept_data: Vec<f32> = kept
+            .iter()
+            .flat_map(|&r| data[r * m..(r + 1) * m].to_vec())
+            .collect();
+        let kept_w: Vec<f32> = kept.iter().map(|&r| w[r]).collect();
+        let a = weighted_cuts(&data, n, m, Some(&w), 1);
+        let b = weighted_cuts(&kept_data, kept.len(), m, Some(&kept_w), 1);
+        assert_eq!(a.values, b.values);
+        assert_eq!(a.offsets, b.offsets);
+    }
+
+    #[test]
+    fn weights_move_cuts_toward_heavy_rows_and_are_thread_invariant() {
+        let (n, m) = (5000, 2);
+        let data = continuous(n, m, 3);
+        // 值 < 0.25 的行权重 20:加权中位数应该掉进 [0, 0.25)。
+        let w: Vec<f32> = (0..n)
+            .map(|r| if data[r * m] < 0.25 { 20.0 } else { 1.0 })
+            .collect();
+        let plain = weighted_cuts(&data, n, m, None, 1);
+        let heavy = weighted_cuts(&data, n, m, Some(&w), 1);
+        let below = |c: &BinCuts| c.cuts_for(0).iter().filter(|&&v| v < 0.25).count();
+        assert!(
+            below(&heavy) > 2 * below(&plain),
+            "加权后 [0,0.25) 里的 cut 应明显变多:{} vs {}",
+            below(&heavy),
+            below(&plain)
+        );
+        // 第 1 列的权重和它的取值无关 → cuts 不该大变,但仍是合法递增序列。
+        assert!(heavy.cuts_for(1).windows(2).all(|p| p[0] < p[1]));
+        for t in [2, 4, 8] {
+            let again = weighted_cuts(&data, n, m, Some(&w), t);
+            assert_eq!(again.values, heavy.values, "nthread={t} 改变了加权 cuts");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "有限的非负数")]
+    fn rejects_negative_weight_at_binning() {
+        let (data, n, m) = toy();
+        weighted_cuts(&data, n, m, Some(&[1.0, -1.0, 1.0, 1.0]), 1);
     }
 }

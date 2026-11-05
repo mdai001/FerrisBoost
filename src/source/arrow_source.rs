@@ -95,6 +95,20 @@ pub(crate) fn build_cuts_and_count_with_nthread(
     max_bins: usize,
     nthread: usize,
 ) -> anyhow::Result<(BinCuts, usize)> {
+    build_cuts_and_count_weighted(batches, max_bins, nthread, false)
+}
+
+/// 加权分箱(XGBoost hist 的 sketch 同样按样本权重加权)。
+///
+/// `weighted = true` 时每个 batch 的**最后一列**是样本权重,不参与分箱;
+/// 其余列是特征。权重必须有限且非负,0 权重的行不影响 cuts。
+/// 全 1 权重和不加权的 cuts 逐位相同(不加权时本来就按权重 1 插入)。
+pub(crate) fn build_cuts_and_count_weighted(
+    batches: impl Iterator<Item = anyhow::Result<RecordBatch>>,
+    max_bins: usize,
+    nthread: usize,
+    weighted: bool,
+) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
@@ -117,10 +131,35 @@ pub(crate) fn build_cuts_and_count_with_nthread(
         };
         let Some(batch) = next else { break };
         let batch = batch?;
+        let row_offset = n_rows;
         n_rows = n_rows
             .checked_add(batch.num_rows())
             .ok_or_else(|| anyhow::anyhow!("输入行数溢出 usize"))?;
-        let n_feats = batch.num_columns();
+        let n_feats = batch.num_columns() - usize::from(weighted);
+        let weights: Option<Vec<f32>> = if weighted {
+            let mut w = Vec::with_capacity(batch.num_rows());
+            for_each_column_f32(&batch, n_feats, |v| w.push(v))?;
+            if let Some(i) = w.iter().position(|v| !v.is_finite() || *v < 0.0) {
+                anyhow::bail!(
+                    "样本权重第 {} 行是 {};权重必须是有限的非负数",
+                    row_offset + i,
+                    w[i]
+                );
+            }
+            Some(w)
+        } else {
+            None
+        };
+        let push_column = |col: usize, sketch: &mut crate::sketch::FeatureSketch| match &weights {
+            None => for_each_column_f32(&batch, col, |value| sketch.push(value, 1.0)),
+            Some(w) => {
+                let mut row = 0usize;
+                for_each_column_f32(&batch, col, |value| {
+                    sketch.push(value, w[row]);
+                    row += 1;
+                })
+            }
+        };
         let sk = sketches.get_or_insert_with(|| SketchSet::new(n_feats, max_bins));
         anyhow::ensure!(
             n_feats == sk.n_feats(),
@@ -133,16 +172,14 @@ pub(crate) fn build_cuts_and_count_with_nthread(
             // materialized f32 buffer that used to separate those operations.
             for (col, sketch) in sk.per_feat.iter_mut().enumerate() {
                 let _p = crate::source::openprof::sub("convert+sketch");
-                for_each_column_f32(&batch, col, |value| sketch.push(value, 1.0))?;
+                push_column(col, sketch)?;
             }
         } else {
             // 这里的计时是整个 batch 的 elapsed wall,不是各 worker 用时之和。
             let _p = crate::source::openprof::sub("parallel batch");
             pool.install(|| {
                 sk.per_feat.par_iter_mut().enumerate().try_for_each(
-                    |(col, sketch)| -> anyhow::Result<()> {
-                        for_each_column_f32(&batch, col, |value| sketch.push(value, 1.0))
-                    },
+                    |(col, sketch)| -> anyhow::Result<()> { push_column(col, sketch) },
                 )
             })?;
         }

@@ -161,7 +161,8 @@ the same.
 ## Validation and early stopping
 
 For in-memory data, each validation entry is a
-`(features, labels, name)` tuple:
+`(features, labels, name)` tuple, or `(features, labels, weights, name)` for a
+weighted validation set (see [Sample weights](#sample-weights)):
 
 ```python
 X_train, X_valid = X[:8_000], X[8_000:]
@@ -191,12 +192,31 @@ print(history["valid"]["logloss"])
 FerrisBoost automatically reuses the training cuts for validation data. This
 is required for consistent bin assignments.
 
-Early stopping watches the last configured metric of the last validation set.
-The Python API currently uses one default metric selected by the objective;
-there is no `eval_metric` parameter yet:
+Early stopping watches the last configured metric of the last validation set,
+as in XGBoost. Choose metrics with `params["eval_metric"]`, either one name or a
+list:
 
-- `binary:logistic`: `logloss`
-- `reg:squarederror`: `rmse`
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "eval_metric": ["logloss", "auc"]},
+    X_train,
+    label=y_train,
+    num_boost_round=500,
+    evals=[(X_valid, y_valid, "valid")],
+    early_stopping_rounds=20,  # watches auc, the last metric
+)
+```
+
+| Metric | Objectives | Definition |
+|---|---|---|
+| `rmse` | both | Root mean squared error; for `binary:logistic` it is computed on probabilities, as in XGBoost |
+| `logloss` | `binary:logistic` | Negative log-likelihood |
+| `error` | `binary:logistic` | Error rate at threshold 0.5 (`p > 0.5` counts as positive) |
+| `auc` | `binary:logistic` | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it |
+
+Without `eval_metric`, the objective selects the default: `logloss` for
+`binary:logistic` and `rmse` for `reg:squarederror`. With weighted validation
+data every metric is weighted the same way XGBoost does it.
 
 Like `xgboost.Booster.predict`, `Model.predict()` uses all trees by default,
 including trees built after the best iteration. To predict with the early-
@@ -208,6 +228,59 @@ best_prediction = model.predict(
     n_trees=model.best_iteration + 1,
 )
 ```
+
+## Sample weights
+
+Pass per-row weights with `weight=`. They work like XGBoost's
+`DMatrix(weight=...)`: each row's gradient and Hessian are multiplied by its
+weight, so `min_child_weight` and the split gain both see weighted sums, and
+the quantile sketch that chooses bin boundaries is weighted too, so heavily
+weighted regions of a feature get finer bins.
+
+```python
+w_train = np.where(y_train == 1, 5.0, 1.0)   # e.g. up-weight the rare class
+w_valid = np.where(y_valid == 1, 5.0, 1.0)
+
+model = fb.train(
+    {"objective": "binary:logistic", "eval_metric": "auc"},
+    X_train,
+    label=y_train,
+    weight=w_train,
+    num_boost_round=200,
+    evals=[(X_valid, y_valid, w_valid, "valid")],
+)
+```
+
+For Parquet and CSV input, `weight` names a column, which is excluded from the
+features. File validation sets reuse the same label and weight column names.
+Headerless CSV takes a zero-based column index, as `label` does:
+
+```python
+model = fb.train(params, "train.parquet", label="target", weight="w",
+                 evals=[("valid.parquet", "valid")])
+model = fb.train(params, "train.csv", label=4, weight=5, header=False)
+```
+
+Rules:
+
+- Weights must be finite and non-negative. A row with weight `0` has no effect
+  on the trees or the bin boundaries: the model is identical to one trained
+  without that row.
+- All-ones weights give the same model, byte for byte, as no weights.
+- Arrays, Parquet (single file, multiple files, or a reused quantized cache),
+  and CSV produce identical weighted bin boundaries and models for the same
+  data.
+- Weighted metrics are `sum(w * loss) / sum(w)`; weighted `auc` uses
+  `w * label` and `w * (1 - label)` as the positive and negative masses.
+- CPU and `gpu_math="exact"` GPU training stay byte-identical with weights.
+  `gpu_math="fast"` keeps the weights on the GPU, which costs 4 bytes per row;
+  the GPU memory planner accounts for it.
+
+**Relation to XGBoost:** when every feature has fewer distinct values than
+`max_bin`, the bins are the same and weighted models match XGBoost exactly.
+For continuous features, FerrisBoost and XGBoost use different quantile-sketch
+implementations, with or without weights, so individual bin boundaries can sit
+slightly apart; both are accurate weighted quantiles.
 
 ## Custom callbacks
 
@@ -295,7 +368,8 @@ limits, available work, and memory safety bounds. Readers preserve file and row
 order for Parquet, CSV, and CSV.gz inputs.
 
 For file-backed validation data, entries are `(path, name)` tuples. Validation
-files must use the same label column name as the training file:
+files must use the same label column name (and `weight` column name, if any) as
+the training file:
 
 ```python
 history = {}
@@ -603,6 +677,7 @@ empty `evals_result()`.
 | `base_score` | `0.5` | Value before the objective transform |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |
 | `cache_path` | `None` | Persistent Parquet cache directory |
+| `eval_metric` | objective default | One name or a list: `rmse`, `logloss`, `error`, `auc`; early stopping watches the last one |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
 
@@ -617,6 +692,7 @@ The following familiar XGBoost parameters are recognized but not implemented:
 Call options accepted by `fb.train()`, `fb.Model.save_model()`, and `fb.Model.load_model()`:
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
+- `weight` (`fb.train()` only): per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
 
 ## Common errors
 

@@ -24,9 +24,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ferrisboost::columns::BinningStrategy;
 use ferrisboost::comm::Local;
 use ferrisboost::source::DenseSource;
-use ferrisboost::train::{train, TrainConfig};
+use ferrisboost::train::{train, train_weighted, TrainConfig};
 use ferrisboost::types::{Objective, TrainParams};
 
 fn fixtures_dir() -> PathBuf {
@@ -132,7 +133,11 @@ struct Case {
 }
 
 fn load_index() -> Vec<Case> {
-    let raw = fs::read_to_string(fixtures_dir().join("index.json"))
+    load_index_from("index.json")
+}
+
+fn load_index_from(file: &str) -> Vec<Case> {
+    let raw = fs::read_to_string(fixtures_dir().join(file))
         .expect("fixture 不在?跑 uv run python internal-docs/tools/gen_fixtures.py 重新生成");
     let idx: serde_json::Value = serde_json::from_str(&raw).unwrap();
     idx["cases"]
@@ -439,6 +444,54 @@ fn bit_exact_vs_xgboost_across_thread_counts() {
                     name = case.name,
                 );
             }
+        }
+    }
+}
+
+/// 样本权重:XGBoost `DMatrix(weight=w)` 训出来的 margin,位精确。
+///
+/// 三种权重形状(均匀 / 重尾 / 三成为 0)× 两个 objective × 两个 seed,
+/// 外加一个深树长跑。低基数数据上分箱无损,所以这里锁的是梯度
+/// `(g·w, h·w)` 的施加位置和精度 —— 换成 f64 乘、或者在 hessian 下限
+/// 之前乘权重,都会在这里翻掉。线程数也一起换,权重不该引入顺序依赖。
+#[test]
+fn bit_exact_vs_xgboost_with_sample_weights() {
+    let cases = load_index_from("weighted_index.json");
+    assert_eq!(cases.len(), 13, "加权 fixture 应该有 13 个配置");
+    let dir = fixtures_dir();
+    for case in &cases {
+        let x = read_f32(&dir.join(format!("{}.x", case.name)));
+        let y = read_f32(&dir.join(format!("{}.y", case.name)));
+        let w = read_f32(&dir.join(format!("{}.w", case.name)));
+        assert_eq!(w.len(), case.n_rows);
+        for nthread in [1, 4] {
+            // 加权分箱,和 Python 入口同一条路径(低基数数据上与不加权等价)。
+            let src = DenseSource::new_weighted_with_nthread(
+                &x,
+                case.n_rows,
+                case.n_features,
+                BinningStrategy::Sketch {
+                    max_bins: case.params.max_bin as usize,
+                },
+                case.params.cols_per_block,
+                nthread,
+                Some(&w),
+            );
+            let cfg = TrainConfig {
+                base_score: case.base_score,
+                ..TrainConfig::new(
+                    TrainParams {
+                        nthread,
+                        ..case.params.clone()
+                    },
+                    case.objective,
+                )
+            };
+            let model = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local).unwrap();
+            let got: Vec<f32> = (0..case.n_rows)
+                .map(|r| model.predict_margin(&x[r * case.n_features..(r + 1) * case.n_features]))
+                .collect();
+            assert_bit_exact(case, &got);
         }
     }
 }
