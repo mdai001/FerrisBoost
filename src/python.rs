@@ -261,7 +261,7 @@ fn resolve_blocking(
                         cfg.params.device_quantize.unwrap_or(true),
                         fast,
                         true,
-                        32 * 1024 * 1024,
+                        crate::gpu_mem_plan::RM_STAGE_BYTES,
                     );
                     // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
                     // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——

@@ -273,7 +273,7 @@ const MAX_HIST_NODES_PER_BATCH: usize = 32;
 /// ⚠️ 第一版是整块大小的暂存区(wide 上 305 MB),而它**只在 warm-up
 /// 用一次** —— 常驻一整块只为了转置那一下,是白占。分块之后这笔常驻
 /// 从 305 MB 降到 32 MB,而转置本身仍然是那个两维都合并的 tiled kernel。
-const RM_STAGE_BYTES: usize = 32 * 1024 * 1024;
+const RM_STAGE_BYTES: usize = crate::gpu_mem_plan::RM_STAGE_BYTES as usize;
 
 /// 行主序流式上传的暂存区,**每个 slot 独占一份**。
 ///
@@ -305,9 +305,6 @@ impl RmStaging {
         !self.host.is_empty()
     }
 }
-/// 每个 slot 的暂存下限。slot 很多时按总预算平分会把 chunk 切得过碎,
-/// 使 warm-up 的 H2D 次数无谓上升;低于这个值就不再切。
-const RM_STAGE_MIN_PER_SLOT: usize = 4 * 1024 * 1024;
 
 /// `partition()` 的返回值:本层内的登记号,`resolve_partitions()` 后才有行数。
 pub type PartitionToken = usize;
@@ -1104,24 +1101,23 @@ impl GpuTrainCtx {
             None
         };
 
-        // 行主序转置暂存:**每个 slot 一份,但总预算不变**。
+        // 行主序转置暂存:每个 slot 一份,与 planner 共用分配公式。
         // 以前是全局一块 32 MiB 配一把 `self.lock()`,而那把锁一直持有到
         // `stream.synchronize()`,把所有 slot 的上传串成一条 —— 多流之下
         // 重叠因此**结构上不可能出现**。现在把同一份预算切给每个 slot,
-        // 显存总量一字不变,换到的是各自独立的 source lifetime。
+        // 超过八个 slot 时 4 MiB 下限会提高总量,由 planner 同步计入。
         let rm_slot_count = hist_stream_count + resident_block_count;
-        let rm_stage_bytes_per_slot = if row_major {
-            (RM_STAGE_BYTES / rm_slot_count.max(1)).max(RM_STAGE_MIN_PER_SLOT)
-        } else {
-            0
-        };
         // pinned 模式要两块轮转,所以把**同一份**每-slot 预算切成两半,
         // device 总量不变;多出来的只有 pinned host 内存(单独登记)。
         let rm_bufs = if row_major && use_pinned { 2usize } else { 1 };
         let rm_chunk_rows = if row_major {
-            (rm_stage_bytes_per_slot / rm_bufs / max_block_feats.max(1))
-                .clamp(1, n_rows)
-                .max(1)
+            crate::gpu_mem_plan::row_major_stage_rows(
+                n_rows as u64,
+                max_block_feats as u64,
+                rm_slot_count as u64,
+                rm_bufs as u64,
+                RM_STAGE_BYTES as u64,
+            ) as usize
         } else {
             0
         };

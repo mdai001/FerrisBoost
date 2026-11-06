@@ -44,6 +44,23 @@ pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
     }
 }
 
+/// Shared row-major staging policy for planning and runtime allocation.
+pub(crate) const RM_STAGE_BYTES: u64 = 32 * 1024 * 1024;
+const RM_STAGE_MIN_PER_SLOT: u64 = 4 * 1024 * 1024;
+
+pub(crate) fn row_major_stage_rows(
+    rows: u64,
+    cols: u64,
+    slots: u64,
+    buffers: u64,
+    budget: u64,
+) -> u64 {
+    let per_slot = (budget / slots.max(1)).max(RM_STAGE_MIN_PER_SLOT);
+    (per_slot / buffers.max(1) / cols.max(1))
+        .max(1)
+        .min(rows.max(1))
+}
+
 /// 一次训练的 streaming 显存模型。所有单位都是字节。
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
@@ -59,6 +76,10 @@ pub struct StreamingMemModel {
     pub resident_extra_col_bytes: u64,
     /// Resident-only per-block scratch that does not scale with block width.
     pub resident_extra_fixed_bytes: u64,
+    /// Training row count for the bounded row-major staging allocation.
+    pub staging_rows: u64,
+    /// Nominal staging charge already included in fixed_bytes; zero disables it.
+    pub staging_budget: u64,
 }
 
 impl StreamingMemModel {
@@ -119,6 +140,8 @@ impl StreamingMemModel {
             slot_col_bytes,
             resident_extra_col_bytes: 0,
             resident_extra_fixed_bytes: 0,
+            staging_rows: n_rows,
+            staging_budget: stage,
         }
     }
 
@@ -195,12 +218,50 @@ impl StreamingMemModel {
         if resident_slot == 0 {
             return 0;
         }
-        ((budget_bytes - base) / resident_slot).min(total_blocks)
+        // Stage slots grow with residency, so a linear per-block division can
+        // overfill the budget after the 4 MiB/slot floor becomes active.
+        let mut low = 0;
+        let mut high = ((budget_bytes - base) / resident_slot).min(total_blocks);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if self.peak_for_layout(cols, streams, mid) <= budget_bytes {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
     }
 
     /// `cols` 宽、`streams` 条流、`resident` 个常驻块时的峰值。
     pub fn peak_for_layout(&self, cols: u64, streams: u64, resident: u64) -> u64 {
+        let slots = streams.saturating_add(resident);
+        // Keep the original conservative fixed allowance for small layouts.
+        // The row cap can make two pinned buffers larger than one pageable
+        // buffer, so plan the maximum of both supported buffering modes.
+        let extra_stage = if self.staging_budget > 0 && cols <= ROW_MAJOR_MAX_FEATS {
+            [1, 2]
+                .into_iter()
+                .map(|buffers| {
+                    row_major_stage_rows(
+                        self.staging_rows,
+                        cols,
+                        slots,
+                        buffers,
+                        self.staging_budget,
+                    )
+                    .saturating_mul(cols)
+                    .saturating_mul(buffers)
+                    .saturating_mul(slots)
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(self.staging_budget)
+        } else {
+            0
+        };
         self.fixed_bytes
+            .saturating_add(extra_stage)
             .saturating_add(
                 cols.saturating_mul(self.slot_col_bytes)
                     .saturating_mul(streams),
@@ -716,6 +777,8 @@ mod tests {
             slot_col_bytes: 10,
             resident_extra_col_bytes: 5,
             resident_extra_fixed_bytes: 20,
+            staging_rows: 0,
+            staging_budget: 0,
         };
         // Base = fixed + 2 columns * one stream * 10 = 120.
         // A resident costs 2 * (10 + 5) + 20 = 50.
@@ -781,6 +844,8 @@ mod tests {
             slot_col_bytes: 10,
             resident_extra_col_bytes: 5,
             resident_extra_fixed_bytes: 20,
+            staging_rows: 0,
+            staging_budget: 0,
         };
         let budget = 170;
         let free_vram = budget + default_safety_reserve(budget * 2);
