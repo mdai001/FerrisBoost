@@ -939,10 +939,7 @@ fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool
     if output_margin {
         margin
     } else {
-        match model.objective {
-            Objective::SquaredError => margin,
-            Objective::Logistic => 1.0 / (1.0 + (-margin).exp()),
-        }
+        model.objective.transform(margin)
     }
 }
 
@@ -1411,9 +1408,9 @@ fn gpu_prediction_selected(
 }
 
 fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin: bool) {
-    if !output_margin && model.objective == Objective::Logistic {
+    if !output_margin && !model.objective.transform_is_identity() {
         for value in values {
-            *value = 1.0 / (1.0 + (-*value).exp());
+            *value = model.objective.transform(*value);
         }
     }
 }
@@ -2112,15 +2109,14 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     } else {
         requested_hist_cap
     };
-    let objective = match objective.as_str() {
-        "binary:logistic" => Objective::Logistic,
-        "reg:squarederror" => Objective::SquaredError,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "objective {other:?} 不支持,现在只有 binary:logistic 和 reg:squarederror"
-            )))
-        }
-    };
+    let objective = Objective::from_name(&objective)
+        .filter(|_| objective != "reg:linear")
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "objective {objective:?} 不支持;支持的有 {}",
+                Objective::supported_names()
+            ))
+        })?;
     Ok(Parsed {
         params: TrainParams {
             n_rounds: get!("num_boost_round"),

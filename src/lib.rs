@@ -13,6 +13,7 @@ pub mod gpu_mem_plan;
 pub mod hist;
 mod inference;
 pub mod metrics;
+pub mod objective;
 pub mod sketch;
 pub mod source;
 pub mod split;

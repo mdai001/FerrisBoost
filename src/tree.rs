@@ -260,10 +260,7 @@ impl Model {
     /// 回归返回预测值本身。要原始分数用 `predict_margin`。
     pub fn predict(&self, features: &[f32]) -> f32 {
         let m = self.predict_margin(features);
-        match self.objective {
-            Objective::SquaredError => m,
-            Objective::Logistic => 1.0 / (1.0 + (-m).exp()),
-        }
+        self.objective.transform(m)
     }
 
     /// 导出成 XGBoost 兼容的 JSON。
@@ -348,8 +345,8 @@ impl Model {
                     num_target: "1".into(),
                 },
                 objective: xgb::ObjectiveJson {
-                    name: objective_name(self.objective).into(),
-                    rest: reg_loss_param(),
+                    name: self.objective.name().into(),
+                    rest: self.objective.json_params(),
                 },
             },
         };
@@ -420,12 +417,13 @@ impl Model {
             )));
         }
 
-        let objective = match learner.objective.name.as_str() {
-            "reg:squarederror" | "reg:linear" => Objective::SquaredError,
-            "binary:logistic" => Objective::Logistic,
-            other => {
+        let objective = match Objective::from_name(&learner.objective.name) {
+            Some(o) => o,
+            None => {
                 return Err(unsupported(format_args!(
-                    "objective {other} 不在第一版范围里"
+                    "objective {} 不支持;支持的有 {}",
+                    learner.objective.name,
+                    Objective::supported_names()
                 )))
             }
         };
@@ -522,28 +520,6 @@ pub fn split_bin(cuts: &BinCuts, feat: FeatId, split_cond: f32) -> u32 {
 /// 都是 2.0 才有的),所以版本号也要跟着报 2.x,不然 XGBoost 会走
 /// 老版本的兼容分支去找不存在的字段。
 const XGB_VERSION: [i32; 3] = [2, 0, 0];
-
-fn objective_name(obj: Objective) -> &'static str {
-    match obj {
-        Objective::SquaredError => "reg:squarederror",
-        Objective::Logistic => "binary:logistic",
-    }
-}
-
-/// 两个 objective 都挂在 reg_loss_param 下面,XGBoost 加载时会找它。
-fn reg_loss_param() -> BTreeMap<String, serde_json::Value> {
-    let mut inner = serde_json::Map::new();
-    inner.insert(
-        "scale_pos_weight".into(),
-        serde_json::Value::String("1".into()),
-    );
-    let mut rest = BTreeMap::new();
-    rest.insert(
-        "reg_loss_param".to_string(),
-        serde_json::Value::Object(inner),
-    );
-    rest
-}
 
 fn unsupported(args: std::fmt::Arguments) -> serde_json::Error {
     serde_json::Error::custom(args)

@@ -944,18 +944,9 @@ fn train_with_backend(
     if let Some(w) = weights {
         validate_weights(w, n, "训练集")?;
     }
-    if cfg.objective == Objective::Logistic {
-        anyhow::ensure!(
-            labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
-            "binary:logistic 的标签必须在 [0, 1]"
-        );
-        anyhow::ensure!(
-            cfg.base_score.is_finite() && cfg.base_score > 0.0 && cfg.base_score < 1.0,
-            "binary:logistic 的 base_score 必须是 (0, 1) 内的有限概率"
-        );
-    } else {
-        anyhow::ensure!(cfg.base_score.is_finite(), "base_score 必须是有限值");
-    }
+    cfg.objective.validate_labels(labels, "训练集")?;
+    anyhow::ensure!(cfg.base_score.is_finite(), "base_score 必须是有限值");
+    cfg.objective.validate_base_score(cfg.base_score)?;
     let source_bytes_start = source.source_bytes_read();
     let source_reads_start = source.source_block_reads();
     let p = &cfg.params;
@@ -1042,13 +1033,8 @@ fn train_with_backend(
             "验证集 {:?} 的标签必须全部是有限值",
             ev.name
         );
-        if cfg.objective == Objective::Logistic {
-            anyhow::ensure!(
-                ev.labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
-                "验证集 {:?} 的 binary:logistic 标签必须在 [0, 1]",
-                ev.name
-            );
-        }
+        cfg.objective
+            .validate_labels(ev.labels, &format!("验证集 {:?} ", ev.name))?;
         if let Some(w) = ev.weights {
             validate_weights(w, ev.source.n_rows(), &format!("验证集 {:?} ", ev.name))?;
             for m in &cfg.eval_metrics {
@@ -2858,37 +2844,13 @@ fn owner_rank(_feat: FeatId) -> usize {
 /// 二分类忘了取 logit 的话,起点就从 0.0 变成 0.5,第一棵树的梯度
 /// 全错,而且错得很小 —— 训得出来,就是对不上。
 pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
-    match obj {
-        Objective::SquaredError => base_score,
-        // logit(0.5) = 0.0
-        Objective::Logistic => {
-            assert!(
-                base_score > 0.0 && base_score < 1.0,
-                "binary:logistic 的 base_score 是概率,必须在 (0, 1) 里,给的是 {base_score}"
-            );
-            (base_score / (1.0 - base_score)).ln()
-        }
-    }
+    obj.base_margin(base_score)
 }
 
-/// 单行的梯度。`gradient_bounds` 和量化那一趟共用它,保证两遍算的
-/// 是同一个函数 —— 各写一遍的话,求上界用的和真正累加的可能不一致,
-/// 而那会让 scale 偏小、定点溢出。
+/// 单行的梯度;定义在 `Objective::gradient`。
 #[inline]
 fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
-    match obj {
-        Objective::SquaredError => GradPair {
-            grad: pred - label,
-            hess: 1.0,
-        },
-        Objective::Logistic => {
-            let s = 1.0 / (1.0 + (-pred).exp());
-            GradPair {
-                grad: s - label,
-                hess: (s * (1.0 - s)).max(1e-16),
-            }
-        }
-    }
+    obj.gradient(pred, label)
 }
 
 /// XGBoost `RegLossObj::GetGradient`:`GradientPair(grad * w, hess * w)`,

@@ -1933,10 +1933,7 @@ impl GpuTrainCtx {
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
-        let obj_code: u32 = match objective {
-            crate::types::Objective::SquaredError => 0,
-            crate::types::Objective::Logistic => 1,
-        };
+        let obj_code: u32 = objective.device_code();
         {
             let threads = 256u32;
             let blocks = n_rows_u32.div_ceil(threads).min(65535);
