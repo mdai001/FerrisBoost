@@ -207,3 +207,27 @@ def test_gpu_prediction_matches_cpu():
     m = fb.train({"objective": "multi:softprob", "num_class": 4}, x, label=y,
                  num_boost_round=5, quiet=True)
     np.testing.assert_allclose(m.predict(x, use_gpu=True), m.predict(x), rtol=0, atol=1e-6)
+
+
+def test_multiclass_parquet_output_follows_single_output_rules(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=400, k=3, seed=21)
+    src = str(tmp_path / "x.parquet")
+    pq.write_table(pa.table({f"f{i}": x[:, i] for i in range(x.shape[1])}), src)
+    m = fb.train({"objective": "multi:softprob", "num_class": 3}, x, label=y,
+                 num_boost_round=2, quiet=True)
+    with pytest.raises(ValueError, match="扩展名"):
+        m.predict_to_parquet(src, str(tmp_path / "out.csv"))
+    with pytest.raises(ValueError, match="prediction_column"):
+        m.predict_to_parquet(src, str(tmp_path / "a.parquet"), prediction_column=" ")
+    existing = tmp_path / "exists.parquet"
+    existing.write_bytes(b"keep")
+    with pytest.raises(FileExistsError):
+        m.predict_to_parquet(src, str(existing))
+    assert existing.read_bytes() == b"keep"
+    # 预测失败(特征对不上)时不留下半成品
+    pq.write_table(pa.table({"zz": x[:, 0]}), str(tmp_path / "bad.parquet"))
+    with pytest.raises(Exception):
+        m.predict_to_parquet(str(tmp_path / "bad.parquet"), str(tmp_path / "partial.parquet"))
+    assert not (tmp_path / "partial.parquet").exists()

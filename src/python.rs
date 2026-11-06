@@ -1568,6 +1568,46 @@ impl PyModel {
         use parquet::basic::Compression;
         use parquet::file::properties::WriterProperties;
 
+        // 和单输出路径同样的输出规则:列名非空、扩展名、不覆盖已有文件、
+        // 失败时删掉半成品。全部在预测之前检查,不白算一遍。
+        if prediction_column.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "prediction_column 不能为空或只包含空白",
+            ));
+        }
+        let out_path = std::path::PathBuf::from(output_path);
+        let valid_extension = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("parquet") || e.eq_ignore_ascii_case("pq"));
+        if !valid_extension {
+            return Err(PyValueError::new_err(
+                "prediction 输出路径必须使用 .parquet 或 .pq 扩展名",
+            ));
+        }
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
+                    "prediction 输出已存在,不会覆盖: {}",
+                    out_path.display()
+                )))
+            }
+            Err(error) => {
+                return Err(PyValueError::new_err(format!(
+                    "无法创建 prediction 输出 {}: {error}",
+                    out_path.display()
+                )))
+            }
+        };
+        let mut cleanup = IncompletePredictionOutput {
+            path: out_path,
+            complete: false,
+        };
         let (n, mut margins) =
             self.multiclass_margins(py, data, n_trees, header, predict_threads, false)?;
         let k = self.inner.num_outputs();
@@ -1612,8 +1652,6 @@ impl PyModel {
                 .collect();
             let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
                 .context("创建 prediction Arrow batch 失败")?;
-            let file = std::fs::File::create(output_path)
-                .with_context(|| format!("创建输出文件 {output_path:?} 失败"))?;
             let props = WriterProperties::builder()
                 .set_compression(Compression::SNAPPY)
                 .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
@@ -1621,10 +1659,16 @@ impl PyModel {
             let mut writer = ArrowWriter::try_new(file, schema, Some(props))
                 .context("创建 prediction Parquet writer 失败")?;
             writer.write(&batch).context("写 prediction Parquet 失败")?;
-            writer.close().context("完成 prediction Parquet 失败")?;
+            writer.finish().context("完成 prediction Parquet 失败")?;
+            writer
+                .inner()
+                .sync_all()
+                .context("同步 prediction Parquet 文件失败")?;
             Ok(n)
         };
-        py.detach(write).map_err(to_py_err)
+        let n = py.detach(write).map_err(to_py_err)?;
+        cleanup.complete = true;
+        Ok(n)
     }
 
     fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
