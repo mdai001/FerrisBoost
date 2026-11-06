@@ -2109,6 +2109,10 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     } else {
         requested_hist_cap
     };
+    // 同一个 max_delta_step 同时喂给树和 count:poisson 的 Hessian 稳定项。
+    // 没给时 XGBoost 的 learner 对 count:poisson 把它设成 0.7(两边都是),
+    // 其它 objective 树上是 0。
+    let max_delta_step: Option<f32> = get!("max_delta_step");
     let objective = Objective::from_name(&objective)
         .filter(|_| objective != "reg:linear")
         .ok_or_else(|| {
@@ -2116,7 +2120,15 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                 "objective {objective:?} 不支持;支持的有 {}",
                 Objective::supported_names()
             ))
-        })?;
+        })?
+        .with_params(
+            max_delta_step,
+            get!("tweedie_variance_power"),
+            get!("huber_slope"),
+        );
+    objective
+        .validate_params()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(Parsed {
         params: TrainParams {
             n_rounds: get!("num_boost_round"),
@@ -2127,7 +2139,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             gamma: get!("gamma"),
             min_child_weight: get!("min_child_weight"),
             alpha: get!("alpha"),
-            max_delta_step: get!("max_delta_step"),
+            max_delta_step: max_delta_step.unwrap_or(objective.default_tree_max_delta_step()),
             scale_pos_weight: get!("scale_pos_weight"),
             subsample: get!("subsample"),
             colsample_bytree: get!("colsample_bytree"),

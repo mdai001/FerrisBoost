@@ -417,7 +417,8 @@ impl Model {
             )));
         }
 
-        let objective = match Objective::from_name(&learner.objective.name) {
+        let objective = match Objective::from_json(&learner.objective.name, &learner.objective.rest)
+        {
             Some(o) => o,
             None => {
                 return Err(unsupported(format_args!(

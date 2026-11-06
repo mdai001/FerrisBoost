@@ -42,7 +42,10 @@ _DEFAULTS: dict[str, Any] = {
     "gamma": 0.0,
     # L1 正则(alias reg_alpha)、叶子步长上限、正类梯度权重:语义同 XGBoost。
     "alpha": 0.0,
-    "max_delta_step": 0.0,
+    # None = 树不限(0);count:poisson 的 Hessian 稳定项另用 0.7(XGBoost 默认)。
+    "max_delta_step": None,
+    "tweedie_variance_power": 1.5,
+    "huber_slope": 1.0,
     "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
@@ -100,7 +103,8 @@ _ALIASES = {
     "max_leaves": "max_leaves",
 }
 
-_OBJECTIVES = ("binary:logistic", "reg:squarederror")
+_OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
+               "reg:tweedie", "reg:pseudohubererror")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
@@ -204,8 +208,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             )
     if out["device_quantize"] is not None:
         out["device_quantize"] = bool(out["device_quantize"])
-    for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "max_delta_step",
-                "scale_pos_weight", "subsample",
+    if out["max_delta_step"] is not None:
+        out["max_delta_step"] = float(out["max_delta_step"])
+    for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "tweedie_variance_power",
+                "huber_slope", "scale_pos_weight", "subsample",
                 "colsample_bytree"):
         out[key] = float(out[key])
     if out["base_score"] is not None:

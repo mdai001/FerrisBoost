@@ -165,7 +165,7 @@ def test_invalid_eval_weights_are_rejected():
 
 
 @pytest.mark.parametrize("params, match", [
-    ({"eval_metric": "mae"}, "不支持"),
+    ({"eval_metric": "ndcg"}, "不支持"),
     ({"eval_metric": "auc", "objective": "reg:squarederror"}, "binary:logistic"),
     ({"eval_metric": []}, "字符串"),
     ({"eval_metric": 3}, "字符串"),

@@ -536,10 +536,28 @@ impl Default for TrainParams {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// 训练目标。带参数的变体存的是 XGBoost 同名参数的**解析后**的值;
+/// 行为(梯度、链接函数、校验、JSON)全部在 `crate::objective` 里。
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Objective {
     SquaredError,
     Logistic,
+    /// `count:poisson`。`max_delta_step` 只用于 Hessian 的稳定化
+    /// (XGBoost `PoissonRegressionParam`,默认 0.7),和树的
+    /// `max_delta_step`(默认 0)是两个量。
+    Poisson {
+        max_delta_step: f32,
+    },
+    /// `reg:gamma`
+    Gamma,
+    /// `reg:tweedie`,`tweedie_variance_power` ∈ [1, 2)。
+    Tweedie {
+        variance_power: f32,
+    },
+    /// `reg:pseudohubererror`,`huber_slope` ≠ 0。
+    PseudoHuber {
+        slope: f32,
+    },
 }
 
 #[cfg(test)]

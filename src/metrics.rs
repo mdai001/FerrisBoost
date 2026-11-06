@@ -289,6 +289,12 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
     match obj {
         Objective::SquaredError => Box::new(Rmse),
         Objective::Logistic => Box::new(LogLoss),
+        Objective::Poisson { .. } => Box::new(Elementwise::new(Ew::PoissonNll, obj)),
+        Objective::Gamma => Box::new(Elementwise::new(Ew::GammaDeviance, obj)),
+        Objective::Tweedie { variance_power } => {
+            Box::new(Elementwise::new(Ew::TweedieNll(variance_power), obj))
+        }
+        Objective::PseudoHuber { slope } => Box::new(Elementwise::new(Ew::Mphe(slope), obj)),
     }
 }
 
@@ -298,20 +304,35 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
 /// `binary:logistic`;`rmse` 两个 objective 都接(二分类时和 XGBoost
 /// 一样在概率上算)。不认识或组合不支持时返回说明原因的错误。
 pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, String> {
+    let binary = matches!(obj, Objective::Logistic);
+    // 新加的逐行指标:和 XGBoost 一样在 objective 变换后的预测上算。
+    if let Some(kind) = Ew::parse(name, obj)? {
+        if matches!(kind, Ew::Error(_)) && !binary {
+            return Err(format!(
+                "eval_metric {name:?} 是二分类指标,需要 objective=\"binary:logistic\""
+            ));
+        }
+        return Ok(Box::new(Elementwise::new(kind, obj)));
+    }
     match (name, obj) {
         ("rmse", Objective::SquaredError) => Ok(Box::new(Rmse)),
         ("rmse", Objective::Logistic) => Ok(Box::new(ProbRmse)),
+        ("rmse", _) => Ok(Box::new(Elementwise::new(Ew::Rmse, obj))),
         ("logloss", Objective::Logistic) => Ok(Box::new(LogLoss)),
         ("error", Objective::Logistic) => Ok(Box::new(ClassError)),
         ("auc", Objective::Logistic) => Ok(Box::new(Auc)),
-        ("logloss" | "error" | "auc", Objective::SquaredError) => Err(format!(
+        ("logloss" | "error" | "auc", _) => Err(format!(
             "eval_metric {name:?} 是二分类指标,需要 objective=\"binary:logistic\""
         )),
         _ => Err(format!(
-            "eval_metric {name:?} 不支持,现在只有 rmse / logloss / error / auc"
+            "eval_metric {name:?} 不支持,现在有 {SUPPORTED_METRICS}"
         )),
     }
 }
+
+/// 报错里列出的全部 metric 名字。
+pub const SUPPORTED_METRICS: &str = "rmse / mae / mape / mphe / logloss / error / error@t / auc / \
+poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
     match name {
@@ -320,6 +341,244 @@ pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
         "error" => Some(Box::new(ClassError)),
         "auc" => Some(Box::new(Auc)),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------- 逐行指标
+//
+// XGBoost `EvalEWiseBase` 家族(`src/metric/elementwise_metric.cu`):
+// 每行在 **f32** 里算 `residue = EvalRow(label, transform(margin))`,
+// 再 `residue *= w`(f32),最后在 f64 里求和、`GetFinal(esum, wsum)`。
+// 逐行公式逐位照搬;求和按行号串行(XGBoost 的线程分段只影响 f64 尾数)。
+
+extern "C" {
+    // XGBoost `common::LogGamma(float)` → `std::lgamma(float)` = C `lgammaf`
+    //(glibc 和 MSVC CRT 都有)。
+    fn lgammaf(x: f32) -> f32;
+}
+
+/// 逐行指标的种类。带参数的(error@t、tweedie-nloglik@rho、mphe 的 slope)
+/// 存解析后的值。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Ew {
+    Rmse,
+    Mae,
+    Mape,
+    /// `mphe`,参数是 `huber_slope`(objective 是 pseudohuber 时取它的,否则 1)。
+    Mphe(f32),
+    PoissonNll,
+    GammaDeviance,
+    GammaNll,
+    /// `tweedie-nloglik@rho`
+    TweedieNll(f32),
+    /// `error@t`(t ≠ 0.5 时名字带阈值)
+    Error(f32),
+}
+
+impl Ew {
+    /// 解析新加的 metric 名字;不是这一族的返回 `Ok(None)`。
+    fn parse(name: &str, obj: Objective) -> Result<Option<Ew>, String> {
+        let (base, param) = match name.split_once('@') {
+            Some((b, p)) => (b, Some(p)),
+            None => (name, None),
+        };
+        let num = |p: &str| -> Result<f32, String> {
+            p.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| format!("eval_metric {name:?} 的参数 {p:?} 不是有限数"))
+        };
+        let no_param = |kind: Ew| -> Result<Option<Ew>, String> {
+            match param {
+                None => Ok(Some(kind)),
+                Some(_) => Err(format!("eval_metric {name:?} 不接受 @ 参数")),
+            }
+        };
+        match base {
+            "mae" => no_param(Ew::Mae),
+            "mape" => no_param(Ew::Mape),
+            "mphe" => no_param(Ew::Mphe(match obj {
+                Objective::PseudoHuber { slope } => slope,
+                _ => crate::objective::HUBER_DEFAULT_SLOPE,
+            })),
+            "poisson-nloglik" => no_param(Ew::PoissonNll),
+            "gamma-deviance" => no_param(Ew::GammaDeviance),
+            "gamma-nloglik" => no_param(Ew::GammaNll),
+            "tweedie-nloglik" => {
+                let rho =
+                    match param {
+                        Some(p) => num(p)?,
+                        None => return Err(
+                            "tweedie-nloglik 要写成 tweedie-nloglik@rho,比如 tweedie-nloglik@1.5"
+                                .into(),
+                        ),
+                    };
+                if !(1.0..2.0).contains(&rho) {
+                    return Err(format!("tweedie-nloglik 的 rho 必须在 [1, 2),给的是 {rho}"));
+                }
+                Ok(Some(Ew::TweedieNll(rho)))
+            }
+            "error" => match param {
+                Some(p) => Ok(Some(Ew::Error(num(p)?))),
+                None => Ok(None), // 普通 error 走原来的 ClassError
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// XGBoost 的 `Name()`。
+    fn name(self) -> String {
+        match self {
+            Ew::Rmse => "rmse".into(),
+            Ew::Mae => "mae".into(),
+            Ew::Mape => "mape".into(),
+            Ew::Mphe(_) => "mphe".into(),
+            Ew::PoissonNll => "poisson-nloglik".into(),
+            Ew::GammaDeviance => "gamma-deviance".into(),
+            Ew::GammaNll => "gamma-nloglik".into(),
+            Ew::TweedieNll(rho) => format!("tweedie-nloglik@{}", xgb_float(rho)),
+            Ew::Error(0.5) => "error".into(),
+            Ew::Error(t) => format!("error@{}", xgb_float(t)),
+        }
+    }
+
+    /// `EvalRow(label, pred)`,f32,逐位照搬。
+    #[inline]
+    fn row(self, y: f32, p: f32) -> f32 {
+        match self {
+            Ew::Rmse => {
+                let d = y - p;
+                d * d
+            }
+            Ew::Mae => (y - p).abs(),
+            Ew::Mape => ((y - p) / y).abs(),
+            Ew::Mphe(slope) => {
+                let a = y - p;
+                let r = a / slope;
+                slope * slope * ((1.0 + r * r).sqrt() - 1.0)
+            }
+            Ew::PoissonNll => {
+                let py = p.max(1e-16);
+                // SAFETY: lgammaf 是纯数学函数,只读参数。
+                let lg = unsafe { lgammaf(y + 1.0) };
+                lg + py - py.ln() * y
+            }
+            Ew::GammaDeviance => {
+                let (pt, lb) = (p + 1e-6, y + 1e-6);
+                (pt / lb).ln() + lb / pt - 1.0
+            }
+            Ew::GammaNll => {
+                let py = p.max(1e-6);
+                let theta: f32 = (-1.0f64 / py as f64) as f32;
+                let b = -(-theta).ln();
+                -(y * theta - b)
+            }
+            Ew::TweedieNll(rho) => {
+                let a = y * ((1.0 - rho) * p.ln()).exp() / (1.0 - rho);
+                let b = ((2.0 - rho) * p.ln()).exp() / (2.0 - rho);
+                -a + b
+            }
+            Ew::Error(t) => {
+                if p > t {
+                    1.0 - y
+                } else {
+                    y
+                }
+            }
+        }
+    }
+
+    /// `GetFinal(esum, wsum)`。
+    fn finish(self, esum: f64, wsum: f64) -> f64 {
+        match self {
+            Ew::Rmse => {
+                if wsum == 0.0 {
+                    esum.sqrt()
+                } else {
+                    (esum / wsum).sqrt()
+                }
+            }
+            Ew::GammaDeviance => 2.0 * esum / if wsum <= 0.0 { 1e-6 } else { wsum },
+            _ => {
+                if wsum == 0.0 {
+                    esum
+                } else {
+                    esum / wsum
+                }
+            }
+        }
+    }
+}
+
+/// XGBoost 用 `std::ostream << float` 拼 metric 名字(默认 6 位有效数字,
+/// 去掉尾随 0):1.5 → "1.5",0.7 → "0.7"。
+fn xgb_float(v: f32) -> String {
+    let s = format!("{:.6}", v as f64);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    // 6 位**有效数字**:整数部分超过 1 位时再截;这里的参数都 < 10,够用。
+    s.to_string()
+}
+
+/// 逐行指标:objective 的预测变换 + `Ew` 的逐行公式。
+pub struct Elementwise {
+    kind: Ew,
+    link: Objective,
+    name: String,
+}
+
+impl Elementwise {
+    pub fn new(kind: Ew, link: Objective) -> Self {
+        Self {
+            kind,
+            link,
+            name: kind.name(),
+        }
+    }
+
+    fn sums(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> (f64, f64) {
+        assert_eq!(
+            pred.len(),
+            label.len(),
+            "{} 的预测和标签长度必须一致",
+            self.name
+        );
+        assert!(!pred.is_empty(), "{} 不能评估空数据", self.name);
+        let (mut esum, mut wsum) = (0.0f64, 0.0f64);
+        for (i, (&m, &y)) in pred.iter().zip(label).enumerate() {
+            let wt = weight.map_or(1.0f32, |w| w[i]);
+            let residue = self.kind.row(y, self.link.transform(m)) * wt;
+            esum += residue as f64;
+            wsum += wt as f64;
+        }
+        (esum, wsum)
+    }
+}
+
+impl Metric for Elementwise {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
+        self.eval_weighted(pred, label, None)
+    }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        if let Some(w) = weight {
+            assert_eq!(
+                pred.len(),
+                w.len(),
+                "{} 的预测和权重长度必须一致",
+                self.name
+            );
+        }
+        let (esum, wsum) = self.sums(pred, label, weight);
+        self.kind.finish(esum, wsum) as f32
     }
 }
 
@@ -408,7 +667,26 @@ mod tests {
             "rmse"
         );
         assert!(for_objective("auc", Objective::SquaredError).is_err());
-        assert!(for_objective("mae", Objective::Logistic).is_err());
+        // 逐行指标和 XGBoost 一样接受任何 objective(在变换后的预测上算)
+        assert_eq!(
+            for_objective("mae", Objective::Logistic).unwrap().name(),
+            "mae"
+        );
+        assert!(for_objective("ndcg", Objective::Logistic).is_err());
+        assert!(for_objective("error@0.7", Objective::SquaredError).is_err());
+        assert_eq!(
+            for_objective("error@0.7", Objective::Logistic)
+                .unwrap()
+                .name(),
+            "error@0.7"
+        );
+        assert!(for_objective("tweedie-nloglik", Objective::Gamma).is_err());
+        assert_eq!(
+            for_objective("tweedie-nloglik@1.2", Objective::Gamma)
+                .unwrap()
+                .name(),
+            "tweedie-nloglik@1.2"
+        );
         // 二分类 rmse 在概率空间:raw=0 → p=0.5,label=1 → rmse=0.5
         let m = for_objective("rmse", Objective::Logistic).unwrap();
         assert_eq!(m.eval(&[0.0], &[1.0]), 0.5);

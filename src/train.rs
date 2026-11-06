@@ -650,14 +650,9 @@ impl TrainConfig {
     pub fn resolve_base_score(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
         self.base_score.unwrap_or_else(|| {
             let spw = self.params.scale_pos_weight;
-            // XGBoost:spw 偏离 1 超过 kRtEps 时改用一步 Newton(FitIntercept)。
-            if (spw - 1.0).abs() > 1e-6 {
-                let g = gradient_weights(labels, weights, spw);
-                self.objective
-                    .newton_base_score(labels, g.as_deref().or(weights))
-            } else {
-                self.objective.estimate_base_score(labels, weights)
-            }
+            let g = gradient_weights(self.objective, labels, weights, spw);
+            self.objective
+                .initial_base_score(labels, weights, g.as_deref().or(weights), spw)
         })
     }
 }
@@ -961,11 +956,12 @@ fn train_with_backend(
         validate_weights(w, n, "训练集")?;
     }
     cfg.objective.validate_labels(labels, "训练集")?;
+    cfg.objective.validate_params()?;
     let base_score = cfg.resolve_base_score(labels, weights);
     // 梯度用的权重:样本权重 × (标签 == 1 时 scale_pos_weight)。只进梯度,
     // metric 和分箱仍然只看样本权重 —— 和 XGBoost `RegLossObj` 一致。
     // spw == 1 时不复制(乘 1 是恒等,结果逐位相同)。
-    let spw_weights = gradient_weights(labels, weights, cfg.params.scale_pos_weight);
+    let spw_weights = gradient_weights(cfg.objective, labels, weights, cfg.params.scale_pos_weight);
     let grad_weights: Option<&[f32]> = spw_weights.as_deref().or(weights);
     anyhow::ensure!(base_score.is_finite(), "base_score 必须是有限值");
     cfg.objective.validate_base_score(base_score)?;
@@ -2890,8 +2886,13 @@ fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
 
 /// 把 `scale_pos_weight` 折进梯度权重(XGBoost `RegLossObj::GetGradient`:
 /// `w = weight or 1; if label == 1.0 { w *= spw }`)。spw == 1 返回 `None`。
-fn gradient_weights(labels: &[f32], weights: Option<&[f32]>, spw: f32) -> Option<Vec<f32>> {
-    if spw == 1.0 {
+fn gradient_weights(
+    obj: Objective,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    spw: f32,
+) -> Option<Vec<f32>> {
+    if spw == 1.0 || !obj.uses_scale_pos_weight() {
         return None;
     }
     Some(
@@ -3213,7 +3214,12 @@ mod tests {
             })
             .collect();
         let src = DenseSource::from_row_major(&x, 40, 1, 255, 1);
-        for obj in Objective::ALL {
+        // 走加权均值(FitInterceptGlmLike)的 objective;gamma 要求标签为正,
+        // pseudohuber 走 Newton,另有测试。
+        let glm_like = Objective::ALL
+            .into_iter()
+            .filter(|o| !matches!(o, Objective::Gamma | Objective::PseudoHuber { .. }));
+        for obj in glm_like {
             let cfg = TrainConfig::new(params(2, 1), obj);
             let m = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
             let mean = y.iter().fold(0.0f64, |a, &v| a + v as f64 / 40.0) as f32;
