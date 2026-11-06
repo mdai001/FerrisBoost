@@ -2855,16 +2855,23 @@ fn build_tree(
     // max_depth == 0 时这里处理根叶子。其它提前停下的叶子已在上面写过。
     {
         let _t = prof::Timer::new(&prof::UPDATE_PRED);
-        for ln in level {
-            debug_assert!(t.nodes[ln.node].is_leaf);
-            let value = t.nodes[ln.node].leaf_value;
-            if let Some(ctx) = gpu {
-                ctx.assign_leaf_value(ln.rows.device(), value)?;
-            } else if let NodeRows::Host(rows) = ln.rows {
-                for row in rows {
-                    predictions[row as usize] += value;
-                }
+        if let Some(ctx) = gpu {
+            for ln in level {
+                debug_assert!(t.nodes[ln.node].is_leaf);
+                ctx.assign_leaf_value(ln.rows.device(), t.nodes[ln.node].leaf_value)?;
             }
+        } else {
+            let leaves: Vec<(&[RowId], f32)> = level
+                .iter()
+                .map(|ln| {
+                    debug_assert!(t.nodes[ln.node].is_leaf);
+                    (ln.rows.host(), t.nodes[ln.node].leaf_value)
+                })
+                .collect();
+            apply_host_leaf_updates(predictions, &leaves);
+            drop(leaves);
+            // Keep row-buffer release in the same profiled phase as before.
+            drop(level);
         }
         // `gpu_math = "fast"` 下 delta 由 device 上的 gradient kernel 直接
         // 消费,host 永远不需要看它 —— 这一次 4 B/行 的 D2H 整个消失。
@@ -2911,6 +2918,56 @@ struct ChildLeaves {
     right_value: f32,
     left_bounds: split::NodeBounds,
     right_bounds: split::NodeBounds,
+}
+
+/// Apply terminal leaves to host predictions. Stable partitioning keeps each
+/// leaf's row IDs sorted. Split the destination into disjoint contiguous slices
+/// so workers need neither unsafe scatter writes nor an O(rows) delta buffer.
+/// Each destination retains the original leaf/row addition order, even for
+/// repeated row IDs; only independent destination ranges execute concurrently.
+fn apply_host_leaf_updates(predictions: &mut [f32], leaves: &[(&[RowId], f32)]) {
+    const CHUNK_ROWS: usize = 1 << 16;
+    const MIN_PARALLEL_ROWS: usize = 2 * CHUNK_ROWS;
+    assert!(
+        leaves.iter().all(|(rows, _)| rows
+            .last()
+            .is_none_or(|&row| (row as usize) < predictions.len())),
+        "leaf row index exceeds prediction buffer"
+    );
+    debug_assert!(leaves
+        .iter()
+        .all(|(rows, _)| rows.windows(2).all(|pair| pair[0] <= pair[1])));
+    let active_rows: usize = leaves.iter().map(|(rows, _)| rows.len()).sum();
+    // Avoid a chunk-by-leaf search explosion for deep trees or sparse tails.
+    // Both bounds are work estimates; the old serial path remains available.
+    let leaf_searches = leaves
+        .len()
+        .saturating_mul(predictions.len().div_ceil(CHUNK_ROWS));
+    if active_rows < MIN_PARALLEL_ROWS
+        || leaf_searches > active_rows / 16
+        || rayon::current_num_threads() == 1
+    {
+        for &(rows, value) in leaves {
+            for &row in rows {
+                predictions[row as usize] += value;
+            }
+        }
+        return;
+    }
+    predictions
+        .par_chunks_mut(CHUNK_ROWS)
+        .enumerate()
+        .for_each(|(chunk, output)| {
+            let start = chunk * CHUNK_ROWS;
+            let end = start + output.len();
+            for &(rows, value) in leaves {
+                let first = rows.partition_point(|&row| (row as usize) < start);
+                let count = rows[first..].partition_point(|&row| (row as usize) < end);
+                for &row in &rows[first..first + count] {
+                    output[row as usize - start] += value;
+                }
+            }
+        });
 }
 
 /// 无约束:叶子值就是 `leaf_of`,界保持 `UNBOUNDED`(一位不动)。
@@ -4575,5 +4632,184 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("monotone_constraints"), "{err}");
+    }
+
+    fn assert_host_leaf_updates_match(initial: Vec<f32>, owned_leaves: Vec<(Vec<RowId>, f32)>) {
+        let leaves: Vec<(&[RowId], f32)> = owned_leaves
+            .iter()
+            .map(|(rows, value)| (rows.as_slice(), *value))
+            .collect();
+        for (leaf_idx, (rows, _)) in leaves.iter().enumerate() {
+            assert!(
+                rows.windows(2).all(|pair| pair[0] <= pair[1]),
+                "test leaf {leaf_idx} must be sorted"
+            );
+            assert!(rows.iter().all(|&row| (row as usize) < initial.len()));
+        }
+
+        // This is the reference contract: preserve the original leaf-major,
+        // row-minor sequence of f32 additions, including repeated row IDs.
+        let mut expected = initial.clone();
+        for (rows, value) in &leaves {
+            for &row in *rows {
+                expected[row as usize] += *value;
+            }
+        }
+
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut actual = initial.clone();
+            pool.install(|| apply_host_leaf_updates(&mut actual, &leaves));
+            assert_eq!(actual.len(), expected.len());
+            for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "prediction row {row} differs with a {threads}-thread pool"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_leaf_updates_match_serial_f32_order_at_small_sizes_and_chunk_edges() {
+        for n_rows in [0usize, 1, 65_535, 65_536, 65_537] {
+            let initial: Vec<f32> = (0..n_rows)
+                .map(|row| match row % 7 {
+                    0 => -0.0,
+                    1 => f32::MAX,
+                    2 => f32::MIN,
+                    3 => 1.0e20,
+                    4 => -1.0e20,
+                    _ => row as f32 * 0.25,
+                })
+                .collect();
+            let mut all_rows: Vec<RowId> = (0..n_rows as RowId).collect();
+            let sparse: Vec<RowId> = (0..n_rows).step_by(97).map(|row| row as RowId).collect();
+            let mut reverse_order_subset = sparse.clone();
+            reverse_order_subset.sort_unstable();
+            // Empty lists and duplicate IDs are valid inputs. Duplicates are
+            // deliberate here so the oracle also checks repeated additions.
+            let mut repeated = vec![];
+            for &row in sparse.iter().take(4) {
+                repeated.extend([row, row]);
+            }
+            repeated.sort_unstable();
+            if n_rows > 0 {
+                all_rows.extend([0, 0, (n_rows - 1) as RowId]);
+                all_rows.sort_unstable();
+            }
+            let leaves = vec![
+                (Vec::new(), 99.0),
+                (all_rows, -0.0),
+                (sparse, 3.0),
+                (repeated, -1.0e20),
+                (reverse_order_subset, 1.0e20),
+                (Vec::new(), f32::MAX),
+            ];
+            assert_host_leaf_updates_match(initial, leaves);
+        }
+    }
+
+    #[test]
+    fn host_leaf_updates_preserve_order_for_large_interleaved_and_late_sparse_leaves() {
+        let n_rows = 262_147usize;
+        let initial: Vec<f32> = (0..n_rows)
+            .map(|row| if row % 13 == 0 { 1.0e20 } else { -0.0 })
+            .collect();
+
+        // Eight balanced, sorted, interleaved row lists make the large update
+        // enter the chunked path. Every row receives exactly one update here.
+        let balanced: Vec<(Vec<RowId>, f32)> = (0..8usize)
+            .map(|lane| {
+                let rows = (lane..n_rows).step_by(8).map(|row| row as RowId).collect();
+                (rows, lane as f32 + 0.5)
+            })
+            .collect();
+        assert_host_leaf_updates_match(initial.clone(), balanced);
+
+        // Exercise overlap and addition order after earlier leaves have
+        // already changed the same rows. The final sparse leaf is intentionally
+        // later in leaf order and uses non-associative values.
+        let all_rows: Vec<RowId> = (0..n_rows as RowId).collect();
+        let overlap: Vec<RowId> = (0..n_rows).step_by(3).map(|row| row as RowId).collect();
+        let later_subset: Vec<RowId> = (0..n_rows).step_by(11).map(|row| row as RowId).collect();
+        let mut leaves = vec![
+            (all_rows, 1.0e20),
+            (overlap.clone(), -1.0e20),
+            (overlap, 3.0),
+            (Vec::new(), 7.0),
+            (later_subset, -1.0e20),
+        ];
+        // Add repeated occurrences and cross-leaf overlap while keeping the
+        // affected lists sorted.
+        leaves[2].0.extend([0, 0, 33, 33]);
+        leaves[2].0.sort_unstable();
+        assert_host_leaf_updates_match(initial, leaves);
+    }
+
+    #[test]
+    fn host_leaf_updates_many_contiguous_leaves_match_serial_oracle() {
+        let n_rows = 262_144usize;
+        let initial: Vec<f32> = (0..n_rows)
+            .map(|row| match row % 5 {
+                0 => -0.0,
+                1 => 1.0e20,
+                2 => -1.0e20,
+                _ => row as f32 * 0.125,
+            })
+            .collect();
+        let leaves: Vec<(Vec<RowId>, f32)> = (0..4_096usize)
+            .map(|leaf| {
+                let start = leaf * 64;
+                let rows = (start..start + 64).map(|row| row as RowId).collect();
+                (rows, (leaf % 17) as f32 - 8.0)
+            })
+            .collect();
+        assert_host_leaf_updates_match(initial, leaves);
+    }
+
+    #[test]
+    fn host_leaf_updates_large_buffer_with_few_rows_preserves_untouched_bits() {
+        let n_rows = 262_147usize;
+        let initial: Vec<f32> = (0..n_rows)
+            .map(|row| match row % 4 {
+                0 => -0.0,
+                1 => f32::MAX,
+                2 => f32::MIN,
+                _ => row as f32 * 0.25,
+            })
+            .collect();
+        let leaves = vec![
+            (vec![0, 65_535, 65_536, 262_146], 3.0),
+            (vec![65_536, 262_146], -1.0e20),
+        ];
+        assert_host_leaf_updates_match(initial, leaves);
+    }
+
+    #[test]
+    fn host_leaf_updates_reject_out_of_range_rows_with_serial_and_parallel_pools() {
+        let n_rows = 131_072usize;
+        let initial = vec![0.0f32; n_rows];
+        let invalid_rows: Vec<RowId> = (0..=n_rows as RowId).collect();
+        let leaves = [(invalid_rows.as_slice(), 1.0f32)];
+
+        for threads in [1, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut predictions = initial.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.install(|| apply_host_leaf_updates(&mut predictions, &leaves));
+            }));
+            assert!(
+                result.is_err(),
+                "out-of-range row must panic with a {threads}-thread pool"
+            );
+        }
     }
 }
