@@ -570,8 +570,9 @@ Limitations in this version:
 - Multiclass file prediction reads the input once per class.
 - `predict_to_parquet` for multiclass models builds the whole output in memory
   before writing; it is not streamed in bounded batches like the single-output
-  path. It also does not yet check that the target is new or ends in `.parquet`
-  or `.pq`, so it overwrites an existing file.
+  path. Like the single-output path, it refuses to overwrite an existing file,
+  requires a `.parquet` or `.pq` extension, and removes a partial file if
+  prediction fails.
 - The lower-level `predict_array()` and `predict_files()` methods reject
   multiclass models; use `predict()`.
 
