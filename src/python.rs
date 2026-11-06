@@ -1431,6 +1431,12 @@ fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin
     }
 }
 
+/// 多分类文件预测:每类的单输出视图和它的压缩推理模型。
+type MulticlassPredictors = (
+    Arc<Vec<PyModel>>,
+    Vec<Arc<crate::inference::CompactInferenceModel>>,
+);
+
 #[pyclass(name = "Model", module = "ferrisboost._core")]
 pub struct PyModel {
     inner: Model,
@@ -1502,8 +1508,17 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
     ) -> PyResult<(usize, Vec<f32>)> {
+        let k = self.inner.num_outputs();
+        if let Some(specs) = path_specs_of(data)? {
+            let arr =
+                self.predict_files(py, specs, true, n_trees, header, predict_threads, use_gpu)?;
+            let arr = arr
+                .cast::<numpy::PyArray2<f32>>()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let margins = arr.readonly().as_slice()?.to_vec();
+            return Ok((margins.len() / k, margins));
+        }
         let views = self.class_views().map_err(to_py_err)?;
-        let k = views.len();
         let upto = n_trees.unwrap_or(self.inner.trees.len());
         let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
         for (c, view) in views.iter().enumerate() {
@@ -1537,6 +1552,18 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // 文件输入:单遍读、按 batch 给每类打分(见 predict_files)。
+        if let Some(specs) = path_specs_of(data)? {
+            return self.predict_files(
+                py,
+                specs,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+            );
+        }
         let (n, mut margins) =
             self.multiclass_margins(py, data, n_trees, header, predict_threads, use_gpu)?;
         let k = self.inner.num_outputs();
@@ -1783,17 +1810,15 @@ impl PyModel {
         }
         // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
         if let Some(specs) = path_specs_of(data)? {
-            return self
-                .predict_files(
-                    py,
-                    specs,
-                    output_margin,
-                    n_trees,
-                    header,
-                    predict_threads,
-                    use_gpu,
-                )
-                .map(Bound::into_any);
+            return self.predict_files(
+                py,
+                specs,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+            );
         }
         let x: PyReadonlyArray2<'py, f32> = data.extract().map_err(|_| {
             PyValueError::new_err(
@@ -1933,14 +1958,9 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         use crate::tree::SchemaMode;
         ensure_gpu_prediction_available(use_gpu)?;
-        if self.inner.num_outputs() > 1 {
-            return Err(PyValueError::new_err(
-                "多分类模型的预测是二维的,请用 Model.predict()",
-            ));
-        }
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -1978,11 +1998,32 @@ impl PyModel {
 
         let names = self.inner.feature_names.clone();
         let canonical_n_features = self.inner.n_features;
-        let inference = self.inference_model().map_err(to_py_err)?;
-        let projected_features = inference.canonical_features().to_vec();
-        let n_features = inference.n_features();
         let upto = n_trees.unwrap_or(self.inner.trees.len());
-        let inner = inference.model();
+        let k_out = self.inner.num_outputs();
+        // 多分类:文件只读一遍。每个 batch 按**完整**规范特征投影一次,
+        // 然后每个类别视图在内存里 gather 自己(压缩过)的特征子集、用自己的
+        // 单输出预测器打分,按行交错后做 softmax / argmax。
+        let multiclass: Option<MulticlassPredictors> = if k_out > 1 {
+            let views = self.class_views().map_err(to_py_err)?;
+            let infs = views
+                .iter()
+                .map(|v| v.inference_model())
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map_err(to_py_err)?;
+            Some((views, infs))
+        } else {
+            None
+        };
+        let single = if k_out == 1 {
+            Some(self.inference_model().map_err(to_py_err)?)
+        } else {
+            None
+        };
+        let projected_features: Vec<usize> = match &single {
+            Some(inference) => inference.canonical_features().to_vec(),
+            None => (0..canonical_n_features).collect(),
+        };
+        let n_features = projected_features.len();
         let mut out: Vec<f32> = Vec::new();
         let rows_total = if resolved.format == crate::source::input::InputFormat::Parquet {
             resolved
@@ -2002,7 +2043,17 @@ impl PyModel {
             n_features,
             n_features.max(1),
         );
-        let work_per_row = prediction_work_per_row(inner, upto);
+        let work_per_row = match (&single, &multiclass) {
+            (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
+            (None, Some((views, _))) => views
+                .iter()
+                .enumerate()
+                .map(|(c, v)| {
+                    prediction_work_per_row(&v.inner, self.inner.class_tree_count(upto, c))
+                })
+                .sum(),
+            (None, None) => unreachable!(),
+        };
         let known_gpu_selection = rows_total
             .and_then(|rows| usize::try_from(rows).ok())
             .map(|rows| gpu_prediction_selected(use_gpu, rows, n_features, work_per_row));
@@ -2050,6 +2101,79 @@ impl PyModel {
                         let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
                             gpu_prediction_selected(use_gpu, n_rows, n_features, work_per_row)
                         });
+                        if let Some((views, infs)) = &multiclass {
+                            let workers = resolved_predict_workers(
+                                predict_threads,
+                                predict_worker_cap,
+                                n_rows,
+                                work_per_row,
+                            );
+                            let mut margins = vec![0.0f32; n_rows * k_out];
+                            for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
+                                let nt = self.inner.class_tree_count(upto, c);
+                                let gathered;
+                                let vdata: &[f32] = if vinf.is_identity(canonical_n_features) {
+                                    data
+                                } else {
+                                    gathered = project_canonical_rows(
+                                        data,
+                                        n_rows,
+                                        canonical_n_features,
+                                        vinf.canonical_features(),
+                                    )?;
+                                    &gathered
+                                };
+                                #[cfg(feature = "cuda")]
+                                let col = if gpu_batch {
+                                    view.gpu_predictor(0)?.predict_margins(vdata, n_rows, nt)?
+                                } else {
+                                    score_contiguous_rows(
+                                        &*vinf.cpu_predictor()?,
+                                        vdata,
+                                        n_rows,
+                                        vinf.n_features(),
+                                        nt,
+                                        workers,
+                                        &mut predict_pool,
+                                    )?
+                                };
+                                #[cfg(not(feature = "cuda"))]
+                                let col = {
+                                    let _ = (gpu_batch, view);
+                                    score_contiguous_rows(
+                                        &*vinf.cpu_predictor()?,
+                                        vdata,
+                                        n_rows,
+                                        vinf.n_features(),
+                                        nt,
+                                        workers,
+                                        &mut predict_pool,
+                                    )?
+                                };
+                                for (i, v) in col.into_iter().enumerate() {
+                                    margins[i * k_out + c] = v;
+                                }
+                            }
+                            if output_margin {
+                                out.extend(margins);
+                            } else if let crate::types::Objective::Softmax { .. } =
+                                self.inner.objective
+                            {
+                                out.extend(
+                                    margins
+                                        .chunks_exact(k_out)
+                                        .map(|r| crate::objective::argmax(r) as f32),
+                                );
+                            } else {
+                                margins
+                                    .par_chunks_exact_mut(k_out)
+                                    .for_each(crate::objective::softmax_in_place);
+                                out.extend(margins);
+                            }
+                            return Ok(());
+                        }
+                        let inference = single.as_ref().expect("单输出 inference");
+                        let inner = inference.model();
                         #[cfg(feature = "cuda")]
                         if gpu_batch {
                             let predictor = match &gpu_predictor {
@@ -2100,7 +2224,20 @@ impl PyModel {
             })
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
         reporter.complete(rows);
-        Ok(PyArray1::from_vec(py, out))
+        let two_d = k_out > 1
+            && (output_margin
+                || !matches!(
+                    self.inner.objective,
+                    crate::types::Objective::Softmax { .. }
+                ));
+        if two_d {
+            let n = out.len() / k_out;
+            return PyArray1::from_vec(py, out)
+                .reshape([n, k_out])
+                .map(Bound::into_any)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+        }
+        Ok(PyArray1::from_vec(py, out).into_any())
     }
 
     /// Stream file prediction directly to one Parquet file. CPU scoring uses

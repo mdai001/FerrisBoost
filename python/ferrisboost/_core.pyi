@@ -59,7 +59,7 @@ class Model:
         models write columns {prediction_column}_0, {prediction_column}_1, ...
         (multi:softprob or output_margin=True) or one class-index column
         (multi:softmax); in this version that path builds the output in memory
-        and reads the input once per class.
+        before writing (the input is still read once).
         """
         ...
     def save_model(
