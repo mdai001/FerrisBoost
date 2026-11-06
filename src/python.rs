@@ -9,7 +9,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, ToPyArray};
+use numpy::{
+    PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, ToPyArray,
+};
 #[cfg(not(feature = "cuda"))]
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -1427,9 +1429,204 @@ pub struct PyModel {
     #[cfg(feature = "cuda")]
     gpu_predictors:
         Mutex<std::collections::HashMap<usize, Arc<crate::backend::cuda::GpuInferenceModel>>>,
+    /// 多分类:每类一个单输出视图(`Model::class_view`),带各自的预测缓存。
+    class_views: Mutex<Option<Arc<Vec<PyModel>>>>,
 }
 
 impl PyModel {
+    /// 不带训练历史的普通包装(多分类的类视图用)。
+    fn plain(inner: Model, quiet: bool, model_io_threads: usize, ingest_threads: usize) -> Self {
+        PyModel {
+            inner,
+            history: Vec::new(),
+            quiet,
+            model_io_threads,
+            ingest_threads,
+            cpu_predictor: Mutex::new(None),
+            inference_model: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+            class_views: Mutex::new(None),
+        }
+    }
+
+    fn class_views(&self) -> anyhow::Result<Arc<Vec<PyModel>>> {
+        let mut cache = self
+            .class_views
+            .lock()
+            .map_err(|_| anyhow::anyhow!("class view cache poisoned"))?;
+        if let Some(v) = cache.as_ref() {
+            return Ok(Arc::clone(v));
+        }
+        let views = Arc::new(
+            (0..self.inner.num_outputs())
+                .map(|c| {
+                    PyModel::plain(
+                        self.inner.class_view(c),
+                        self.quiet,
+                        self.model_io_threads,
+                        self.ingest_threads,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        *cache = Some(Arc::clone(&views));
+        Ok(views)
+    }
+
+    /// 多分类预测:每类视图各跑一遍单输出路径(CPU / GPU / 文件都复用),
+    /// 再按行组合。返回按行排的 `n × K` margin。
+    ///
+    /// ⚠️ 文件输入会被读 K 遍(每类一遍);0.0.6 再做单遍多输出。
+    #[allow(clippy::too_many_arguments)]
+    fn multiclass_margins<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
+    ) -> PyResult<(usize, Vec<f32>)> {
+        let views = self.class_views().map_err(to_py_err)?;
+        let k = views.len();
+        let upto = n_trees.unwrap_or(self.inner.trees.len());
+        let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for (c, view) in views.iter().enumerate() {
+            let nt = self.inner.class_tree_count(upto, c);
+            let out = view.predict(py, data, true, Some(nt), header, predict_threads, use_gpu)?;
+            let arr = out
+                .cast::<PyArray1<f32>>()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            cols.push(arr.readonly().as_slice()?.to_vec());
+        }
+        let n = cols[0].len();
+        let mut margins = vec![0.0f32; n * k];
+        for (c, col) in cols.iter().enumerate() {
+            for (i, &v) in col.iter().enumerate() {
+                margins[i * k + c] = v;
+            }
+        }
+        Ok((n, margins))
+    }
+
+    /// 多分类预测的最终形状:`output_margin` / softprob → `(n, K)`,
+    /// softmax → `(n,)` 类别下标(和 XGBoost `Booster.predict` 一致)。
+    #[allow(clippy::too_many_arguments)]
+    fn predict_multiclass<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (n, mut margins) =
+            self.multiclass_margins(py, data, n_trees, header, predict_threads, use_gpu)?;
+        let k = self.inner.num_outputs();
+        if !output_margin {
+            if let crate::types::Objective::Softmax { .. } = self.inner.objective {
+                let labels: Vec<f32> = margins
+                    .chunks_exact(k)
+                    .map(|row| crate::objective::argmax(row) as f32)
+                    .collect();
+                return Ok(PyArray1::from_vec(py, labels).into_any());
+            }
+            margins
+                .par_chunks_exact_mut(k)
+                .for_each(crate::objective::softmax_in_place);
+        }
+        let arr = PyArray1::from_vec(py, margins)
+            .reshape([n, k])
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(arr.into_any())
+    }
+
+    /// 多分类写 Parquet:`softprob` / margin 写 K 列 `{column}_{k}`,
+    /// `softmax` 写一列类别下标。
+    ///
+    /// ⚠️ 0.0.5 先在内存里算完再写(不是单输出那条有界流式管线);
+    /// 输入文件每类读一遍。0.0.6 做单遍、流式的多输出写出。
+    #[allow(clippy::too_many_arguments)]
+    fn multiclass_to_parquet(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        output_path: &str,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        prediction_column: &str,
+    ) -> PyResult<usize> {
+        use arrow::array::{ArrayRef, Float32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::Compression;
+        use parquet::file::properties::WriterProperties;
+
+        let (n, mut margins) =
+            self.multiclass_margins(py, data, n_trees, header, predict_threads, false)?;
+        let k = self.inner.num_outputs();
+        let softmax_labels = !output_margin
+            && matches!(
+                self.inner.objective,
+                crate::types::Objective::Softmax { .. }
+            );
+        let columns: Vec<(String, Vec<f32>)> = if softmax_labels {
+            vec![(
+                prediction_column.to_string(),
+                margins
+                    .chunks_exact(k)
+                    .map(|r| crate::objective::argmax(r) as f32)
+                    .collect(),
+            )]
+        } else {
+            if !output_margin {
+                margins
+                    .par_chunks_exact_mut(k)
+                    .for_each(crate::objective::softmax_in_place);
+            }
+            (0..k)
+                .map(|c| {
+                    (
+                        format!("{prediction_column}_{c}"),
+                        (0..n).map(|i| margins[i * k + c]).collect(),
+                    )
+                })
+                .collect()
+        };
+        let write = || -> anyhow::Result<usize> {
+            let schema = Arc::new(Schema::new(
+                columns
+                    .iter()
+                    .map(|(name, _)| Field::new(name, DataType::Float32, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let arrays: Vec<ArrayRef> = columns
+                .iter()
+                .map(|(_, v)| Arc::new(Float32Array::from(v.clone())) as ArrayRef)
+                .collect();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+                .context("创建 prediction Arrow batch 失败")?;
+            let file = std::fs::File::create(output_path)
+                .with_context(|| format!("创建输出文件 {output_path:?} 失败"))?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
+                .build();
+            let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+                .context("创建 prediction Parquet writer 失败")?;
+            writer.write(&batch).context("写 prediction Parquet 失败")?;
+            writer.close().context("完成 prediction Parquet 失败")?;
+            Ok(n)
+        };
+        py.detach(write).map_err(to_py_err)
+    }
+
     fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
         let mut cache = self
             .cpu_predictor
@@ -1503,13 +1700,12 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         ensure_gpu_prediction_available(use_gpu)?;
-        // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
-        if let Some(specs) = path_specs_of(data)? {
-            return self.predict_files(
+        if self.inner.num_outputs() > 1 {
+            return self.predict_multiclass(
                 py,
-                specs,
+                data,
                 output_margin,
                 n_trees,
                 header,
@@ -1517,12 +1713,27 @@ impl PyModel {
                 use_gpu,
             );
         }
+        // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
+        if let Some(specs) = path_specs_of(data)? {
+            return self
+                .predict_files(
+                    py,
+                    specs,
+                    output_margin,
+                    n_trees,
+                    header,
+                    predict_threads,
+                    use_gpu,
+                )
+                .map(Bound::into_any);
+        }
         let x: PyReadonlyArray2<'py, f32> = data.extract().map_err(|_| {
             PyValueError::new_err(
                 "predict 只接受文件路径(单个 / 列表 / 目录 / glob)或二维 f32 numpy 数组",
             )
         })?;
         self.predict_array(py, x, output_margin, n_trees, predict_threads, use_gpu)
+            .map(Bound::into_any)
     }
 
     #[pyo3(signature = (x, output_margin=false, n_trees=None, *,
@@ -1538,6 +1749,11 @@ impl PyModel {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
             ensure_gpu_prediction_available(use_gpu)?;
+            if self.inner.num_outputs() > 1 {
+                return Err(PyValueError::new_err(
+                    "多分类模型的预测是二维的,请用 Model.predict()",
+                ));
+            }
             let shape = x.shape();
             let (n_rows, n_features) = (shape[0], shape[1]);
             if n_features != self.inner.n_features {
@@ -1652,6 +1868,11 @@ impl PyModel {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         use crate::tree::SchemaMode;
         ensure_gpu_prediction_available(use_gpu)?;
+        if self.inner.num_outputs() > 1 {
+            return Err(PyValueError::new_err(
+                "多分类模型的预测是二维的,请用 Model.predict()",
+            ));
+        }
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -1837,6 +2058,18 @@ impl PyModel {
                     "predict_to_parquet 只接受文件路径、路径列表、目录或 glob 输入",
                 )
             })?;
+            if self.inner.num_outputs() > 1 {
+                return self.multiclass_to_parquet(
+                    py,
+                    data,
+                    output_path,
+                    output_margin,
+                    n_trees,
+                    header,
+                    predict_threads,
+                    prediction_column,
+                );
+            }
             predict_files_to_parquet(
                 self,
                 py,
@@ -1911,6 +2144,7 @@ impl PyModel {
                 cpu_predictor: Mutex::new(None),
                 #[cfg(feature = "cuda")]
                 gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+                class_views: Mutex::new(None),
                 inference_model: Mutex::new(None),
             })
         })
@@ -2125,6 +2359,10 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             max_delta_step,
             get!("tweedie_variance_power"),
             get!("huber_slope"),
+            {
+                let k: Option<u32> = get!("num_class");
+                k.unwrap_or(0)
+            },
         );
     objective
         .validate_params()
@@ -2368,6 +2606,7 @@ fn finish(
         inference_model: Mutex::new(None),
         #[cfg(feature = "cuda")]
         gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+        class_views: Mutex::new(None),
     }
 }
 

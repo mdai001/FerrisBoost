@@ -957,7 +957,23 @@ fn train_with_backend(
     }
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
-    let base_score = cfg.resolve_base_score(labels, weights);
+    let num_class = cfg.objective.num_outputs();
+    // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
+    // (XGBoost 把标量复制成 K 份),否则按类别频率估计。
+    let class_margins: Vec<f32> = if num_class > 1 {
+        cfg.objective.validate_labels(labels, "训练集")?;
+        match cfg.base_score {
+            Some(b) => vec![b; num_class],
+            None => cfg.objective.initial_class_margins(labels, weights),
+        }
+    } else {
+        Vec::new()
+    };
+    let base_score = if num_class > 1 {
+        class_margins[0]
+    } else {
+        cfg.resolve_base_score(labels, weights)
+    };
     // 梯度用的权重:样本权重 × (标签 == 1 时 scale_pos_weight)。只进梯度,
     // metric 和分箱仍然只看样本权重 —— 和 XGBoost `RegLossObj` 一致。
     // spw == 1 时不复制(乘 1 是恒等,结果逐位相同)。
@@ -1096,6 +1112,7 @@ fn train_with_backend(
         // 由知道 schema 的入口层填。空 = 位置模式,也是 numpy 入口的正解。
         feature_names: Vec::new(),
         schema_mode: None,
+        class_base_margins: Vec::new(),
         best_iteration: None,
         best_score: None,
     };
@@ -1145,7 +1162,13 @@ fn train_with_backend(
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
                     gpu_split_cache: cfg.params.gpu_split_cache,
-                    gpu_math: cfg.params.gpu_math,
+                    // 多分类还没有 device softmax kernel:fast 降到 exact 路径
+                    // (host 梯度、CPU/GPU 逐字节相同),并在下面明确打印。
+                    gpu_math: if num_class > 1 {
+                        crate::types::GpuMath::Exact
+                    } else {
+                        cfg.params.gpu_math
+                    },
                     fast_weights: grad_weights.is_some(),
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
@@ -1191,6 +1214,30 @@ fn train_with_backend(
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
             .init_fast_math(labels, grad_weights, margin)?;
+    }
+
+    if num_class > 1 {
+        if gpu.is_some() && cfg.params.gpu_math == crate::types::GpuMath::Fast && !cfg.quiet {
+            eprintln!(
+                "GPU_MATH requested=fast effective=exact reason=multiclass \
+                 (device softmax gradients are not implemented yet)"
+            );
+        }
+        model.class_base_margins = class_margins;
+        return train_multiclass_rounds(
+            MulticlassRun {
+                source,
+                labels,
+                weights,
+                evals,
+                cfg,
+                comm,
+                gpu: gpu.as_ref(),
+                pool: &pool,
+            },
+            model,
+            callbacks,
+        );
     }
 
     // 融合路径把「施加 delta」推迟到下一轮开头,所以要记着是否欠一次。
@@ -1590,6 +1637,7 @@ pub fn train_gpu_one_tree(
             // 训练层没有列名概念;由知道 schema 的入口层填。
             feature_names: Vec::new(),
             schema_mode: None,
+            class_base_margins: Vec::new(),
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -1635,6 +1683,7 @@ pub fn train_gpu_one_tree(
         // 训练层没有列名概念;由知道 schema 的入口层填。
         feature_names: Vec::new(),
         schema_mode: None,
+        class_base_margins: Vec::new(),
         trees: vec![tree],
         base_score,
         objective: cfg.objective,
@@ -1642,6 +1691,196 @@ pub fn train_gpu_one_tree(
         best_iteration: None,
         best_score: None,
     })
+}
+
+/// 多分类训练需要的只读上下文。
+struct MulticlassRun<'a> {
+    source: &'a dyn BlockSource,
+    labels: &'a [f32],
+    weights: Option<&'a [f32]>,
+    evals: &'a [EvalSet<'a>],
+    cfg: &'a TrainConfig,
+    comm: &'a dyn Comm,
+    gpu: Option<&'a crate::backend::cuda::GpuTrainCtx>,
+    pool: &'a rayon::ThreadPool,
+}
+
+/// 多分类(`multi:softprob` / `multi:softmax`,XGBoost `one_output_per_tree`)。
+///
+/// 每轮:按行算一次 softmax 梯度(K 列),然后 k = 0..K 各建一棵单输出树,
+/// 复用和单输出完全相同的建树路径。和单输出循环的区别:
+/// - 预测是 K 份 `n` 长的 margin;第 k 棵树只累加到第 k 份;
+/// - 行采样 / 列采样的「轮次」键是**树序号** `round·K + k`,每棵树独立抽样
+///   (XGBoost 也是每棵树各采一次);K = 1 时就是原来的 `round`;
+/// - GPU 的叶子增量在每棵树之后立即施加(单输出路径那种「推迟到下一轮
+///   梯度那一遍」的融合在这里不适用:下一棵树要用的是另一类的梯度);
+/// - `gpu_math="fast"` 已在上面降为 exact。
+fn train_multiclass_rounds(
+    run: MulticlassRun<'_>,
+    mut model: Model,
+    callbacks: &mut [Box<dyn Callback>],
+) -> anyhow::Result<Model> {
+    let MulticlassRun {
+        source,
+        labels,
+        weights,
+        evals,
+        cfg,
+        comm,
+        gpu,
+        pool,
+    } = run;
+    let n = source.n_rows();
+    let k_count = cfg.objective.num_outputs();
+    let margins = model.class_base_margins.clone();
+    let mut class_preds: Vec<Vec<f32>> = margins.iter().map(|&m| vec![m; n]).collect();
+    let mut eval_class_preds: Vec<Vec<Vec<f32>>> = evals
+        .iter()
+        .map(|e| {
+            margins
+                .iter()
+                .map(|&m| vec![m; e.source.n_rows()])
+                .collect()
+        })
+        .collect();
+    let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
+    let device_quant = gpu.is_some_and(|c| c.device_quantize_enabled());
+
+    for round in 0..cfg.params.n_rounds {
+        let round_started = std::time::Instant::now();
+        pool.install(|| {
+            let _t = prof::Timer::new(&prof::GRAD);
+            cfg.objective
+                .softmax_gradients(&class_preds, labels, weights, &mut grads)
+        });
+        for class in 0..k_count {
+            let tree_index = (round * k_count + class) as u64;
+            let mut gpair_f32 = std::mem::take(&mut grads[class]);
+            // 行采样:和单输出相同的确定性掩码,键是树序号。
+            if cfg.params.subsample < 1.0 && !device_quant {
+                let th = crate::subsample::threshold_for(cfg.params.subsample);
+                for (i, g) in gpair_f32.iter_mut().enumerate() {
+                    if !crate::subsample::row_selected(i as u64, th, cfg.params.seed, tree_index) {
+                        *g = GradPair {
+                            grad: 0.0,
+                            hess: 0.0,
+                        };
+                    }
+                }
+            }
+            let (quantizer, fixed, dev_root_sum) = if device_quant {
+                let ctx = gpu.expect("device_quant 蕴含 gpu 存在");
+                let _t = prof::Timer::new(&prof::QUANTIZE);
+                let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
+                    &gpair_f32,
+                    crate::subsample::threshold_for(cfg.params.subsample),
+                    cfg.params.seed,
+                    tree_index,
+                )?;
+                (q, Vec::new(), Some(root))
+            } else {
+                pool.install(|| {
+                    let _t = prof::Timer::new(&prof::QUANTIZE);
+                    let quantizer = GradQuantizer::new(&gpair_f32, n);
+                    let fixed: Vec<GradPairFixed> = gpair_f32
+                        .par_iter()
+                        .map(|&g| quantizer.to_fixed(g))
+                        .collect();
+                    (quantizer, fixed, None)
+                })
+            };
+            drop(gpair_f32);
+            if let (Some(ctx), false) = (gpu, device_quant) {
+                ctx.upload_gpair(&fixed)?;
+            }
+            let sampled: Option<Vec<FeatId>> = if cfg.params.colsample_bytree < 1.0 {
+                Some(crate::colsample::sample_features(
+                    source.n_features(),
+                    cfg.params.colsample_bytree,
+                    cfg.params.seed,
+                    tree_index as usize,
+                ))
+            } else {
+                None
+            };
+            let tree = pool.install(|| {
+                build_tree(
+                    source,
+                    &fixed,
+                    dev_root_sum,
+                    &quantizer,
+                    &mut class_preds[class],
+                    cfg,
+                    comm,
+                    gpu,
+                    sampled.as_deref(),
+                )
+            })?;
+            // GPU 路径的叶子增量还在 device 回传的 buffer 里:立即施加到这一类。
+            if let Some(ctx) = gpu {
+                let preds = &mut class_preds[class];
+                let mut applied = Ok(());
+                pool.install(|| {
+                    applied = ctx.with_prediction_delta(&mut |delta| {
+                        preds
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .for_each(|(p, d)| *p += *d);
+                    });
+                });
+                applied?;
+            }
+            {
+                let _t = prof::Timer::new(&prof::EVAL);
+                for (ev, preds) in evals.iter().zip(eval_class_preds.iter_mut()) {
+                    update_predictions(&mut preds[class], &tree, ev.source)?;
+                }
+            }
+            model.trees.push(tree);
+        }
+
+        // 指标要按行排的 n × K margin。
+        let interleaved: Vec<Vec<f32>> = eval_class_preds
+            .iter()
+            .map(|per_class| interleave_classes(per_class))
+            .collect();
+        let m = evaluate(&interleaved, evals, round, cfg);
+        #[allow(clippy::unnecessary_fold)]
+        let keep_going = callbacks
+            .iter_mut()
+            .map(|cb| cb.after_iteration(&m))
+            .fold(true, |a, b| a && b);
+        if prof::enabled() {
+            prof::ROUND_WALL.fetch_add(
+                round_started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if !keep_going {
+            break;
+        }
+    }
+    for cb in callbacks.iter_mut() {
+        cb.after_training();
+    }
+    if let Some((iter, score)) = callbacks.iter().find_map(|cb| cb.best_iteration()) {
+        model.best_iteration = Some(iter);
+        model.best_score = Some(score);
+    }
+    Ok(model)
+}
+
+/// K 份按类排的预测 → 按行排的 `n × K`。
+fn interleave_classes(per_class: &[Vec<f32>]) -> Vec<f32> {
+    let k = per_class.len();
+    let n = per_class.first().map_or(0, Vec::len);
+    let mut out = vec![0.0f32; n * k];
+    for (c, col) in per_class.iter().enumerate() {
+        for (i, &v) in col.iter().enumerate() {
+            out[i * k + c] = v;
+        }
+    }
+    out
 }
 
 /// 在每个验证集上算每个指标。

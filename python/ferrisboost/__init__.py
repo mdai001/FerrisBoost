@@ -46,6 +46,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_delta_step": None,
     "tweedie_variance_power": 1.5,
     "huber_slope": 1.0,
+    # multi:softprob / multi:softmax 必须给;其它 objective 忽略。
+    "num_class": None,
     "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
@@ -104,7 +106,7 @@ _ALIASES = {
 }
 
 _OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
-               "reg:tweedie", "reg:pseudohubererror")
+               "reg:tweedie", "reg:pseudohubererror", "multi:softprob", "multi:softmax")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
@@ -208,6 +210,12 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             )
     if out["device_quantize"] is not None:
         out["device_quantize"] = bool(out["device_quantize"])
+    if out["num_class"] is not None:
+        if isinstance(out["num_class"], bool) or int(out["num_class"]) != out["num_class"]:
+            raise ValueError(f"num_class 要是整数,给的是 {out['num_class']!r}")
+        out["num_class"] = int(out["num_class"])
+        if out["num_class"] < 0:
+            raise ValueError("num_class 不能是负数")
     if out["max_delta_step"] is not None:
         out["max_delta_step"] = float(out["max_delta_step"])
     for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "tweedie_variance_power",

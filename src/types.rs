@@ -558,6 +558,14 @@ pub enum Objective {
     PseudoHuber {
         slope: f32,
     },
+    /// `multi:softprob`:每轮 `num_class` 棵树,预测是每类概率。
+    Softprob {
+        num_class: u32,
+    },
+    /// `multi:softmax`:同上,预测是概率最大的类别下标(f32)。
+    Softmax {
+        num_class: u32,
+    },
 }
 
 #[cfg(test)]

@@ -295,6 +295,9 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
             Box::new(Elementwise::new(Ew::TweedieNll(variance_power), obj))
         }
         Objective::PseudoHuber { slope } => Box::new(Elementwise::new(Ew::Mphe(slope), obj)),
+        Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
+            Box::new(MultiClass::new(MultiKind::LogLoss, num_class as usize))
+        }
     }
 }
 
@@ -304,6 +307,23 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
 /// `binary:logistic`;`rmse` 两个 objective 都接(二分类时和 XGBoost
 /// 一样在概率上算)。不认识或组合不支持时返回说明原因的错误。
 pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, String> {
+    // 多分类只接 mlogloss / merror(XGBoost 对其它指标会因为预测长度不符报错)。
+    if obj.is_multiclass() {
+        let k = obj.num_outputs();
+        return match name {
+            "mlogloss" => Ok(Box::new(MultiClass::new(MultiKind::LogLoss, k))),
+            "merror" => Ok(Box::new(MultiClass::new(MultiKind::Error, k))),
+            _ => Err(format!(
+                "eval_metric {name:?} 不能用于 {};多分类支持 mlogloss / merror",
+                obj.name()
+            )),
+        };
+    }
+    if matches!(name, "mlogloss" | "merror") {
+        return Err(format!(
+            "eval_metric {name:?} 是多分类指标,需要 objective=\"multi:softprob\" 或 \"multi:softmax\""
+        ));
+    }
     let binary = matches!(obj, Objective::Logistic);
     // 新加的逐行指标:和 XGBoost 一样在 objective 变换后的预测上算。
     if let Some(kind) = Ew::parse(name, obj)? {
@@ -332,7 +352,7 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
 
 /// 报错里列出的全部 metric 名字。
 pub const SUPPORTED_METRICS: &str = "rmse / mae / mape / mphe / logloss / error / error@t / auc / \
-poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho";
+poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / mlogloss / merror";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
     match name {
@@ -579,6 +599,80 @@ impl Metric for Elementwise {
         }
         let (esum, wsum) = self.sums(pred, label, weight);
         self.kind.finish(esum, wsum) as f32
+    }
+}
+
+// ---------------------------------------------------------------- 多分类指标
+//
+// XGBoost `EvalMultiLogLoss` / `EvalMatchError`(`multiclass_metric.cu`):
+// 预测先按行 softmax(`EvalTransform`),每行 `EvalRow(label, probs) * w`
+// 在 f64 里累加,`GetFinal = esum / wsum`。`pred` 是**按行**排的
+// `n × K` raw margin。
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MultiKind {
+    LogLoss,
+    Error,
+}
+
+pub struct MultiClass {
+    kind: MultiKind,
+    num_class: usize,
+}
+
+impl MultiClass {
+    pub fn new(kind: MultiKind, num_class: usize) -> Self {
+        Self { kind, num_class }
+    }
+}
+
+impl Metric for MultiClass {
+    fn name(&self) -> &str {
+        match self.kind {
+            MultiKind::LogLoss => "mlogloss",
+            MultiKind::Error => "merror",
+        }
+    }
+
+    fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
+        self.eval_weighted(pred, label, None)
+    }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        let k = self.num_class;
+        assert_eq!(
+            pred.len(),
+            label.len() * k,
+            "{} 的预测长度必须是 n × num_class",
+            self.name()
+        );
+        assert!(!label.is_empty(), "{} 不能评估空数据", self.name());
+        let mut row = vec![0.0f32; k];
+        let (mut esum, mut wsum) = (0.0f64, 0.0f64);
+        for (i, &y) in label.iter().enumerate() {
+            let w = weight.map_or(1.0f32, |w| w[i]);
+            row.copy_from_slice(&pred[i * k..(i + 1) * k]);
+            crate::objective::softmax_in_place(&mut row);
+            let c = y as usize;
+            let residue: f32 = match self.kind {
+                MultiKind::LogLoss => {
+                    let eps = 1e-16f32;
+                    if row[c] > eps {
+                        -row[c].ln()
+                    } else {
+                        -eps.ln()
+                    }
+                }
+                MultiKind::Error => f32::from(crate::objective::argmax(&row) != c),
+            };
+            esum += (residue * w) as f64;
+            wsum += w as f64;
+        }
+        (esum / wsum) as f32
     }
 }
 

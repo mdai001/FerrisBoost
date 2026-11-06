@@ -206,6 +206,11 @@ pub struct Model {
     /// 所以这里显式记一笔:`None` 的模型做文件预测直接报错,让用户重训
     /// 或改用 numpy 预测,而不是替他赌一把。
     pub schema_mode: Option<SchemaMode>,
+    /// 多分类每类的 base margin(长度 `num_class`);单输出模型为空,用
+    /// `base_score`。第 i 棵树属于第 `i % num_class` 类(XGBoost
+    /// `one_output_per_tree` 的 `tree_info`)。
+    #[serde(default)]
+    pub class_base_margins: Vec<f32>,
 }
 
 /// 特征怎么和输入列对上。
@@ -235,6 +240,62 @@ impl SchemaMode {
 }
 
 impl Model {
+    /// 每行几个输出:多分类是 `num_class`,其余 1。
+    pub fn num_outputs(&self) -> usize {
+        self.class_base_margins.len().max(1)
+    }
+
+    /// 多分类模型里只属于第 `class` 类的那部分,包装成一个**单输出**模型
+    /// (objective 换成恒等链接的 `reg:squarederror`,base_score = 该类的
+    /// base margin)。所有单输出预测路径(CPU 分块、GPU、文件)因此不用
+    /// 认识多分类:对每类各跑一遍,再按行做 softmax / argmax。
+    ///
+    /// `n_trees`(总树数的前缀)对应到这一类的前 `ceil((n_trees − class) / K)` 棵。
+    pub fn class_view(&self, class: usize) -> Model {
+        let k = self.num_outputs();
+        assert!(class < k, "类别 {class} 超出 num_class = {k}");
+        Model {
+            trees: self.trees.iter().skip(class).step_by(k).cloned().collect(),
+            base_score: self
+                .class_base_margins
+                .get(class)
+                .copied()
+                .unwrap_or(self.base_score),
+            objective: Objective::SquaredError,
+            n_features: self.n_features,
+            best_iteration: None,
+            best_score: None,
+            feature_names: self.feature_names.clone(),
+            schema_mode: self.schema_mode,
+            class_base_margins: Vec::new(),
+        }
+    }
+
+    /// 总树数前缀 `n_trees` 里属于第 `class` 类的棵数。
+    pub fn class_tree_count(&self, n_trees: usize, class: usize) -> usize {
+        let k = self.num_outputs();
+        let n = n_trees.min(self.trees.len());
+        if n <= class {
+            0
+        } else {
+            (n - class).div_ceil(k)
+        }
+    }
+
+    /// 多分类(也适用于单输出)的原始分数:返回长度 `num_outputs()` 的向量。
+    pub fn predict_margins_upto(&self, features: &[f32], n_trees: usize) -> Vec<f32> {
+        let k = self.num_outputs();
+        if k == 1 {
+            return vec![self.predict_margin_upto(features, n_trees)];
+        }
+        let mut out = self.class_base_margins.clone();
+        let n = n_trees.min(self.trees.len());
+        for (i, t) in self.trees[..n].iter().enumerate() {
+            out[i % k] += t.leaf_value(features);
+        }
+        out
+    }
+
     /// 原始分数(链接函数**之前**)。训练循环累加的就是这个空间的值。
     ///
     /// 用**全部**树,即使早停记了 best_iteration —— 和 XGBoost 的
@@ -329,8 +390,17 @@ impl Model {
                             num_trees: trees.len().to_string(),
                             num_parallel_tree: "1".into(),
                         },
-                        iteration_indptr: (0..=trees.len() as i32).collect(),
-                        tree_info: vec![0; trees.len()],
+                        iteration_indptr: {
+                            // 每轮 K 棵树:indptr 按 K 递增(最后一轮可能不满)。
+                            let k = self.num_outputs();
+                            let n = trees.len();
+                            let mut v: Vec<i32> = (0..n).step_by(k).map(|i| i as i32).collect();
+                            v.push(n as i32);
+                            v
+                        },
+                        tree_info: (0..trees.len())
+                            .map(|i| (i % self.num_outputs()) as i32)
+                            .collect(),
                         trees,
                     },
                 },
@@ -338,9 +408,25 @@ impl Model {
                     // base_score 存的是**变换前**空间的值(二分类是概率),
                     // 和 TrainConfig.base_score 同一个空间。XGBoost 自己
                     // 在加载时调 ProbToMargin,这里不能先转 logit。
-                    base_score: self.base_score.to_string(),
+                    base_score: if self.class_base_margins.is_empty() {
+                        self.base_score.to_string()
+                    } else {
+                        // 多分类:XGBoost 的向量写法 "[a,b,c]"(margin 空间)。
+                        format!(
+                            "[{}]",
+                            self.class_base_margins
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    },
                     boost_from_average: "1".into(),
-                    num_class: "0".into(),
+                    num_class: if self.class_base_margins.is_empty() {
+                        "0".into()
+                    } else {
+                        self.class_base_margins.len().to_string()
+                    },
                     num_feature: self.n_features.to_string(),
                     num_target: "1".into(),
                 },
@@ -377,12 +463,7 @@ impl Model {
             )));
         }
         let mp = &learner.learner_model_param;
-        if parse_param::<i32>("num_class", &mp.num_class)? > 1 {
-            return Err(unsupported(format_args!(
-                "多分类不在第一版范围里(num_class = {})",
-                mp.num_class
-            )));
-        }
+        let num_class = parse_param::<i32>("num_class", &mp.num_class)?.max(1) as usize;
         // ⚠️ 多目标模型(XGBoost 2.x 可能只存一个标量 base_score)必须拒绝:
         // 当成单目标读会把所有目标的树加在一起,静默给出错的预测。
         if !mp.num_target.trim().is_empty() && parse_param::<i32>("num_target", &mp.num_target)? > 1
@@ -392,9 +473,18 @@ impl Model {
                 mp.num_target
             )));
         }
-        if let Some(g) = booster.model.tree_info.iter().find(|&&g| g != 0) {
+        // 多分类(one_output_per_tree)要求第 i 棵树属于第 i % K 类 —— XGBoost
+        // 训练出来的就是这个排法;别的排法(比如手工拼接的模型)直接拒绝,
+        // 不猜。
+        if let Some((i, g)) = booster
+            .model
+            .tree_info
+            .iter()
+            .enumerate()
+            .find(|&(i, &g)| g as usize != i % num_class)
+        {
             return Err(unsupported(format_args!(
-                "tree_info 里有输出组 {g}:只支持单输出模型"
+                "第 {i} 棵树的 tree_info = {g},不是 {i} % num_class({num_class}):不支持这种输出组排法"
             )));
         }
         for t in &booster.model.trees {
@@ -429,8 +519,30 @@ impl Model {
             }
         };
 
+        anyhow_like_check(
+            num_class == objective.num_outputs(),
+            format_args!(
+                "num_class = {num_class} 和 objective {} 不一致",
+                learner.objective.name
+            ),
+        )?;
         let n_features = parse_param::<usize>("num_feature", &mp.num_feature)?;
-        let base_score = parse_base_score(&mp.base_score)?;
+        let (base_score, class_base_margins) = if num_class > 1 {
+            let v = parse_base_score_vector(&mp.base_score)?;
+            // XGBoost 老模型可能只存一个标量:按 learner 的规则复制成 K 份。
+            let v = if v.len() == 1 {
+                vec![v[0]; num_class]
+            } else {
+                v
+            };
+            anyhow_like_check(
+                v.len() == num_class,
+                format_args!("base_score 有 {} 个值,num_class = {num_class}", v.len()),
+            )?;
+            (v[0], v)
+        } else {
+            (parse_base_score(&mp.base_score)?, Vec::new())
+        };
 
         let source_trees = &booster.model.trees;
         let workers = model_tree_conversion_workers(
@@ -469,6 +581,7 @@ impl Model {
             best_score: attrs
                 .get("best_score")
                 .and_then(|v| v.trim().parse::<f32>().ok()),
+            class_base_margins,
         })
     }
 }
@@ -532,6 +645,33 @@ fn unsupported(args: std::fmt::Arguments) -> serde_json::Error {
 ///
 /// 实测 3.4.1 加载我们写的裸标量没问题,所以导出仍然写裸标量 ——
 /// 往回兼容老版本更划算。
+/// `base_score` 的向量写法 `"[a,b,c]"`(也接受标量)。多分类用。
+fn parse_base_score_vector(raw: &str) -> Result<Vec<f32>, serde_json::Error> {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(t);
+    let v = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|p| parse_param::<f32>("base_score", p))
+        .collect::<Result<Vec<_>, _>>()?;
+    if v.is_empty() {
+        return Err(unsupported(format_args!("base_score 是空的:{raw:?}")));
+    }
+    Ok(v)
+}
+
+fn anyhow_like_check(ok: bool, msg: std::fmt::Arguments) -> Result<(), serde_json::Error> {
+    if ok {
+        Ok(())
+    } else {
+        Err(unsupported(msg))
+    }
+}
+
 fn parse_base_score(raw: &str) -> Result<f32, serde_json::Error> {
     let t = raw.trim();
     let inner = t
@@ -851,6 +991,7 @@ mod tests {
         Model {
             feature_names: Vec::new(),
             schema_mode: None,
+            class_base_margins: Vec::new(),
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
