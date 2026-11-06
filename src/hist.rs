@@ -721,4 +721,94 @@ mod tests {
             assert_same(&got.bins, &want);
         }
     }
+
+    /// Broader indexed-row regression coverage for the column-major builder.
+    ///
+    /// The feature counts include odd widths and a tail after many potential
+    /// pairs. Each feature has its own bin count and offset. The 4,203-row
+    /// input crosses the default 4,096-row tile boundary. Large signed fixed
+    /// values exercise exact integer accumulation while remaining well inside
+    /// i64 bounds even when selected rows are duplicated.
+    #[test]
+    fn build_feature_width_and_row_selection_matrix_matches_scalar_reference() {
+        const N_ROWS: usize = 4_203;
+        const LARGE: i64 = 1_i64 << 42;
+
+        for n_feats in [1usize, 2, 3, 4, 7, 63] {
+            let bin_counts: Vec<usize> = (0..n_feats).map(|f| 1 + ((f * 3) % 7)).collect();
+            let mut offsets = Vec::with_capacity(n_feats + 1);
+            offsets.push(0u32);
+            for &count in &bin_counts {
+                offsets.push(*offsets.last().unwrap() + count as u32);
+            }
+
+            let mut block = vec![MISSING_BIN; n_feats * N_ROWS];
+            for f in 0..n_feats {
+                for row in 0..N_ROWS {
+                    // Vary missing locations and valid bins independently by
+                    // feature so no pair of columns has identical contents.
+                    if (row * 5 + f * 11) % 17 != 0 {
+                        block[f * N_ROWS + row] = ((row * 7 + f * 3) % bin_counts[f]) as Bin;
+                    }
+                }
+            }
+
+            let gpair: Vec<GradPairFixed> = (0..N_ROWS)
+                .map(|row| {
+                    let sign = if row % 2 == 0 { 1 } else { -1 };
+                    GradPairFixed {
+                        grad: sign * (LARGE + (row as i64 % 31)),
+                        hess: -sign * (LARGE / 2 + (row as i64 % 19)),
+                    }
+                })
+                .collect();
+
+            let all_rows: Vec<RowId> = (0..N_ROWS as RowId).collect();
+            let sparse_rows: Vec<RowId> = (0..N_ROWS as RowId)
+                .filter(|r| r % 97 == 3 || *r == N_ROWS as RowId - 1)
+                .collect();
+            let duplicate_rows: Vec<RowId> = vec![0, 4_202, 0, 2_048, 2_048, 17];
+            let single_row: Vec<RowId> = vec![2_047];
+            let empty_rows: Vec<RowId> = Vec::new();
+
+            let mut full = vec![GradPairFixed::default(); *offsets.last().unwrap() as usize];
+            build(&block, N_ROWS, n_feats, &offsets, &gpair, None, &mut full);
+            assert_eq!(
+                full,
+                reference(&block, N_ROWS, n_feats, &offsets, &gpair, &all_rows),
+                "full build mismatch for {n_feats} features"
+            );
+
+            let selections: [(&str, &[RowId]); 5] = [
+                ("all rows", &all_rows),
+                ("empty", &empty_rows),
+                ("single row", &single_row),
+                ("sparse", &sparse_rows),
+                ("duplicates", &duplicate_rows),
+            ];
+            for (label, rows) in selections {
+                let mut got = vec![GradPairFixed::default(); full.len()];
+                build(
+                    &block,
+                    N_ROWS,
+                    n_feats,
+                    &offsets,
+                    &gpair,
+                    Some(rows),
+                    &mut got,
+                );
+                assert_eq!(
+                    got,
+                    reference(&block, N_ROWS, n_feats, &offsets, &gpair, rows),
+                    "{label} indexed build mismatch for {n_feats} features"
+                );
+                if label == "all rows" {
+                    assert_eq!(
+                        got, full,
+                        "None and Some(all rows) differ for {n_feats} features"
+                    );
+                }
+            }
+        }
+    }
 }
