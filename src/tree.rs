@@ -211,6 +211,15 @@ pub struct Model {
     /// `one_output_per_tree` 的 `tree_info`)。
     #[serde(default)]
     pub class_base_margins: Vec<f32>,
+    /// 训练用的 `scale_pos_weight`,原样写进 `reg_loss_param`(XGBoost 保存
+    /// 的是实际值)。只有 RegLossObj 家族(squarederror / logistic / gamma)
+    /// 会写出来;老模型没有这个字段,默认 1。
+    #[serde(default = "default_scale_pos_weight")]
+    pub scale_pos_weight: f32,
+}
+
+fn default_scale_pos_weight() -> f32 {
+    1.0
 }
 
 /// 特征怎么和输入列对上。
@@ -268,6 +277,7 @@ impl Model {
             feature_names: self.feature_names.clone(),
             schema_mode: self.schema_mode,
             class_base_margins: Vec::new(),
+            scale_pos_weight: self.scale_pos_weight,
         }
     }
 
@@ -432,7 +442,7 @@ impl Model {
                 },
                 objective: xgb::ObjectiveJson {
                     name: self.objective.name().into(),
-                    rest: self.objective.json_params(),
+                    rest: self.objective.json_params(self.scale_pos_weight),
                 },
             },
         };
@@ -582,6 +592,7 @@ impl Model {
                 .get("best_score")
                 .and_then(|v| v.trim().parse::<f32>().ok()),
             class_base_margins,
+            scale_pos_weight: Objective::scale_pos_weight_from_json(&learner.objective.rest),
         })
     }
 }
@@ -992,6 +1003,7 @@ mod tests {
             feature_names: Vec::new(),
             schema_mode: None,
             class_base_margins: Vec::new(),
+            scale_pos_weight: 1.0,
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1091,6 +1103,54 @@ mod tests {
         for row in [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [f32::NAN, 0.5]] {
             assert_eq!(back.predict(&row), m.predict(&row), "行 {row:?}");
         }
+    }
+
+    #[test]
+    fn scale_pos_weight_is_saved_and_loaded() {
+        for (obj, spw, text) in [
+            (Objective::Logistic, 3.0f32, "3"),
+            (Objective::SquaredError, 0.3, "0.3"),
+            (Objective::Gamma, 2.5, "2.5"),
+        ] {
+            let m = Model {
+                objective: obj,
+                scale_pos_weight: spw,
+                ..fixture_model()
+            };
+            let json = m.to_xgboost_json().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v["learner"]["objective"]["reg_loss_param"]["scale_pos_weight"],
+                text
+            );
+            let back = Model::from_xgboost_json(&json).unwrap();
+            assert_eq!(back.scale_pos_weight, spw);
+            assert_eq!(back.to_xgboost_json().unwrap(), json);
+        }
+        // 缺字段(老模型 / 外部模型)读成 1;老的序列化 Model 也能读
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture_model().to_xgboost_json().unwrap()).unwrap();
+        v["learner"]["objective"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reg_loss_param");
+        assert_eq!(
+            Model::from_xgboost_json(&v.to_string())
+                .unwrap()
+                .scale_pos_weight,
+            1.0
+        );
+        let mut old = serde_json::to_value(fixture_model()).unwrap();
+        old.as_object_mut().unwrap().remove("scale_pos_weight");
+        let old: Model = serde_json::from_value(old).unwrap();
+        assert_eq!(old.scale_pos_weight, 1.0);
+        // class_view 带着它走
+        let view = Model {
+            scale_pos_weight: 4.0,
+            ..fixture_model()
+        }
+        .class_view(0);
+        assert_eq!(view.scale_pos_weight, 4.0);
     }
 
     #[test]

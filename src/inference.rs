@@ -414,6 +414,7 @@ mod tests {
             feature_names: (0..5).map(|i| format!("f{i}")).collect(),
             schema_mode: Some(crate::tree::SchemaMode::Named),
             class_base_margins: Vec::new(),
+            scale_pos_weight: 1.0,
         };
         let before = canonical.to_xgboost_json().unwrap();
         let compact = CompactInferenceModel::new(&canonical).unwrap();
@@ -474,6 +475,7 @@ mod tests {
             feature_names: (0..5).map(|i| format!("f{i}")).collect(),
             schema_mode: Some(crate::tree::SchemaMode::Named),
             class_base_margins: Vec::new(),
+            scale_pos_weight: 1.0,
         };
         let predictor = CpuInferenceModel::new(&model).unwrap();
         let patterns = [

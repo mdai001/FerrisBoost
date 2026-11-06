@@ -1113,6 +1113,7 @@ fn train_with_backend(
         feature_names: Vec::new(),
         schema_mode: None,
         class_base_margins: Vec::new(),
+        scale_pos_weight: cfg.params.scale_pos_weight,
         best_iteration: None,
         best_score: None,
     };
@@ -1638,6 +1639,7 @@ pub fn train_gpu_one_tree(
             feature_names: Vec::new(),
             schema_mode: None,
             class_base_margins: Vec::new(),
+            scale_pos_weight: cfg.params.scale_pos_weight,
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -1684,6 +1686,7 @@ pub fn train_gpu_one_tree(
         feature_names: Vec::new(),
         schema_mode: None,
         class_base_margins: Vec::new(),
+        scale_pos_weight: cfg.params.scale_pos_weight,
         trees: vec![tree],
         base_score,
         objective: cfg.objective,

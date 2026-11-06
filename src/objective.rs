@@ -464,11 +464,16 @@ impl Objective {
 
     /// 模型 JSON 里 objective 下面的参数块(XGBoost `SaveConfig`)。
     /// XGBoost 加载时会按名字去找它,缺了会报错。
-    pub fn json_params(self) -> BTreeMap<String, serde_json::Value> {
+    ///
+    /// RegLossObj 家族写训练时的实际 `scale_pos_weight`(最短 f32 表示,
+    /// 和其它参数块一致);其它 objective 不带这个参数。
+    pub fn json_params(self, scale_pos_weight: f32) -> BTreeMap<String, serde_json::Value> {
         match self {
-            Objective::SquaredError | Objective::Logistic | Objective::Gamma => {
-                json_block("reg_loss_param", "scale_pos_weight", "1".into())
-            }
+            Objective::SquaredError | Objective::Logistic | Objective::Gamma => json_block(
+                "reg_loss_param",
+                "scale_pos_weight",
+                scale_pos_weight.to_string(),
+            ),
             Objective::Poisson { max_delta_step } => json_block(
                 "poisson_regression_param",
                 "max_delta_step",
@@ -488,6 +493,11 @@ impl Objective {
                 num_class.to_string(),
             ),
         }
+    }
+
+    /// 读模型时恢复 `reg_loss_param.scale_pos_weight`(缺了就是 1)。
+    pub fn scale_pos_weight_from_json(rest: &BTreeMap<String, serde_json::Value>) -> f32 {
+        json_param(rest, "reg_loss_param", "scale_pos_weight").unwrap_or(1.0)
     }
 
     /// 读模型时按 JSON 参数块恢复 objective 参数(缺了就用默认值)。
@@ -659,7 +669,7 @@ mod tests {
     fn names_round_trip() {
         for o in Objective::ALL {
             assert_eq!(Objective::from_name(o.name()), Some(o));
-            assert_eq!(Objective::from_json(o.name(), &o.json_params()), Some(o));
+            assert_eq!(Objective::from_json(o.name(), &o.json_params(1.0)), Some(o));
         }
         assert_eq!(
             Objective::from_name("reg:linear"),
@@ -669,7 +679,7 @@ mod tests {
         let t = Objective::Tweedie {
             variance_power: 1.25,
         };
-        assert_eq!(Objective::from_json(t.name(), &t.json_params()), Some(t));
+        assert_eq!(Objective::from_json(t.name(), &t.json_params(1.0)), Some(t));
     }
 
     #[test]
