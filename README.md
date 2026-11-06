@@ -112,7 +112,7 @@ model = fb.train(
     num_boost_round=200,
 )
 
-# Predict returns a 1-D NumPy float32 array:
+# Predict returns a 1-D NumPy float32 array (multiclass models return a 2-D array):
 prediction = model.predict("test.parquet", predict_threads=0)
 model.save_model("model.json")
 ```
@@ -219,6 +219,10 @@ FerrisBoost prediction is independent of the training backend. CPU prediction pa
 
 File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes one `float32` prediction column without collecting the complete result in Python memory.
 
+### Objectives and metrics
+
+Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `multi:softprob`, and `multi:softmax`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `mlogloss`, and `merror`. See the Python API How-To for which metrics apply to which objective.
+
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
@@ -237,6 +241,15 @@ Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
+
+### 0.0.5 (unreleased)
+
+- Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.
+- Added `alpha` (alias `reg_alpha`), `max_delta_step`, and `scale_pos_weight`, with XGBoost semantics, on CPU and GPU. For `count:poisson`, an unset `max_delta_step` becomes `0.7`, as in XGBoost.
+- Added objectives `count:poisson`, `reg:gamma`, `reg:tweedie` (`tweedie_variance_power`), and `reg:pseudohubererror` (`huber_slope`), on CPU and GPU.
+- Added multiclass objectives `multi:softprob` and `multi:softmax` (`num_class`): `predict` returns `(n, num_class)` probabilities or margins, or class indices for `multi:softmax`. Multiclass models interchange with XGBoost in both directions. In this version, file prediction for multiclass models reads the input once per class, and `predict_to_parquet` builds its output in memory.
+- Added metrics `mae`, `mape`, `mphe`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `error@t`, `aucpr`, `mlogloss`, and `merror`. `rmse` and the other pointwise metrics are computed on transformed predictions.
+- GPU: `gpu_math="exact"` stays byte-identical to CPU for all new objectives and parameters. `gpu_math="fast"` supports the new regression objectives; it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.
 
 ### 0.0.4
 

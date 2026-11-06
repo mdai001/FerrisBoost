@@ -158,6 +158,148 @@ prediction = model.predict(X)
 For squared-error models, normal predictions and raw-margin predictions are
 the same.
 
+## Count, positive, and robust regression objectives
+
+Besides `reg:squarederror`, these regression objectives follow XGBoost's
+definitions:
+
+| Objective | Use it for | Labels | Link | Default metric |
+|---|---|---|---|---|
+| `count:poisson` | Non-negative counts | `>= 0` | `exp` | `poisson-nloglik` |
+| `reg:gamma` | Strictly positive, skewed targets | `> 0` | `exp` | `gamma-deviance` |
+| `reg:tweedie` | Non-negative targets with many zeros and a positive tail (insurance claims, for example) | `>= 0` | `exp` | `tweedie-nloglik@rho` |
+| `reg:pseudohubererror` | Targets with outliers | any | identity | `mphe` |
+
+The three log-link objectives (`count:poisson`, `reg:gamma`, `reg:tweedie`)
+predict `exp(margin)`, so predictions are positive; `output_margin=True`
+returns the margin before `exp`. Labels that violate the requirement in the
+table are rejected before training starts.
+
+Two parameters belong to specific objectives:
+
+- `tweedie_variance_power` (default `1.5`, must be in `[1, 2)`) selects the
+  Tweedie distribution. Values near `1` behave like Poisson and values near
+  `2` like gamma. The default metric is named after it, for example
+  `tweedie-nloglik@1.5`.
+- `huber_slope` (default `1`, must be non-zero) is the pseudo-Huber slope. The
+  `mphe` metric uses the same value.
+
+```python
+rng = np.random.default_rng(7)
+Xr = rng.normal(size=(5_000, 8)).astype(np.float32)
+rate = np.exp(0.5 * Xr[:, 0] - 0.3 * Xr[:, 1])
+
+counts = rng.poisson(rate).astype(np.float32)
+model = fb.train(
+    {"objective": "count:poisson", "max_depth": 4, "eta": 0.1},
+    Xr, label=counts, num_boost_round=100,
+)
+expected_counts = model.predict(Xr)          # exp(margin), always positive
+
+durations = rng.gamma(2.0, rate / 2.0).astype(np.float32) + 1e-3
+model = fb.train(
+    {"objective": "reg:gamma", "max_depth": 4, "eta": 0.1},
+    Xr, label=durations, num_boost_round=100,
+)
+
+noisy = (3.0 * Xr[:, 0] + rng.standard_t(2, size=5_000)).astype(np.float32)
+model = fb.train(
+    {"objective": "reg:pseudohubererror", "huber_slope": 2.0, "max_depth": 4},
+    Xr, label=noisy, num_boost_round=100,
+)
+
+claims = np.where(rng.random(5_000) < 0.4, 0.0, rng.gamma(2.0, rate)).astype(np.float32)
+model = fb.train(
+    {"objective": "reg:tweedie", "tweedie_variance_power": 1.3, "max_depth": 4},
+    Xr, label=claims, num_boost_round=100,
+)
+```
+
+For `count:poisson`, an unset `max_delta_step` becomes `0.7`, as in XGBoost's
+learner. It is applied to the Poisson Hessian and to the tree's leaf-weight
+clamp (see [Regularization and class imbalance](#regularization-and-class-imbalance)).
+Passing `max_delta_step` explicitly, including `0`, overrides that default.
+
+The log-link objectives need a positive `base_score`, because the starting
+margin is `log(base_score)`. The estimated default is positive whenever the
+labels are not all zero. If every label is `0` (possible for Poisson and
+Tweedie), pass an explicit positive `base_score`. See
+[Starting prediction](#starting-prediction-base_score).
+
+All of these objectives work with sample weights, monotone constraints,
+`alpha`, `max_delta_step`, GPU training, and XGBoost model exchange. On the
+CPU and with `gpu_math="exact"`, models match XGBoost exactly when every
+feature has fewer distinct values than `max_bin`.
+
+## Regularization and class imbalance
+
+Three parameters have the semantics of their XGBoost namesakes:
+
+- `alpha` (alias `reg_alpha`, default `0`): L1 regularization on leaf weights.
+  The leaf weight is soft-thresholded, so small gradients no longer produce a
+  leaf value, and the split gain accounts for the L1 term.
+- `max_delta_step` (default `0`, meaning no limit): the largest absolute leaf
+  weight, before it is scaled by `eta`. A small positive value (1 to 10) can
+  stabilize logistic regression on very unbalanced data. For `count:poisson`
+  the unset default is `0.7` (see above).
+- `scale_pos_weight` (default `1`): multiplies the gradient and Hessian of rows
+  whose label is `1`. A common choice for unbalanced binary data is
+  `sum(negative) / sum(positive)`.
+
+```python
+neg, pos = (y == 0).sum(), (y == 1).sum()
+
+model = fb.train(
+    {
+        "objective": "binary:logistic",
+        "alpha": 0.5,
+        "max_delta_step": 1.0,
+        "scale_pos_weight": neg / pos,
+    },
+    X,
+    label=y,
+    num_boost_round=200,
+)
+```
+
+Notes:
+
+- `scale_pos_weight` only changes the gradients. Evaluation metrics and the
+  weighted quantile sketch use the sample weights alone. It applies to
+  `binary:logistic`, `reg:squarederror`, and `reg:gamma`, and is ignored by the
+  other objectives, as in XGBoost.
+- Predictions from a model trained with `scale_pos_weight` are shifted toward
+  the positive class and are no longer calibrated probabilities.
+- When `scale_pos_weight` is not `1` and `base_score` is unset, the default
+  `base_score` comes from one Newton step instead of the label mean, as in
+  XGBoost.
+- All three parameters work on CPU and GPU. With `gpu_math="exact"`, GPU models
+  stay byte-identical to CPU models.
+
+## Starting prediction (`base_score`)
+
+When `base_score` is not set, FerrisBoost estimates it from the training labels,
+as XGBoost 2.0 and later do:
+
+| Objective | Default `base_score` |
+|---|---|
+| `reg:squarederror`, `binary:logistic`, `count:poisson`, `reg:gamma`, `reg:tweedie` | The label mean (weighted if weights are given) |
+| `reg:pseudohubererror` | One Newton step from margin `0` |
+| `reg:squarederror`, `binary:logistic`, `reg:gamma` with `scale_pos_weight != 1` | One Newton step from margin `0` |
+| `multi:softprob`, `multi:softmax` | Per-class log-frequency margins, centered to mean zero |
+
+Because the estimate depends on the data, default models of `binary:logistic`
+and `reg:squarederror` differ from those trained with FerrisBoost 0.0.4, which
+started from a fixed `0.5`. They now match XGBoost's default models. To
+reproduce a 0.0.4 model, set `"base_score": 0.5` explicitly. An explicit
+`base_score` is used as given.
+
+`base_score` is in the space after the objective's transform: a probability for
+`binary:logistic` (any value in `[0, 1]`, so that all-0 or all-1 labels train),
+a mean for the log-link objectives (it must be positive), and a margin for
+multiclass objectives, where a single value is used for every class. The
+trained value is stored in the model and used again at prediction time.
+
 ## Validation and early stopping
 
 For in-memory data, each validation entry is a
@@ -217,14 +359,36 @@ model = fb.train(
 
 | Metric | Objectives | Definition |
 |---|---|---|
-| `rmse` | both | Root mean squared error; for `binary:logistic` it is computed on probabilities, as in XGBoost |
+| `rmse` | all except multiclass | Root mean squared error on the transformed prediction (probabilities for `binary:logistic`, `exp(margin)` for log-link objectives), as in XGBoost |
+| `mae` | all except multiclass | Mean absolute error on the transformed prediction |
+| `mape` | all except multiclass | Mean absolute percentage error, `abs((label - prediction) / label)` |
+| `mphe` | all except multiclass | Mean pseudo-Huber error; uses `huber_slope` for `reg:pseudohubererror` and `1` otherwise |
 | `logloss` | `binary:logistic` | Negative log-likelihood |
 | `error` | `binary:logistic` | Error rate at threshold 0.5 (`p > 0.5` counts as positive) |
+| `error@t` | `binary:logistic` | Error rate at threshold `t`, for example `error@0.7` |
 | `auc` | `binary:logistic` | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it |
+| `aucpr` | `binary:logistic` | Area under the precision-recall curve. Larger is better, so early stopping maximizes it |
+| `poisson-nloglik` | `count:poisson` | Negative Poisson log-likelihood |
+| `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
+| `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
+| `tweedie-nloglik@rho` | `reg:tweedie` | Negative Tweedie log-likelihood at variance power `rho` in `[1, 2)`, for example `tweedie-nloglik@1.5`. The `@rho` part is required |
+| `mlogloss` | `multi:softprob`, `multi:softmax` | Multiclass negative log-likelihood |
+| `merror` | `multi:softprob`, `multi:softmax` | Multiclass error rate |
+
+The likelihood and deviance metrics are meant for the objective they are listed
+with: they are computed on the transformed prediction and assume it is
+positive. Multiclass objectives accept only `mlogloss` and `merror`, and those
+two are rejected for other objectives. The binary metrics are rejected for
+every other objective, with a `ValueError` before training starts. The key in
+`evals_result` is the metric name as written, for example
+`history["valid"]["tweedie-nloglik@1.5"]`.
 
 Without `eval_metric`, the objective selects the default: `logloss` for
-`binary:logistic` and `rmse` for `reg:squarederror`. With weighted validation
-data every metric is weighted the same way XGBoost does it.
+`binary:logistic`, `rmse` for `reg:squarederror`, `poisson-nloglik` for
+`count:poisson`, `gamma-deviance` for `reg:gamma`, `tweedie-nloglik@rho` (with
+the objective's `tweedie_variance_power`) for `reg:tweedie`, `mphe` for
+`reg:pseudohubererror`, and `mlogloss` for both multiclass objectives. With
+weighted validation data every metric is weighted the same way XGBoost does it.
 
 Like `xgboost.Booster.predict`, `Model.predict()` uses all trees by default,
 including trees built after the best iteration. To predict with the early-
@@ -330,6 +494,92 @@ fewer distinct values than `max_bin`, on CPU and GPU, with or without
 weights. CPU and `gpu_math="exact"` GPU models stay byte-identical. The
 constraints are not stored in the saved model, as in XGBoost; prediction does
 not need them.
+
+## Multiclass classification
+
+Use `multi:softprob` or `multi:softmax` with `num_class`, the number of classes
+(at least 2). Labels must be integers in `[0, num_class)`:
+
+```python
+rng = np.random.default_rng(3)
+Xm = rng.normal(size=(6_000, 10)).astype(np.float32)
+score = Xm[:, 0] - Xm[:, 1] + rng.normal(scale=0.5, size=6_000)
+ym = np.digitize(score, [-1.0, 0.0, 1.0]).astype(np.float32)   # classes 0..3
+
+model = fb.train(
+    {"objective": "multi:softprob", "num_class": 4, "max_depth": 4, "eta": 0.2},
+    Xm[:5_000],
+    label=ym[:5_000],
+    num_boost_round=100,
+    evals=[(Xm[5_000:], ym[5_000:], "valid")],   # default metric: mlogloss
+    early_stopping_rounds=10,
+)
+```
+
+Each boosting round builds `num_class` trees, one per class, as XGBoost does.
+`model.num_trees` therefore counts trees, not rounds, and equals
+`num_class` times the number of rounds. Row and column sampling are drawn per
+tree. Sample weights, `monotone_constraints`, `alpha`, `max_delta_step`, GPU
+training, and file input work as for the other objectives;
+`scale_pos_weight` is ignored.
+
+The default `base_score` is a per-class margin computed from the log of the
+(weighted) class frequencies. An explicit `base_score` is a margin that is
+used for every class.
+
+Metrics are `mlogloss` (the default) and `merror`; no other metric is
+accepted for a multiclass objective.
+
+### Multiclass prediction
+
+| Call | Shape and meaning |
+|---|---|
+| `predict(X)` with `multi:softprob` | `(n, num_class)` class probabilities |
+| `predict(X)` with `multi:softmax` | `(n,)` predicted class index, as `float32` |
+| `predict(X, output_margin=True)` | `(n, num_class)` raw margins for either objective |
+
+```python
+proba = model.predict(Xm[5_000:])                      # shape (1000, 4)
+labels = proba.argmax(axis=1)
+margins = model.predict(Xm[5_000:], output_margin=True)
+```
+
+`n_trees` counts trees, so truncating to the early-stopping round takes
+`num_class` trees per round:
+
+```python
+best = model.predict(
+    Xm[5_000:],
+    n_trees=(model.best_iteration + 1) * 4,   # num_class = 4
+)
+```
+
+File prediction works as for single-output models:
+`model.predict("test.parquet")` returns the same arrays. `predict_to_parquet`
+writes one column per class named `prediction_0`, `prediction_1`, ... for
+`multi:softprob` and for `output_margin=True`, and a single class-index column
+(named by `prediction_column`) for `multi:softmax`:
+
+```python
+model.predict_to_parquet("test.parquet", "proba.parquet")
+# columns: prediction_0, prediction_1, prediction_2, prediction_3
+```
+
+Limitations in this version:
+
+- Multiclass file prediction reads the input once per class.
+- `predict_to_parquet` for multiclass models builds the whole output in memory
+  before writing; it is not streamed in bounded batches like the single-output
+  path. It also does not yet check that the target is new or ends in `.parquet`
+  or `.pq`, so it overwrites an existing file.
+- The lower-level `predict_array()` and `predict_files()` methods reject
+  multiclass models; use `predict()`.
+
+### Multiclass models and XGBoost
+
+Multiclass models are saved with `num_class`, per-tree class ids, and a vector
+`base_score`, and are exchanged with XGBoost in both directions: XGBoost loads
+a FerrisBoost multiclass model, and FerrisBoost loads one trained by XGBoost.
 
 ## Custom callbacks
 
@@ -550,6 +800,16 @@ memory budget, without manual chunk or batch tuning:
   matching CPU training. `"fast"` is deterministic, but CPU and GPU models are
   not guaranteed to be bit-identical; FerrisBoost does not promise universal
   parity with XGBoost GPU training.
+- **Objectives and parameters on GPU**: Every objective (including the
+  multiclass ones) and the `alpha`, `max_delta_step`, `scale_pos_weight`,
+  sample-weight, and monotone-constraint options work with `device="cuda"`.
+  `gpu_math="exact"` stays byte-identical to CPU training for all of them.
+- **`gpu_math="fast"` and objectives**: `"fast"` supports `reg:squarederror`,
+  `binary:logistic`, `count:poisson`, `reg:gamma`, `reg:tweedie`, and
+  `reg:pseudohubererror`. It is deterministic from run to run but not
+  byte-identical to CPU. Support for the newer regression objectives is a
+  first version; it is correct, and its speed will be optimized in 0.0.6.
+- **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported (device softmax gradients); optimization continues in 0.0.6.
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
@@ -563,7 +823,7 @@ memory budget, without manual chunk or batch tuning:
 
 ## Prediction
 
-`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is always a one-dimensional `numpy.ndarray` of `float32`. Prediction has its own CPU thread control and does not inherit training `nthread`:
+`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is a `float32` `numpy.ndarray`. It is one-dimensional, with shape `(n,)`, except for multiclass models, which return two-dimensional `(n, num_class)` probabilities or margins; `multi:softmax` returns a one-dimensional array of class indices unless `output_margin=True` (see [Multiclass prediction](#multiclass-prediction)). Predictions are in the objective's output space: probabilities for `binary:logistic`, `exp(margin)` for `count:poisson`, `reg:gamma`, and `reg:tweedie`, and the margin itself for the other regression objectives; `output_margin=True` returns the raw margin. Prediction has its own CPU thread control and does not inherit training `nthread`:
 
 ```python
 prediction = model.predict(data, predict_threads=0)  # process-aware auto
@@ -610,7 +870,7 @@ File readers validate the full canonical schema before projecting batches to the
 
 Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
 
-`predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
+`predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. For multiclass models it writes one column per class instead (see [Multiclass prediction](#multiclass-prediction)). The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
 
 The direct-output path keeps a bounded two-batch channel between scoring and one ordered Parquet writer thread. The writer can overlap encoding/output with the next input batch while preserving file order and row order. Auto mode shares one process-visible CPU budget across ingest, scoring, and the writer; explicit ingest or prediction thread counts are preserved and produce an oversubscription warning when their total plus the writer exceeds that budget.
 
@@ -705,7 +965,10 @@ empty `evals_result()`.
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| `objective` | `binary:logistic` | Also supports `reg:squarederror` |
+| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `multi:softprob`, `multi:softmax` |
+| `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
+| `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
+| `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
 | `max_bin` | `255` | Must be between 1 and 255 |
 | `eta` | `0.3` | Alias: `learning_rate` |
@@ -713,25 +976,25 @@ empty `evals_result()`.
 | `gamma` | `0.0` | Minimum split loss |
 | `min_child_weight` | `1.0` | Minimum child Hessian |
 | `alpha` | `0.0` | L1 regularization on leaf weights; alias: `reg_alpha` |
-| `max_delta_step` | `0.0` | Maximum absolute leaf weight before `eta` (`0` = no limit); can help logistic regression with very unbalanced classes |
-| `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
+| `max_delta_step` | `0.0` | Maximum absolute leaf weight before `eta` (`0` = no limit); can help logistic regression with very unbalanced classes. For `count:poisson` an unset value becomes `0.7`, for the tree and the objective alike |
+| `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. Used by `binary:logistic`, `reg:squarederror`, and `reg:gamma`, ignored by the other objectives. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
 | `subsample` | `1.0` | Deterministic per-tree row sampling in `(0, 1]`; all rows still receive the learned tree |
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `cols_per_block` | automatic | Positive integer; normally leave unset |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
 | `gpu_memory_budget` | automatic | Positive integer planner budget for GPU training memory; auto derives from free VRAM with safety headroom |
-| `gpu_math` | `"exact"` | `"exact"` (byte-by-byte identical to CPU) or deterministic `"fast"` (CPU/GPU models need not be bit-identical) |
+| `gpu_math` | `"exact"` | `"exact"` (byte-by-byte identical to CPU) or deterministic `"fast"` (CPU/GPU models need not be bit-identical); see [Train on GPU](#train-on-gpu) for objective support |
 | `device_quantize` | `True` | Fixed-point gradient/Hessian quantization on GPU; feature binning remains on host/source |
 | `hist_streams` | automatic | Planned by GPU planner based on execution path, block width, and VRAM; override with `1` or `2` |
 | `hist_nodes_per_batch` | automatic | Multi-node merge batch size (`1..=32`) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
 | `seed` | `0` | Alias: `random_state` |
-| `base_score` | estimated | Starting prediction, before the objective transform (a probability for `binary:logistic`). If unset, it is estimated from the training labels as XGBoost 2.0+ does: the (weighted) label mean |
+| `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |
 | `cache_path` | `None` | Persistent Parquet cache directory |
-| `eval_metric` | objective default | One name or a list: `rmse`, `logloss`, `error`, `auc`; early stopping watches the last one |
+| `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
@@ -768,6 +1031,31 @@ prediction = model.predict(X_test)
 The prediction matrix must have exactly `model.n_features` columns in training
 feature order. File label columns are excluded automatically during training;
 do not include the label as a prediction feature.
+
+### Labels do not fit the objective
+
+Training validates labels before the first round: `binary:logistic` needs
+labels in `[0, 1]`, `count:poisson` and `reg:tweedie` need non-negative labels,
+`reg:gamma` needs strictly positive labels, and multiclass objectives need
+integer labels in `[0, num_class)`.
+
+### A multiclass objective is missing `num_class`
+
+`multi:softprob` and `multi:softmax` need `num_class >= 2` in the parameters.
+`num_class` must also be larger than the largest label.
+
+### A metric does not fit the objective
+
+Binary metrics (`logloss`, `error`, `error@t`, `auc`, `aucpr`) require
+`binary:logistic`. `mlogloss` and `merror` require a multiclass objective, and
+multiclass objectives accept only those two. `tweedie-nloglik` must be written
+with its variance power, such as `tweedie-nloglik@1.5`.
+
+### All labels are zero with a log-link objective
+
+`count:poisson`, `reg:gamma`, and `reg:tweedie` start from `log(base_score)`, so
+`base_score` must be positive. The label mean is zero when every label is `0`,
+so pass an explicit positive value, for example `"base_score": 0.1`.
 
 ### Early stopping does not stop
 

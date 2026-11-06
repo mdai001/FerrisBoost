@@ -26,13 +26,20 @@ class Model:
         predict_threads: int = 0,
         use_gpu: bool = False,
     ) -> NDArray[np.float32]:
-        """Return ordered 1-D float32 predictions from an array or path specs.
+        """Return ordered float32 predictions from an array or path specs.
+
+        The result is 1-D with shape (n,), except for multiclass models:
+        multi:softprob returns (n, num_class) probabilities, multi:softmax
+        returns (n,) class indices (as float32), and output_margin=True returns
+        (n, num_class) raw margins for either multiclass objective.
 
         File inputs accept PathLike, lists, directories, and globs. Pass
         header=False for headerless CSV. All trees are used unless n_trees is
-        set; output_margin=True returns raw scores. predict_threads=0 selects
-        auto CPU workers. use_gpu=True permits GPU 0 scoring in CUDA builds,
-        with CPU selection for batches where GPU overhead is not worthwhile.
+        set; n_trees counts trees, so a multiclass model uses num_class trees
+        per boosting round. output_margin=True returns raw scores (before the
+        objective's transform). predict_threads=0 selects auto CPU workers.
+        use_gpu=True permits GPU 0 scoring in CUDA builds, with CPU selection
+        for batches where GPU overhead is not worthwhile.
         """
         ...
     def predict_to_parquet(
@@ -48,7 +55,11 @@ class Model:
     ) -> int:
         """CPU-score file inputs and write ordered float32 predictions to Parquet.
 
-        The target must not exist. Return the number of rows written.
+        The target must not exist. Return the number of rows written. Multiclass
+        models write columns {prediction_column}_0, {prediction_column}_1, ...
+        (multi:softprob or output_margin=True) or one class-index column
+        (multi:softmax); in this version that path builds the output in memory
+        and reads the input once per class.
         """
         ...
     def save_model(
