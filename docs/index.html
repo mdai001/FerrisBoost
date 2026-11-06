@@ -97,7 +97,18 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
-      <h3>0.0.3 (unreleased)</h3>
+      <h3>0.0.4</h3>
+      <ul>
+        <li>Added per-row sample weights (<code>weight=</code>), including weighted validation sets. Weights apply to gradients, metrics, and bin boundaries, as in XGBoost.</li>
+        <li>Added <code>params["eval_metric"]</code> with <code>rmse</code>, <code>logloss</code>, <code>error</code>, and <code>auc</code>.</li>
+        <li>Added <code>params["monotone_constraints"]</code> (XGBoost semantics; tuple, string, or by feature name), on CPU and GPU.</li>
+        <li>Fixed: validation files and pyarrow validation tables are now matched to the training features by column name. Previously they were matched by position, so a validation file with reordered columns produced wrong metrics and early stopping.</li>
+        <li>Fixed: an exception raised in a callback is no longer lost when more callbacks follow it.</li>
+        <li>Fixed: feature values of ±inf now raise a clear error instead of crashing, and very large finite values (near the f32 limit) train correctly.</li>
+        <li>Fixed: an empty validation set, duplicate column names, and sample weights whose sum overflows f32 now raise a clear error.</li>
+        <li>Fixed: loading a multi-target XGBoost model now raises an error instead of silently giving wrong predictions.</li>
+      </ul>
+      <h3>0.0.3</h3>
       <ul>
         <li>Improved data-loading and model I/O performance.</li>
         <li>Reduced prediction overhead and improved throughput.</li>
