@@ -249,7 +249,7 @@ logging, and the complete parameter reference.
 - Added objectives `count:poisson`, `reg:gamma`, `reg:tweedie` (`tweedie_variance_power`), and `reg:pseudohubererror` (`huber_slope`), on CPU and GPU.
 - Added multiclass objectives `multi:softprob` and `multi:softmax` (`num_class`): `predict` returns `(n, num_class)` probabilities or margins, or class indices for `multi:softmax`. Multiclass models interchange with XGBoost in both directions. In this version, file prediction for multiclass models reads the input once per class, and `predict_to_parquet` builds its output in memory.
 - Added metrics `mae`, `mape`, `mphe`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `error@t`, `aucpr`, `mlogloss`, and `merror`. `rmse` and the other pointwise metrics are computed on transformed predictions.
-- GPU: `gpu_math="exact"` stays byte-identical to CPU for all new objectives and parameters. `gpu_math="fast"` supports the new regression objectives; it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.
+- GPU: `gpu_math="exact"` stays byte-identical to CPU for all new objectives and parameters. `gpu_math="fast"` supports the new regression objectives and multiclass (device softmax gradients); it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.
 
 ### 0.0.4
 
