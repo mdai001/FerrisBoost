@@ -1710,7 +1710,7 @@ impl ParquetBlockSource {
             let batch = batch?;
             let n = batch.num_rows();
             for (local, &f) in feat_ids.iter().enumerate() {
-                let values = crate::source::arrow_source::column_as_f32(&batch, local)?;
+                let values = crate::source::arrow_source::feature_as_f32(&batch, local)?;
                 let dst = &mut out[local * n_rows + row_base..][..n];
                 for (slot, v) in dst.iter_mut().zip(values) {
                     // null 和 NaN 都是缺失

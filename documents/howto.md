@@ -339,7 +339,12 @@ validation columns are matched to the training features by name, so their order
 may differ. A validation table with missing or extra columns is rejected. NumPy
 arrays have no column names and are matched by position.
 
-Feature values must be finite or missing (`NaN`). Values of `±inf` are rejected
+Feature values must be finite or missing (`NaN`). The exact largest `float32`
+value (`numpy.finfo(numpy.float32).max`) is reserved for split boundaries and is
+rejected in training and validation features; rescale such a feature first.
+Finite values that overflow while computing gradients or Hessians produce a
+training error instead of being silently converted to fixed-point integers.
+Values of `±inf` are rejected
 during training, as in XGBoost.
 
 Early stopping watches the last configured metric of the last validation set,

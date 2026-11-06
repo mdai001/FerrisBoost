@@ -636,10 +636,9 @@ impl Model {
 /// 用 `f32::MIN` / `f32::MAX` 而不是 ±inf:JSON 里没有无穷,
 /// serde 会把它写成 `null`,XGBoost 读回来直接炸。
 ///
-/// 有限哨兵的代价只有一个:特征值**恰好等于** `f32::MAX` 时
-/// `v < MAX` 为假,这一行会走右边而不是训练时的左边。没有任何有限
-/// f32 比 `f32::MAX` 更大,换个数也躲不掉;真出现这种取值,分箱和
-/// 梯度早就先出问题了。
+/// f32::MAX is reserved as the finite upper sentinel. Raw feature inputs equal
+/// to it are rejected by the source adapters; otherwise strict raw comparisons
+/// would disagree with the nonmissing quantized partition at this boundary.
 pub fn split_threshold(cuts: &BinCuts, feat: FeatId, bin: u32) -> f32 {
     let c = cuts.cuts_for(feat);
     if bin == 0 {

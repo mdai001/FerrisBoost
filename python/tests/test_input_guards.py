@@ -161,12 +161,75 @@ def test_wide_range_finite_values_train_like_xgboost():
     x, y = data(400, 3)
     x = np.round(x * 2).astype(np.float32)
     x[:, 0] = np.where(x[:, 0] > 0, 2e38, -2e38).astype(np.float32)
-    x[:4, 2] = [-3.0e38, 3.0e38, np.finfo(np.float32).max, -np.finfo(np.float32).max]
+    below_max = np.nextafter(np.float32(np.finfo(np.float32).max), np.float32(0.0))
+    x[:4, 2] = [-3.0e38, 3.0e38, below_max, -np.finfo(np.float32).max]
     p = {**BASE, "base_score": 0.5, "max_bin": 255}
     ours = fb.train(p, x, label=y, num_boost_round=5, quiet=True).predict(x, output_margin=True)
     bst = xgb.train({**p, "tree_method": "hist"}, xgb.DMatrix(x, label=y), num_boost_round=5)
     assert np.isfinite(ours).all()
     np.testing.assert_array_equal(ours, bst.predict(xgb.DMatrix(x), output_margin=True))
+
+
+def test_exact_float32_max_feature_is_rejected_for_numpy_and_arrow():
+    x = np.array([[np.finfo(np.float32).max], [1.0]], dtype=np.float32)
+    y = np.array([1.0, 0.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="f32::MAX"):
+        fb.train(BASE, x, label=y, num_boost_round=1, quiet=True)
+
+    pa = pytest.importorskip("pyarrow")
+    table = pa.table({"f0": x[:, 0]})
+    with pytest.raises(Exception, match="f32::MAX"):
+        fb.train(BASE, table, label=y, num_boost_round=1, quiet=True)
+
+
+@pytest.mark.parametrize("fmt", ["csv", "parquet"])
+def test_exact_float32_max_feature_is_rejected_from_training_file(tmp_path, fmt):
+    values = np.array([[np.finfo(np.float32).max], [1.0]], dtype=np.float32)
+    labels = np.array([1.0, 0.0], dtype=np.float32)
+    path = tmp_path / f"max.{fmt}"
+    WRITERS[fmt](path, values, labels)
+
+    with pytest.raises(Exception, match="f32::MAX"):
+        fb.train(BASE, str(path), label="label", num_boost_round=1, quiet=True)
+
+
+@pytest.mark.parametrize("fmt", ["csv", "parquet"])
+def test_exact_float32_max_feature_is_rejected_from_eval_file_with_training_cuts(
+    tmp_path, fmt
+):
+    safe = np.array([[1.0], [2.0]], dtype=np.float32)
+    bad = np.array([[np.finfo(np.float32).max], [3.0]], dtype=np.float32)
+    labels = np.array([1.0, 0.0], dtype=np.float32)
+    train_path = tmp_path / f"train.{fmt}"
+    eval_path = tmp_path / f"eval.{fmt}"
+    WRITERS[fmt](train_path, safe, labels)
+    WRITERS[fmt](eval_path, bad, labels)
+
+    with pytest.raises(Exception, match="f32::MAX"):
+        fb.train(
+            BASE,
+            str(train_path),
+            label="label",
+            num_boost_round=1,
+            evals=[(str(eval_path), "validation")],
+            quiet=True,
+        )
+
+
+def test_exact_float32_max_feature_is_rejected_from_numpy_eval():
+    train_x = np.array([[1.0], [2.0]], dtype=np.float32)
+    eval_x = np.array([[np.finfo(np.float32).max], [3.0]], dtype=np.float32)
+    labels = np.array([1.0, 0.0], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="f32::MAX"):
+        fb.train(
+            BASE,
+            train_x,
+            label=labels,
+            num_boost_round=1,
+            evals=[(eval_x, labels, "validation")],
+            quiet=True,
+        )
 
 
 def test_empty_eval_set_is_rejected():

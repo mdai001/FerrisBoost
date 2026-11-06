@@ -214,6 +214,7 @@ impl DenseSource {
                     let dst = &mut block[local * n_rows..(local + 1) * n_rows];
                     for (row, slot) in dst.iter_mut().enumerate() {
                         let v = data[row * n_features + f as usize];
+                        assert!(v != f32::MAX, "feature contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
                         // NaN 是唯一的缺失表示。find_bin 不接受 NaN
                         // (partition_point 的比较对 NaN 永远是 false,
                         // 会静默落到 bin 0),所以必须在这里拦掉。

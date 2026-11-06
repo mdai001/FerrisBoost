@@ -2817,10 +2817,10 @@ fn finish(
 
 /// 特征里的 ±inf 直接拒绝(XGBoost 同样拒绝);缺失值要用 NaN。
 fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
-    match data.iter().position(|v| v.is_infinite()) {
+    match data.iter().position(|v| v.is_infinite() || *v == f32::MAX) {
         None => Ok(()),
         Some(i) => Err(PyValueError::new_err(format!(
-            "{what}第 {} 行第 {} 列是 {}:特征不能是 ±inf(缺失值请用 NaN)",
+            "{what}第 {} 行第 {} 列是 {}:特征不能是 ±inf 或保留的 f32::MAX(缺失值请用 NaN;极端值请先缩放)",
             i / n_features.max(1),
             i % n_features.max(1),
             data[i]

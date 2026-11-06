@@ -31,7 +31,7 @@ pub(crate) fn column_as_f32(batch: &RecordBatch, col: usize) -> anyhow::Result<V
 /// 训练入口用 `column_as_f32`,它拒绝 ±inf。
 pub(crate) fn column_as_f32_allow_inf(batch: &RecordBatch, col: usize) -> anyhow::Result<Vec<f32>> {
     let mut output = Vec::with_capacity(batch.num_rows());
-    visit_column_f32::<false>(batch, col, |value| output.push(value))?;
+    visit_column_f32::<false, false>(batch, col, |value| output.push(value))?;
     Ok(output)
 }
 
@@ -44,10 +44,26 @@ pub(crate) fn for_each_column_f32(
     col: usize,
     visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    visit_column_f32::<true>(batch, col, visit)
+    visit_column_f32::<true, false>(batch, col, visit)
 }
 
-fn visit_column_f32<const REJECT_INF: bool>(
+/// Features reserve f32::MAX for the finite missing/nonmissing split sentinel.
+/// Labels and weights use the ordinary numeric visitor and are not restricted.
+pub(crate) fn for_each_feature_f32(
+    batch: &RecordBatch,
+    col: usize,
+    visit: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    visit_column_f32::<true, true>(batch, col, visit)
+}
+
+pub(crate) fn feature_as_f32(batch: &RecordBatch, col: usize) -> anyhow::Result<Vec<f32>> {
+    let mut output = Vec::with_capacity(batch.num_rows());
+    for_each_feature_f32(batch, col, |value| output.push(value))?;
+    Ok(output)
+}
+
+fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
     batch: &RecordBatch,
     col: usize,
     mut visit: impl FnMut(f32),
@@ -62,6 +78,7 @@ fn visit_column_f32<const REJECT_INF: bool>(
                 .downcast_ref::<$ty>()
                 .expect("类型已经 match 过了");
             let mut any_inf = false;
+            let mut any_max = false;
             for i in 0..n {
                 let v = if values.is_null(i) {
                     f32::NAN
@@ -69,7 +86,11 @@ fn visit_column_f32<const REJECT_INF: bool>(
                     values.value(i) as f32
                 };
                 any_inf |= v.is_infinite();
+                if REJECT_MAX { any_max |= v == f32::MAX; }
                 visit(v);
+            }
+            if REJECT_MAX && any_max {
+                anyhow::bail!("feature column {col} contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
             }
             if REJECT_INF && any_inf {
                 let i = (0..n)
@@ -183,10 +204,10 @@ pub(crate) fn build_cuts_and_count_weighted(
             None
         };
         let push_column = |col: usize, sketch: &mut crate::sketch::FeatureSketch| match &weights {
-            None => for_each_column_f32(&batch, col, |value| sketch.push(value, 1.0)),
+            None => for_each_feature_f32(&batch, col, |value| sketch.push(value, 1.0)),
             Some(w) => {
                 let mut row = 0usize;
-                for_each_column_f32(&batch, col, |value| {
+                for_each_feature_f32(&batch, col, |value| {
                     sketch.push(value, w[row]);
                     row += 1;
                 })
@@ -279,7 +300,7 @@ pub fn quantize_with_nthread(
                     for (local, &f) in feats.iter().enumerate() {
                         let dst = &mut block[local];
                         dst.reserve(batch.num_rows());
-                        for_each_column_f32(&batch, f as usize, |value| {
+                        for_each_feature_f32(&batch, f as usize, |value| {
                             // null and NaN share the missing sentinel.
                             dst.push(if value.is_nan() {
                                 MISSING_BIN
@@ -377,7 +398,7 @@ fn quantize_with_nthread_known_rows(
                         let start = local * n_rows + row_offset;
                         let output = &mut block.data[start..start + batch_rows];
                         let mut index = 0usize;
-                        for_each_column_f32(&batch, feature as usize, |value| {
+                        for_each_feature_f32(&batch, feature as usize, |value| {
                             output[index] = if value.is_nan() {
                                 MISSING_BIN
                             } else {
