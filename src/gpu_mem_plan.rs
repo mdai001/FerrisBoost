@@ -28,6 +28,22 @@ pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usiz
     (blocks, blocks + PARTITION_BATCH_CAPACITY)
 }
 
+/// `gpu_math = "fast"` 多分类(`n_outputs = K > 1`)比单输出多出来的 device 字节数:
+/// - prediction 从 `n` 个 f32 变成 `K × n`(class-major),多 `(K-1) × n × 4`;
+/// - 每行 softmax 的 `wmax` 与 `(float)wsum`,各一个 f32:`n × 8`。
+///   它们让每个类的 gradient kernel 只读自己那一列 prediction(而不是 K 列),
+///   也让「第 k 棵树的 delta 立刻施加」不会影响同一轮里后面各类的梯度。
+///
+/// 规划器和 `GpuTrainCtx::new` **都调用这一个函数**,所以两边不可能漂移。
+/// 单输出(`K <= 1`)恒为 0。
+pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
+    if n_outputs <= 1 {
+        0
+    } else {
+        n_rows * 4 * (n_outputs - 1) + n_rows * 8
+    }
+}
+
 /// 一次训练的 streaming 显存模型。所有单位都是字节。
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
@@ -111,6 +127,14 @@ impl StreamingMemModel {
     /// host 加权,调用方不得在 exact 下调用它(memory model = 实际路径)。
     pub fn with_fast_weights(mut self, n_rows: u64) -> Self {
         self.fixed_bytes += n_rows * 4;
+        self
+    }
+
+    /// `gpu_math = "fast"` 多分类:K 份常驻 prediction + 每行 softmax 统计量。
+    /// 与 `GpuTrainCtx` 的 `multiclass_bytes` 一一对应(同一个
+    /// [`fast_multiclass_extra_bytes`]);单输出或 exact 下不得调用(等价于加 0)。
+    pub fn with_fast_multiclass(mut self, n_rows: u64, n_outputs: u64) -> Self {
+        self.fixed_bytes += fast_multiclass_extra_bytes(n_rows, n_outputs);
         self
     }
 
@@ -1008,6 +1032,52 @@ mod resolve_tests {
         assert_eq!(weighted.fixed_bytes, base.fixed_bytes + 4_000_000);
         assert_eq!(weighted.per_col_bytes, base.per_col_bytes);
         assert_eq!(weighted.slot_col_bytes, base.slot_col_bytes);
+    }
+
+    #[test]
+    fn fast_multiclass_adds_k_minus_one_predictions_plus_softmax_stats() {
+        let rows = 1_000_000u64;
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        // 单输出:不收任何费用。
+        assert_eq!(
+            base.with_fast_multiclass(rows, 1).fixed_bytes,
+            base.fixed_bytes
+        );
+        for k in [2u64, 5, 7, 100] {
+            let mc = base.with_fast_multiclass(rows, k);
+            // (K-1) × 4 B 额外 prediction + 8 B/行 wmax/wsum。
+            assert_eq!(
+                mc.fixed_bytes,
+                base.fixed_bytes + rows * 4 * (k - 1) + rows * 8
+            );
+            assert_eq!(
+                mc.fixed_bytes - base.fixed_bytes,
+                fast_multiclass_extra_bytes(rows, k)
+            );
+            // 只加 O(行数) 固定部分,不碰随列块宽走的部分。
+            assert_eq!(mc.per_col_bytes, base.per_col_bytes);
+            assert_eq!(mc.slot_col_bytes, base.slot_col_bytes);
+        }
+        // 与样本权重(+4 B/行)可叠加,互不影响。
+        let both = base.with_fast_weights(rows).with_fast_multiclass(rows, 5);
+        assert_eq!(
+            both.fixed_bytes,
+            base.fixed_bytes + rows * 4 + fast_multiclass_extra_bytes(rows, 5)
+        );
+    }
+
+    #[test]
+    fn fast_multiclass_cost_can_make_the_planner_fail_loudly() {
+        // 同一预算下:单输出放得下,K 很大的 fast 多分类放不下 -> 报错,不静默回退。
+        let rows = 50_000_000u64;
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let free = base.peak_for(1) + 64 * 1024 * 1024;
+        assert!(base.solve_cols(free, 28).is_some());
+        let mc = base.with_fast_multiclass(rows, 20);
+        assert!(mc.solve_cols(free, 28).is_none());
+        // 规划入口把 `solve_cols == None` 变成明确的错误(见
+        // `resolve_gpu_streaming_cols_per_block`),这里钉住新预算项确实参与了判定。
+        assert!(mc.peak_for(1) > free);
     }
 
     #[test]

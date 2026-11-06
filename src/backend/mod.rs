@@ -32,6 +32,7 @@ pub mod cuda {
         pub gpu_split_cache: bool,
         pub gpu_math: crate::types::GpuMath,
         pub fast_weights: bool,
+        pub n_outputs: usize,
     }
     impl Default for SharedHistogramConfig {
         fn default() -> Self {
@@ -45,6 +46,7 @@ pub mod cuda {
                 gpu_split_cache: crate::types::DEFAULT_GPU_SPLIT_CACHE,
                 gpu_math: crate::types::GpuMath::Exact,
                 fast_weights: false,
+                n_outputs: 1,
             }
         }
     }
@@ -138,8 +140,23 @@ pub mod cuda {
             &self,
             _labels: &[f32],
             _weights: Option<&[f32]>,
-            _margin: f32,
+            _margins: &[f32],
         ) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn fast_multiclass_begin_round(&self) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn fast_multiclass_gradient_and_quantize(
+            &self,
+            _class: usize,
+            _threshold: u64,
+            _seed: u64,
+            _tree: u64,
+        ) -> Result<(crate::types::GradQuantizer, GradPairFixed, f32)> {
+            match self.0 {}
+        }
+        pub fn fast_multiclass_apply_delta(&self, _class: usize) -> Result<()> {
             match self.0 {}
         }
         pub fn fast_gradient_and_quantize(

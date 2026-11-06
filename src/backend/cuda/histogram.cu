@@ -629,6 +629,99 @@ extern "C" __global__ void apply_delta_and_gradient(
 }
 
 
+// ---------------------------------------------------------------- 多分类 fast
+//
+// `gpu_math = "fast"` 的 multi:softprob / multi:softmax。prediction 是 class-major
+// 的 `K × n`(`pred[k * n + i]`),所以每个类的 prediction 列、delta 施加都是连续访问。
+//
+// 一轮的流程(host 在 `train_multiclass_rounds` 里驱动):
+//   1. `softmax_row_stats`  —— 读 K 列旧 prediction,每行只算一次 wmax 和 (float)wsum;
+//   2. 对每个类 k:`softmax_class_gradient` 只读 pred 的第 k 列 + 上面两个统计量,
+//      写出 interleaved [grad, hess] 的 f32 gpair(并按行采样置零),走通用的
+//      max → scale → 定点量化尾巴,建第 k 棵树;
+//   3. `add_class_delta` 把这棵树的叶子增量加到第 k 列。
+// 第 k 类的梯度只依赖「这一轮开始时」的 K 个 margin。第 k 列在第 k 棵树之前不会变,
+// 其余列 wmax / wsum 已经固化在统计量里,所以第 k 棵树之后立刻施加 delta,
+// 不会改变同一轮里后面各类的梯度 —— 和 XGBoost「一轮一次 GetGradient」一致。
+//
+// 公式逐步对应 `Objective::softmax_gradients`(XGBoost `SoftmaxMultiClassObj`):
+// wmax 从 FLT_MIN(最小正规格化数)起取 fmaxf,wsum 在 double 里按类序累加,
+// p = expf(m - wmax) / (float)wsum,h = max(2p(1-p)w, 1e-16),g = (p - [y==k]) w。
+// 不保证与 host 逐位相同(CUDA expf),但每步算术用显式 _rn,不允许编译器 FMA 收缩;
+// 没有浮点原子操作,每行只有一个写者,所以结果逐次运行确定。
+extern "C" __global__ void softmax_row_stats(
+    const float* pred,
+    uint32_t n_rows,
+    uint32_t n_classes,
+    float* wmax_out,
+    float* wsum_out) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        float wmax = 1.17549435e-38f;  // FLT_MIN
+        for (uint32_t k = 0; k < n_classes; ++k) {
+            wmax = fmaxf(pred[(uint64_t)k * n_rows + i], wmax);
+        }
+        double wsum = 0.0;
+        for (uint32_t k = 0; k < n_classes; ++k) {
+            wsum = __dadd_rn(wsum, (double)expf(__fsub_rn(pred[(uint64_t)k * n_rows + i], wmax)));
+        }
+        wmax_out[i] = wmax;
+        wsum_out[i] = __double2float_rn(wsum);
+    }
+}
+
+extern "C" __global__ void softmax_class_gradient(
+    const float* pred,
+    const float* wmax,
+    const float* wsum,
+    const float* label,
+    const float* weight,
+    uint32_t has_weight,
+    uint32_t n_rows,
+    uint32_t class_id,
+    float* gpair_out,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        const float m = pred[(uint64_t)class_id * n_rows + i];
+        float p = __fdiv_rn(expf(__fsub_rn(m, wmax[i])), wsum[i]);
+        const float w = has_weight ? weight[i] : 1.0f;
+        float h = fmaxf(
+            __fmul_rn(__fmul_rn(__fmul_rn(2.0f, p), __fsub_rn(1.0f, p)), w), 1e-16f);
+        if (label[i] == (float)class_id) { p = __fsub_rn(p, 1.0f); }
+        float g = __fmul_rn(p, w);
+        // 与 `apply_delta_and_gradient` 相同的整数行采样:未选中行只把工作
+        // gpair 置零。prediction 的更新在别的 kernel 里,无条件执行。
+        if (subsample_threshold != ~0ULL) {
+            const unsigned long long hsh = fb_mix(
+                subsample_seed
+                ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
+                   | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
+                ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
+            if ((hsh >> 11) >= subsample_threshold) {
+                g = 0.0f;
+                h = 0.0f;
+            }
+        }
+        gpair_out[(uint64_t)i * 2] = g;
+        gpair_out[(uint64_t)i * 2 + 1] = h;
+    }
+}
+
+extern "C" __global__ void add_class_delta(
+    float* pred,
+    const float* delta,
+    uint32_t n_rows,
+    uint32_t class_id) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        float* slot = pred + (uint64_t)class_id * n_rows + i;
+        *slot = __fadd_rn(*slot, delta[i]);
+    }
+}
+
 extern "C" __global__ void gpair_max_abs(
     float* gpair,
     uint32_t n_rows,

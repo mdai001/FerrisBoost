@@ -38,6 +38,19 @@ if actual_version != expected_directive:
     raise SystemExit(f"ERROR: expected {expected_directive}, found {actual_version}")
 new = "\n".join(line.rstrip() for line in new.splitlines()) + "\n"
 
+# nvcc names internal-linkage symbols `_INTERNAL_<8 hex>_<file>_cu_...`, where the
+# hash depends on the absolute source path. It only appears in debug-info name
+# strings (encoded as decimal .b8 bytes) but makes the PTX differ between
+# checkouts. Pin it to a constant so regeneration is path-independent.
+_PINNED_ID = "73eb3007"
+_INTERNAL_PREFIX = ",".join(str(b) for b in b"_INTERNAL_")
+_PINNED_BYTES = ",".join(str(b) for b in (_PINNED_ID + "_").encode())
+new = re.sub(
+    rf"({re.escape(_INTERNAL_PREFIX)},)(?:\d+,){{8}}95\b",
+    lambda m: m.group(1) + _PINNED_BYTES,
+    new,
+)
+
 source = open(src, "rb").read()
 fnv = 0xcbf29ce484222325
 for byte in source:

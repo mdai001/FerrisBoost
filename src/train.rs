@@ -1214,7 +1214,7 @@ fn train_with_backend(
     if fast_math {
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
-            .init_fast_math(labels, grad_weights, margin)?;
+            .init_fast_math(labels, grad_weights, std::slice::from_ref(&margin))?;
     }
 
     if num_class > 1 {

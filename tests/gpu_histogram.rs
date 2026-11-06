@@ -1292,6 +1292,7 @@ fn shared_histogram_tiles_features_and_rows() {
             gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
             fast_weights: false,
+            n_outputs: 1,
             threads_per_block: 64,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -1375,6 +1376,7 @@ fn atomic32_layout_is_bit_exact_when_low_word_overflows() {
             gpu_split_cache: false,
             gpu_math: ferrisboost::types::GpuMath::Exact,
             fast_weights: false,
+            n_outputs: 1,
             threads_per_block: 256,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -2680,5 +2682,252 @@ fn monotone_training_is_cpu_gpu_byte_identical() {
                 "{what}: 约束应该真的改变模型"
             );
         }
+    }
+}
+
+// ------------------------------------------------------------ 多分类 fast
+
+fn multiclass_fixture(
+    n_rows: usize,
+    n_feats: usize,
+    k: usize,
+) -> (DenseSource, Vec<f32>, Vec<f32>) {
+    let data: Vec<f32> = (0..n_rows)
+        .flat_map(|row| {
+            (0..n_feats).map(move |feat| {
+                if (row * 7 + feat) % 29 == 0 {
+                    f32::NAN
+                } else {
+                    ((row * 13 + feat * 11) % 41) as f32
+                }
+            })
+        })
+        .collect();
+    let labels: Vec<f32> = (0..n_rows)
+        .map(|row| {
+            let s = ((row * 13) % 41) + ((row * 5) % 7);
+            (s * k / 48).min(k - 1) as f32
+        })
+        .collect();
+    let weights: Vec<f32> = (0..n_rows)
+        .map(|row| [0.5, 1.0, 2.0, 0.25, 3.0][(row * 3) % 5])
+        .collect();
+    (
+        DenseSource::from_row_major(&data, n_rows, n_feats, 32, 3),
+        labels,
+        weights,
+    )
+}
+
+/// 多分类 fast 的梯度 kernel 对拍 host `softmax_gradients`:同一份初始 margin 下,
+/// 每个类的量化 scale 必须相同(pow2,对 ULP 级差异不敏感),root sum 只差
+/// 量化舍入。同时钉住行采样(键 = 树序号)与 host 选同一批行。
+#[test]
+fn gpu_multiclass_fast_gradient_matches_host_softmax() {
+    use ferrisboost::types::{GradPair, GradQuantizer, Objective};
+    let k = 5usize;
+    let n_rows = 3000usize;
+    let (_, labels, weights) = multiclass_fixture(n_rows, 4, k);
+    let obj = Objective::Softprob {
+        num_class: k as u32,
+    };
+    let margins: Vec<f32> = (0..k).map(|c| 0.3 * c as f32 - 0.7).collect();
+    let config = SharedHistogramConfig {
+        runtime_log: false,
+        gpu_math: ferrisboost::types::GpuMath::Fast,
+        fast_weights: true,
+        n_outputs: k,
+        ..Default::default()
+    };
+    let ctx = GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
+    ctx.init_fast_math(&labels, Some(&weights), &margins)
+        .unwrap();
+    // 初始化后 device prediction 是 class-major 的 K 份 base margin。
+    let mut dev = vec![0.0f32; n_rows * k];
+    ctx.sync_prediction_to_host(&mut dev).unwrap();
+    for c in 0..k {
+        assert!(dev[c * n_rows..(c + 1) * n_rows]
+            .iter()
+            .all(|&v| v == margins[c]));
+    }
+
+    let class_preds: Vec<Vec<f32>> = margins.iter().map(|&m| vec![m; n_rows]).collect();
+    let mut host: Vec<Vec<GradPair>> = vec![Vec::new(); k];
+    obj.softmax_gradients(&class_preds, &labels, Some(&weights), &mut host);
+
+    ctx.fast_multiclass_begin_round().unwrap();
+    for (rate, class) in [(1.0f32, 0usize), (1.0, 3), (0.6, 2)] {
+        let tree = (7 * k + class) as u64;
+        let threshold = ferrisboost::subsample::threshold_for(rate);
+        let mut col = host[class].clone();
+        if rate < 1.0 {
+            for (i, g) in col.iter_mut().enumerate() {
+                if !ferrisboost::subsample::row_selected(i as u64, threshold, 11, tree) {
+                    *g = GradPair {
+                        grad: 0.0,
+                        hess: 0.0,
+                    };
+                }
+            }
+        }
+        let hq = GradQuantizer::new(&col, n_rows);
+        let host_sum = col.iter().fold(GradPairFixed::default(), |mut acc, &g| {
+            let f = hq.to_fixed(g);
+            acc.grad += f.grad;
+            acc.hess += f.hess;
+            acc
+        });
+        let (dq, dsum, _) = ctx
+            .fast_multiclass_gradient_and_quantize(class, threshold, 11, tree)
+            .unwrap();
+        assert_eq!(dq.grad_scale(), hq.grad_scale(), "class {class} grad scale");
+        assert_eq!(dq.hess_scale(), hq.hess_scale(), "class {class} hess scale");
+        let tol = n_rows as i64; // 每行最多差一个定点单位
+        assert!(
+            (dsum.grad - host_sum.grad).abs() <= tol && (dsum.hess - host_sum.hess).abs() <= tol,
+            "class {class} rate {rate}: device {dsum:?} vs host {host_sum:?}"
+        );
+    }
+    // 越界类别明确报错,单输出入口拒绝多分类。
+    assert!(ctx
+        .fast_multiclass_gradient_and_quantize(k, u64::MAX, 0, 0)
+        .is_err());
+    assert!(ctx
+        .fast_gradient_and_quantize(Objective::Logistic, u64::MAX, 0, 0)
+        .is_err());
+}
+
+/// 多分类 fast 训练:逐次确定,和 exact(= CPU 字节)接近,覆盖 K=2/3/7、权重、
+/// 行/列采样、单调约束、streaming/resident 两种布局。
+#[test]
+fn gpu_multiclass_fast_is_deterministic_and_close_to_exact() {
+    use ferrisboost::types::{GpuMath, Objective, TrainParams};
+    for k in [2usize, 3, 7] {
+        let n_rows = 2400usize;
+        let n_feats = 6usize;
+        let (source, labels, weights) = multiclass_fixture(n_rows, n_feats, k);
+        for (weighted, subsample, colsample, monotone, resident) in [
+            (false, 1.0f32, 1.0f32, vec![], None),
+            (true, 0.75, 0.7, vec![], Some(0usize)),
+            (true, 1.0, 1.0, vec![1i8, -1, 0, 0, 0, 1], None),
+        ] {
+            let what = format!(
+                "k={k} weighted={weighted} subsample={subsample} colsample={colsample} \
+                 monotone={monotone:?} resident={resident:?}"
+            );
+            let run = |math: GpuMath| {
+                let params = TrainParams {
+                    n_rounds: 4,
+                    max_depth: 4,
+                    max_bin: 32,
+                    cols_per_block: 3,
+                    nthread: 1,
+                    subsample,
+                    colsample_bytree: colsample,
+                    monotone_constraints: monotone.clone(),
+                    resident_blocks: resident,
+                    seed: 6,
+                    gpu_math: math,
+                    ..Default::default()
+                };
+                let cfg = TrainConfig::new(
+                    params,
+                    Objective::Softprob {
+                        num_class: k as u32,
+                    },
+                );
+                train_gpu_weighted(
+                    0,
+                    &source,
+                    &labels,
+                    weighted.then_some(&weights[..]),
+                    &[],
+                    &cfg,
+                    &mut [],
+                    &Local,
+                )
+                .unwrap()
+            };
+            let exact = run(GpuMath::Exact);
+            let fast = run(GpuMath::Fast);
+            let again = run(GpuMath::Fast);
+            assert_eq!(
+                fast.to_xgboost_json().unwrap(),
+                again.to_xgboost_json().unwrap(),
+                "{what}: fast 必须逐次确定"
+            );
+            assert_eq!(fast.trees.len(), 4 * k, "{what}");
+            // 所有行都收到了 delta(采样不是预测掩码):margin 和 exact 接近。
+            let row = |i: usize| -> Vec<f32> {
+                (0..n_feats)
+                    .map(|f| {
+                        if (i * 7 + f).is_multiple_of(29) {
+                            f32::NAN
+                        } else {
+                            ((i * 13 + f * 11) % 41) as f32
+                        }
+                    })
+                    .collect()
+            };
+            let mut max_diff = 0.0f32;
+            for i in (0..n_rows).step_by(7) {
+                let a = fast.predict_margins_upto(&row(i), usize::MAX);
+                let b = exact.predict_margins_upto(&row(i), usize::MAX);
+                for (x, y) in a.iter().zip(&b) {
+                    max_diff = max_diff.max((x - y).abs());
+                }
+            }
+            assert!(
+                max_diff < 5e-3,
+                "{what}: fast 与 exact 的 margin 差 {max_diff}"
+            );
+        }
+    }
+}
+
+/// 预算:运行时的 `multiclass_bytes`、回显和规划器的 `with_fast_multiclass`
+/// 必须是同一个数;exact 与单输出不收费。
+#[test]
+fn gpu_multiclass_fast_budget_matches_planner_and_echo() {
+    use ferrisboost::gpu_mem_plan::StreamingMemModel;
+    use ferrisboost::types::GpuMath;
+    let n_rows = 5000usize;
+    let ctx_for = |math: GpuMath, k: usize| {
+        let config = SharedHistogramConfig {
+            runtime_log: false,
+            gpu_math: math,
+            n_outputs: k,
+            ..Default::default()
+        };
+        GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap()
+    };
+    let single = ctx_for(GpuMath::Fast, 1);
+    assert_eq!(single.budget().multiclass_bytes, 0);
+    assert!(!single.path_summary().contains("multiclass"));
+    let exact = ctx_for(GpuMath::Exact, 7);
+    assert_eq!(exact.budget().multiclass_bytes, 0);
+    assert_eq!(
+        exact.budget().total(),
+        ctx_for(GpuMath::Exact, 1).budget().total()
+    );
+    assert!(!exact.path_summary().contains("multiclass"));
+
+    for k in [2usize, 5, 7] {
+        let ctx = ctx_for(GpuMath::Fast, k);
+        let extra = n_rows * 4 * (k - 1) + n_rows * 8;
+        let b = ctx.budget();
+        assert_eq!(b.multiclass_bytes, extra);
+        assert_eq!(b.total(), single.budget().total() + extra);
+        assert_eq!(b.per_row_bytes(), single.budget().per_row_bytes() + extra);
+        assert!(b.report().contains("multiclass"));
+        let echo = ctx.path_summary();
+        assert!(
+            echo.contains(&format!("multiclass_outputs={k} multiclass_bytes={extra}")),
+            "{echo}"
+        );
+        // 规划器用同一个公式。
+        let base = StreamingMemModel::new(n_rows as u64, 32, 1, 16, true, true, true, 0);
+        let planned = base.with_fast_multiclass(n_rows as u64, k as u64);
+        assert_eq!(planned.fixed_bytes - base.fixed_bytes, extra as u64);
     }
 }

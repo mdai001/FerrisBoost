@@ -84,6 +84,10 @@ pub struct GpuMemoryBudget {
     pub hist_nodes_batch_idx_bytes: usize,
     /// `gpu_math = "fast"` 的常驻 prediction + label,各 O(行数)。exact 下为 0。
     pub fast_math_bytes: usize,
+    /// `gpu_math = "fast"` 多分类(K > 1)比单输出多出来的部分:`(K-1)` 份常驻
+    /// prediction + 每行 softmax 的 wmax/wsum。单输出或 exact 下为 0。
+    /// 公式见 `gpu_mem_plan::fast_multiclass_extra_bytes`(规划器同用)。
+    pub multiclass_bytes: usize,
     /// 行主序原型的转置暂存区(一块,不随 resident 块数增长)。关闭时为 0。
     pub rm_stage_bytes: usize,
     pub offsets_bytes: usize,
@@ -144,6 +148,7 @@ impl GpuMemoryBudget {
             + self.gpair_f32_bytes
             + self.hist_nodes_batch_idx_bytes
             + self.fast_math_bytes
+            + self.multiclass_bytes
             + self.rm_stage_bytes
             + self.hist_feature_select_bytes
     }
@@ -158,6 +163,7 @@ impl GpuMemoryBudget {
             + self.prediction_bytes
             + self.gpair_f32_bytes
             + self.fast_math_bytes
+            + self.multiclass_bytes
     }
 
     pub fn report(&self) -> String {
@@ -165,7 +171,7 @@ impl GpuMemoryBudget {
         format!(
             "预分配显存 {:.1} MB({} 条 histogram stream) = gpair {:.1} + row_idx {:.1} + partition 输出 {:.1} \
              + partition 临时 {:.1} + partition 取列 {:.1} + 列块 buffer {:.1} \
-             + 直方图 {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
+             + 直方图 {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + multiclass {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -182,6 +188,7 @@ impl GpuMemoryBudget {
             mb(self.gpair_f32_bytes),
             mb(self.hist_nodes_batch_idx_bytes),
             mb(self.fast_math_bytes),
+            mb(self.multiclass_bytes),
             mb(self.rm_stage_bytes),
             mb(self.per_row_bytes()),
         )
@@ -369,6 +376,10 @@ struct GpuBuffers {
     label_resident: Option<CudaSlice<f32>>,
     /// `gpu_math = "fast"` 且带样本权重:权重常驻 device,只上传一次。
     weight_resident: Option<CudaSlice<f32>>,
+    /// 多分类 fast:每行 softmax 的 wmax / (float)wsum,每轮开头算一次,
+    /// 同一轮里 K 个类的梯度 kernel 共用。
+    mc_wmax: Option<CudaSlice<f32>>,
+    mc_wsum: Option<CudaSlice<f32>>,
     /// 当前节点的行索引。
     rows: CudaSlice<u32>,
     part_col: CudaSlice<u8>,
@@ -527,6 +538,14 @@ pub struct GpuTrainCtx {
     hist_batched_fn: Option<CudaFunction>,
     /// `gpu_math = "fast"` 的 prediction-apply + gradient kernel。
     apply_grad_fn: Option<CudaFunction>,
+    /// `gpu_math = "fast"` 多分类(`n_outputs > 1`)的三个 kernel:
+    /// 每行 softmax 统计量、单类梯度、单类 delta 施加。单输出时为 `None`。
+    mc_stats_fn: Option<CudaFunction>,
+    mc_grad_fn: Option<CudaFunction>,
+    mc_delta_fn: Option<CudaFunction>,
+    /// 每行输出数 K(多分类 = `num_class`,其余 1)。决定常驻 prediction 的
+    /// 形状 `K × n`;规划器按同一个数计费。
+    n_outputs: usize,
     /// GPU-local row-major 原型:转置、行主序 histogram、行主序取列。
     /// 三个要么都有要么都没有。
     rm_transpose_fn: Option<CudaFunction>,
@@ -708,6 +727,24 @@ impl GpuTrainCtx {
         } else {
             None
         };
+        // 多分类 fast 的三个 kernel。只有 Fast 且 K > 1 才加载;exact 的多分类
+        // 在 host 算梯度,device 不需要知道 K。
+        let n_outputs = config.n_outputs.max(1);
+        let multiclass_fast = fast_math && n_outputs > 1;
+        let load_mc = |name: &str| -> Result<Option<CudaFunction>> {
+            if !multiclass_fast {
+                return Ok(None);
+            }
+            Ok(Some(
+                state
+                    .module
+                    .load_function(name)
+                    .with_context(|| format!("PTX 中找不到 {name}"))?,
+            ))
+        };
+        let mc_stats_fn = load_mc("softmax_row_stats")?;
+        let mc_grad_fn = load_mc("softmax_class_gradient")?;
+        let mc_delta_fn = load_mc("add_class_delta")?;
         // GPU-local row-major 原型。**只是 GPU 侧的表示**:Parquet / Arrow /
         // host 量化 cache / FFI 一个都不动,列块照旧按列主序上传,上传后在
         // device 上转置一次。
@@ -1261,11 +1298,13 @@ impl GpuTrainCtx {
 
         // fast 模式的两块常驻 O(行数) buffer。必须登记进预算 ——
         // 「每一项预分配都必须出现在预算报告里」。
+        // prediction 是 class-major 的 `K × n`(K = 1 时和以前完全一样)。
+        // 多出来的 `(K-1) × n` 和 softmax 统计量记在 `multiclass_bytes`。
         let (pred_resident, label_resident) = if fast_math {
             (
                 Some(
                     stream
-                        .alloc_zeros::<f32>(n_rows.max(1))
+                        .alloc_zeros::<f32>((n_rows * n_outputs).max(1))
                         .context("fast pred 分配")?,
                 ),
                 Some(
@@ -1276,6 +1315,28 @@ impl GpuTrainCtx {
             )
         } else {
             (None, None)
+        };
+        let (mc_wmax, mc_wsum) = if multiclass_fast {
+            (
+                Some(
+                    stream
+                        .alloc_zeros::<f32>(n_rows.max(1))
+                        .context("多分类 softmax wmax 分配")?,
+                ),
+                Some(
+                    stream
+                        .alloc_zeros::<f32>(n_rows.max(1))
+                        .context("多分类 softmax wsum 分配")?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
+        let multiclass_bytes = if fast_math {
+            crate::gpu_mem_plan::fast_multiclass_extra_bytes(n_rows as u64, n_outputs as u64)
+                as usize
+        } else {
+            0
         };
         let fast_weight_bytes = if fast_math && config.fast_weights {
             n_rows * 4
@@ -1294,6 +1355,7 @@ impl GpuTrainCtx {
         // 行主序转置的落地区:H2D 先进这里(列主序),转置后写进 slot.bins
         let budget = GpuMemoryBudget {
             fast_math_bytes: if fast_math { n_rows * 4 * 2 } else { 0 } + fast_weight_bytes,
+            multiclass_bytes,
             rm_stage_bytes: if row_major {
                 rm_stage_len * rm_bufs * rm_slot_count
             } else {
@@ -1383,6 +1445,10 @@ impl GpuTrainCtx {
             rm_hist_fn,
             rm_count_fn,
             apply_grad_fn,
+            mc_stats_fn,
+            mc_grad_fn,
+            mc_delta_fn,
+            n_outputs,
             gpu_math,
             state: state.clone(),
             stream,
@@ -1417,6 +1483,8 @@ impl GpuTrainCtx {
                 pred_resident,
                 label_resident,
                 weight_resident,
+                mc_wmax,
+                mc_wsum,
                 gpair,
                 rows,
                 part_col,
@@ -1502,6 +1570,16 @@ impl GpuTrainCtx {
             + match self.gpu_math {
                 crate::types::GpuMath::Exact => " gpu_math=exact",
                 crate::types::GpuMath::Fast => " gpu_math=fast",
+            }
+            // 多分类 fast 的 device 分配(K 份 prediction + softmax 统计量),
+            // 取自实际分配用的同一个预算项。单输出 / exact 不出现这两个字段。
+            + &if self.mc_stats_fn.is_some() {
+                format!(
+                    " multiclass_outputs={} multiclass_bytes={}",
+                    self.n_outputs, self.budget.multiclass_bytes
+                )
+            } else {
+                String::new()
             }
             + if self.gpair_quantize_fn.is_some() { " quantize=device" } else { " quantize=host" }
             + match (self.gpu_math, self.gpair_quantize_fn.is_some()) {
@@ -1929,6 +2007,11 @@ impl GpuTrainCtx {
             .apply_grad_fn
             .as_ref()
             .context("gpu_math=fast 未启用")?;
+        // 单输出 kernel 假设 prediction 是 `n` 个 f32;多分类走 `fast_multiclass_*`。
+        ensure!(
+            self.n_outputs == 1 && !objective.is_multiclass(),
+            "fast_gradient_and_quantize 只用于单输出 objective;多分类用 fast_multiclass_*"
+        );
         let mut buf = self.lock()?;
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
@@ -1979,6 +2062,149 @@ impl GpuTrainCtx {
         self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
     }
 
+    /// 多分类 fast 一轮的开头:读 K 列旧 prediction,每行算一次 softmax 的
+    /// `wmax` 和 `(float)wsum`。这一轮里 K 个类的梯度共用它。
+    pub fn fast_multiclass_begin_round(&self) -> Result<()> {
+        let stats_fn = self
+            .mc_stats_fn
+            .as_ref()
+            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
+        let mut buf = self.lock()?;
+        let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
+        let n_classes = u32::try_from(self.n_outputs).context("类别数超过 u32")?;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows_u32.div_ceil(threads).min(65535), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let GpuBuffers {
+            pred_resident,
+            mc_wmax,
+            mc_wsum,
+            ..
+        } = &mut *buf;
+        let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+        let wmax = mc_wmax.as_mut().context("softmax wmax buffer 未分配")?;
+        let wsum = mc_wsum.as_mut().context("softmax wsum buffer 未分配")?;
+        let mut launch = self.stream.launch_builder(stats_fn);
+        launch
+            .arg(pred)
+            .arg(&n_rows_u32)
+            .arg(&n_classes)
+            .arg(wmax)
+            .arg(wsum);
+        unsafe { launch.launch(cfg) }.context("launch softmax_row_stats")?;
+        Ok(())
+    }
+
+    /// 多分类 fast:第 `class` 类的梯度(带行采样,键 = 树序号 `subsample_tree`)
+    /// → 通用的 device 量化尾巴。必须在 [`Self::fast_multiclass_begin_round`] 之后、
+    /// 本轮第 `class` 棵树的 delta 施加之前调用。语义同
+    /// [`Self::fast_gradient_and_quantize`]:**不保证与 CPU 逐字节相同**。
+    pub fn fast_multiclass_gradient_and_quantize(
+        &self,
+        class: usize,
+        subsample_threshold: u64,
+        subsample_seed: u64,
+        subsample_tree: u64,
+    ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        let grad_fn = self
+            .mc_grad_fn
+            .as_ref()
+            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
+        ensure!(
+            class < self.n_outputs,
+            "类别 {class} 超出 {}",
+            self.n_outputs
+        );
+        let mut buf = self.lock()?;
+        self.sync_if_timing()?;
+        let started = std::time::Instant::now();
+        let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
+        let class_id = class as u32;
+        {
+            let threads = 256u32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_rows_u32.div_ceil(threads).min(65535), 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let GpuBuffers {
+                pred_resident,
+                label_resident,
+                weight_resident,
+                mc_wmax,
+                mc_wsum,
+                gpair_f32,
+                ..
+            } = &mut *buf;
+            let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+            let label = label_resident
+                .as_ref()
+                .context("fast label buffer 未分配")?;
+            let wmax = mc_wmax.as_ref().context("softmax wmax buffer 未分配")?;
+            let wsum = mc_wsum.as_ref().context("softmax wsum buffer 未分配")?;
+            let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            let has_weight: u32 = weight_resident.is_some().into();
+            let weight = weight_resident.as_ref().unwrap_or(label);
+            let mut launch = self.stream.launch_builder(grad_fn);
+            launch
+                .arg(pred)
+                .arg(wmax)
+                .arg(wsum)
+                .arg(label)
+                .arg(weight)
+                .arg(&has_weight)
+                .arg(&n_rows_u32)
+                .arg(&class_id)
+                .arg(out)
+                .arg(&subsample_threshold)
+                .arg(&subsample_seed)
+                .arg(&subsample_tree);
+            unsafe { launch.launch(cfg) }.context("launch softmax_class_gradient")?;
+        }
+        // gradient kernel 已经按行采样置零;量化尾巴不再采样。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
+    }
+
+    /// 多分类 fast:把刚建完的那棵树的叶子增量加到第 `class` 类的 device
+    /// prediction 上(device 是权威副本,host 不更新)。
+    pub fn fast_multiclass_apply_delta(&self, class: usize) -> Result<()> {
+        let delta_fn = self
+            .mc_delta_fn
+            .as_ref()
+            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
+        ensure!(
+            class < self.n_outputs,
+            "类别 {class} 超出 {}",
+            self.n_outputs
+        );
+        let mut buf = self.lock()?;
+        let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
+        let class_id = class as u32;
+        let threads = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows_u32.div_ceil(threads).min(65535), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let GpuBuffers {
+            pred_resident,
+            prediction_delta,
+            ..
+        } = &mut *buf;
+        let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
+        let mut launch = self.stream.launch_builder(delta_fn);
+        launch
+            .arg(pred)
+            .arg(&*prediction_delta)
+            .arg(&n_rows_u32)
+            .arg(&class_id);
+        unsafe { launch.launch(cfg) }.context("launch add_class_delta")?;
+        Ok(())
+    }
+
     pub fn fast_math_enabled(&self) -> bool {
         self.apply_grad_fn.is_some()
     }
@@ -1999,12 +2225,14 @@ impl GpuTrainCtx {
     /// 训练循环本身不需要它 —— fast 模式下 device 才是权威副本。
     /// 它是 O(行数) 的一次 D2H,所以特意起了一个让代价显而易见的名字,
     /// 而不是藏在某个 getter 后面。
+    ///
+    /// 多分类(K > 1)的输出是 class-major 的 `K × n`:`out[k * n + i]`。
     pub fn sync_prediction_to_host(&self, out: &mut [f32]) -> Result<()> {
-        if out.len() != self.n_rows {
+        if out.len() != self.n_rows * self.n_outputs {
             bail!(
-                "prediction 长度 {} 与训练行数 {} 不符",
+                "prediction 长度 {} 与训练行数 × 输出数 {} 不符",
                 out.len(),
-                self.n_rows
+                self.n_rows * self.n_outputs
             );
         }
         let buf = self.lock()?;
@@ -2023,8 +2251,16 @@ impl GpuTrainCtx {
         &self,
         labels: &[f32],
         weights: Option<&[f32]>,
-        margin: f32,
+        // 每个输出一个初始 raw margin(单输出 1 个,多分类 K 个)。
+        margins: &[f32],
     ) -> Result<()> {
+        if margins.len() != self.n_outputs {
+            bail!(
+                "初始 margin 有 {} 个,但 device prediction 有 {} 个输出",
+                margins.len(),
+                self.n_outputs
+            );
+        }
         if labels.len() != self.n_rows {
             bail!(
                 "label 长度 {} 与训练行数 {} 不符",
@@ -2058,10 +2294,23 @@ impl GpuTrainCtx {
             .memcpy_htod(labels, label)
             .context("label H2D")?;
         let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
-        let host_pred = vec![margin; self.n_rows];
-        self.stream
-            .memcpy_htod(&host_pred, pred)
-            .context("初始 prediction H2D")?;
+        if let [margin] = margins {
+            // 单输出:和以前逐字节相同的一次整块 H2D。
+            let host_pred = vec![*margin; self.n_rows];
+            self.stream
+                .memcpy_htod(&host_pred, pred)
+                .context("初始 prediction H2D")?;
+        } else {
+            // class-major:第 k 个 n 长切片填第 k 类的 base margin。
+            let mut host_pred = vec![0.0f32; self.n_rows];
+            for (k, &margin) in margins.iter().enumerate() {
+                host_pred.fill(margin);
+                let mut dst = pred.slice_mut(k * self.n_rows..(k + 1) * self.n_rows);
+                self.stream
+                    .memcpy_htod(&host_pred, &mut dst)
+                    .context("初始 prediction H2D")?;
+            }
+        }
         self.stream.synchronize().context("等待 fast-math 初始化")?;
         Ok(())
     }

@@ -152,6 +152,10 @@ pub struct SharedHistogramConfig {
     /// device(+4 B/行),由 objective kernel 直接乘进 grad/hess。
     /// exact 路径在 host 加权,不分配任何 device buffer。
     pub fast_weights: bool,
+    /// 每行输出数 K(多分类 = `num_class`,其余 1)。只有 `gpu_math = Fast` 且
+    /// `K > 1` 才有内存代价:常驻 prediction 变成 `K × n`,外加每行 softmax 统计量。
+    /// 规划器必须用同一个 K(`gpu_mem_plan::fast_multiclass_extra_bytes`)。
+    pub n_outputs: usize,
 }
 
 impl Default for SharedHistogramConfig {
@@ -171,6 +175,7 @@ impl Default for SharedHistogramConfig {
             resident_blocks: None,
             gpu_math: crate::types::GpuMath::Exact,
             fast_weights: false,
+            n_outputs: 1,
         }
     }
 }
