@@ -712,6 +712,9 @@ empty `evals_result()`.
 | `lambda` | `1.0` | Alias: `reg_lambda` |
 | `gamma` | `0.0` | Minimum split loss |
 | `min_child_weight` | `1.0` | Minimum child Hessian |
+| `alpha` | `0.0` | L1 regularization on leaf weights; alias: `reg_alpha` |
+| `max_delta_step` | `0.0` | Maximum absolute leaf weight before `eta` (`0` = no limit); can help logistic regression with very unbalanced classes |
+| `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
 | `subsample` | `1.0` | Deterministic per-tree row sampling in `(0, 1]`; all rows still receive the learned tree |
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `cols_per_block` | automatic | Positive integer; normally leave unset |
@@ -735,9 +738,7 @@ Unknown parameters raise `ValueError`; they are not silently ignored.
 
 The following familiar XGBoost parameters are recognized but not implemented:
 
-- `alpha` / `reg_alpha`
 - `max_leaves`
-- `scale_pos_weight`
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 

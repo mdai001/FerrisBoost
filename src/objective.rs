@@ -130,6 +130,25 @@ impl Objective {
         }
     }
 
+    /// XGBoost `FitIntercept::InitEstimation`(一步 Newton):在 margin = 0
+    /// 处求梯度(乘梯度权重),f64 求和,`w = −ΣG / max(ΣH, kRtEps)` 截成
+    /// f32,再 `PredTransform` 回到 base_score 的空间。XGBoost 在
+    /// `scale_pos_weight ≠ 1` 时走这里;按行号串行求和(= XGBoost nthread=1)。
+    pub fn newton_base_score(self, labels: &[f32], grad_weights: Option<&[f32]>) -> f32 {
+        let (mut sg, mut sh) = (0.0f64, 0.0f64);
+        for (i, &y) in labels.iter().enumerate() {
+            let g = self.gradient(0.0, y);
+            let (g, h) = match grad_weights {
+                Some(w) => (g.grad * w[i], g.hess * w[i]),
+                None => (g.grad, g.hess),
+            };
+            sg += g as f64;
+            sh += h as f64;
+        }
+        let w = (-sg / sh.max(K_RT_EPS as f64)) as f32;
+        self.transform(w)
+    }
+
     /// raw margin → 预测值(XGBoost `PredTransform`)。
     #[inline]
     pub fn transform(self, margin: f32) -> f32 {

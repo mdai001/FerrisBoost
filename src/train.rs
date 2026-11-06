@@ -648,8 +648,17 @@ impl TrainConfig {
 
     /// 解析 base_score:用户给的值,或从训练标签/权重估计。
     pub fn resolve_base_score(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        self.base_score
-            .unwrap_or_else(|| self.objective.estimate_base_score(labels, weights))
+        self.base_score.unwrap_or_else(|| {
+            let spw = self.params.scale_pos_weight;
+            // XGBoost:spw 偏离 1 超过 kRtEps 时改用一步 Newton(FitIntercept)。
+            if (spw - 1.0).abs() > 1e-6 {
+                let g = gradient_weights(labels, weights, spw);
+                self.objective
+                    .newton_base_score(labels, g.as_deref().or(weights))
+            } else {
+                self.objective.estimate_base_score(labels, weights)
+            }
+        })
     }
 }
 
@@ -953,6 +962,11 @@ fn train_with_backend(
     }
     cfg.objective.validate_labels(labels, "训练集")?;
     let base_score = cfg.resolve_base_score(labels, weights);
+    // 梯度用的权重:样本权重 × (标签 == 1 时 scale_pos_weight)。只进梯度,
+    // metric 和分箱仍然只看样本权重 —— 和 XGBoost `RegLossObj` 一致。
+    // spw == 1 时不复制(乘 1 是恒等,结果逐位相同)。
+    let spw_weights = gradient_weights(labels, weights, cfg.params.scale_pos_weight);
+    let grad_weights: Option<&[f32]> = spw_weights.as_deref().or(weights);
     anyhow::ensure!(base_score.is_finite(), "base_score 必须是有限值");
     cfg.objective.validate_base_score(base_score)?;
     let source_bytes_start = source.source_bytes_read();
@@ -1002,6 +1016,18 @@ fn train_with_backend(
     anyhow::ensure!(
         p.min_child_weight.is_finite() && p.min_child_weight >= 0.0,
         "min_child_weight 必须是非负有限值"
+    );
+    anyhow::ensure!(
+        p.alpha.is_finite() && p.alpha >= 0.0,
+        "alpha 必须是非负有限值"
+    );
+    anyhow::ensure!(
+        p.max_delta_step.is_finite() && p.max_delta_step >= 0.0,
+        "max_delta_step 必须是非负有限值"
+    );
+    anyhow::ensure!(
+        p.scale_pos_weight.is_finite() && p.scale_pos_weight >= 0.0,
+        "scale_pos_weight 必须是非负有限值"
     );
     anyhow::ensure!(
         p.subsample > 0.0 && p.subsample <= 1.0 && p.subsample.is_finite(),
@@ -1067,7 +1093,7 @@ fn train_with_backend(
     let mut predictions = vec![margin; n];
     let mut model = Model {
         trees: Vec::with_capacity(cfg.params.n_rounds),
-        base_score: base_score,
+        base_score,
         objective: cfg.objective,
         n_features: source.n_features(),
         // 训练层不认识"列名"这个概念(它只见到量化后的块),所以留空,
@@ -1124,7 +1150,7 @@ fn train_with_backend(
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
                     gpu_split_cache: cfg.params.gpu_split_cache,
                     gpu_math: cfg.params.gpu_math,
-                    fast_weights: weights.is_some(),
+                    fast_weights: grad_weights.is_some(),
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
                 },
@@ -1168,7 +1194,7 @@ fn train_with_backend(
     if fast_math {
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
-            .init_fast_math(labels, weights, margin)?;
+            .init_fast_math(labels, grad_weights, margin)?;
     }
 
     // 融合路径把「施加 delta」推迟到下一轮开头,所以要记着是否欠一次。
@@ -1219,7 +1245,7 @@ fn train_with_backend(
             pool.install(|| -> anyhow::Result<()> {
                 let _t = prof::Timer::new(&prof::GRAD);
                 ctx.with_prediction_delta(&mut |delta| {
-                    out = match weights {
+                    out = match grad_weights {
                         None => predictions
                             .par_iter_mut()
                             .zip(delta.par_iter())
@@ -1246,7 +1272,7 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
-                match weights {
+                match grad_weights {
                     None => compute_gradients(&predictions, labels, cfg.objective),
                     Some(w) => compute_gradients_weighted(&predictions, labels, w, cfg.objective),
                 }
@@ -1569,7 +1595,7 @@ pub fn train_gpu_one_tree(
             feature_names: Vec::new(),
             schema_mode: None,
             trees: vec![tree],
-            base_score: base_score,
+            base_score,
             objective: cfg.objective,
             n_features: source.n_features(),
             best_iteration: None,
@@ -1614,7 +1640,7 @@ pub fn train_gpu_one_tree(
         feature_names: Vec::new(),
         schema_mode: None,
         trees: vec![tree],
-        base_score: base_score,
+        base_score,
         objective: cfg.objective,
         n_features: source.n_features(),
         best_iteration: None,
@@ -2592,7 +2618,7 @@ fn build_tree(
 
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
 fn monotone_at(p: &TrainParams, bounds: split::NodeBounds) -> Option<split::Monotone<'_>> {
-    p.has_monotone().then_some(split::Monotone {
+    p.uses_given_weight().then_some(split::Monotone {
         constraints: &p.monotone_constraints,
         bounds,
     })
@@ -2616,7 +2642,7 @@ fn child_leaves(
     p: &TrainParams,
     parent: split::NodeBounds,
 ) -> ChildLeaves {
-    if !p.has_monotone() {
+    if !p.uses_given_weight() {
         return ChildLeaves {
             left_value: leaf_of(c.left, q, p),
             right_value: leaf_of(c.right, q, p),
@@ -2860,6 +2886,28 @@ pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
 #[inline]
 fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
     obj.gradient(pred, label)
+}
+
+/// 把 `scale_pos_weight` 折进梯度权重(XGBoost `RegLossObj::GetGradient`:
+/// `w = weight or 1; if label == 1.0 { w *= spw }`)。spw == 1 返回 `None`。
+fn gradient_weights(labels: &[f32], weights: Option<&[f32]>, spw: f32) -> Option<Vec<f32>> {
+    if spw == 1.0 {
+        return None;
+    }
+    Some(
+        labels
+            .par_iter()
+            .enumerate()
+            .map(|(i, &y)| {
+                let w = weights.map_or(1.0, |w| w[i]);
+                if y == 1.0 {
+                    w * spw
+                } else {
+                    w
+                }
+            })
+            .collect(),
+    )
 }
 
 /// XGBoost `RegLossObj::GetGradient`:`GradientPair(grad * w, hess * w)`,

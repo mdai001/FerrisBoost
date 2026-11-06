@@ -40,6 +40,10 @@ _DEFAULTS: dict[str, Any] = {
     "eta": 0.3,
     "lambda": 1.0,
     "gamma": 0.0,
+    # L1 正则(alias reg_alpha)、叶子步长上限、正类梯度权重:语义同 XGBoost。
+    "alpha": 0.0,
+    "max_delta_step": 0.0,
+    "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
     "colsample_bytree": 1.0,
@@ -100,9 +104,7 @@ _OBJECTIVES = ("binary:logistic", "reg:squarederror")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
-    "alpha": "L1 正则还没实现",
     "max_leaves": "leaf-wise 生长还没实现(现在是 depthwise)",
-    "scale_pos_weight": "还没实现",
     "tree_method": "只有 hist 一种,不用设",
     "num_parallel_tree": "随机森林模式不支持",
 }
@@ -202,7 +204,8 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             )
     if out["device_quantize"] is not None:
         out["device_quantize"] = bool(out["device_quantize"])
-    for key in ("eta", "lambda", "gamma", "min_child_weight", "subsample",
+    for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "max_delta_step",
+                "scale_pos_weight", "subsample",
                 "colsample_bytree"):
         out[key] = float(out[key])
     if out["base_score"] is not None:

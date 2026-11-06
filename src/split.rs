@@ -152,12 +152,32 @@ impl Monotone<'_> {
     }
 }
 
-/// XGBoost `CalcWeight`(α = 0、max_delta_step = 0):f64 算完截成 f32。
+/// XGBoost `ThresholdL1`:`sign(G)·max(|G| − α, 0)`。α = 0 时恒等(逐位)。
+fn threshold_l1(grad: f64, alpha: f32) -> f64 {
+    let a = alpha as f64;
+    if grad > a {
+        grad - a
+    } else if grad < -a {
+        grad + a
+    } else {
+        0.0
+    }
+}
+
+/// XGBoost `CalcWeight`(`param.h`):`−ThresholdL1(G, α) / (H + λ)`,
+/// `max_delta_step ≠ 0` 时再按绝对值夹住;全程 f64,最后截成 f32
+/// (evaluator 的标量版本返回 float)。α = 0 且 max_delta_step = 0 时
+/// 和以前的 `−G / (H + λ)` 逐位相同。
 fn xgb_weight(grad: f64, hess: f64, p: &TrainParams) -> f32 {
     if hess <= 0.0 {
         return 0.0;
     }
-    (-grad / (hess + p.lambda as f64)) as f32
+    let mut dw = -threshold_l1(grad, p.alpha) / (hess + p.lambda as f64);
+    let mds = p.max_delta_step;
+    if mds != 0.0 && dw.abs() > mds as f64 {
+        dw = (mds as f64).copysign(dw);
+    }
+    dw as f32
 }
 
 /// 约束模式下节点(或孩子)的权重:`ApplyBounds(CalcWeight(sum))`。
@@ -182,7 +202,8 @@ fn gain_given_weight(grad: f64, hess: f64, w: f32, p: &TrainParams) -> f32 {
         return 0.0;
     }
     let square = (w * w) as f64;
-    (-((2.0 * grad * w as f64 + (hess + p.lambda as f64) * square) + 0.0)) as f32
+    let l1 = 2.0 * p.alpha as f64 * (w.abs() as f64);
+    (-((2.0 * grad * w as f64 + (hess + p.lambda as f64) * square) + l1)) as f32
 }
 
 /// 约束模式下节点自身的增益(父节点那一项),用节点自己的界。

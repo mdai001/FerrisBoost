@@ -354,6 +354,13 @@ pub struct TrainParams {
     pub lambda: f32,
     pub gamma: f32,
     pub min_child_weight: f32,
+    /// L1 正则(XGBoost `alpha` / `reg_alpha`)。0 = 关。
+    pub alpha: f32,
+    /// 叶子权重绝对值上限(XGBoost `max_delta_step`)。0 = 不限。
+    pub max_delta_step: f32,
+    /// 标签 == 1 的行梯度权重再乘这个数(XGBoost `scale_pos_weight`,
+    /// 只影响梯度,不影响 metric 和分箱)。1 = 关。
+    pub scale_pos_weight: f32,
     pub subsample: f32,
     pub colsample_bytree: f32,
     /// 每个列块包含多少个特征。决定内存工作集和并行粒度。
@@ -482,6 +489,14 @@ impl TrainParams {
         self.monotone_constraints.iter().any(|&c| c != 0)
     }
 
+    /// split 评估要不要走 XGBoost 的「给定权重」形式
+    /// (`CalcWeight` → 夹界 → `CalcGainGivenWeight`)。单调约束、L1、
+    /// `max_delta_step` 都要它;三者都关时走原来的 `G²/(H+λ)` 路径,
+    /// 和 0.0.4 逐位相同。
+    pub fn uses_given_weight(&self) -> bool {
+        self.has_monotone() || self.alpha != 0.0 || self.max_delta_step != 0.0
+    }
+
     /// 某个特征的约束方向;超出列表长度的特征不约束。
     pub fn monotone_of(&self, feat: FeatId) -> i8 {
         self.monotone_constraints
@@ -501,6 +516,9 @@ impl Default for TrainParams {
             lambda: 1.0,
             gamma: 0.0,
             min_child_weight: 1.0,
+            alpha: 0.0,
+            max_delta_step: 0.0,
+            scale_pos_weight: 1.0,
             subsample: 1.0,
             colsample_bytree: 1.0,
             cols_per_block: 64,

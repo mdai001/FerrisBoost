@@ -43,8 +43,8 @@ def test_aliases_are_accepted():
 
 def test_unimplemented_param_is_explicit():
     x, y = toy()
-    with pytest.raises(ValueError, match="L1 正则"):
-        fb.train({**BASE, "alpha": 1.0}, x, label=y, num_boost_round=2)
+    with pytest.raises(ValueError, match="leaf-wise"):
+        fb.train({**BASE, "max_leaves": 8}, x, label=y, num_boost_round=2)
 
 
 def test_bad_objective_lists_the_supported_ones():

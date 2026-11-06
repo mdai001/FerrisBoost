@@ -2126,6 +2126,9 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             lambda: get!("lambda"),
             gamma: get!("gamma"),
             min_child_weight: get!("min_child_weight"),
+            alpha: get!("alpha"),
+            max_delta_step: get!("max_delta_step"),
+            scale_pos_weight: get!("scale_pos_weight"),
             subsample: get!("subsample"),
             colsample_bytree: get!("colsample_bytree"),
             // 占位:真正的值要等拿到 schema 才能定,见 BlockingPlan。
