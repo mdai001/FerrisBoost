@@ -2294,21 +2294,26 @@ impl GpuTrainCtx {
             .memcpy_htod(labels, label)
             .context("label H2D")?;
         let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
-        if let [margin] = margins {
-            // 单输出:和以前逐字节相同的一次整块 H2D。
-            let host_pred = vec![*margin; self.n_rows];
-            self.stream
-                .memcpy_htod(&host_pred, pred)
-                .context("初始 prediction H2D")?;
-        } else {
-            // class-major:第 k 个 n 长切片填第 k 类的 base margin。
-            let mut host_pred = vec![0.0f32; self.n_rows];
-            for (k, &margin) in margins.iter().enumerate() {
-                host_pred.fill(margin);
-                let mut dst = pred.slice_mut(k * self.n_rows..(k + 1) * self.n_rows);
+        // class-major:第 k 个 n 长切片填第 k 类的 base margin(单输出 K = 1)。
+        // 用一块固定大小的 host 块分段上传,而不是物化 n 长的 host 数组 ——
+        // 后者在 margin 不是 +0.0 时(比如 logit(0.5) = −0.0)会实打实占用
+        // 4 B/行的常驻内存。值逐元素相同,结果不变。
+        const FILL_CHUNK: usize = 1 << 20;
+        for (k, &margin) in margins.iter().enumerate() {
+            let chunk = vec![margin; FILL_CHUNK.min(self.n_rows).max(1)];
+            let mut start = 0usize;
+            while start < self.n_rows {
+                let end = (start + FILL_CHUNK).min(self.n_rows);
+                let mut dst = pred.slice_mut(k * self.n_rows + start..k * self.n_rows + end);
                 self.stream
-                    .memcpy_htod(&host_pred, &mut dst)
+                    .memcpy_htod(&chunk[..end - start], &mut dst)
                     .context("初始 prediction H2D")?;
+                // 可分页源上的 H2D 是同步的,复用 chunk 安全;显式同步保证这一点
+                // 不依赖 driver 的实现细节。
+                self.stream
+                    .synchronize()
+                    .context("初始 prediction H2D 同步")?;
+                start = end;
             }
         }
         self.stream.synchronize().context("等待 fast-math 初始化")?;

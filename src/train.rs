@@ -1102,7 +1102,9 @@ fn train_with_backend(
     }
     let _profile_guard = prof::begin();
     let margin = base_margin(cfg.objective, base_score);
-    let mut predictions = vec![margin; n];
+    // host 的训练预测;`gpu_math="fast"` 时 device 是权威副本、host 这份从不
+    // 读写,所以下面确定了 fast 之后才按需分配(省 4 B/行的常驻内存)。
+    let mut predictions: Vec<f32> = Vec::new();
     let mut model = Model {
         trees: Vec::with_capacity(cfg.params.n_rounds),
         base_score,
@@ -1207,6 +1209,10 @@ fn train_with_backend(
     // 从此不再更新 —— 训练结束后没人读它(eval 走独立的 `eval_preds`),
     // 所以这不是「两份状态不同步」,而是所有权转移。
     let fast_math = gpu.as_ref().is_some_and(|c| c.fast_math_enabled());
+    // 多分类有自己的 K 份预测(train_multiclass_rounds),也不需要这一份。
+    if !fast_math && num_class == 1 {
+        predictions = vec![margin; n];
+    }
     if fast_math {
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
