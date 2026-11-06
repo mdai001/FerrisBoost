@@ -269,6 +269,13 @@ fn resolve_blocking(
                     } else {
                         model
                     };
+                    // fast 多分类:K 份常驻 prediction + softmax 统计量。
+                    // exact 的多分类在 host 算梯度,device 上不多占。
+                    let model = if fast {
+                        model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
+                    } else {
+                        model
+                    };
                     if cfg.params.gpu_split_cache
                         && !matches!(
                             std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),

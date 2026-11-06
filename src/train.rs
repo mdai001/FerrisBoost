@@ -1163,14 +1163,10 @@ fn train_with_backend(
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
                     gpu_split_cache: cfg.params.gpu_split_cache,
-                    // 多分类还没有 device softmax kernel:fast 降到 exact 路径
-                    // (host 梯度、CPU/GPU 逐字节相同),并在下面明确打印。
-                    gpu_math: if num_class > 1 {
-                        crate::types::GpuMath::Exact
-                    } else {
-                        cfg.params.gpu_math
-                    },
+                    gpu_math: cfg.params.gpu_math,
                     fast_weights: grad_weights.is_some(),
+                    // 规划器(python.rs)和这里必须用同一个 K 计费。
+                    n_outputs: num_class,
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
                 },
@@ -1214,16 +1210,19 @@ fn train_with_backend(
     if fast_math {
         gpu.as_ref()
             .expect("fast_math 蕴含 gpu 存在")
-            .init_fast_math(labels, grad_weights, std::slice::from_ref(&margin))?;
+            .init_fast_math(
+                labels,
+                grad_weights,
+                // 多分类:K 个 base margin(class-major 的 K 份 device prediction)。
+                if num_class > 1 {
+                    &class_margins
+                } else {
+                    std::slice::from_ref(&margin)
+                },
+            )?;
     }
 
     if num_class > 1 {
-        if gpu.is_some() && cfg.params.gpu_math == crate::types::GpuMath::Fast && !cfg.quiet {
-            eprintln!(
-                "GPU_MATH requested=fast effective=exact reason=multiclass \
-                 (device softmax gradients are not implemented yet)"
-            );
-        }
         model.class_base_margins = class_margins;
         return train_multiclass_rounds(
             MulticlassRun {
@@ -1717,7 +1716,11 @@ struct MulticlassRun<'a> {
 ///   (XGBoost 也是每棵树各采一次);K = 1 时就是原来的 `round`;
 /// - GPU 的叶子增量在每棵树之后立即施加(单输出路径那种「推迟到下一轮
 ///   梯度那一遍」的融合在这里不适用:下一棵树要用的是另一类的梯度);
-/// - `gpu_math="fast"` 已在上面降为 exact。
+/// - `gpu_math="fast"`:device 持有 `K × n` 的权威 prediction(host 的
+///   `class_preds` 不分配、不更新)。每轮一个 kernel 算一次每行的 softmax 统计量,
+///   每个类再一个 kernel 写出该类的 f32 gpair(含行采样,键同样是树序号)并走
+///   通用 device 量化;建完树后 delta 在 device 上直接加到该类的列。
+///   梯度每轮只算一次(而不是 K 次),且 host 没有任何 O(n·K) 的搬运。
 fn train_multiclass_rounds(
     run: MulticlassRun<'_>,
     mut model: Model,
@@ -1736,7 +1739,13 @@ fn train_multiclass_rounds(
     let n = source.n_rows();
     let k_count = cfg.objective.num_outputs();
     let margins = model.class_base_margins.clone();
-    let mut class_preds: Vec<Vec<f32>> = margins.iter().map(|&m| vec![m; n]).collect();
+    // fast:device 是 prediction 的权威副本,host 这份不存在。
+    let fast_math = gpu.is_some_and(|c| c.fast_math_enabled());
+    let mut class_preds: Vec<Vec<f32>> = if fast_math {
+        Vec::new()
+    } else {
+        margins.iter().map(|&m| vec![m; n]).collect()
+    };
     let mut eval_class_preds: Vec<Vec<Vec<f32>>> = evals
         .iter()
         .map(|e| {
@@ -1751,16 +1760,26 @@ fn train_multiclass_rounds(
 
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
-        pool.install(|| {
+        if fast_math {
             let _t = prof::Timer::new(&prof::GRAD);
-            cfg.objective
-                .softmax_gradients(&class_preds, labels, weights, &mut grads)
-        });
+            gpu.expect("fast_math 蕴含 gpu 存在")
+                .fast_multiclass_begin_round()?;
+        } else {
+            pool.install(|| {
+                let _t = prof::Timer::new(&prof::GRAD);
+                cfg.objective
+                    .softmax_gradients(&class_preds, labels, weights, &mut grads)
+            });
+        }
         for class in 0..k_count {
             let tree_index = (round * k_count + class) as u64;
-            let mut gpair_f32 = std::mem::take(&mut grads[class]);
+            let mut gpair_f32 = if fast_math {
+                Vec::new()
+            } else {
+                std::mem::take(&mut grads[class])
+            };
             // 行采样:和单输出相同的确定性掩码,键是树序号。
-            if cfg.params.subsample < 1.0 && !device_quant {
+            if cfg.params.subsample < 1.0 && !device_quant && !fast_math {
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
                 for (i, g) in gpair_f32.iter_mut().enumerate() {
                     if !crate::subsample::row_selected(i as u64, th, cfg.params.seed, tree_index) {
@@ -1771,7 +1790,20 @@ fn train_multiclass_rounds(
                     }
                 }
             }
-            let (quantizer, fixed, dev_root_sum) = if device_quant {
+            let (quantizer, fixed, dev_root_sum) = if fast_math {
+                // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
+                // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
+                // kernel、无条件执行 —— 采样掩码不是预测掩码。
+                let ctx = gpu.expect("fast_math 蕴含 gpu 存在");
+                let _t = prof::Timer::new(&prof::QUANTIZE);
+                let (q, root, _ms) = ctx.fast_multiclass_gradient_and_quantize(
+                    class,
+                    crate::subsample::threshold_for(cfg.params.subsample),
+                    cfg.params.seed,
+                    tree_index,
+                )?;
+                (q, Vec::new(), Some(root))
+            } else if device_quant {
                 let ctx = gpu.expect("device_quant 蕴含 gpu 存在");
                 let _t = prof::Timer::new(&prof::QUANTIZE);
                 let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
@@ -1806,21 +1838,32 @@ fn train_multiclass_rounds(
             } else {
                 None
             };
+            // fast:GPU 建树不读写 host prediction,给空切片。
+            let mut no_host_pred: [f32; 0] = [];
             let tree = pool.install(|| {
                 build_tree(
                     source,
                     &fixed,
                     dev_root_sum,
                     &quantizer,
-                    &mut class_preds[class],
+                    if fast_math {
+                        &mut no_host_pred
+                    } else {
+                        &mut class_preds[class]
+                    },
                     cfg,
                     comm,
                     gpu,
                     sampled.as_deref(),
                 )
             })?;
+            // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
+            if fast_math {
+                gpu.expect("fast_math 蕴含 gpu 存在")
+                    .fast_multiclass_apply_delta(class)?;
+            }
             // GPU 路径的叶子增量还在 device 回传的 buffer 里:立即施加到这一类。
-            if let Some(ctx) = gpu {
+            else if let Some(ctx) = gpu {
                 let preds = &mut class_preds[class];
                 let mut applied = Ok(());
                 pool.install(|| {

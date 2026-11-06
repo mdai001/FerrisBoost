@@ -184,21 +184,93 @@ def model_bytes(model, tmp_path, name):
     return path.read_bytes()
 
 
+EXTRAS = [{}, {"subsample": 0.8, "colsample_bytree": 0.7},
+          {"monotone_constraints": (1, 0, 0, -1, 0)}]
+
+
 @cuda
 @pytest.mark.parametrize("gpu_math", ["exact", "fast"])
-@pytest.mark.parametrize("extra", [{}, {"subsample": 0.8, "colsample_bytree": 0.7},
-                                   {"monotone_constraints": (1, 0, 0, -1, 0)}])
+@pytest.mark.parametrize("extra", EXTRAS)
 def test_gpu_matches_cpu(tmp_path, capfd, gpu_math, extra):
     x, y = make(n=4000, k=5, seed=13)
     w = np.random.default_rng(13).uniform(0.2, 3, len(y)).astype(np.float32)
     p = {"objective": "multi:softprob", "num_class": 5, "max_depth": 6, "seed": 4, **extra}
     cpu = fb.train(p, x, label=y, weight=w, num_boost_round=5, quiet=True)
-    gpu = fb.train({**p, "device": "cuda", "gpu_math": gpu_math}, x, label=y, weight=w,
-                   num_boost_round=5, quiet=gpu_math == "exact")
-    # fast 在多分类上降为 exact(并打印原因),所以同样逐字节相同
-    assert model_bytes(cpu, tmp_path, "cpu") == model_bytes(gpu, tmp_path, "gpu")
-    if gpu_math == "fast":
-        assert "effective=exact reason=multiclass" in capfd.readouterr().err
+    gpu_p = {**p, "device": "cuda", "gpu_math": gpu_math}
+    gpu = fb.train(gpu_p, x, label=y, weight=w, num_boost_round=5, quiet=gpu_math == "exact")
+    err = capfd.readouterr().err
+    if gpu_math == "exact":
+        # exact:host 梯度,CPU/GPU 逐字节相同。
+        assert model_bytes(cpu, tmp_path, "cpu") == model_bytes(gpu, tmp_path, "gpu")
+        return
+    # fast:不再降级成 exact,回显明确是 fast。
+    assert "effective=exact" not in err and "GPU_MATH" not in err
+    assert "gpu_math=fast" in err
+    # 每次运行确定,但不保证和 CPU 逐字节相同(CUDA expf)。
+    again = fb.train(gpu_p, x, label=y, weight=w, num_boost_round=5, quiet=True)
+    assert model_bytes(gpu, tmp_path, "a") == model_bytes(again, tmp_path, "b")
+    assert gpu.num_trees == cpu.num_trees == 25
+    np.testing.assert_allclose(gpu.predict(x), cpu.predict(x), rtol=0, atol=1e-4)
+
+
+@cuda
+@pytest.mark.parametrize("k", [2, 7])
+@pytest.mark.parametrize("objective", ["multi:softprob", "multi:softmax"])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_gpu_fast_class_counts(tmp_path, k, objective, weighted):
+    x, y = make(n=3000, k=k, seed=20 + k)
+    w = (np.random.default_rng(k).uniform(0.2, 3, len(y)).astype(np.float32)
+         if weighted else None)
+    p = {"objective": objective, "num_class": k, "max_depth": 5, "seed": 2,
+         "subsample": 0.8, "colsample_bytree": 0.8}
+    cpu = fb.train(p, x, label=y, weight=w, num_boost_round=4, quiet=True)
+    fast = {**p, "device": "cuda", "gpu_math": "fast"}
+    a = fb.train(fast, x, label=y, weight=w, num_boost_round=4, quiet=True)
+    b = fb.train(fast, x, label=y, weight=w, num_boost_round=4, quiet=True)
+    assert model_bytes(a, tmp_path, "a") == model_bytes(b, tmp_path, "b")
+    assert a.num_trees == 4 * k
+    if objective == "multi:softprob":
+        np.testing.assert_allclose(a.predict(x), cpu.predict(x), rtol=0, atol=1e-4)
+    else:
+        # softmax 预测是类别下标:允许极少数近平局的行翻转。
+        assert np.mean(a.predict(x) == cpu.predict(x)) > 0.995
+
+
+@cuda
+def test_gpu_fast_early_stopping_with_evals():
+    x, y = make(n=4000, k=5, seed=31)
+    vx, vy = make(n=1500, k=5, seed=32)
+    p = {"objective": "multi:softprob", "num_class": 5, "max_depth": 5, "eta": 0.6,
+         "eval_metric": ["mlogloss", "merror"]}
+    kw = dict(evals=[(vx, vy, "v")], num_boost_round=200, early_stopping_rounds=4, quiet=True)
+    cpu_res, a_res, b_res = {}, {}, {}
+    cpu = fb.train(p, x, label=y, evals_result=cpu_res, **kw)
+    a = fb.train({**p, "device": "cuda", "gpu_math": "fast"}, x, label=y, evals_result=a_res, **kw)
+    b = fb.train({**p, "device": "cuda", "gpu_math": "fast"}, x, label=y, evals_result=b_res, **kw)
+    assert a_res == b_res and a.best_iteration == b.best_iteration
+    assert abs(a.best_iteration - cpu.best_iteration) <= 2
+    n = min(len(a_res["v"]["mlogloss"]), len(cpu_res["v"]["mlogloss"]))
+    np.testing.assert_allclose(a_res["v"]["mlogloss"][:n], cpu_res["v"]["mlogloss"][:n],
+                               rtol=1e-3)
+
+
+@cuda
+def test_gpu_fast_echo_reports_multiclass_allocation(capfd):
+    n, k = 3000, 5
+    x, y = make(n=n, k=k, seed=41)
+    w = np.random.default_rng(1).uniform(0.2, 3, n).astype(np.float32)
+    fast = {"objective": "multi:softprob", "num_class": k, "device": "cuda",
+            "gpu_math": "fast", "max_depth": 4}
+    fb.train(fast, x, label=y, weight=w, num_boost_round=1)
+    err = capfd.readouterr().err
+    line = next(ln for ln in err.splitlines() if ln.startswith("GPU_PATH"))
+    assert "gpu_math=fast" in line and f"multiclass_outputs={k}" in line
+    # (K-1) 份额外 prediction + 每行 softmax 的 wmax / wsum(各 4 B)。
+    assert f"multiclass_bytes={n * 4 * (k - 1) + n * 8}" in line
+    # exact 模式不分配这块,回显里也不应出现。
+    fb.train({**fast, "gpu_math": "exact"}, x, label=y, weight=w, num_boost_round=1)
+    line = next(ln for ln in capfd.readouterr().err.splitlines() if ln.startswith("GPU_PATH"))
+    assert "gpu_math=exact" in line and "multiclass_bytes" not in line
 
 
 @cuda

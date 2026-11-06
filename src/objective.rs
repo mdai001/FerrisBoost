@@ -447,7 +447,8 @@ impl Objective {
             Objective::Gamma => 3,
             Objective::Tweedie { .. } => 4,
             Objective::PseudoHuber { .. } => 5,
-            // 多分类没有 fast kernel:训练入口把它降到 exact 路径(见 train.rs)。
+            // 多分类不走这个单输出 kernel:fast 用 softmax_row_stats /
+            // softmax_class_gradient / add_class_delta(见 histogram.cu)。
             Objective::Softprob { .. } | Objective::Softmax { .. } => u32::MAX,
         }
     }
