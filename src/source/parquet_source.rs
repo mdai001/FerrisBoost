@@ -177,7 +177,7 @@ fn projected_reader(
     columns: &[usize],
     batch_size: usize,
     row_group: Option<usize>,
-) -> anyhow::Result<ParquetRecordBatchReader> {
+) -> anyhow::Result<ProjectedReader> {
     let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
     let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
     // Sparse projections (especially labels and streaming feature tiles) must
@@ -249,20 +249,47 @@ fn coalesced_projection(metadata: &ArrowReaderMetadata, columns: &[usize]) -> bo
     true
 }
 
+/// 投影读取器:列**按 `columns` 给的顺序**返回。
+///
+/// ⚠️ Parquet 投影只决定读哪些列,返回顺序永远是文件里的物理顺序。
+/// 下标不是升序时(按列名绑定的验证集、列序不同的文件)必须重排回来,
+/// 否则每个特征会静默读到别的列。升序时 `order` 是 `None`,零开销。
+pub(crate) struct ProjectedReader {
+    inner: ParquetRecordBatchReader,
+    order: Option<Vec<usize>>,
+}
+
+impl Iterator for ProjectedReader {
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.inner.next()?;
+        Some(match &self.order {
+            None => batch,
+            Some(order) => batch.map(|b| crate::source::input::reorder(&b, order)),
+        })
+    }
+}
+
 fn build_projected_reader<T: ChunkReader + 'static>(
     input: T,
     metadata: ArrowReaderMetadata,
     columns: &[usize],
     batch_size: usize,
     row_group: Option<usize>,
-) -> anyhow::Result<ParquetRecordBatchReader> {
+) -> anyhow::Result<ProjectedReader> {
+    let (mask_cols, order) = crate::source::input::projection_and_order(columns);
+    let identity = order.iter().enumerate().all(|(i, &o)| i == o) && order.len() == mask_cols.len();
     let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata);
-    let mask = ProjectionMask::roots(builder.parquet_schema(), columns.to_vec());
+    let mask = ProjectionMask::roots(builder.parquet_schema(), mask_cols);
     let mut builder = builder.with_projection(mask).with_batch_size(batch_size);
     if let Some(row_group) = row_group {
         builder = builder.with_row_groups(vec![row_group]);
     }
-    Ok(builder.build()?)
+    Ok(ProjectedReader {
+        inner: builder.build()?,
+        order: (!identity).then_some(order),
+    })
 }
 
 fn parallel_row_groups(
@@ -422,20 +449,8 @@ fn feature_columns<'a>(
         // 权重列找不到要报错,不能静默当成「没给权重」。
         column_index(path, w)?;
     }
-    let mut idx = Vec::new();
-    let mut names = Vec::new();
-    for (i, f) in schema.fields().iter().enumerate() {
-        if !targets.excludes(f.name()) {
-            idx.push(i);
-            names.push(f.name().clone());
-        }
-    }
-    anyhow::ensure!(
-        !idx.is_empty(),
-        "除了标签列 {:?} 之外没有别的列了",
-        targets.label
-    );
-    Ok((idx, names))
+    let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    targets.select_features(&columns)
 }
 
 /// 读一整列 f32(单文件 parquet 的权重列用)。不量化、不留其它列。

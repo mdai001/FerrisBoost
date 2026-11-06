@@ -14,6 +14,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 NVCC=${NVCC:-/usr/local/cuda/bin/nvcc}
+# Resolve a bare `NVCC=nvcc` to its real path: the leak check below matches the
+# toolkit directory, and `dirname nvcc` would be `.`.
+NVCC=$(command -v "$NVCC") || { echo "ERROR: nvcc not found: ${NVCC}" >&2; exit 1; }
 SRC=src/backend/cuda/histogram.cu
 OUT=src/backend/cuda/histogram.ptx
 EXPECTED_PTX_VERSION=8.0
@@ -33,10 +36,11 @@ fi
 # Relativise .file paths, drop the nvcc banner, embed the source hash.
 python3 scripts/sanitize_ptx.py "$TMP" "$SRC" "$EXPECTED_PTX_VERSION"
 
-LEAK_RE="$HOME\|$(pwd)\|/tmp/\|/usr/local/cuda\|$(dirname "$NVCC")"
-if grep -q "$LEAK_RE" "$TMP"; then
+# Fixed strings, not a regex: paths may contain `.` or other metacharacters.
+LEAK=(-e "$HOME" -e "$(pwd)" -e /tmp/ -e /usr/local/cuda -e "$(dirname "$(dirname "$NVCC")")")
+if grep -qF "${LEAK[@]}" "$TMP"; then
   echo "ERROR: generated PTX still contains build-machine paths" >&2
-  grep -n "$LEAK_RE" "$TMP" | head -3 >&2
+  grep -nF "${LEAK[@]}" "$TMP" | head -3 >&2
   exit 1
 fi
 mv "$TMP" "$OUT"

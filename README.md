@@ -243,6 +243,11 @@ logging, and the complete parameter reference.
 - Added per-row sample weights (`weight=`), including weighted validation sets. Weights apply to gradients, metrics, and bin boundaries, as in XGBoost.
 - Added `params["eval_metric"]` with `rmse`, `logloss`, `error`, and `auc`.
 - Added `params["monotone_constraints"]` (XGBoost semantics; tuple, string, or by feature name), on CPU and GPU.
+- Fixed: validation files and pyarrow validation tables are now matched to the training features by column name. Previously they were matched by position, so a validation file with reordered columns produced wrong metrics and early stopping.
+- Fixed: an exception raised in a callback is no longer lost when more callbacks follow it.
+- Fixed: feature values of ±inf now raise a clear error instead of crashing, and very large finite values (near the f32 limit) train correctly.
+- Fixed: an empty validation set, duplicate column names, and sample weights whose sum overflows f32 now raise a clear error.
+- Fixed: loading a multi-target XGBoost model now raises an error instead of silently giving wrong predictions.
 
 ### 0.0.3
 

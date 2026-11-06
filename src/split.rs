@@ -40,9 +40,12 @@ pub struct SplitCandidate {
 }
 
 /// 叶子权重。f64 算完再降到 f32 —— 除法只做一次,不累积。
+///
+/// hess ≤ 0(节点里全是零权重样本)时是 0,和 XGBoost 的 `CalcWeight` 一致;
+/// 否则 `lambda = 0` 时会算出 0/0 = NaN 叶子。
 pub fn leaf_weight(sum: GradPairFixed, q: &GradQuantizer, p: &TrainParams) -> f32 {
     let (grad, hess) = q.to_f64(sum);
-    (-grad / (hess + p.lambda as f64)) as f32
+    xgb_weight(grad, hess, p)
 }
 
 /// 分裂增益。f64:定点累加出来的和是精确的,别在最后一步又用 f32

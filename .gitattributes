@@ -1,0 +1,5 @@
+# Raw little-endian f32 test fixtures: never touch line endings.
+tests/fixtures/*.x      binary
+tests/fixtures/*.y      binary
+tests/fixtures/*.w      binary
+tests/fixtures/*.margin binary

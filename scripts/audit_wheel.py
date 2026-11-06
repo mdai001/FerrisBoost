@@ -42,8 +42,13 @@ CHECKS = [
     ("env/credentials",       [b".env", b"AWS_SECRET", b"API_KEY", b"BEGIN PRIVATE KEY",
                                b"password=", b"token="]),
     ("shell history",         [b".bash_history", b".zsh_history"]),
-    ("cargo registry (raw)",  [b"/home/", b"/Users/", b"C:\\\\Users"]),
+    # Windows paths appear both raw and JSON/Rust-escaped.
+    ("cargo registry (raw)",  [b"/home/", b"/Users/", b"C:\\Users", b"C:\\\\Users",
+                               b"C:/Users", b"\\AppData\\"]),
     ("embedded GPU name",     [b"GeForce", b"Quadro", b"Tesla V", b"RTX "]),
+    # ELF `.comment` banners; scripts/sanitize_wheel.py strips the section.
+    ("toolchain banner",      [b"GCC: (", b"rustc version ", b"Linker: LLD",
+                               b"clang version "]),
     ("compiler fingerprint",  [b"Compiler Build ID:",
                                b"Cuda compilation tools, release",
                                b"Based on NVVM "]),

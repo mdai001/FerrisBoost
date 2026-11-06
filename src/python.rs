@@ -76,10 +76,18 @@ fn guard<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
 /// 其它 Rust 侧的锁。
 struct PyCallback {
     func: Py<PyAny>,
+    /// 所有用户回调共用:第一个抛出的异常存在这里,训练返回后原样抛出。
+    ///
+    /// ⚠️ 不能靠 `PyErr::restore` 把异常留在解释器里:后面的回调再进
+    /// Python 会把它冲掉,训练于是静默返回一个被截断的模型。
+    error: Arc<Mutex<Option<PyErr>>>,
 }
 
 impl Callback for PyCallback {
     fn after_iteration(&mut self, m: &RoundMetrics) -> bool {
+        if self.error.lock().expect("callback error slot").is_some() {
+            return false; // 已经有回调抛了异常:后面的不再调用
+        }
         Python::attach(|py| {
             let metrics = PyDict::new(py);
             for (eval_name, metric, value) in &m.entries {
@@ -97,7 +105,7 @@ impl Callback for PyCallback {
                 // 只有显式返回 False 才停;返回 None 当继续
                 Ok(ret) => !matches!(ret.extract::<bool>(py), Ok(false)),
                 Err(e) => {
-                    e.restore(py);
+                    *self.error.lock().expect("callback error slot") = Some(e);
                     false // 回调抛异常就停下来,异常在训练返回后抛出去
                 }
             }
@@ -2215,13 +2223,27 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
 }
 
 /// 组装 callbacks:早停和 verbose 在 Rust 侧,用户的函数包一层。
-#[allow(clippy::type_complexity)] // Callback ownership and the shared history handle are returned together.
+struct Callbacks {
+    list: Vec<Box<dyn Callback>>,
+    history: Arc<Mutex<Vec<RoundMetrics>>>,
+    error: Arc<Mutex<Option<PyErr>>>,
+}
+
+/// 训练返回后调用:用户回调抛过异常就把它抛出去。
+fn raise_callback_error(slot: &Mutex<Option<PyErr>>) -> PyResult<()> {
+    match slot.lock().expect("callback error slot").take() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 fn build_callbacks(
     lower_is_better: bool,
     early_stopping_rounds: Option<usize>,
     verbose_eval: Option<usize>,
     user: Option<&Bound<'_, PyList>>,
-) -> PyResult<(Vec<Box<dyn Callback>>, Arc<Mutex<Vec<RoundMetrics>>>)> {
+) -> PyResult<Callbacks> {
+    let error = Arc::new(Mutex::new(None));
     let recorder = RecordHistory::new();
     let handle = recorder.handle();
     let mut cbs: Vec<Box<dyn Callback>> = Vec::new();
@@ -2236,11 +2258,18 @@ fn build_callbacks(
     }
     if let Some(list) = user {
         for f in list.iter() {
-            cbs.push(Box::new(PyCallback { func: f.unbind() }));
+            cbs.push(Box::new(PyCallback {
+                func: f.unbind(),
+                error: Arc::clone(&error),
+            }));
         }
     }
     cbs.push(Box::new(recorder));
-    Ok((cbs, handle))
+    Ok(Callbacks {
+        list: cbs,
+        history: handle,
+        error,
+    })
 }
 
 /// 收尾:把规范特征名钉进模型。
@@ -2331,6 +2360,19 @@ fn finish(
     }
 }
 
+/// 特征里的 ±inf 直接拒绝(XGBoost 同样拒绝);缺失值要用 NaN。
+fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
+    match data.iter().position(|v| v.is_infinite()) {
+        None => Ok(()),
+        Some(i) => Err(PyValueError::new_err(format!(
+            "{what}第 {} 行第 {} 列是 {}:特征不能是 ±inf(缺失值请用 NaN)",
+            i / n_features.max(1),
+            i % n_features.max(1),
+            data[i]
+        ))),
+    }
+}
+
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
@@ -2385,6 +2427,7 @@ fn train_dense(
             return Err(PyValueError::new_err("样本权重必须是有限的非负数"));
         }
     }
+    reject_inf(x.as_slice()?, n_features, "训练集")?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     let train_src = DenseSource::new_weighted_with_nthread(
         x.as_slice()?,
@@ -2418,6 +2461,7 @@ fn train_dense(
                     eshape[1]
                 )));
             }
+            reject_inf(ex.as_slice()?, n_features, &format!("验证集 {name} "))?;
             let src = DenseSource::new(
                 ex.as_slice()?,
                 eshape[0],
@@ -2434,7 +2478,11 @@ fn train_dense(
     // numpy 入口没有列名:只接受按位置的约束(Python 层已把 pyarrow 列名解析掉)。
     cfg.resolve_monotone(n_features, &[])?;
     let (train_cfg, lower_is_better) = cfg.train_config()?;
-    let (mut cbs, handle) = build_callbacks(
+    let Callbacks {
+        list: mut cbs,
+        history: handle,
+        error: cb_error,
+    } = build_callbacks(
         lower_is_better,
         early_stopping_rounds,
         verbose_eval,
@@ -2508,9 +2556,7 @@ fn train_dense(
     }
 
     // 回调里抛的异常在这儿冒出来
-    if PyErr::occurred(py) {
-        return Err(PyErr::fetch(py));
-    }
+    raise_callback_error(&cb_error)?;
     // numpy 入口没有列名 —— 位置模式。
     Ok(finish(
         model,
@@ -2689,6 +2735,7 @@ fn train_file(
     let max_bin = cfg.params.max_bin;
     let ingest_quiet = cfg.quiet;
     let open_paths = |ps: &[std::path::PathBuf],
+                      targets: crate::source::Targets<'_>,
                       cuts: Option<crate::columns::BinCuts>,
                       first_csv_schema: Option<arrow::datatypes::SchemaRef>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
@@ -2731,7 +2778,10 @@ fn train_file(
         }
     };
     // 验证集同样接受多文件规格。
+    // ⚠️ 验证集**按列名**绑定到训练集的特征(无表头 CSV 只能按位置):
+    // 按位置读的话,列顺序不同的验证文件会被静默错配,早停跟着选错轮数。
     let open_spec = |spec: &str,
+                     train_features: &[String],
                      cuts: Option<crate::columns::BinCuts>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         let r = crate::source::input::resolve(&[spec.to_string()])?;
@@ -2741,7 +2791,12 @@ fn train_file(
             r.format.label(),
             resolved.format.label()
         );
-        open_paths(&r.paths, cuts, None)
+        let eval_targets = if header || fmt == "parquet" {
+            targets.with_features(train_features)
+        } else {
+            targets
+        };
+        open_paths(&r.paths, eval_targets, cuts, None)
     };
 
     let device = cfg.device;
@@ -2758,7 +2813,11 @@ fn train_file(
         let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         cfg.resolve_monotone(n_features, &names)?;
         let (train_cfg, lower_is_better) = cfg.train_config()?;
-        let (mut cbs, handle) = build_callbacks(
+        let Callbacks {
+            list: mut cbs,
+            history: handle,
+            error: cb_error,
+        } = build_callbacks(
             lower_is_better,
             early_stopping_rounds,
             verbose_eval,
@@ -2810,7 +2869,7 @@ fn train_file(
                 // 时校验会直接报错)。给它自己的路径要用户显式指定。
                 let d = ParquetBlockSource::with_cuts_and_cache_and_nthread(
                     &p,
-                    targets,
+                    targets.with_features(&names),
                     src.cuts().clone(),
                     cfg.params.cols_per_block,
                     QuantizedCacheOptions {
@@ -2880,9 +2939,7 @@ fn train_file(
                 overall_started.elapsed().as_secs_f64()
             );
         }
-        if PyErr::occurred(py) {
-            return Err(PyErr::fetch(py));
-        }
+        raise_callback_error(&cb_error)?;
         // 命名模式:列名取自 parquet schema,标签列已排除(分支开头已读出)。
         return Ok(finish(
             model,
@@ -2894,7 +2951,7 @@ fn train_file(
         ));
     }
 
-    let ds = open_paths(&paths, None, csv_preflight.clone()).map_err(to_py_err)?;
+    let ds = open_paths(&paths, targets, None, csv_preflight.clone()).map_err(to_py_err)?;
     ingest_reporter.complete(ds.source.n_rows());
     // A deferred source only learns its aggregate row count during open.
     // Complete the GPU plan now, preserving the requested block width while
@@ -2913,7 +2970,11 @@ fn train_file(
     }
     cfg.resolve_monotone(n_features, &ds.feature_names)?;
     let (train_cfg, lower_is_better) = cfg.train_config()?;
-    let (mut cbs, handle) = build_callbacks(
+    let Callbacks {
+        list: mut cbs,
+        history: handle,
+        error: cb_error,
+    } = build_callbacks(
         lower_is_better,
         early_stopping_rounds,
         verbose_eval,
@@ -2930,7 +2991,8 @@ fn train_file(
     if let Some(list) = evals {
         for item in list.iter() {
             let (p, name): (String, String) = item.extract()?;
-            let d = open_spec(&p, Some(ds.source.cuts().clone())).map_err(to_py_err)?;
+            let d = open_spec(&p, &ds.feature_names, Some(ds.source.cuts().clone()))
+                .map_err(to_py_err)?;
             eval_data.push((name, d));
         }
     }
@@ -2993,9 +3055,7 @@ fn train_file(
             overall_started.elapsed().as_secs_f64()
         );
     }
-    if PyErr::occurred(py) {
-        return Err(PyErr::fetch(py));
-    }
+    raise_callback_error(&cb_error)?;
     Ok(finish(
         model,
         handle,

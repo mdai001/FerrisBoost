@@ -261,13 +261,6 @@ def _normalize_monotone(mc: Any) -> list[int] | dict[str, int] | None:
     )
 
 
-def _arrow_column_names(obj: Any) -> list[str] | None:
-    mod = type(obj).__module__ or ""
-    if mod.startswith("pyarrow") and hasattr(obj, "column_names"):
-        return list(obj.column_names)
-    return None
-
-
 def _resolve_named_monotone(mc: dict[str, int], names: list[str]) -> list[int]:
     unknown = [k for k in mc if k not in names]
     if unknown:
@@ -337,17 +330,37 @@ def _file_format(path: str) -> str:
     raise ValueError(f"从后缀看不出 {path!r} 是什么格式,支持 .parquet / .csv")
 
 
-def _from_pyarrow(obj: Any) -> np.ndarray | None:
-    """pyarrow Table / RecordBatch -> f32 矩阵。不是 pyarrow 就返回 None。"""
+def _arrow_table(obj: Any) -> Any:
+    """pyarrow Table / RecordBatch 原样返回,RecordBatchReader 读成 Table;不是 pyarrow 返回 None。"""
     mod = type(obj).__module__ or ""
     if not mod.startswith("pyarrow"):
         return None
-    try:
-        table = obj if hasattr(obj, "column_names") else obj.read_all()
-    except AttributeError:
-        return None
+    if hasattr(obj, "column_names"):
+        return obj
+    if hasattr(obj, "read_all"):
+        return obj.read_all()
+    return None
+
+
+def _arrow_matrix(table: Any, order: list[str] | None = None, what: str = "data") -> np.ndarray:
+    """pyarrow 表 -> f32 矩阵。给了 `order` 就**按列名**取列并排成这个顺序。
+
+    验证集按列名绑定到训练集:按位置取的话,列顺序不同的表会被静默错配。
+    """
+    names = list(table.column_names)
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ValueError(f"{what} 里有重复的列名 {dups};列名必须唯一")
+    if order is not None:
+        missing = [n for n in order if n not in names]
+        extra = [n for n in names if n not in order]
+        if missing or extra:
+            raise ValueError(
+                f"{what} 的列和训练集对不上(按列名绑定):缺少 {missing},多出 {extra}"
+            )
+        names = order
     cols = [np.asarray(table.column(c).to_numpy(zero_copy_only=False), dtype=np.float32)
-            for c in table.column_names]
+            for c in names]
     return np.ascontiguousarray(np.stack(cols, axis=1))
 
 
@@ -422,16 +435,16 @@ def train(
                                  early_stopping_rounds, verbose, cb_list,
                                  weight=weight)
     else:
-        arrow = _from_pyarrow(data)
+        table = _arrow_table(data)
+        names = None if table is None else list(table.column_names)
         if isinstance(p["monotone_constraints"], dict):
-            names = _arrow_column_names(data)
             if names is None:
                 raise ValueError(
                     "按列名给的 monotone_constraints 需要列名:numpy 数组没有列名,"
                     "请改用按位置的元组,或用 pyarrow Table / 带表头的文件"
                 )
             p["monotone_constraints"] = _resolve_named_monotone(p["monotone_constraints"], names)
-        x = _as_matrix(arrow if arrow is not None else data)
+        x = _as_matrix(_arrow_matrix(table) if table is not None else data)
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):
             raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
@@ -447,8 +460,11 @@ def train(
                 raise ValueError(
                     "evals 的元素要是 (data, label, name) 或 (data, label, weight, name)"
                 )
-            ea = _from_pyarrow(ed)
-            ex = _as_matrix(ea if ea is not None else ed, f"evals[{name}]")
+            et = _arrow_table(ed)
+            if et is not None:
+                # 训练集也有列名时按列名绑定;否则(numpy 训练集)只能按位置。
+                ed = _arrow_matrix(et, names, f"evals[{name}]")
+            ex = _as_matrix(ed, f"evals[{name}]")
             if ew is not None:
                 ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")
             eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name)))

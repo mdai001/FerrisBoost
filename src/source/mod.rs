@@ -24,6 +24,9 @@ pub use dense::DenseSource;
 pub struct Targets<'a> {
     pub label: &'a str,
     pub weight: Option<&'a str>,
+    /// 给了就**按列名**取特征,并排成这个顺序(验证集要和训练集的
+    /// 特征一一对上)。`None` 时按文件里的物理顺序。
+    pub features: Option<&'a [String]>,
 }
 
 impl<'a> Targets<'a> {
@@ -32,7 +35,68 @@ impl<'a> Targets<'a> {
             weight != Some(label),
             "weight 列和 label 列不能是同一列 {label:?}"
         );
-        Ok(Self { label, weight })
+        Ok(Self {
+            label,
+            weight,
+            features: None,
+        })
+    }
+
+    /// 要求文件里的特征列正好是 `names`(按名字绑定,顺序随 `names`)。
+    pub fn with_features(self, names: &'a [String]) -> Self {
+        Self {
+            features: Some(names),
+            ..self
+        }
+    }
+
+    /// 从文件 schema 里挑出特征列。`columns` 是 schema 的全部列名(物理顺序)。
+    ///
+    /// 列名重复直接报错:按名字绑定时第二个同名列永远绑不到,
+    /// 静默用第一个只会训出错模型。
+    pub(crate) fn select_features(
+        &self,
+        columns: &[&str],
+    ) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = columns.iter().find(|n| !seen.insert(**n)) {
+            anyhow::bail!("文件里有重复的列名 {dup:?};列名必须唯一");
+        }
+        let mut idx = Vec::new();
+        let mut names = Vec::new();
+        for (i, n) in columns.iter().enumerate() {
+            if !self.excludes(n) {
+                idx.push(i);
+                names.push(n.to_string());
+            }
+        }
+        anyhow::ensure!(
+            !idx.is_empty(),
+            "除了标签列 {:?} 之外没有别的列了",
+            self.label
+        );
+        let Some(want) = self.features else {
+            return Ok((idx, names));
+        };
+        let missing: Vec<&str> = want
+            .iter()
+            .filter(|w| !names.contains(w))
+            .map(String::as_str)
+            .collect();
+        let extra: Vec<&str> = names
+            .iter()
+            .filter(|n| !want.contains(n))
+            .map(String::as_str)
+            .collect();
+        anyhow::ensure!(
+            missing.is_empty() && extra.is_empty(),
+            "特征列和训练集对不上(按列名绑定):缺少 {missing:?},多出 {extra:?}"
+        );
+        let idx = want
+            .iter()
+            .map(|w| idx[names.iter().position(|n| n == w).expect("checked")])
+            .collect();
+        Ok((idx, want.to_vec()))
     }
 
     /// 这一列是标签或权重(不进特征)。
@@ -46,6 +110,7 @@ impl<'a> From<&'a str> for Targets<'a> {
         Self {
             label,
             weight: None,
+            features: None,
         }
     }
 }
@@ -55,6 +120,7 @@ impl<'a> From<&'a String> for Targets<'a> {
         Self {
             label: label.as_str(),
             weight: None,
+            features: None,
         }
     }
 }
@@ -200,3 +266,34 @@ mod pipeline_tests {
 // 3. Parquet footer 里有每个 column chunk 的 min/max 和 null count。
 //    分箱的第一遍扫描可以用这些统计做初始估计,省掉一整轮 IO。
 //    这个优化在行分块下拿不到。
+
+#[cfg(test)]
+mod targets_tests {
+    use super::Targets;
+
+    #[test]
+    fn select_features_binds_by_name_and_rejects_mismatch() {
+        let cols = ["label", "b", "w", "a", "c"];
+        let t = Targets::new("label", Some("w")).unwrap();
+        assert_eq!(
+            t.select_features(&cols).unwrap(),
+            (vec![1, 3, 4], vec!["b".into(), "a".into(), "c".into()])
+        );
+        let want: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        assert_eq!(
+            t.with_features(&want).select_features(&cols).unwrap(),
+            (vec![3, 1, 4], want.clone())
+        );
+        let err = t
+            .with_features(&want)
+            .select_features(&["label", "a", "b", "zz", "w"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"c\"") && err.contains("\"zz\""), "{err}");
+        let err = t
+            .select_features(&["label", "a", "a"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("重复"), "{err}");
+    }
+}

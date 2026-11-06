@@ -875,6 +875,13 @@ fn validate_weights(weights: &[f32], n: usize, name: &str) -> anyhow::Result<()>
         weights.iter().all(|w| w.is_finite() && *w >= 0.0),
         "{name}的权重必须全部是有限的非负值"
     );
+    // 单个权重有限,加起来(以及乘上梯度后)仍可能溢出 f32,
+    // 训练会悄悄变成 inf / NaN。总和超出 f32 范围直接拒绝。
+    let total: f64 = weights.iter().map(|&w| f64::from(w)).sum();
+    anyhow::ensure!(
+        total <= f64::from(f32::MAX),
+        "{name}的权重总和是 {total:e},超出了 f32 范围;请把权重整体缩小"
+    );
     Ok(())
 }
 
@@ -920,6 +927,12 @@ fn train_with_backend(
 ) -> anyhow::Result<Model> {
     let n = source.n_rows();
     anyhow::ensure!(n > 0, "训练数据必须至少有一行");
+    // 行号是 u32(`RowId`):超过就会静默截断成错的行。
+    anyhow::ensure!(
+        n <= crate::types::RowId::MAX as usize,
+        "训练数据有 {n} 行,超过了支持的上限 {}",
+        crate::types::RowId::MAX
+    );
     anyhow::ensure!(source.n_features() > 0, "训练数据必须至少有一个特征");
     validate_source_metadata(source, "训练集")?;
     anyhow::ensure!(
@@ -1002,6 +1015,14 @@ fn train_with_backend(
         p.colsample_bytree
     );
     for ev in evals {
+        anyhow::ensure!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
+        anyhow::ensure!(
+            ev.source.n_rows() <= crate::types::RowId::MAX as usize,
+            "验证集 {:?} 有 {} 行,超过了支持的上限 {}",
+            ev.name,
+            ev.source.n_rows(),
+            crate::types::RowId::MAX
+        );
         anyhow::ensure!(
             ev.labels.len() == ev.source.n_rows(),
             "验证集 {:?} 的标签有 {} 行,数据有 {} 行",
@@ -2574,8 +2595,6 @@ fn build_tree(
     Ok(t)
 }
 
-/// 叶子权重 × learning_rate。收缩在这里做,不在预测时 ——
-/// 见 tree.rs 里 `Node::leaf_value` 的说明。
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
 fn monotone_at(p: &TrainParams, bounds: split::NodeBounds) -> Option<split::Monotone<'_>> {
     p.has_monotone().then_some(split::Monotone {
@@ -2621,6 +2640,8 @@ fn child_leaves(
     }
 }
 
+/// 叶子权重 × learning_rate。收缩在这里做,不在预测时 ——
+/// 见 tree.rs 里 `Node::leaf_value` 的说明。
 fn leaf_of(sum: GradPairFixed, q: &GradQuantizer, p: &TrainParams) -> f32 {
     split::leaf_weight(sum, q, p) * p.learning_rate
 }
@@ -2870,13 +2891,6 @@ fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
     }
 }
 
-/// 每行独立,没有归约,所以并行**不可能**改变任何一个元素的值 ——
-/// `collect` 保序,第 i 个输出永远只由第 i 个输入决定。
-///
-/// 这一段和下面的量化是 Amdahl 分析里那部分「按行的串行工作」的主要成分:
-/// 它们只随行数走、完全不进列块那一维,所以以前无论开多少线程都是单线程跑。
-/// GPU 路径上尤其明显 —— HIGGS 1050 万行时 GRAD + QUANTIZE 合计约
-/// 145 ms/轮,占整轮 0.345 s 的四成以上,而那时 GPU 在干等。
 /// XGBoost `RegLossObj::GetGradient`:`GradientPair(grad * w, hess * w)`,
 /// hess 的 `max(.., 1e-16)` 在乘权重**之前**。f32 乘法,与 XGBoost 同。
 #[inline]
@@ -2899,6 +2913,13 @@ fn compute_gradients_weighted(
         .collect()
 }
 
+/// 每行独立,没有归约,所以并行**不可能**改变任何一个元素的值 ——
+/// `collect` 保序,第 i 个输出永远只由第 i 个输入决定。
+///
+/// 这一段和下面的量化是 Amdahl 分析里那部分「按行的串行工作」的主要成分:
+/// 它们只随行数走、完全不进列块那一维,所以以前无论开多少线程都是单线程跑。
+/// GPU 路径上尤其明显 —— HIGGS 1050 万行时 GRAD + QUANTIZE 合计约
+/// 145 ms/轮,占整轮 0.345 s 的四成以上,而那时 GPU 在干等。
 fn compute_gradients(pred: &[f32], label: &[f32], obj: Objective) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter())

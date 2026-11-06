@@ -500,7 +500,7 @@ fn batch_to_contiguous_rows_legacy(
         .context("prediction batch size overflow")?;
     rows.resize(values, 0.0);
     for c in 0..n_features {
-        let column = super::arrow_source::column_as_f32(batch, c)?;
+        let column = super::arrow_source::column_as_f32_allow_inf(batch, c)?;
         for (row, value) in rows.chunks_exact_mut(n_features).zip(column) {
             row[c] = value;
         }
@@ -522,7 +522,7 @@ mod packing_tests {
         let width = batch.num_columns();
         let mut rows = vec![0.0; batch.num_rows() * width];
         for c in 0..width {
-            let column = crate::source::arrow_source::column_as_f32(batch, c)?;
+            let column = crate::source::arrow_source::column_as_f32_allow_inf(batch, c)?;
             for (row, value) in rows.chunks_exact_mut(width).zip(column) {
                 row[c] = value;
             }

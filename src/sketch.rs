@@ -219,8 +219,16 @@ impl FeatureSketch {
 ///
 /// 用中点而不是直接取右值,是为了让边界上的样本落在预期的一侧。
 /// 中点因浮点精度等于左值时退化为取右值。
+///
+/// ⚠️ `b - a` 在两端都接近 f32 上限时会溢出成 inf(如 -2e38 和 2e38),
+/// 那时改用 `a/2 + b/2`;正常范围内保持原公式,分箱逐位不变。
 fn midpoint(a: f32, b: f32) -> f32 {
-    let m = a + (b - a) * 0.5;
+    let d = b - a;
+    let m = if d.is_finite() {
+        a + d * 0.5
+    } else {
+        a * 0.5 + b * 0.5
+    };
     if m <= a {
         b
     } else {
@@ -608,6 +616,31 @@ mod tests {
         let mut sk = FeatureSketch::new(16);
         assert!(sk.cuts(16).is_empty());
         assert_eq!(sk.total_weight(), 0.0);
+    }
+
+    #[test]
+    fn wide_range_finite_values_give_finite_cuts() {
+        // -2e38 和 2e38 之差溢出 f32:中点不能变成 inf(以前会 panic)。
+        let mut set = SketchSet::new(1, 16);
+        for v in [-3.0e38f32, -2.0e38, 0.0, 2.0e38, f32::MAX] {
+            set.push_row(&[v], 1.0);
+        }
+        let cuts = set.finalize();
+        assert_eq!(cuts.n_bins(0), 5);
+        assert!(
+            cuts.values.iter().all(|c| c.is_finite()),
+            "{:?}",
+            cuts.values
+        );
+        assert!(cuts.values.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn midpoint_is_unchanged_in_normal_range() {
+        // 正常范围内必须逐位等于原公式 —— 分箱要和 XGBoost 逐位一致。
+        for (a, b) in [(0.0f32, 1.0f32), (-3.5, 7.25), (1e-30, 2e-30), (1e30, 3e30)] {
+            assert_eq!(midpoint(a, b).to_bits(), (a + (b - a) * 0.5).to_bits());
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-p
 # maturin writes the absolute build directory into the SBOM's bom-ref fields.
 # RUSTFLAGS remapping cannot reach that, because maturin generates it rather
 # than rustc, so it is rewritten after the fact and RECORD is regenerated.
+# The same pass drops the ELF `.comment` section (toolchain banners).
 WHEEL=$(ls -t "$WHEEL_OUT"/*.whl | head -1)
 "$PY" scripts/sanitize_wheel.py "$WHEEL"
 "$PY" scripts/sanitize_wheel.py "$WHEEL" --check
@@ -42,4 +43,9 @@ WHEEL=$(ls -t "$WHEEL_OUT"/*.whl | head -1)
 if [[ -n "${FB_DIST_NAME:-}" && "${FB_DIST_NAME}" != "ferrisboost" ]]; then
   WHEEL=$("$PY" scripts/rebrand_wheel.py "$WHEEL" "$FB_DIST_NAME")
 fi
+# Fail closed: a wheel with any fingerprint is not a release artifact.
+"$PY" scripts/audit_wheel.py "$WHEEL" > /dev/null || {
+  echo "audit_wheel.py found fingerprints in $WHEEL; rerun it to see them" >&2
+  exit 1
+}
 echo "$WHEEL"

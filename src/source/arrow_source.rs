@@ -27,9 +27,27 @@ pub(crate) fn column_as_f32(batch: &RecordBatch, col: usize) -> anyhow::Result<V
     Ok(output)
 }
 
+/// 预测输入用:±inf 原样保留(只决定走哪个分支,和 XGBoost 预测一致)。
+/// 训练入口用 `column_as_f32`,它拒绝 ±inf。
+pub(crate) fn column_as_f32_allow_inf(batch: &RecordBatch, col: usize) -> anyhow::Result<Vec<f32>> {
+    let mut output = Vec::with_capacity(batch.num_rows());
+    visit_column_f32::<false>(batch, col, |value| output.push(value))?;
+    Ok(output)
+}
+
 /// Visit one numeric Arrow column as f32 without allocating an intermediate
 /// buffer. Values, null handling, and casts are identical to `column_as_f32`.
+///
+/// 训练入口:±inf(含 f64 换成 f32 时溢出的值)报错,XGBoost 同样拒绝。
 pub(crate) fn for_each_column_f32(
+    batch: &RecordBatch,
+    col: usize,
+    visit: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    visit_column_f32::<true>(batch, col, visit)
+}
+
+fn visit_column_f32<const REJECT_INF: bool>(
     batch: &RecordBatch,
     col: usize,
     mut visit: impl FnMut(f32),
@@ -43,12 +61,26 @@ pub(crate) fn for_each_column_f32(
                 .as_any()
                 .downcast_ref::<$ty>()
                 .expect("类型已经 match 过了");
+            let mut any_inf = false;
             for i in 0..n {
-                visit(if values.is_null(i) {
+                let v = if values.is_null(i) {
                     f32::NAN
                 } else {
                     values.value(i) as f32
-                });
+                };
+                any_inf |= v.is_infinite();
+                visit(v);
+            }
+            if REJECT_INF && any_inf {
+                let i = (0..n)
+                    .find(|&i| !values.is_null(i) && (values.value(i) as f32).is_infinite())
+                    .expect("any_inf");
+                anyhow::bail!(
+                    "第 {col} 列第 {i} 行是 {}(换成 f32 是 {}):不支持 ±inf \
+                     或超出 f32 范围的值(XGBoost 同样拒绝);缺失值请用 null / NaN",
+                    values.value(i),
+                    values.value(i) as f32
+                );
             }
         }};
     }

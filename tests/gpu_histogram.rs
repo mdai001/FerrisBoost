@@ -2383,7 +2383,9 @@ fn gpu_split_cache_bytes_match_allocations_and_activation_rules() {
     assert_eq!(make_default_ctx(0, 2).budget().split_cache_bytes, 0);
     assert_eq!(make_default_ctx(2, 1).budget().split_cache_bytes, 0);
     let expected_per_slot =
-        max_hist_bins * 16 * 2 * 2 + max_feats * (2 * 64 + 8) + 2 * (32 + 64 * 2);
+        // per feature: candidates 64/node + feats/enabled/monotone 12;
+        // per node: sums 16 + metadata 16 + bounds 8, plus the packet window.
+        max_hist_bins * 16 * 2 * 2 + max_feats * (2 * 64 + 12) + 2 * (40 + 64 * 2);
     let bucket_profile = matches!(
         std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
         Ok("1") | Ok("true")
@@ -2399,7 +2401,7 @@ fn gpu_split_cache_bytes_match_allocations_and_activation_rules() {
         assert_eq!(
             make_ctx(true, 2, 2).budget().split_cache_bytes,
             2 * expected_per_slot,
-            "budget must include two histogram generations, feature candidates, packets, sums, metadata, and feature masks"
+            "budget must include two histogram generations, feature candidates, packets, sums, metadata, monotone bounds, and feature masks"
         );
         assert_eq!(
             make_default_ctx(2, 2).budget().split_cache_bytes,

@@ -192,6 +192,14 @@ print(history["valid"]["logloss"])
 FerrisBoost automatically reuses the training cuts for validation data. This
 is required for consistent bin assignments.
 
+When both the training data and a validation table are pyarrow tables, the
+validation columns are matched to the training features by name, so their order
+may differ. A validation table with missing or extra columns is rejected. NumPy
+arrays have no column names and are matched by position.
+
+Feature values must be finite or missing (`NaN`). Values of `±inf` are rejected
+during training, as in XGBoost.
+
 Early stopping watches the last configured metric of the last validation set,
 as in XGBoost. Choose metrics with `params["eval_metric"]`, either one name or a
 list:
@@ -410,7 +418,9 @@ order for Parquet, CSV, and CSV.gz inputs.
 
 For file-backed validation data, entries are `(path, name)` tuples. Validation
 files must use the same label column name (and `weight` column name, if any) as
-the training file:
+the training file. Feature columns are matched to the training features by
+name, so their order may differ, but a validation file with missing or extra
+feature columns is rejected. Headerless CSV files are matched by position.
 
 ```python
 history = {}

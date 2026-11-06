@@ -149,15 +149,7 @@ fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles>
     };
     let label_col = find(targets.label)?;
     let weight_col = targets.weight.map(find).transpose()?;
-    let feat_cols: Vec<usize> = (0..names.len())
-        .filter(|i| *i != label_col && Some(*i) != weight_col)
-        .collect();
-    anyhow::ensure!(
-        !feat_cols.is_empty(),
-        "除了标签列 {:?} 之外没有别的列了",
-        targets.label
-    );
-    let feat_names = feat_cols.iter().map(|&i| names[i].to_string()).collect();
+    let (feat_cols, feat_names) = targets.select_features(&names)?;
     Ok(ColumnRoles {
         features: feat_cols,
         label: label_col,

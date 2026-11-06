@@ -386,6 +386,29 @@ impl Model {
                 mp.num_class
             )));
         }
+        // ⚠️ 多目标模型(XGBoost 2.x 可能只存一个标量 base_score)必须拒绝:
+        // 当成单目标读会把所有目标的树加在一起,静默给出错的预测。
+        if !mp.num_target.trim().is_empty() && parse_param::<i32>("num_target", &mp.num_target)? > 1
+        {
+            return Err(unsupported(format_args!(
+                "多目标模型不支持(num_target = {})",
+                mp.num_target
+            )));
+        }
+        if let Some(g) = booster.model.tree_info.iter().find(|&&g| g != 0) {
+            return Err(unsupported(format_args!(
+                "tree_info 里有输出组 {g}:只支持单输出模型"
+            )));
+        }
+        for t in &booster.model.trees {
+            let leaf = t.tree_param.size_leaf_vector.trim();
+            if !leaf.is_empty() && parse_param::<i32>("size_leaf_vector", leaf)? > 1 {
+                return Err(unsupported(format_args!(
+                    "第 {} 棵树是向量叶子(size_leaf_vector = {leaf}):只支持标量叶子",
+                    t.id
+                )));
+            }
+        }
         if parse_param::<i32>(
             "num_parallel_tree",
             &booster.model.gbtree_model_param.num_parallel_tree,
@@ -1176,6 +1199,37 @@ mod tests {
             // 报错要说人话,不能是 "invalid type at line 1"
             assert!(!err.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn multi_output_models_are_rejected() {
+        // 2.x 的多目标模型可能只存一个标量 base_score:光看 base_score 拦不住,
+        // 必须看 num_target / tree_info / size_leaf_vector。
+        let cases = [
+            (
+                "\"num_target\": \"1\"",
+                "\"num_target\": \"2\"",
+                "num_target",
+            ),
+            ("\"tree_info\": [0]", "\"tree_info\": [1]", "tree_info"),
+            (
+                "\"size_leaf_vector\": \"1\"",
+                "\"size_leaf_vector\": \"2\"",
+                "size_leaf_vector",
+            ),
+        ];
+        for (from, to, what) in cases {
+            let broken = XGB_DUMP.replace(from, to);
+            assert_ne!(broken, XGB_DUMP, "替换没生效:{from}");
+            let err = Model::from_xgboost_json(&broken).expect_err(what);
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+        // 老模型的 size_leaf_vector 是 "0";没有 num_target 字段也照常加载。
+        let old = XGB_DUMP
+            .replace("\"size_leaf_vector\": \"1\"", "\"size_leaf_vector\": \"0\"")
+            .replace(", \"num_target\": \"1\"", "");
+        assert_ne!(old, XGB_DUMP);
+        Model::from_xgboost_json(&old).unwrap();
     }
 
     #[test]

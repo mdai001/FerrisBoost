@@ -1327,9 +1327,11 @@ impl GpuTrainCtx {
                 resident_block_count
                     * ((max_hist_bins * 2 * hist_nodes_per_batch).max(1) * 8 * 2
                         + (max_block_feats * hist_nodes_per_batch * 64).max(1)
-                        + max_block_feats.max(1) * 8
+                        // feats + enabled + monotone(各 4 B)
+                        + max_block_feats.max(1) * 12
+                        // sums 16 + metadata 16 + bounds 8,再加 packet 窗口
                         + hist_nodes_per_batch
-                            * (32 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES))
+                            * (40 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES))
             } else {
                 0
             },
