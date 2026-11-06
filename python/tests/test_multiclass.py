@@ -303,3 +303,22 @@ def test_multiclass_parquet_output_follows_single_output_rules(tmp_path):
     with pytest.raises(Exception):
         m.predict_to_parquet(str(tmp_path / "bad.parquet"), str(tmp_path / "partial.parquet"))
     assert not (tmp_path / "partial.parquet").exists()
+
+
+def test_multiclass_parquet_output_inside_input_directory(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=400, k=3, seed=22)
+    d = tmp_path / "inputs"
+    d.mkdir()
+    pq.write_table(pa.table({f"f{i}": x[:, i] for i in range(x.shape[1])}), str(d / "part-0.parquet"))
+    m = fb.train({"objective": "multi:softprob", "num_class": 3}, x, label=y,
+                 num_boost_round=2, quiet=True)
+    # 输出落在输入目录里(目录和 glob 两种写法):不能把自己当成输入读进去
+    for spec, out in [(str(d), d / "pred-a.parquet"), (str(d / "*.parquet"), d / "pred-b.parquet")]:
+        n = m.predict_to_parquet(spec, str(out))
+        assert n == len(y)
+        got = pq.read_table(str(out))
+        np.testing.assert_array_equal(np.column_stack([got[c].to_numpy() for c in got.column_names]),
+                                      m.predict(x))
+        (out).unlink()

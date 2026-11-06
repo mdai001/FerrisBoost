@@ -3169,6 +3169,14 @@ fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
     obj.gradient(pred, label)
 }
 
+/// 训练会不会有一份逐行的梯度权重(样本权重,或折进 `scale_pos_weight`
+/// 之后的隐式权重)。`gpu_math="fast"` 时它常驻显存(4 B/行),所以显存
+/// 规划器必须用**同一个**判断 —— 不能只看用户有没有传样本权重。
+/// 与 `gradient_weights(..).is_some() || weights.is_some()` 逐项一致。
+pub(crate) fn has_gradient_weights(obj: Objective, has_sample_weights: bool, spw: f32) -> bool {
+    has_sample_weights || (spw != 1.0 && obj.uses_scale_pos_weight())
+}
+
 /// 把 `scale_pos_weight` 折进梯度权重(XGBoost `RegLossObj::GetGradient`:
 /// `w = weight or 1; if label == 1.0 { w *= spw }`)。spw == 1 返回 `None`。
 fn gradient_weights(
@@ -3481,6 +3489,26 @@ mod tests {
             let (model, _) = train_on(&x, &y, nf, params(max_depth, 2), Objective::Logistic);
             for t in &model.trees {
                 assert!(depth_of(t, 0) <= max_depth, "max_depth {max_depth} 被突破");
+            }
+        }
+    }
+
+    #[test]
+    fn planner_weight_predicate_matches_training_allocation() {
+        let y = vec![0.0f32, 1.0, 1.0, 0.0];
+        let w = vec![0.5f32; 4];
+        for obj in Objective::ALL {
+            for spw in [1.0f32, 0.0, 2.5] {
+                for sample in [None, Some(w.as_slice())] {
+                    let allocated =
+                        gradient_weights(obj, &y, sample, spw).is_some() || sample.is_some();
+                    assert_eq!(
+                        has_gradient_weights(obj, sample.is_some(), spw),
+                        allocated,
+                        "{obj:?} spw={spw} sample={}",
+                        sample.is_some()
+                    );
+                }
             }
         }
     }

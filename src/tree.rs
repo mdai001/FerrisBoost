@@ -318,7 +318,16 @@ impl Model {
     /// `iteration_range=(0, n_trees)`。
     ///
     /// 早停之后想要"最佳轮次的模型",传 `best_iteration + 1`。
+    ///
+    /// # Panics
+    /// 多分类模型(`num_outputs() > 1`)每行有 K 个输出,标量接口没有意义:
+    /// 用 `predict_margins_upto` / `predict_row`。
     pub fn predict_margin_upto(&self, features: &[f32], n_trees: usize) -> f32 {
+        assert!(
+            self.class_base_margins.is_empty(),
+            "多分类模型({} 类)没有标量预测:用 predict_margins_upto / predict_row",
+            self.num_outputs()
+        );
         let n = n_trees.min(self.trees.len());
         let mut acc = crate::train::base_margin(self.objective, self.base_score);
         for t in &self.trees[..n] {
@@ -329,9 +338,26 @@ impl Model {
 
     /// 和 XGBoost 的 `Booster.predict()` 同义:二分类返回概率,
     /// 回归返回预测值本身。要原始分数用 `predict_margin`。
+    ///
+    /// # Panics
+    /// 多分类模型:用 `predict_row`。
     pub fn predict(&self, features: &[f32]) -> f32 {
         let m = self.predict_margin(features);
         self.objective.transform(m)
+    }
+
+    /// 任意 objective 的一行预测,和 XGBoost `Booster.predict()` 同义:
+    /// 单输出返回 `[值]`;`multi:softprob` 返回 K 个概率;`multi:softmax`
+    /// 返回 `[类别下标]`。
+    pub fn predict_row(&self, features: &[f32]) -> Vec<f32> {
+        if self.class_base_margins.is_empty() {
+            return vec![self.predict(features)];
+        }
+        let mut m = self.predict_margins_upto(features, self.trees.len());
+        match self.objective.transform_row(&mut m) {
+            Some(class) => vec![class],
+            None => m,
+        }
     }
 
     /// 导出成 XGBoost 兼容的 JSON。
@@ -996,6 +1022,36 @@ mod tests {
         let (l, _r) = t.split_leaf(root, 0, 1.5, true, 4.0, 0.0, 6.0, 3.0, 4.0);
         t.split_leaf(l, 1, 0.5, false, 2.0, 1.0, 3.0, 2.0, 3.0);
         t
+    }
+
+    fn multiclass_fixture() -> Model {
+        let mut m = fixture_model();
+        m.trees.clear();
+        m.objective = Objective::Softmax { num_class: 3 };
+        m.class_base_margins = vec![1.1, 2.2, 3.3];
+        m
+    }
+
+    #[test]
+    fn multiclass_row_prediction_respects_output_groups() {
+        let m = multiclass_fixture();
+        let x = vec![0.0f32; m.n_features];
+        assert_eq!(m.predict_row(&x), vec![2.0]);
+        assert_eq!(m.predict_margins_upto(&x, 0), vec![1.1, 2.2, 3.3]);
+        let mut p = m.clone();
+        p.objective = Objective::Softprob { num_class: 3 };
+        let probs = p.predict_row(&x);
+        assert_eq!(probs.len(), 3);
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(probs[2] > probs[1] && probs[1] > probs[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "多分类模型")]
+    fn multiclass_scalar_prediction_is_rejected() {
+        let m = multiclass_fixture();
+        let x = vec![0.0f32; m.n_features];
+        let _ = m.predict_margin(&x);
     }
 
     fn fixture_model() -> Model {

@@ -299,6 +299,10 @@ pub(crate) struct CompactInferenceModel {
 
 impl CompactInferenceModel {
     pub(crate) fn new(canonical: &Model) -> Result<Self> {
+        // 单输出预测器:多分类模型要先拆成 `Model::class_view`。
+        if canonical.num_outputs() > 1 {
+            bail!("prediction 预测器只接单输出模型;多分类请按类拆成 class_view");
+        }
         if canonical.n_features == 0 {
             bail!("prediction 模型必须至少有一个 feature");
         }

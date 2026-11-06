@@ -263,8 +263,15 @@ fn resolve_blocking(
                         true,
                         32 * 1024 * 1024,
                     );
-                    // fast 模式下权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
-                    let model = if fast && cfg.weighted {
+                    // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
+                    // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
+                    // 和训练时的分配用同一个判断。
+                    let model = if fast
+                        && crate::train::has_gradient_weights(
+                            cfg.objective,
+                            cfg.weighted,
+                            cfg.params.scale_pos_weight,
+                        ) {
                         model.with_fast_weights(rows)
                     } else {
                         model
@@ -1592,6 +1599,17 @@ impl PyModel {
                 "prediction 输出路径必须使用 .parquet 或 .pq 扩展名",
             ));
         }
+        // 先拒绝已存在的目标(不白算一遍),但**不在这里创建文件**:
+        // 输出若落在输入目录 / glob 里,先建出来的空文件会被当成输入读进去。
+        // 输入全部读完、预测算完之后才 create_new(仍然原子地拒绝覆盖)。
+        if out_path.exists() {
+            return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
+                "prediction 输出已存在,不会覆盖: {}",
+                out_path.display()
+            )));
+        }
+        let (n, mut margins) =
+            self.multiclass_margins(py, data, n_trees, header, predict_threads, false)?;
         let file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1615,8 +1633,7 @@ impl PyModel {
             path: out_path,
             complete: false,
         };
-        let (n, mut margins) =
-            self.multiclass_margins(py, data, n_trees, header, predict_threads, false)?;
+
         let k = self.inner.num_outputs();
         let softmax_labels = !output_margin
             && matches!(
