@@ -303,7 +303,9 @@ impl GpuBlockSession<'_> {
             }
             cache.features_ready = true;
         }
-        let has_monotone = u32::from(p.has_monotone());
+        // 「给定权重」模式:单调约束、alpha、max_delta_step 任一开启。
+        // 没有单调约束时 monotone 缓冲区保持全 0、界是 ±f32::MAX。
+        let has_monotone = u32::from(p.uses_given_weight());
         if has_monotone != 0 {
             stream.memcpy_htod(&bounds, &mut cache.bounds.slice_mut(..bounds.len()))?;
             self.timing.split_metadata_h2d_calls += 1;
@@ -353,6 +355,8 @@ impl GpuBlockSession<'_> {
             .arg(&p.lambda)
             .arg(&p.gamma)
             .arg(&p.min_child_weight)
+            .arg(&p.alpha)
+            .arg(&p.max_delta_step)
             .arg(&cache.bounds)
             .arg(&cache.monotone)
             .arg(&has_monotone)
