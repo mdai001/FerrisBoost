@@ -2386,7 +2386,7 @@ impl GpuTrainCtx {
             max_grad = max_grad.max(pair[0]);
             max_hess = max_hess.max(pair[1]);
         }
-        let quantizer = GradQuantizer::from_bounds(max_grad, max_hess, self.n_rows);
+        let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, self.n_rows)?;
 
         {
             let grad_scale = quantizer.grad_scale();

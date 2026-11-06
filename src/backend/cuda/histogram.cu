@@ -752,8 +752,12 @@ extern "C" __global__ void gpair_max_abs(
                 gpair[(uint64_t)i * 2 + 1] = 0.0f;
             }
         }
-        mg = fmax(mg, fabs((double)gpair[(uint64_t)i * 2]));
-        mh = fmax(mh, fabs((double)gpair[(uint64_t)i * 2 + 1]));
+        // fmax ignores NaN, so map all non-finite pairs to an infinite bound.
+        // The existing small D2H reduction then rejects them before quantization.
+        const double g = (double)gpair[(uint64_t)i * 2];
+        const double h = (double)gpair[(uint64_t)i * 2 + 1];
+        mg = fmax(mg, isfinite(g) ? fabs(g) : INFINITY);
+        mh = fmax(mh, isfinite(h) ? fabs(h) : INFINITY);
     }
     rg[threadIdx.x] = mg;
     rh[threadIdx.x] = mh;

@@ -195,6 +195,12 @@ pub struct GradQuantizer {
 
 impl GradQuantizer {
     pub fn new(gpair: &[GradPair], n_rows: usize) -> Self {
+        Self::try_new(gpair, n_rows).expect("non-finite gradient or Hessian")
+    }
+
+    /// Checked training entry point. Invalid values propagate through the existing
+    /// max reduction as infinity, without adding another full-row scan.
+    pub fn try_new(gpair: &[GradPair], n_rows: usize) -> anyhow::Result<Self> {
         // `max` 是结合律和交换律都成立的,而且对 f64 是**精确**运算
         // (不像求和会引入舍入),所以并行归约和串行逐位相同 ——
         // scale 不变,量化结果就不变,位精确契约不受影响。
@@ -202,15 +208,10 @@ impl GradQuantizer {
             .par_iter()
             .fold(
                 || (0.0f64, 0.0f64),
-                |(g_acc, h_acc), g| {
-                    (
-                        g_acc.max((g.grad as f64).abs()),
-                        h_acc.max((g.hess as f64).abs()),
-                    )
-                },
+                |(g_acc, h_acc), g| (g_acc.max(finite_abs(g.grad)), h_acc.max(finite_abs(g.hess))),
             )
             .reduce(|| (0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
-        Self::from_bounds(max_grad, max_hess, n_rows)
+        Self::try_from_bounds(max_grad, max_hess, n_rows)
     }
 
     /// 从已知的上界直接构造。
@@ -218,16 +219,26 @@ impl GradQuantizer {
     /// 有它就不必为了求上界而把整个 f32 梯度数组物化出来 —— 扫一遍算
     /// 上界、再扫一遍直接产出定点值,峰值内存少一整份浮点梯度。
     pub fn from_bounds(max_grad: f64, max_hess: f64, n_rows: usize) -> Self {
+        Self::try_from_bounds(max_grad, max_hess, n_rows)
+            .expect("invalid gradient or Hessian bounds")
+    }
+
+    /// Reject non-finite bounds before float-to-integer conversion can saturate.
+    pub fn try_from_bounds(max_grad: f64, max_hess: f64, n_rows: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            max_grad.is_finite() && max_hess.is_finite() && max_grad >= 0.0 && max_hess >= 0.0,
+            "non-finite gradient or Hessian (or invalid bounds); reduce extreme labels, weights, base_score or objective parameters"
+        );
         // grad 和 hess 分开定 scale:logistic 的 hess 最大 0.25,
         // 和 grad 不是一个量级,共用一个 scale 白扔几位精度。
         let grad_scale = pow2_scale(max_grad, n_rows);
         let hess_scale = pow2_scale(max_hess, n_rows);
-        Self {
+        Ok(Self {
             grad_scale,
             hess_scale,
             grad_inverse_scale: grad_scale.recip(),
             hess_inverse_scale: hess_scale.recip(),
-        }
+        })
     }
 
     pub fn to_fixed(&self, g: GradPair) -> GradPairFixed {
@@ -265,6 +276,15 @@ impl GradQuantizer {
 
     pub fn hess_scale(&self) -> f64 {
         self.hess_scale
+    }
+}
+
+#[inline]
+fn finite_abs(v: f32) -> f64 {
+    if v.is_finite() {
+        (v as f64).abs()
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -706,15 +726,7 @@ mod inverse_scale_tests {
     #[test]
     fn constructors_keep_inverse_scales_in_sync() {
         for rows in [0, 1, 100, 10_500_000, usize::MAX] {
-            for bound in [
-                0.0,
-                f32::from_bits(1) as f64,
-                0.25,
-                1.0,
-                f32::MAX as f64,
-                f64::NAN,
-                f64::INFINITY,
-            ] {
+            for bound in [0.0, f32::from_bits(1) as f64, 0.25, 1.0, f32::MAX as f64] {
                 let q = GradQuantizer::from_bounds(bound, 0.25, rows);
                 let value = GradPairFixed {
                     grad: -123456789,

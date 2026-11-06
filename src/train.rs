@@ -1413,13 +1413,13 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::QUANTIZE);
-                let quantizer = GradQuantizer::new(&gpair_f32, n);
+                let quantizer = GradQuantizer::try_new(&gpair_f32, n)?;
                 let fixed: Vec<GradPairFixed> = gpair_f32
                     .par_iter()
                     .map(|&g| quantizer.to_fixed(g))
                     .collect();
-                (quantizer, fixed, None)
-            })
+                Ok::<_, anyhow::Error>((quantizer, fixed, None))
+            })?
         };
         drop(quantize_phase);
         {
@@ -1601,7 +1601,7 @@ pub fn train_gpu_one_tree(
     let margin = base_margin(cfg.objective, base_score);
     let predictions = vec![margin; source.n_rows()];
     let gpair = compute_gradients(&predictions, labels, cfg.objective);
-    let quantizer = GradQuantizer::new(&gpair, source.n_rows());
+    let quantizer = GradQuantizer::try_new(&gpair, source.n_rows())?;
     let fixed: Vec<GradPairFixed> = gpair.iter().map(|&g| quantizer.to_fixed(g)).collect();
     let root_sum = hist::node_sum(&fixed, None);
     let mut tree = Tree::default();
@@ -1822,13 +1822,13 @@ fn train_multiclass_rounds(
             } else {
                 pool.install(|| {
                     let _t = prof::Timer::new(&prof::QUANTIZE);
-                    let quantizer = GradQuantizer::new(&gpair_f32, n);
+                    let quantizer = GradQuantizer::try_new(&gpair_f32, n)?;
                     let fixed: Vec<GradPairFixed> = gpair_f32
                         .par_iter()
                         .map(|&g| quantizer.to_fixed(g))
                         .collect();
-                    (quantizer, fixed, None)
-                })
+                    Ok::<_, anyhow::Error>((quantizer, fixed, None))
+                })?
             };
             drop(gpair_f32);
             if let (Some(ctx), false) = (gpu, device_quant) {
