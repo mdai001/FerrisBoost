@@ -1989,7 +1989,7 @@ struct Parsed {
     /// 那些由 Rust 侧的显存规划器决定,见 `gpu_mem_plan`。
     device: Option<usize>,
     objective: Objective,
-    base_score: f32,
+    base_score: Option<f32>,
     cache_budget_bytes: Option<usize>,
     cache_path: Option<String>,
     /// File ingest concurrency, independent of training `nthread`.

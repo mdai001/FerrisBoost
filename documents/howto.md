@@ -725,7 +725,7 @@ empty `evals_result()`.
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
 | `seed` | `0` | Alias: `random_state` |
-| `base_score` | `0.5` | Value before the objective transform |
+| `base_score` | estimated | Starting prediction, before the objective transform (a probability for `binary:logistic`). If unset, it is estimated from the training labels as XGBoost 2.0+ does: the (weighted) label mean |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |
 | `cache_path` | `None` | Persistent Parquet cache directory |
 | `eval_metric` | objective default | One name or a list: `rmse`, `logloss`, `error`, `auc`; early stopping watches the last one |

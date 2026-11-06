@@ -628,21 +628,28 @@ pub struct TrainConfig {
     /// 和 XGBoost 的 base_score 同义:**变换前**空间里的初始预测。
     /// 回归时就是预测值本身,二分类时是概率。
     ///
-    /// 注意 XGBoost 2.0 起不给这个参数时会用标签均值估一个,不再是
-    /// 固定 0.5。对拍时两边都要显式设死,否则第一棵树的梯度就对不上。
-    pub base_score: f32,
+    /// `None`(默认)和 XGBoost 2.0+ 一样从训练标签估计
+    /// (`Objective::estimate_base_score`);给了值就原样用。
+    /// 训练出来的 `Model.base_score` 永远是解析后的那个数。
+    pub base_score: Option<f32>,
 }
 
 impl TrainConfig {
-    /// XGBoost 老版本的默认值,两个 objective 都是 0.5。
+    /// `base_score` 默认不设:和 XGBoost 一样从标签估计。
     pub fn new(params: TrainParams, objective: Objective) -> Self {
         Self {
             params,
             objective,
             quiet: false,
             eval_metrics: vec![crate::metrics::default_metric(objective)],
-            base_score: 0.5,
+            base_score: None,
         }
+    }
+
+    /// 解析 base_score:用户给的值,或从训练标签/权重估计。
+    pub fn resolve_base_score(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
+        self.base_score
+            .unwrap_or_else(|| self.objective.estimate_base_score(labels, weights))
     }
 }
 
@@ -945,8 +952,9 @@ fn train_with_backend(
         validate_weights(w, n, "训练集")?;
     }
     cfg.objective.validate_labels(labels, "训练集")?;
-    anyhow::ensure!(cfg.base_score.is_finite(), "base_score 必须是有限值");
-    cfg.objective.validate_base_score(cfg.base_score)?;
+    let base_score = cfg.resolve_base_score(labels, weights);
+    anyhow::ensure!(base_score.is_finite(), "base_score 必须是有限值");
+    cfg.objective.validate_base_score(base_score)?;
     let source_bytes_start = source.source_bytes_read();
     let source_reads_start = source.source_block_reads();
     let p = &cfg.params;
@@ -1055,11 +1063,11 @@ fn train_with_backend(
         );
     }
     let _profile_guard = prof::begin();
-    let margin = base_margin(cfg.objective, cfg.base_score);
+    let margin = base_margin(cfg.objective, base_score);
     let mut predictions = vec![margin; n];
     let mut model = Model {
         trees: Vec::with_capacity(cfg.params.n_rounds),
-        base_score: cfg.base_score,
+        base_score: base_score,
         objective: cfg.objective,
         n_features: source.n_features(),
         // 训练层不认识"列名"这个概念(它只见到量化后的块),所以留空,
@@ -1078,7 +1086,7 @@ fn train_with_backend(
     // tests/bit_exact_vs_xgboost.rs 兜底,可以动了。
     let mut eval_preds: Vec<Vec<f32>> = evals
         .iter()
-        .map(|e| vec![base_margin(cfg.objective, cfg.base_score); e.source.n_rows()])
+        .map(|e| vec![base_margin(cfg.objective, base_score); e.source.n_rows()])
         .collect();
 
     // GPU 资源按**最坏情况**在训练开始分配一次:gpair、row index、
@@ -1514,7 +1522,8 @@ pub fn train_gpu_one_tree(
     if labels.len() != source.n_rows() {
         anyhow::bail!("labels 长度与 source 行数不符");
     }
-    let margin = base_margin(cfg.objective, cfg.base_score);
+    let base_score = cfg.resolve_base_score(labels, None);
+    let margin = base_margin(cfg.objective, base_score);
     let predictions = vec![margin; source.n_rows()];
     let gpair = compute_gradients(&predictions, labels, cfg.objective);
     let quantizer = GradQuantizer::new(&gpair, source.n_rows());
@@ -1560,7 +1569,7 @@ pub fn train_gpu_one_tree(
             feature_names: Vec::new(),
             schema_mode: None,
             trees: vec![tree],
-            base_score: cfg.base_score,
+            base_score: base_score,
             objective: cfg.objective,
             n_features: source.n_features(),
             best_iteration: None,
@@ -1605,7 +1614,7 @@ pub fn train_gpu_one_tree(
         feature_names: Vec::new(),
         schema_mode: None,
         trees: vec![tree],
-        base_score: cfg.base_score,
+        base_score: base_score,
         objective: cfg.objective,
         n_features: source.n_features(),
         best_iteration: None,
@@ -3143,6 +3152,47 @@ mod tests {
     }
 
     #[test]
+    fn default_base_score_is_the_weighted_label_mean() {
+        let x: Vec<f32> = (0..40).map(|i| (i % 7) as f32).collect();
+        let y: Vec<f32> = (0..40).map(|i| f32::from(i % 3 == 0)).collect();
+        let w: Vec<f32> = (0..40)
+            .map(|i| {
+                if i % 3 == 0 {
+                    3.0
+                } else {
+                    0.5 + (i % 4) as f32
+                }
+            })
+            .collect();
+        let src = DenseSource::from_row_major(&x, 40, 1, 255, 1);
+        for obj in Objective::ALL {
+            let cfg = TrainConfig::new(params(2, 1), obj);
+            let m = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+            let mean = y.iter().fold(0.0f64, |a, &v| a + v as f64 / 40.0) as f32;
+            assert_eq!(m.base_score, mean, "{obj:?}");
+            let mw = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local).unwrap();
+            assert_eq!(
+                mw.base_score,
+                obj.estimate_base_score(&y, Some(&w)),
+                "{obj:?}"
+            );
+            assert_ne!(mw.base_score, mean);
+        }
+        // 全零权重:退回 0.5 而不是 NaN。
+        let zero = vec![0.0f32; 40];
+        assert_eq!(
+            Objective::Logistic.estimate_base_score(&y, Some(&zero)),
+            0.5
+        );
+        // 标签全相同的 logistic:估出 0 / 1,margin 被夹住而不是 ±inf。
+        let ones = vec![1.0f32; 40];
+        let cfg = TrainConfig::new(params(2, 1), Objective::Logistic);
+        let m = train(&src, &ones, &[], &cfg, &mut [], &Local).unwrap();
+        assert_eq!(m.base_score, 1.0);
+        assert!(Objective::Logistic.base_margin(m.base_score).is_finite());
+    }
+
+    #[test]
     fn root_only_tree_updates_the_next_round_predictions() {
         // max_depth=0 不进生长循环,根节点就是终叶。第一轮的叶子值必须
         // 直接累进 predictions,否则第二轮会看到同一份梯度、长出完全
@@ -3151,7 +3201,13 @@ mod tests {
         let y = vec![1.0f32; 8];
         let mut p = params(0, 2);
         p.learning_rate = 0.3;
-        let (model, _) = train_on(&x, &y, 1, p, Objective::SquaredError);
+        // 显式 base_score:估计出的标签均值正好等于全部标签,梯度为 0。
+        let src = DenseSource::from_row_major(&x, 8, 1, p.max_bin, p.cols_per_block);
+        let cfg = TrainConfig {
+            base_score: Some(0.5),
+            ..TrainConfig::new(p, Objective::SquaredError)
+        };
+        let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
 
         let first = model.trees[0].nodes[0].leaf_value;
         let second = model.trees[1].nodes[0].leaf_value;
@@ -3269,7 +3325,7 @@ mod tests {
         p.learning_rate = 1.0;
         let src = DenseSource::from_row_major(&x, 40, nf, p.max_bin, p.cols_per_block);
         let cfg = TrainConfig {
-            base_score: 0.5,
+            base_score: Some(0.5),
             ..TrainConfig::new(p, Objective::SquaredError)
         };
         let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();

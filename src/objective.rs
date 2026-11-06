@@ -11,6 +11,12 @@ use crate::types::{GradPair, Objective};
 
 /// XGBoost 的 sigmoid(f32)。训练梯度、预测变换共用同一个表达式,
 /// 保证两边逐位一致。
+/// XGBoost `kRtEps`。
+const K_RT_EPS: f32 = 1e-6;
+
+/// XGBoost `ObjFunction::DefaultBaseScore()`:无法估计时的回退值。
+pub const DEFAULT_BASE_SCORE: f32 = 0.5;
+
 #[inline]
 fn sigmoid(m: f32) -> f32 {
     1.0 / (1.0 + (-m).exp())
@@ -52,18 +58,56 @@ impl Objective {
     /// 但 base_score 和 XGBoost 一样是在变换**之后**的空间里给的。
     /// 二分类忘了取 logit 的话,起点就从 0.0 变成 0.5,第一棵树的梯度
     /// 全错,而且错得很小 —— 训得出来,就是对不上。
+    ///
+    /// 逐位照搬 XGBoost 3.4.1 `ProbToMargin`:logistic 先夹到
+    /// `[kRtEps, 1 − kRtEps]`(kRtEps = 1e-6,标签全 0 或全 1 时估出的
+    /// 0 / 1 也能用),再用 `common::Logit(x) = −logf(1/x − 1)` ——
+    /// 和 `ln(x/(1−x))` 数学上相等,但 f32 最后一位不一定相同。
     pub fn base_margin(self, base_score: f32) -> f32 {
         match self {
             Objective::SquaredError => base_score,
             // logit(0.5) = 0.0
             Objective::Logistic => {
                 assert!(
-                    base_score > 0.0 && base_score < 1.0,
-                    "binary:logistic 的 base_score 是概率,必须在 (0, 1) 里,给的是 {base_score}"
+                    (0.0..=1.0).contains(&base_score),
+                    "binary:logistic 的 base_score 是概率,必须在 [0, 1] 里,给的是 {base_score}"
                 );
-                (base_score / (1.0 - base_score)).ln()
+                let x = base_score.clamp(K_RT_EPS, 1.0 - K_RT_EPS);
+                -(1.0f32 / x - 1.0).ln()
             }
         }
+    }
+
+    /// 不给 `base_score` 时从训练标签估计(XGBoost 3.4.1 `InitEstimation`)。
+    ///
+    /// 两个现有 objective 都走 `FitInterceptGlmLike`:(加权)标签均值。
+    /// 算术逐位照搬 `common::SampleMean` / `WeightedSampleMean`:
+    /// f64 里累加 `y_i / n`(加权时 `y_i / Σw · w_i`),最后截成 f32。
+    /// XGBoost 按 OpenMP 线程分段求和,我们固定按行号串行累加 ——
+    /// 与 XGBoost `nthread=1` 逐位相同,而且不随线程数变化
+    /// (我们的不变量;XGBoost 多线程时 f64 尾数可能差一点,截到 f32 后
+    /// 几乎总是同一个数)。
+    ///
+    /// 权重全为 0 时 XGBoost 直接报错;我们退回默认 0.5,保证全零权重的
+    /// 退化输入仍能训练(之前的审计修复依赖这一点)。
+    pub fn estimate_base_score(self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
+        let mean = match weights {
+            None => {
+                let n = labels.len() as f64;
+                labels.iter().fold(0.0f64, |acc, &y| acc + y as f64 / n)
+            }
+            Some(w) => {
+                let sum_w = w.iter().fold(0.0f64, |acc, &v| acc + v as f64);
+                if sum_w <= 0.0 {
+                    return DEFAULT_BASE_SCORE;
+                }
+                labels
+                    .iter()
+                    .zip(w)
+                    .fold(0.0f64, |acc, (&y, &wi)| acc + y as f64 / sum_w * wi as f64)
+            }
+        };
+        mean as f32
     }
 
     /// 单行的梯度(未乘权重)。`gradient_bounds` 和量化那一趟共用它,
@@ -119,9 +163,10 @@ impl Objective {
         match self {
             Objective::SquaredError => Ok(()),
             Objective::Logistic => {
+                // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
                 anyhow::ensure!(
-                    base_score.is_finite() && base_score > 0.0 && base_score < 1.0,
-                    "binary:logistic 的 base_score 必须是 (0, 1) 内的有限概率"
+                    base_score.is_finite() && (0.0..=1.0).contains(&base_score),
+                    "binary:logistic 的 base_score 必须是 [0, 1] 内的有限概率"
                 );
                 Ok(())
             }

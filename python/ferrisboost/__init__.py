@@ -74,7 +74,8 @@ _DEFAULTS: dict[str, Any] = {
     # gpair H2D 减半;实测 HIGGS −27%、wide −5.5%。显存吃紧可以关掉。
     "device_quantize": None,
     "seed": 0,
-    "base_score": 0.5,
+    # None = 和 XGBoost 2.0+ 一样从训练标签估计(加权标签均值);给值就原样用。
+    "base_score": None,
     "cache_budget_bytes": None,
     "cache_path": None,
     # XGBoost 同名参数:字符串或字符串列表。None = objective 的默认指标。
@@ -202,8 +203,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     if out["device_quantize"] is not None:
         out["device_quantize"] = bool(out["device_quantize"])
     for key in ("eta", "lambda", "gamma", "min_child_weight", "subsample",
-                "colsample_bytree", "base_score"):
+                "colsample_bytree"):
         out[key] = float(out[key])
+    if out["base_score"] is not None:
+        out["base_score"] = float(out["base_score"])
     if out["cache_budget_bytes"] is not None:
         out["cache_budget_bytes"] = int(out["cache_budget_bytes"])
         if out["cache_budget_bytes"] < 0:

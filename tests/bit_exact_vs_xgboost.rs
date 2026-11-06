@@ -201,7 +201,7 @@ fn margins_with(case: &Case, cols_per_block: usize, nthread: usize) -> Vec<f32> 
         ..case.params.clone()
     };
     let cfg = TrainConfig {
-        base_score: case.base_score,
+        base_score: Some(case.base_score),
         ..TrainConfig::new(params, case.objective)
     };
     let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
@@ -478,7 +478,7 @@ fn bit_exact_vs_xgboost_with_sample_weights() {
                 Some(&w),
             );
             let cfg = TrainConfig {
-                base_score: case.base_score,
+                base_score: Some(case.base_score),
                 ..TrainConfig::new(
                     TrainParams {
                         nthread,
@@ -534,7 +534,7 @@ fn bit_exact_vs_xgboost_with_monotone_constraints() {
                 w.as_deref(),
             );
             let cfg = TrainConfig {
-                base_score: case.base_score,
+                base_score: Some(case.base_score),
                 ..TrainConfig::new(
                     TrainParams {
                         nthread,
