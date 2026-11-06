@@ -1934,6 +1934,7 @@ impl GpuTrainCtx {
         let started = std::time::Instant::now();
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let obj_code: u32 = objective.device_code();
+        let obj_param: f32 = objective.device_param();
         {
             let threads = 256u32;
             let blocks = n_rows_u32.div_ceil(threads).min(65535);
@@ -1967,6 +1968,7 @@ impl GpuTrainCtx {
                 .arg(&has_weight)
                 .arg(&n_rows_u32)
                 .arg(&obj_code)
+                .arg(&obj_param)
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)

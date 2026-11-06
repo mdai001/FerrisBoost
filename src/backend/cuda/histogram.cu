@@ -549,6 +549,8 @@ extern "C" __global__ void apply_delta_and_gradient(
     uint32_t has_weight,
     uint32_t n_rows,
     uint32_t objective,
+    // poisson: max_delta_step; tweedie: variance power; pseudohuber: slope.
+    float obj_param,
     float* gpair_out,
     // 行采样:`row_hash >> 11 < threshold` 即选中。阈值由 host 折算好,
     // **device 上不做任何浮点换算** —— 两边比的是同一个整数,
@@ -567,15 +569,42 @@ extern "C" __global__ void apply_delta_and_gradient(
 
         const float y = label[i];
         float g, h;
+        // Objective codes match `Objective::device_code` (src/objective.rs).
+        // Formulas follow XGBoost 3.4.1 regression_obj.cu; CUDA expf is not
+        // bit-identical to host libm, which is why this path is fast-only.
         if (objective == 0u) {
             // SquaredError
             g = p - y;
             h = 1.0f;
-        } else {
+        } else if (objective == 1u) {
             // Logistic
             const float s = 1.0f / (1.0f + expf(-p));
             g = s - y;
             h = fmaxf(s * (1.0f - s), 1e-16f);
+        } else if (objective == 2u) {
+            // count:poisson
+            g = expf(p) - y;
+            h = expf(p + obj_param);
+        } else if (objective == 3u) {
+            // reg:gamma
+            const float e = expf(p);
+            g = 1.0f - y / e;
+            h = y / e;
+        } else if (objective == 4u) {
+            // reg:tweedie
+            const float rho = obj_param;
+            const float a = expf((1.0f - rho) * p);
+            const float b = expf((2.0f - rho) * p);
+            g = -y * a + b;
+            h = -y * (1.0f - rho) * a + (2.0f - rho) * b;
+        } else {
+            // reg:pseudohubererror
+            const float z = p - y;
+            const float slope2 = obj_param * obj_param;
+            const float scale_sqrt = sqrtf(1.0f + z * z / slope2);
+            const float scale = slope2 + z * z;
+            g = z / scale_sqrt;
+            h = slope2 / (scale * scale_sqrt);
         }
         if (has_weight) {
             const float w = weight[i];
