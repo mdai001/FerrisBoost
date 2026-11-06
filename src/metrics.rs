@@ -284,6 +284,96 @@ impl Metric for Auc {
     }
 }
 
+/// 二分类 PR AUC(XGBoost `aucpr` 的 binary 分支,`BinaryPRAUC`)。
+///
+/// 排序和分段(相同概率合成一段)与 `auc` 相同,但每段面积用 XGBoost 的
+/// `CalcDeltaPRAUC`:段内按线性插值的 FP/TP 曲线对 precision-recall 积分
+/// (闭式解,含 `log` 项)。除数恒为 1,所以直接返回累加面积。
+/// 只有一类样本(`sum(w·y) <= 0` 或 `sum(w·(1-y)) <= 0`)时返回 NaN。
+pub struct AucPr;
+
+/// XGBoost `detail::CalcDeltaPRAUC`,全程 f64,运算顺序照抄。
+fn delta_pr_auc(fp_prev: f64, fp: f64, tp_prev: f64, tp: f64, total_pos: f64) -> f64 {
+    let pr_prev = tp_prev / total_pos;
+    let pr = tp / total_pos;
+    let (a, b) = if tp == tp_prev {
+        (1.0f64, 0.0f64)
+    } else {
+        let h = (fp - fp_prev) / (tp - tp_prev);
+        (h + 1.0, (fp_prev - h * tp_prev) / total_pos)
+    };
+    if b != 0.0 {
+        (pr - pr_prev - b / a * ((a * pr + b).ln() - (a * pr_prev + b).ln())) / a
+    } else {
+        (pr - pr_prev) / a
+    }
+}
+
+impl Metric for AucPr {
+    fn name(&self) -> &str {
+        "aucpr"
+    }
+
+    fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
+        self.eval_weighted(pred, label, None)
+    }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        assert_eq!(pred.len(), label.len(), "aucpr 的预测和标签长度必须一致");
+        if let Some(w) = weight {
+            assert_eq!(pred.len(), w.len(), "aucpr 的预测和权重长度必须一致");
+        }
+        if pred.is_empty() {
+            return f32::NAN;
+        }
+        let wt = |i: usize| weight.map_or(1.0f32, |w| w[i]);
+        // total_pos / total_neg:f32 乘积再累加进 f64(与 XGBoost 一致)。
+        let (mut total_pos, mut total_neg) = (0.0f64, 0.0f64);
+        for (i, &y) in label.iter().enumerate() {
+            let w = wt(i);
+            total_pos += (w * y) as f64;
+            total_neg += (w * (1.0f32 - y)) as f64;
+        }
+        if total_pos <= 0.0 || total_neg <= 0.0 {
+            return f32::NAN;
+        }
+        let p: Vec<f32> = pred.iter().map(|&r| sigmoid_f32(r)).collect();
+        let mut idx: Vec<usize> = (0..p.len()).collect();
+        idx.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+        let first = idx[0];
+        let (y, w) = (label[first], wt(first));
+        let mut fp = (1.0 - y as f64) * w as f64;
+        let mut tp = (y * w) as f64;
+        let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
+        let mut area = 0.0f64;
+        for k in 1..idx.len() {
+            let (i, prev) = (idx[k], idx[k - 1]);
+            if p[i] != p[prev] {
+                area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+                fp_prev = fp;
+                tp_prev = tp;
+            }
+            let (y, w) = (label[i], wt(i));
+            fp += ((1.0f32 - y) * w) as f64;
+            tp += (y * w) as f64;
+        }
+        area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+        if fp <= 0.0 || tp <= 0.0 {
+            area = 0.0;
+        }
+        area.min(1.0) as f32
+    }
+
+    fn lower_is_better(&self) -> bool {
+        false
+    }
+}
+
 /// objective 决定的默认指标,和 XGBoost 一致。
 pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
     match obj {
@@ -303,7 +393,7 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
 
 /// XGBoost `eval_metric` 名字 → metric,按 objective 选对预测变换。
 ///
-/// `logloss` / `error` / `auc` 是概率空间的二分类指标,只接
+/// `logloss` / `error` / `auc` / `aucpr` 是概率空间的二分类指标,只接
 /// `binary:logistic`;`rmse` 两个 objective 都接(二分类时和 XGBoost
 /// 一样在概率上算)。不认识或组合不支持时返回说明原因的错误。
 pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, String> {
@@ -341,7 +431,8 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
         ("logloss", Objective::Logistic) => Ok(Box::new(LogLoss)),
         ("error", Objective::Logistic) => Ok(Box::new(ClassError)),
         ("auc", Objective::Logistic) => Ok(Box::new(Auc)),
-        ("logloss" | "error" | "auc", _) => Err(format!(
+        ("aucpr", Objective::Logistic) => Ok(Box::new(AucPr)),
+        ("logloss" | "error" | "auc" | "aucpr", _) => Err(format!(
             "eval_metric {name:?} 是二分类指标,需要 objective=\"binary:logistic\""
         )),
         _ => Err(format!(
@@ -351,7 +442,8 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
 }
 
 /// 报错里列出的全部 metric 名字。
-pub const SUPPORTED_METRICS: &str = "rmse / mae / mape / mphe / logloss / error / error@t / auc / \
+pub const SUPPORTED_METRICS: &str =
+    "rmse / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
 poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / mlogloss / merror";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
@@ -360,6 +452,7 @@ pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
         "logloss" => Some(Box::new(LogLoss)),
         "error" => Some(Box::new(ClassError)),
         "auc" => Some(Box::new(Auc)),
+        "aucpr" => Some(Box::new(AucPr)),
         _ => None,
     }
 }
@@ -731,6 +824,49 @@ mod tests {
     }
 
     #[test]
+    fn aucpr_matches_xgboost_reference_values() {
+        // 来自 XGBoost 3.4.1 对同一模型的 aucpr(三段并列的预测)。
+        let raw = [
+            -0.0f32,
+            -1.617_205_3,
+            -0.0,
+            1.409_715_3,
+            -0.0,
+            -1.617_205_3,
+            1.409_715_3,
+            -0.0,
+            -0.0,
+            -1.617_205_3,
+            -1.617_205_3,
+            1.409_715_3,
+        ];
+        let y = [1.0f32, 0., 1., 1., 0., 0., 1., 0., 1., 0., 0., 1.];
+        let w = [1.0f32, 2., 0.5, 3., 1., 4., 2., 1., 0.5, 1.5, 2., 1.];
+        let weighted = AucPr.eval_weighted(&raw, &y, Some(&w)) as f64;
+        assert!((weighted - 0.970_779_804_451_6).abs() < 1e-6, "{weighted}");
+        let plain = AucPr.eval(&raw, &y) as f64;
+        assert!((plain - 0.917_699_510_367_1).abs() < 1e-6, "{plain}");
+        assert!(!AucPr.lower_is_better());
+        assert_eq!(AucPr.name(), "aucpr");
+    }
+
+    #[test]
+    fn aucpr_perfect_ties_and_degenerate_inputs() {
+        let y = [0.0f32, 0.0, 1.0, 1.0];
+        let good: Vec<f32> = [0.1f32, 0.2, 0.8, 0.9].iter().map(|&p| logit(p)).collect();
+        assert!((AucPr.eval(&good, &y) - 1.0).abs() < 1e-6);
+        // 全部并列:一段,precision 恒为正类占比 0.5
+        assert!((AucPr.eval(&[0.0; 4], &y) - 0.5).abs() < 1e-6);
+        // 权重整体缩放不改变结果
+        let w = [2.0f32; 4];
+        assert!((AucPr.eval_weighted(&good, &y, Some(&w)) - 1.0).abs() < 1e-6);
+        // 只有一类 / 空数据 → NaN
+        assert!(AucPr.eval(&good[..2], &y[..2]).is_nan());
+        assert!(AucPr.eval(&[0.0; 2], &[1.0, 1.0]).is_nan());
+        assert!(AucPr.eval(&[], &[]).is_nan());
+    }
+
+    #[test]
     fn error_uses_strict_half_threshold() {
         let y = [1.0, 0.0, 1.0, 0.0];
         // p = 0.5 不算正类(严格 >)
@@ -781,6 +917,15 @@ mod tests {
                 .name(),
             "tweedie-nloglik@1.2"
         );
+        let e = for_objective("aucpr", Objective::SquaredError)
+            .err()
+            .unwrap();
+        assert!(e.contains("binary:logistic"), "{e}");
+        assert_eq!(
+            for_objective("aucpr", Objective::Logistic).unwrap().name(),
+            "aucpr"
+        );
+        assert_eq!(by_name("aucpr").unwrap().name(), "aucpr");
         // 二分类 rmse 在概率空间:raw=0 → p=0.5,label=1 → rmse=0.5
         let m = for_objective("rmse", Objective::Logistic).unwrap();
         assert_eq!(m.eval(&[0.0], &[1.0]), 0.5);
