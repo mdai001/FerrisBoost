@@ -373,6 +373,7 @@ fn open_many_impl(
                 transform_threads,
                 true,
                 targets.categorical.unwrap_or(&[]),
+                targets.missing,
             )?;
             (cuts, Some(n_rows))
         }
@@ -384,6 +385,7 @@ fn open_many_impl(
                 transform_threads,
                 false,
                 targets.categorical.unwrap_or(&[]),
+                targets.missing,
             )?;
             (cuts, Some(n_rows))
         }
@@ -429,12 +431,14 @@ fn open_many_impl(
                 cols_per_block,
                 n_rows,
                 transform_threads,
+                targets.missing,
             )?,
             None => ArrowSource::from_batches_with_cuts_and_nthread(
                 batches,
                 cuts,
                 cols_per_block,
                 transform_threads,
+                targets.missing,
             )?,
         }
     };

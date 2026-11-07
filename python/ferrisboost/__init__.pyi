@@ -76,5 +76,16 @@ def train(
     (NaN / null = missing), so a feature has at most 255 categories in this
     version; anything else raises ValueError. params["max_cat_to_onehot"]
     (default 4) and params["max_cat_threshold"] (default 64) match XGBoost.
+
+    params["missing"] (default NaN) is XGBoost's DMatrix `missing`: a feature
+    value equal to it is treated exactly like NaN in the training data and in
+    every validation set, for arrays, DataFrames, PyArrow tables and files
+    (Parquet / CSV are handled by the Rust readers while streaming, so nothing
+    is materialized in Python). Sentinel values never become sketch cut points
+    or categories. It must be NaN or a finite float32; +/-inf and the reserved
+    f32::MAX raise ValueError. It also applies to the integer codes of
+    categorical columns. The model does not store it (XGBoost does not either):
+    pass the same `missing` to Model.predict / predict_to_parquet. A quantized
+    cache_path is only reused with the same `missing`.
     """
     ...

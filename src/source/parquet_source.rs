@@ -524,6 +524,7 @@ fn cuts_only_observed<'a>(
             transform_threads,
             false,
             categorical,
+            targets.missing,
         )
         .map(|(cuts, _)| cuts);
     };
@@ -540,6 +541,7 @@ fn cuts_only_observed<'a>(
         transform_threads,
         true,
         categorical,
+        targets.missing,
     )
     .map(|(cuts, _)| cuts)
 }
@@ -718,6 +720,7 @@ pub(crate) fn open_many_observed<'a>(
                 cuts_plan.1,
                 true,
                 targets.categorical.unwrap_or(&[]),
+                targets.missing,
             )?;
             Some(c)
         }
@@ -725,7 +728,13 @@ pub(crate) fn open_many_observed<'a>(
     };
     let source = match cuts {
         Some(c) => {
-            ArrowSource::with_cuts_and_nthread(|| feats(true), c, cols_per_block, bins_plan.1)?
+            ArrowSource::with_cuts_and_nthread_missing(
+                || feats(true),
+                c,
+                cols_per_block,
+                bins_plan.1,
+                targets.missing,
+            )?
         }
         None => ArrowSource::new_typed_with_phase_threads(
             feats,
@@ -734,6 +743,7 @@ pub(crate) fn open_many_observed<'a>(
             cuts_plan.1,
             bins_plan.1,
             targets.categorical.unwrap_or(&[]),
+            targets.missing,
         )?,
     };
 
@@ -852,9 +862,26 @@ struct CacheManifest {
     /// categorical support (= all numeric).
     #[serde(default)]
     categorical: Vec<bool>,
+    /// Bits of the `missing` sentinel the bins were built with (canonical NaN =
+    /// none). Older caches predate it and were always built without one.
+    #[serde(default = "no_missing_bits")]
+    missing_bits: u32,
     groups: Vec<Vec<FeatId>>,
     /// BLAKE3 of each `block-{i}.bin`, in `groups` order.
     block_hashes: Vec<String>,
+}
+
+fn no_missing_bits() -> u32 {
+    f32::NAN.to_bits()
+}
+
+/// Bit pattern used to compare `missing` sentinels: every NaN is "none".
+fn missing_bits(missing: f32) -> u32 {
+    if missing.is_nan() {
+        no_missing_bits()
+    } else {
+        missing.to_bits()
+    }
 }
 
 enum QuantizedCache {
@@ -899,6 +926,8 @@ pub struct ParquetBlockSource {
     /// 真实从 cache 读入的量化字节数。和 H2D 字节分开统计。
     source_bytes: std::sync::atomic::AtomicU64,
     parquet_loads: AtomicUsize,
+    /// XGBoost `missing` sentinel (NaN = none), applied when quantizing features.
+    missing: f32,
 }
 
 impl ParquetBlockSource {
@@ -1231,6 +1260,7 @@ impl ParquetBlockSource {
             cache_reads: AtomicUsize::new(0),
             source_bytes: std::sync::atomic::AtomicU64::new(0),
             parquet_loads: AtomicUsize::new(0),
+            missing: targets.missing,
         };
         crate::source::openprof::shape(source.n_rows, source.n_features, source.groups.len());
         source.build_cache(targets, max_bins, cols_per_block, options, nthread)?;
@@ -1335,6 +1365,7 @@ impl ParquetBlockSource {
             cuts_offsets: self.cuts.offsets.clone(),
             cuts_hash: cuts_hash(&self.cuts),
             categorical: self.cuts.categorical_flags().to_vec(),
+            missing_bits: missing_bits(self.missing),
             groups: self.groups.clone(),
             block_hashes,
         })
@@ -1399,6 +1430,15 @@ impl ParquetBlockSource {
                 && manifest.cuts_offsets.windows(2).all(|w| w[0] <= w[1]),
             "缓存 cuts offsets 损坏"
         );
+        // The sentinel decides which values are missing, so cached bins are only
+        // valid for the same `missing` (a stale cache would silently bin
+        // sentinel values as ordinary numbers or vice versa).
+        anyhow::ensure!(
+            manifest.missing_bits == missing_bits(targets.missing),
+            "缓存是用不同的 missing 参数建的(缓存 {},本次 {});请换一个 cache_path 或重建缓存",
+            describe_missing(manifest.missing_bits),
+            describe_missing(missing_bits(targets.missing))
+        );
         // A run that declares feature types must match the cached binning:
         // a categorical feature and a numeric one bin differently.
         if let Some(flags) = targets.categorical {
@@ -1456,6 +1496,7 @@ impl ParquetBlockSource {
                 cache_reads: AtomicUsize::new(0),
                 source_bytes: std::sync::atomic::AtomicU64::new(0),
                 parquet_loads: AtomicUsize::new(0),
+                missing: targets.missing,
             },
             labels,
         ))
@@ -1463,6 +1504,15 @@ impl ParquetBlockSource {
 }
 
 static TEMP_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn describe_missing(bits: u32) -> String {
+    let value = f32::from_bits(bits);
+    if value.is_nan() {
+        "NaN".to_string()
+    } else {
+        value.to_string()
+    }
+}
 
 fn default_cache_budget() -> usize {
     let available_kib = std::fs::read_to_string("/proc/meminfo")
@@ -1742,7 +1792,7 @@ impl ParquetBlockSource {
             let batch = batch?;
             let n = batch.num_rows();
             for (local, &f) in feat_ids.iter().enumerate() {
-                let values = crate::source::arrow_source::feature_as_f32(&batch, local)?;
+                let values = crate::source::arrow_source::feature_as_f32(&batch, local, self.missing)?;
                 let dst = &mut out[local * n_rows + row_base..][..n];
                 for (slot, v) in dst.iter_mut().zip(values) {
                     // null 和 NaN 都是缺失
@@ -2680,6 +2730,40 @@ mod tests {
             .expect("不同 cuts 必须拒绝");
         // 现在是**逐值**比较,不再只比哈希,所以报错措辞也换了
         assert!(err.to_string().contains("拒绝使用旧量化数据"), "{err:#}");
+        std::fs::remove_dir_all(cache).ok();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn persistent_cache_is_bound_to_the_missing_sentinel() {
+        let path = write_fixture("cache_missing");
+        let cache = path.with_extension("fbcache_missing");
+        let options = || QuantizedCacheOptions {
+            budget_bytes: Some(0),
+            path: Some(cache.clone()),
+        };
+        let with = |missing: f32| Targets::new("target", None).unwrap().with_missing(missing);
+        let open = |missing: f32| {
+            ParquetBlockSource::open_with_cache_observed(
+                &path,
+                with(missing),
+                16,
+                2,
+                options(),
+                0,
+                |_, _, _| {},
+            )
+        };
+        let (first, _) = open(-999.0).unwrap();
+        assert_eq!(first.parquet_load_count(), first.n_blocks());
+        let (second, _) = open(-999.0).unwrap();
+        assert_eq!(second.parquet_load_count(), 0, "same sentinel reuses the cache");
+        for other in [0.0, f32::NAN] {
+            let Err(err) = open(other) else {
+                panic!("a cache built for a different sentinel must be rejected");
+            };
+            assert!(err.to_string().contains("missing"), "{err:#}");
+        }
         std::fs::remove_dir_all(cache).ok();
         std::fs::remove_file(path).ok();
     }

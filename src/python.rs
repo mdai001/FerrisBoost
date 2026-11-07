@@ -1050,6 +1050,7 @@ fn predict_files_to_parquet(
     n_trees: Option<usize>,
     header: bool,
     predict_threads: usize,
+    missing: f32,
 ) -> PyResult<usize> {
     use crate::tree::SchemaMode;
 
@@ -1209,6 +1210,7 @@ fn predict_files_to_parquet(
             &projected_features,
             header,
             ingest_workers,
+            missing,
             |data, n_rows| {
                 let workers = resolved_predict_workers(
                     predict_threads,
@@ -1554,11 +1556,20 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
+        missing: f32,
     ) -> PyResult<(usize, Vec<f32>)> {
         let k = self.inner.num_outputs();
         if let Some(specs) = path_specs_of(data)? {
-            let arr =
-                self.predict_files(py, specs, true, n_trees, header, predict_threads, use_gpu)?;
+            let arr = self.predict_files(
+                py,
+                specs,
+                true,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+                missing,
+            )?;
             let arr = arr
                 .cast::<numpy::PyArray2<f32>>()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1583,6 +1594,8 @@ impl PyModel {
                 false,
                 false,
                 false,
+                // Array input: the sentinel was already mapped to NaN by `predict`.
+                f64::NAN,
             )?;
             let arr = out
                 .cast::<PyArray1<f32>>()
@@ -1611,6 +1624,7 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
+        missing: f32,
     ) -> PyResult<Bound<'py, PyAny>> {
         // 文件输入:单遍读、按 batch 给每类打分(见 predict_files)。
         if let Some(specs) = path_specs_of(data)? {
@@ -1622,10 +1636,18 @@ impl PyModel {
                 header,
                 predict_threads,
                 use_gpu,
+                missing,
             );
         }
-        let (n, mut margins) =
-            self.multiclass_margins(py, data, n_trees, header, predict_threads, use_gpu)?;
+        let (n, mut margins) = self.multiclass_margins(
+            py,
+            data,
+            n_trees,
+            header,
+            predict_threads,
+            use_gpu,
+            missing,
+        )?;
         let k = self.inner.num_outputs();
         if !output_margin {
             if let crate::types::Objective::Softmax { .. } = self.inner.objective {
@@ -1661,6 +1683,7 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         prediction_column: &str,
+        missing: f32,
     ) -> PyResult<usize> {
         use arrow::array::{ArrayRef, Float32Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1695,8 +1718,15 @@ impl PyModel {
                 out_path.display()
             )));
         }
-        let (n, mut margins) =
-            self.multiclass_margins(py, data, n_trees, header, predict_threads, false)?;
+        let (n, mut margins) = self.multiclass_margins(
+            py,
+            data,
+            n_trees,
+            header,
+            predict_threads,
+            false,
+            missing,
+        )?;
         let file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1839,7 +1869,7 @@ impl PyModel {
     #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, use_gpu=false, iteration_range=None,
                         pred_contribs=false, approx_contribs=false, pred_interactions=false,
-                        pred_leaf=false))]
+                        pred_leaf=false, missing=f64::NAN))]
     /// 预测。`data` 可以是:
     ///
     /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
@@ -1862,7 +1892,15 @@ impl PyModel {
         approx_contribs: bool,
         pred_interactions: bool,
         pred_leaf: bool,
+        missing: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // `missing` (XGBoost semantics): feature values equal to it score as
+        // NaN. Array-likes are normalized (and the sentinel mapped) here, once,
+        // so every branch below sees a plain f32 matrix; file inputs carry the
+        // sentinel into the reader.
+        let missing = crate::source::validate_missing(missing)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let data = &normalize_array_input(py, data, missing)?;
         // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
         // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
         let mut n_trees = n_trees;
@@ -1883,6 +1921,7 @@ impl PyModel {
                         approx_contribs,
                         pred_interactions,
                         pred_leaf,
+                        f64::from(missing),
                     );
                 }
             }
@@ -1904,6 +1943,7 @@ impl PyModel {
                 n_trees,
                 header,
                 predict_threads,
+                missing,
             );
         }
         ensure_gpu_prediction_available(use_gpu)?;
@@ -1918,6 +1958,7 @@ impl PyModel {
                 header,
                 predict_threads,
                 use_gpu,
+                missing,
             );
         }
         // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
@@ -1930,25 +1971,10 @@ impl PyModel {
                 header,
                 predict_threads,
                 use_gpu,
+                missing,
             );
         }
-        let x: PyReadonlyArray2<'py, f32> = match data.extract() {
-            Ok(x) => x,
-            Err(_) => {
-                // pandas DataFrame / PyArrow Table: the Python layer turns them
-                // into the f32 matrix (categorical columns become their codes).
-                let converted = py
-                    .import("ferrisboost")?
-                    .getattr("_as_predict_matrix")?
-                    .call1((data,))?;
-                converted.extract().map_err(|_| {
-                    PyValueError::new_err(
-                        "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、\
-                         pandas DataFrame 或 pyarrow Table",
-                    )
-                })?
-            }
-        };
+        let x: PyReadonlyArray2<'py, f32> = array_input(py, data)?;
         self.predict_array(py, x, output_margin, n_trees, predict_threads, use_gpu)
             .map(Bound::into_any)
     }
@@ -2090,7 +2116,7 @@ impl PyModel {
     /// ⚠️ **不需要标签列。** 标签是训练期元信息;文件里带着也不影响,
     /// 因为选列是按模型的特征名单来的,不是"除某列外全要"。
     #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, use_gpu=false))]
+                        predict_threads=0, use_gpu=false, missing=f32::NAN))]
     #[allow(clippy::too_many_arguments)] // Keep the installed public keyword API stable.
     fn predict_files<'py>(
         &self,
@@ -2101,6 +2127,7 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
+        missing: f32,
     ) -> PyResult<Bound<'py, PyAny>> {
         use crate::tree::SchemaMode;
         ensure_gpu_prediction_available(use_gpu)?;
@@ -2242,6 +2269,7 @@ impl PyModel {
                     &projected_features,
                     header,
                     ingest_workers,
+                    missing,
                     |data, n_rows| {
                         let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
                             gpu_prediction_selected(use_gpu, n_rows, n_features, work_per_row)
@@ -2390,7 +2418,7 @@ impl PyModel {
     /// Parquet encoding/output with the next ingest/score batch.
     #[pyo3(signature = (data, output_path, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, prediction_column="prediction",
-                        iteration_range=None))]
+                        iteration_range=None, missing=f64::NAN))]
     #[allow(clippy::too_many_arguments)] // Public output/lifecycle options are independently specified.
     fn predict_to_parquet(
         &self,
@@ -2403,7 +2431,10 @@ impl PyModel {
         predict_threads: usize,
         prediction_column: &str,
         iteration_range: Option<(usize, usize)>,
+        missing: f64,
     ) -> PyResult<usize> {
+        let missing = crate::source::validate_missing(missing)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let mut n_trees = n_trees;
         if let Some(range) = iteration_range {
             match self.plan_iteration_range(range, n_trees)? {
@@ -2419,6 +2450,7 @@ impl PyModel {
                         predict_threads,
                         prediction_column,
                         None,
+                        f64::from(missing),
                     );
                 }
             }
@@ -2439,6 +2471,7 @@ impl PyModel {
                     header,
                     predict_threads,
                     prediction_column,
+                    missing,
                 );
             }
             predict_files_to_parquet(
@@ -2451,6 +2484,7 @@ impl PyModel {
                 n_trees,
                 header,
                 predict_threads,
+                missing,
             )
         })
     }
@@ -2636,6 +2670,9 @@ struct Parsed {
     /// input order; empty = none declared. Arrow dictionary columns in file
     /// inputs are categorical even when this is empty.
     categorical: Vec<bool>,
+    /// XGBoost `missing`: feature values equal to it are treated as NaN in the
+    /// training data and every validation set. NaN = no sentinel.
+    missing: f32,
 }
 
 /// Python 层归一后的单调约束:按位置,或按列名(要等拿到列名才能解析)。
@@ -2857,6 +2894,11 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             names
         },
         weighted: false,
+        missing: {
+            let raw: f64 = get!("missing");
+            crate::source::validate_missing(raw)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        },
         categorical: {
             let flags: Option<Vec<bool>> = get!("_feature_types");
             flags.unwrap_or_default()
@@ -3038,6 +3080,54 @@ fn finish(
     }
 }
 
+/// A 2-D f32 matrix from `predict` input: a numpy array as is, a pandas
+/// DataFrame / PyArrow table through the Python layer (categorical columns
+/// become their category codes).
+fn array_input<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+) -> PyResult<PyReadonlyArray2<'py, f32>> {
+    match data.extract() {
+        Ok(x) => Ok(x),
+        Err(_) => {
+            let converted = py
+                .import("ferrisboost")?
+                .getattr("_as_predict_matrix")?
+                .call1((data,))?;
+            converted.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、\
+                     pandas DataFrame 或 pyarrow Table",
+                )
+            })
+        }
+    }
+}
+
+/// Apply the XGBoost `missing` sentinel to array-like prediction input.
+///
+/// Path inputs, and any input when `missing` is NaN, are returned untouched
+/// (file readers apply the sentinel while decoding). Otherwise the input is
+/// normalized to an f32 matrix; if some value equals the sentinel a corrected
+/// copy with those values set to NaN is returned, never mutating the caller's
+/// array.
+fn normalize_array_input<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    missing: f32,
+) -> PyResult<Bound<'py, PyAny>> {
+    if missing.is_nan() || path_specs_of(data)?.is_some() {
+        return Ok(data.clone());
+    }
+    let x = array_input(py, data)?;
+    let view = x.as_array();
+    if !view.iter().any(|&v| v == missing) {
+        return Ok(x.as_any().clone());
+    }
+    let mapped = view.mapv(|v| if v == missing { f32::NAN } else { v });
+    Ok(numpy::PyArray2::from_owned_array(py, mapped).into_any())
+}
+
 /// 特征里的 ±inf 直接拒绝(XGBoost 同样拒绝);缺失值要用 NaN。
 fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     match data.iter().position(|v| v.is_infinite() || *v == f32::MAX) {
@@ -3136,11 +3226,15 @@ fn train_dense(
             return Err(PyValueError::new_err("样本权重必须是有限的非负数"));
         }
     }
-    reject_inf(x.as_slice()?, n_features, "训练集")?;
-    check_categorical_codes(x.as_slice()?, n_rows, n_features, &cfg.categorical)?;
+    // The `missing` sentinel becomes NaN before any check or binning (borrowed
+    // when no value matches; otherwise one corrected copy, never the caller's
+    // array). Categorical codes are subject to it too, as in XGBoost.
+    let x_values = crate::source::missing_as_nan(x.as_slice()?, cfg.missing);
+    reject_inf(&x_values, n_features, "训练集")?;
+    check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     let train_src = DenseSource::new_weighted_with_nthread(
-        x.as_slice()?,
+        &x_values,
         n_rows,
         n_features,
         if cfg.categorical.iter().any(|&c| c) {
@@ -3178,9 +3272,10 @@ fn train_dense(
                     eshape[1]
                 )));
             }
-            reject_inf(ex.as_slice()?, n_features, &format!("验证集 {name} "))?;
+            let ex_values = crate::source::missing_as_nan(ex.as_slice()?, cfg.missing);
+            reject_inf(&ex_values, n_features, &format!("验证集 {name} "))?;
             let src = DenseSource::new(
-                ex.as_slice()?,
+                &ex_values,
                 eshape[0],
                 n_features,
                 BinningStrategy::Provided(train_src.cuts()),
@@ -3402,7 +3497,9 @@ fn train_file(
         )));
     }
     let categorical_flags = cfg.categorical.clone();
-    let targets = targets.with_categorical(&categorical_flags);
+    let targets = targets
+        .with_categorical(&categorical_flags)
+        .with_missing(cfg.missing);
     // 行数同样要在 open 之前拿到 —— 显存模型的每一项都按它走。
     // parquet 从 footer 读,不解压任何数据;CSV 不扫全文件就是不知道。
     // ⚠️ **规划器要看到整个数据集的行数,不是第一个文件的。** 只报第一个

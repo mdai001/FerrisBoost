@@ -118,6 +118,11 @@ _DEFAULTS: dict[str, Any] = {
     # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
     # bounds the partition scan.
     "enable_categorical": False,
+    # XGBoost `missing`: a feature value equal to it is treated exactly like NaN
+    # (missing direction). NaN (default) = no extra sentinel. Applies to the
+    # training data and every validation set, for arrays, DataFrames, tables
+    # and files. Not stored in the model: pass the same `missing` to predict.
+    "missing": float("nan"),
     "max_cat_to_onehot": 4,
     "max_cat_threshold": 64,
     # Private wire field set by `train` from `feature_types` / the frame dtypes:
@@ -275,6 +280,7 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         out["eval_metric"] = names
     out["monotone_constraints"] = _normalize_monotone(out["monotone_constraints"])
     out["enable_categorical"] = bool(out["enable_categorical"])
+    out["missing"] = _normalize_missing(out["missing"])
     for key in ("max_cat_to_onehot", "max_cat_threshold"):
         if isinstance(out[key], bool) or int(out[key]) != out[key]:
             raise ValueError(f"{key} 要是整数,给的是 {out[key]!r}")
@@ -282,6 +288,20 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         if out[key] < 1:
             raise ValueError(f"{key} 要 >= 1,给的是 {out[key]}")
     return out
+
+
+def _normalize_missing(value: Any) -> float:
+    """`missing` -> float. NaN means "no sentinel"; ±inf and f32::MAX are rejected.
+
+    The full rule (finite float32 below the reserved f32::MAX) is enforced once,
+    in Rust; this only turns the value into a float and fails early on junk.
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        raise ValueError(f"missing 要是数字(默认 NaN),给的是 {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"missing 要是数字(默认 NaN),给的是 {value!r}") from None
 
 
 def _normalize_quantile_alpha(value: Any, objective: str) -> float | None:
@@ -636,6 +656,12 @@ def train(
 
     权重同时作用于梯度、指标和分箱边界(quantile sketch 按权重加权),
     语义和 XGBoost 一致。
+
+    `params["missing"]`(XGBoost 的 `missing`,默认 NaN):等于它的特征值和 NaN 完全等价
+    (走缺失方向),同时作用于训练集和所有验证集 —— numpy、pandas、pyarrow 和文件入口
+    (Parquet / CSV 由 Rust 读取器流式处理,不在 Python 里物化)。它必须是 NaN 或有限
+    的 float32 值,±inf 和保留的 f32::MAX 会报错。**模型里不保存 `missing`**(XGBoost
+    也不存),预测时要传同一个 `missing`。类别列的整数码同样受它影响。
 
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`

@@ -20,7 +20,7 @@ pub use dense::DenseSource;
 ///
 /// 两者都从特征里排除 —— 拿权重当特征训练,树会照着它分裂。
 /// `&str` 自动转成「只有标签」,所以只认标签的老调用点不用改。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Targets<'a> {
     pub label: &'a str,
     pub weight: Option<&'a str>,
@@ -31,6 +31,10 @@ pub struct Targets<'a> {
     /// weight excluded). `None` = none declared; Arrow dictionary columns are
     /// categorical regardless.
     pub categorical: Option<&'a [bool]>,
+    /// XGBoost `missing`: a feature value equal to this is treated exactly like
+    /// NaN / null. NaN (the default) means no extra sentinel. Applies to feature
+    /// columns only, never to the label or weight column.
+    pub missing: f32,
 }
 
 impl<'a> Targets<'a> {
@@ -44,7 +48,13 @@ impl<'a> Targets<'a> {
             weight,
             features: None,
             categorical: None,
+            missing: f32::NAN,
         })
+    }
+
+    /// Treat feature values equal to `missing` as missing (see the field docs).
+    pub fn with_missing(self, missing: f32) -> Self {
+        Self { missing, ..self }
     }
 
     /// Declare categorical features, one flag per feature in the resolved
@@ -126,6 +136,7 @@ impl<'a> From<&'a str> for Targets<'a> {
             weight: None,
             features: None,
             categorical: None,
+            missing: f32::NAN,
         }
     }
 }
@@ -137,6 +148,53 @@ impl<'a> From<&'a String> for Targets<'a> {
             weight: None,
             features: None,
             categorical: None,
+            missing: f32::NAN,
+        }
+    }
+}
+
+/// Validate a user-supplied `missing` sentinel: NaN (no sentinel) or a finite
+/// float32 below the reserved `f32::MAX`. +/-inf and `f32::MAX` are rejected:
+/// features may never hold them, so a sentinel equal to one would silently
+/// change which inputs are errors.
+pub fn validate_missing(missing: f64) -> anyhow::Result<f32> {
+    if missing.is_nan() {
+        return Ok(f32::NAN);
+    }
+    let narrowed = missing as f32;
+    anyhow::ensure!(
+        narrowed.is_finite() && narrowed != f32::MAX,
+        "missing={missing} is not allowed: it must be NaN or a finite float32 value \
+         (+/-inf and f32::MAX are reserved and rejected in features, so they cannot be \
+         the missing marker; pick a different sentinel)"
+    );
+    Ok(narrowed)
+}
+
+/// Dense feature values with the `missing` sentinel mapped to NaN.
+///
+/// Borrows when nothing needs changing (NaN `missing`, or no value equals it);
+/// otherwise returns one corrected copy, never touching the caller's buffer.
+pub fn missing_as_nan(data: &[f32], missing: f32) -> std::borrow::Cow<'_, [f32]> {
+    use std::borrow::Cow;
+    if missing.is_nan() || !data.contains(&missing) {
+        return Cow::Borrowed(data);
+    }
+    Cow::Owned(
+        data.iter()
+            .map(|&v| if v == missing { f32::NAN } else { v })
+            .collect(),
+    )
+}
+
+/// In-place variant for buffers the reader owns.
+pub fn mask_missing_in_place(data: &mut [f32], missing: f32) {
+    if missing.is_nan() {
+        return;
+    }
+    for v in data {
+        if *v == missing {
+            *v = f32::NAN;
         }
     }
 }
@@ -311,5 +369,62 @@ mod targets_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("重复"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::{mask_missing_in_place, missing_as_nan, validate_missing};
+    use std::borrow::Cow;
+
+    #[test]
+    fn validate_accepts_nan_and_finite_float32() {
+        assert!(validate_missing(f64::NAN).unwrap().is_nan());
+        assert_eq!(validate_missing(-999.0).unwrap(), -999.0);
+        assert_eq!(validate_missing(0.0).unwrap(), 0.0);
+        assert_eq!(validate_missing(f32::MIN as f64).unwrap(), f32::MIN);
+    }
+
+    #[test]
+    fn validate_rejects_inf_f32_max_and_overflow() {
+        for bad in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f32::MAX as f64,
+            1e39,
+            -1e39,
+        ] {
+            let err = validate_missing(bad).unwrap_err().to_string();
+            assert!(err.contains("missing"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn missing_as_nan_borrows_unless_a_value_matches() {
+        let data = [1.0f32, -999.0, f32::NAN, 2.0];
+        assert!(matches!(missing_as_nan(&data, f32::NAN), Cow::Borrowed(_)));
+        assert!(matches!(missing_as_nan(&data, 7.0), Cow::Borrowed(_)));
+        let mapped = missing_as_nan(&data, -999.0);
+        assert!(matches!(mapped, Cow::Owned(_)));
+        assert_eq!(mapped[0], 1.0);
+        assert!(mapped[1].is_nan() && mapped[2].is_nan());
+        assert_eq!(mapped[3], 2.0);
+        assert_eq!(data[1], -999.0, "input untouched");
+    }
+
+    #[test]
+    fn negative_zero_matches_a_zero_sentinel() {
+        // IEEE: -0.0 == 0.0, as in XGBoost's `value == missing`.
+        let mapped = missing_as_nan(&[-0.0f32, 1.0], 0.0);
+        assert!(mapped[0].is_nan() && mapped[1] == 1.0);
+    }
+
+    #[test]
+    fn in_place_mask_respects_nan_sentinel() {
+        let mut data = vec![3.0f32, -1.0, -1.0, 4.0];
+        mask_missing_in_place(&mut data, f32::NAN);
+        assert_eq!(data, vec![3.0, -1.0, -1.0, 4.0]);
+        mask_missing_in_place(&mut data, -1.0);
+        assert!(data[1].is_nan() && data[2].is_nan() && data[0] == 3.0 && data[3] == 4.0);
     }
 }

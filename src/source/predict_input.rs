@@ -68,6 +68,7 @@ where
         projected_features,
         csv_has_header,
         ingest_threads,
+        f32::NAN,
         |data, _| {
             let rows = data
                 .chunks_exact(projected_features.len())
@@ -80,6 +81,10 @@ where
 
 /// Bounded, reusable row-major batches in compact feature order. The callback
 /// borrows the buffer; it must finish consuming it before the next batch.
+///
+/// `missing` is the XGBoost `missing` sentinel: feature values equal to it are
+/// handed to the callback as NaN (NaN = no sentinel), so scoring routes them
+/// down the missing direction exactly as it does for nulls.
 pub fn for_each_projected_contiguous_batch<F>(
     resolved: &ResolvedInput,
     canonical_feature_names: &[String],
@@ -87,6 +92,7 @@ pub fn for_each_projected_contiguous_batch<F>(
     projected_features: &[usize],
     csv_has_header: bool,
     ingest_threads: usize,
+    missing: f32,
     mut on_rows: F,
 ) -> Result<usize>
 where
@@ -138,6 +144,7 @@ where
     for batch in batches {
         let batch = batch?;
         batch_to_contiguous_rows(&batch, projected_features.len(), &mut rows)?;
+        super::mask_missing_in_place(&mut rows, missing);
         total = total
             .checked_add(batch.num_rows())
             .context("prediction row count overflow")?;

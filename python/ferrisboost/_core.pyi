@@ -38,6 +38,7 @@ class Model:
         approx_contribs: bool = False,
         pred_interactions: bool = False,
         pred_leaf: bool = False,
+        missing: float = ...,
     ) -> NDArray[np.float32]:
         """Return ordered float32 predictions from an array or path specs.
 
@@ -61,6 +62,14 @@ class Model:
         Feature values exactly equal to the largest float32 are rejected, as in
         training (the value is reserved for split boundaries); +/-inf and NaN
         follow the usual rules.
+
+        missing (default NaN) is XGBoost's DMatrix `missing`: feature values
+        equal to it are scored exactly like NaN (the missing direction), for
+        arrays, DataFrames, tables and file inputs (the file readers apply it
+        while streaming). It is not stored in the model, so pass the same value
+        used in training; it must be NaN or a finite float32 (+/-inf and the
+        reserved f32::MAX are rejected). It also applies to the integer codes of
+        categorical columns.
 
         pandas DataFrames and PyArrow tables are accepted too; categorical
         columns are scored through their category codes, so they must carry the
@@ -104,6 +113,7 @@ class Model:
         predict_threads: int = 0,
         prediction_column: str = "prediction",
         iteration_range: tuple[int, int] | None = None,
+        missing: float = ...,
     ) -> int:
         """CPU-score file inputs and write ordered float32 predictions to Parquet.
 
@@ -111,7 +121,8 @@ class Model:
         models write columns {prediction_column}_0, {prediction_column}_1, ...
         (multi:softprob or output_margin=True) or one class-index column
         (multi:softmax); in this version that path builds the output in memory
-        before writing (the input is still read once).
+        before writing (the input is still read once). missing has the same
+        meaning as in predict.
         """
         ...
     def save_model(

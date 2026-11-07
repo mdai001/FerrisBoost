@@ -161,6 +161,7 @@ impl PyModel {
         n_trees: Option<usize>,
         header: bool,
         predict_threads: usize,
+        missing: f32,
     ) -> PyResult<Bound<'py, PyAny>> {
         guard(|| {
             let kind = request.kind()?;
@@ -206,6 +207,7 @@ impl PyModel {
                             &projected,
                             header,
                             ingest_workers,
+                            missing,
                             |batch, n_rows| {
                                 let workers = resolved_predict_workers(
                                     predict_threads,

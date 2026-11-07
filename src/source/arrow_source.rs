@@ -31,7 +31,7 @@ pub(crate) fn column_as_f32(batch: &RecordBatch, col: usize) -> anyhow::Result<V
 /// 训练入口用 `column_as_f32`,它拒绝 ±inf。
 pub(crate) fn column_as_f32_allow_inf(batch: &RecordBatch, col: usize) -> anyhow::Result<Vec<f32>> {
     let mut output = Vec::with_capacity(batch.num_rows());
-    visit_column_f32::<false, false>(batch, col, |value| output.push(value))?;
+    visit_column_f32::<false, false>(batch, col, f32::NAN, |value| output.push(value))?;
     Ok(output)
 }
 
@@ -44,28 +44,39 @@ pub(crate) fn for_each_column_f32(
     col: usize,
     visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    visit_column_f32::<true, false>(batch, col, visit)
+    visit_column_f32::<true, false>(batch, col, f32::NAN, visit)
 }
 
 /// Features reserve f32::MAX for the finite missing/nonmissing split sentinel.
 /// Labels and weights use the ordinary numeric visitor and are not restricted.
+///
+/// `missing` is the XGBoost `missing` sentinel: a value equal to it (after the
+/// cast to f32) is visited as NaN, exactly like a null. NaN means no sentinel.
+/// This is the single decode point for training features, so the sketch and
+/// the quantizer both see sentinel values as missing and never as a bin.
 pub(crate) fn for_each_feature_f32(
     batch: &RecordBatch,
     col: usize,
+    missing: f32,
     visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    visit_column_f32::<true, true>(batch, col, visit)
+    visit_column_f32::<true, true>(batch, col, missing, visit)
 }
 
-pub(crate) fn feature_as_f32(batch: &RecordBatch, col: usize) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn feature_as_f32(
+    batch: &RecordBatch,
+    col: usize,
+    missing: f32,
+) -> anyhow::Result<Vec<f32>> {
     let mut output = Vec::with_capacity(batch.num_rows());
-    for_each_feature_f32(batch, col, |value| output.push(value))?;
+    for_each_feature_f32(batch, col, missing, |value| output.push(value))?;
     Ok(output)
 }
 
 fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
     batch: &RecordBatch,
     col: usize,
+    missing: f32,
     mut visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     // A dictionary column carries category codes: visit its decoded values.
@@ -106,7 +117,9 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
                 };
                 any_inf |= v.is_infinite();
                 if REJECT_MAX { any_max |= v == f32::MAX; }
-                visit(v);
+                // `missing` is finite or NaN (validated upstream), so it never
+                // equals an inf / f32::MAX that the checks above reject.
+                visit(if v == missing { f32::NAN } else { v });
             }
             if REJECT_MAX && any_max {
                 // 报列名:`col` 是这一批里的列号,文件只读了部分列时它不是文件里的列号。
@@ -183,7 +196,7 @@ pub(crate) fn build_cuts_and_count_weighted(
     nthread: usize,
     weighted: bool,
 ) -> anyhow::Result<(BinCuts, usize)> {
-    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[])
+    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[], f32::NAN)
 }
 
 /// `build_cuts_and_count_weighted` with categorical features.
@@ -192,12 +205,16 @@ pub(crate) fn build_cuts_and_count_weighted(
 /// excluded) as categorical; an empty slice means "none declared". Dictionary
 /// typed columns are categorical regardless of the list. A categorical
 /// feature's cuts are one bin per integer code `0..=max_code`.
+///
+/// Feature values equal to `missing` are skipped by the sketch like NaN (NaN =
+/// no sentinel), so a sentinel never becomes a bin boundary or a category.
 pub(crate) fn build_cuts_and_count_typed(
     batches: impl Iterator<Item = anyhow::Result<RecordBatch>>,
     max_bins: usize,
     nthread: usize,
     weighted: bool,
     categorical: &[bool],
+    missing: f32,
 ) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
@@ -242,10 +259,10 @@ pub(crate) fn build_cuts_and_count_typed(
             None
         };
         let push_column = |col: usize, sketch: &mut crate::sketch::FeatureSketch| match &weights {
-            None => for_each_feature_f32(&batch, col, |value| sketch.push(value, 1.0)),
+            None => for_each_feature_f32(&batch, col, missing, |value| sketch.push(value, 1.0)),
             Some(w) => {
                 let mut row = 0usize;
-                for_each_feature_f32(&batch, col, |value| {
+                for_each_feature_f32(&batch, col, missing, |value| {
                     sketch.push(value, w[row]);
                     row += 1;
                 })
@@ -318,6 +335,7 @@ pub fn quantize(
         cuts,
         cols_per_block,
         crate::source::DEFAULT_INGEST_THREADS,
+        f32::NAN,
     )
 }
 
@@ -329,6 +347,7 @@ pub fn quantize_with_nthread(
     cuts: &BinCuts,
     cols_per_block: usize,
     nthread: usize,
+    missing: f32,
 ) -> anyhow::Result<(Vec<ColumnBlock>, usize)> {
     assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
     let n_features = cuts.n_feats();
@@ -359,8 +378,8 @@ pub fn quantize_with_nthread(
                     for (local, &f) in feats.iter().enumerate() {
                         let dst = &mut block[local];
                         dst.reserve(batch.num_rows());
-                        for_each_feature_f32(&batch, f as usize, |value| {
-                            // null and NaN share the missing sentinel.
+                        for_each_feature_f32(&batch, f as usize, missing, |value| {
+                            // null, NaN and the `missing` sentinel share MISSING_BIN.
                             dst.push(if value.is_nan() {
                                 MISSING_BIN
                             } else {
@@ -402,6 +421,7 @@ fn quantize_with_nthread_known_rows(
     cols_per_block: usize,
     n_rows: usize,
     nthread: usize,
+    missing: f32,
 ) -> anyhow::Result<Vec<ColumnBlock>> {
     let allocation_profile = crate::source::openprof::start("bins allocate");
     assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
@@ -457,7 +477,7 @@ fn quantize_with_nthread_known_rows(
                         let start = local * n_rows + row_offset;
                         let output = &mut block.data[start..start + batch_rows];
                         let mut index = 0usize;
-                        for_each_feature_f32(&batch, feature as usize, |value| {
+                        for_each_feature_f32(&batch, feature as usize, missing, |value| {
                             output[index] = if value.is_nan() {
                                 MISSING_BIN
                             } else {
@@ -543,6 +563,7 @@ impl ArrowSource {
             cuts_threads,
             quantize_threads,
             &[],
+            f32::NAN,
         )
     }
 
@@ -554,6 +575,7 @@ impl ArrowSource {
         cuts_threads: usize,
         quantize_threads: usize,
         categorical: &[bool],
+        missing: f32,
     ) -> anyhow::Result<Self>
     where
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
@@ -565,6 +587,7 @@ impl ArrowSource {
             cuts_threads,
             false,
             categorical,
+            missing,
         )?;
         let blocks = quantize_with_nthread_known_rows(
             batches(true)?,
@@ -572,6 +595,7 @@ impl ArrowSource {
             cols_per_block,
             n_rows,
             quantize_threads,
+            missing,
         )?;
         let n_features = cuts.n_feats();
         Ok(Self {
@@ -610,7 +634,28 @@ impl ArrowSource {
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
         F: FnMut() -> anyhow::Result<I>,
     {
-        Self::from_batches_with_cuts_and_nthread(batches()?, cuts, cols_per_block, nthread)
+        Self::from_batches_with_cuts_and_nthread(
+            batches()?,
+            cuts,
+            cols_per_block,
+            nthread,
+            f32::NAN,
+        )
+    }
+
+    /// `with_cuts_and_nthread` with the XGBoost `missing` sentinel.
+    pub(crate) fn with_cuts_and_nthread_missing<I, F>(
+        mut batches: F,
+        cuts: BinCuts,
+        cols_per_block: usize,
+        nthread: usize,
+        missing: f32,
+    ) -> anyhow::Result<Self>
+    where
+        I: Iterator<Item = anyhow::Result<RecordBatch>>,
+        F: FnMut() -> anyhow::Result<I>,
+    {
+        Self::from_batches_with_cuts_and_nthread(batches()?, cuts, cols_per_block, nthread, missing)
     }
 
     pub(crate) fn from_batches_with_cuts_and_nthread(
@@ -618,8 +663,10 @@ impl ArrowSource {
         cuts: BinCuts,
         cols_per_block: usize,
         nthread: usize,
+        missing: f32,
     ) -> anyhow::Result<Self> {
-        let (blocks, n_rows) = quantize_with_nthread(batches, &cuts, cols_per_block, nthread)?;
+        let (blocks, n_rows) =
+            quantize_with_nthread(batches, &cuts, cols_per_block, nthread, missing)?;
         let n_features = cuts.n_feats();
         Ok(Self {
             cuts,
@@ -635,9 +682,16 @@ impl ArrowSource {
         cols_per_block: usize,
         n_rows: usize,
         nthread: usize,
+        missing: f32,
     ) -> anyhow::Result<Self> {
-        let blocks =
-            quantize_with_nthread_known_rows(batches, &cuts, cols_per_block, n_rows, nthread)?;
+        let blocks = quantize_with_nthread_known_rows(
+            batches,
+            &cuts,
+            cols_per_block,
+            n_rows,
+            nthread,
+            missing,
+        )?;
         let n_features = cuts.n_feats();
         Ok(Self {
             cuts,
@@ -936,5 +990,126 @@ mod tests {
             panic!("两遍输入行数变化应该被拒绝");
         };
         assert!(error.to_string().contains("两遍扫描行数不一致"), "{error}");
+    }
+    /// The same 3 x 6 data as `batches()` but nulls spelled as a sentinel
+    /// (-999 / 0 for the integer column), split over the same two batches.
+    fn sentinel_batches(sentinel: f64) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float32, false),
+            Field::new("b", DataType::Float64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let s = sentinel;
+        let mk = |a: Vec<f32>, b: Vec<f64>, c: Vec<i64>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(a)),
+                    Arc::new(Float64Array::from(b)),
+                    Arc::new(Int64Array::from(c)),
+                ],
+            )
+            .unwrap()
+        };
+        vec![
+            mk(vec![1.0, 2.0, 3.0], vec![10.0, s, 30.0], vec![7, 8, 9]),
+            mk(vec![4.0, 5.0, 6.0], vec![40.0, 50.0, s], vec![1, 2, 3]),
+        ]
+    }
+
+    #[test]
+    fn feature_decode_maps_the_sentinel_to_nan_for_every_column_type() {
+        let bs = sentinel_batches(-999.0);
+        let b = feature_as_f32(&bs[0], 1, -999.0).unwrap();
+        assert!(b[1].is_nan() && b[0] == 10.0 && b[2] == 30.0);
+        // Without a sentinel the value is an ordinary number.
+        assert_eq!(feature_as_f32(&bs[0], 1, f32::NAN).unwrap()[1], -999.0);
+        // Int64 column: -999 is a sentinel there too.
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        let ints = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(5), Some(-999), None, Some(0)]))],
+        )
+        .unwrap();
+        let v = feature_as_f32(&ints, 0, -999.0).unwrap();
+        assert_eq!((v[0], v[3]), (5.0, 0.0));
+        assert!(v[1].is_nan() && v[2].is_nan());
+        let zero = feature_as_f32(&ints, 0, 0.0).unwrap();
+        assert!(zero[3].is_nan() && zero[1] == -999.0);
+        // Labels / weights use the unrestricted visitor: the sentinel is not applied.
+        assert_eq!(column_as_f32(&bs[0], 1).unwrap()[1], -999.0);
+    }
+
+    #[test]
+    fn sentinel_does_not_disable_the_inf_and_max_checks() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float32, false)]));
+        let mk = |v: f32| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![1.0, v]))])
+                .unwrap()
+        };
+        assert!(feature_as_f32(&mk(f32::INFINITY), 0, -999.0).is_err());
+        assert!(feature_as_f32(&mk(f32::MAX), 0, -999.0).is_err());
+        assert!(feature_as_f32(&mk(-999.0), 0, -999.0).is_ok());
+    }
+
+    #[test]
+    fn sketch_and_cuts_ignore_sentinel_values() {
+        for sentinel in [-999.0f64, 0.0] {
+            let bs = sentinel_batches(sentinel);
+            let (with, rows) =
+                build_cuts_and_count_typed(feed(&bs), 16, 1, false, &[], sentinel as f32).unwrap();
+            assert_eq!(rows, 6);
+            // A sentinel is never a cut point or the observed minimum.
+            let col_b = &with.values[with.offsets[1] as usize..with.offsets[2] as usize];
+            assert!(!col_b.contains(&(sentinel as f32)), "{col_b:?}");
+            // Equal to the sketch of the same data with nulls in those places.
+            let nan_bs: Vec<RecordBatch> = batches();
+            let (reference, _) =
+                build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+            let ref_b =
+                &reference.values[reference.offsets[1] as usize..reference.offsets[2] as usize];
+            assert_eq!(col_b, ref_b);
+        }
+    }
+
+    #[test]
+    fn quantize_sends_sentinel_to_the_missing_bin_like_nan() {
+        let bs = sentinel_batches(-999.0);
+        let nan_bs = batches();
+        let (cuts, _) =
+            build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+        let (with, n) = quantize_with_nthread(feed(&bs), &cuts, 2, 1, -999.0).unwrap();
+        let (without, _) = quantize_with_nthread(feed(&nan_bs), &cuts, 2, 1, f32::NAN).unwrap();
+        assert_eq!(n, 6);
+        let column_b = |blocks: &[ColumnBlock]| -> Vec<Bin> {
+            blocks
+                .iter()
+                .find(|b| b.feat_ids.contains(&1))
+                .map(|b| {
+                    let local = b.feat_ids.iter().position(|&f| f == 1).unwrap();
+                    b.column(local).to_vec()
+                })
+                .unwrap()
+        };
+        let got = column_b(&with);
+        assert_eq!(got, column_b(&without));
+        assert_eq!(got[1], MISSING_BIN);
+        assert_eq!(got[5], MISSING_BIN);
+        // The known-rows path (used by the real two-pass loaders) agrees.
+        let known = quantize_with_nthread_known_rows(feed(&bs), &cuts, 2, 6, 1, -999.0).unwrap();
+        assert_eq!(column_b(&known), got);
+    }
+
+    #[test]
+    fn two_pass_source_with_sentinel_equals_source_with_nulls() {
+        let bs = sentinel_batches(-999.0);
+        let nan_bs = batches();
+        let a = ArrowSource::new_typed_with_phase_threads(|_| Ok(feed(&bs)), 16, 2, 1, 1, &[], -999.0)
+            .unwrap();
+        let b = ArrowSource::new(|| Ok(feed(&nan_bs)), 16, 2).unwrap();
+        // Column b matches in bins; columns a / c hold identical data.
+        for row in 0..6 {
+            assert_eq!(a.bin_at(row, 1), b.bin_at(row, 1), "row {row}");
+        }
     }
 }
