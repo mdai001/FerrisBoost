@@ -127,8 +127,9 @@ margin = model.predict(X, output_margin=True)
 
 Training converts array-like input to a C-contiguous `float32` matrix when
 necessary. Labels are flattened and converted to contiguous `float32`.
-Missing feature values may be represented by `NaN`; labels must not contain
-`NaN`.
+Missing feature values may be represented by `NaN` (or by a sentinel you
+declare with `missing`, see [Missing values](#missing-values-and-the-missing-sentinel));
+labels must not contain `NaN`.
 
 `nthread=0` lets FerrisBoost choose the physical core count. Set a positive
 integer to request an exact thread count.
@@ -563,6 +564,56 @@ weights. CPU and `gpu_math="exact"` GPU models stay byte-identical. The
 constraints are not stored in the saved model, as in XGBoost; prediction does
 not need them.
 
+## Missing values and the `missing` sentinel
+
+`NaN` (and a Parquet / Arrow null, or an empty CSV field) is a missing value:
+the row follows each split's learned default direction. If your data marks
+missing values with a sentinel instead, declare it with `missing`, exactly like
+XGBoost's `DMatrix(..., missing=...)` (default `NaN`):
+
+```python
+model = fb.train(
+    {"objective": "reg:squarederror", "missing": -999.0},
+    X, label=y,
+    evals=[(X_valid, y_valid, "valid")],
+)
+pred = model.predict(X_test, missing=-999.0)     # pass the same value again
+model.predict_to_parquet("test.parquet", "pred.parquet", missing=-999.0)
+```
+
+A feature value equal to `missing` is treated **exactly like `NaN`**, and `NaN`
+stays missing as well. This holds in the training data and in every validation
+set, and in prediction, for NumPy arrays (any dtype), pandas DataFrames, PyArrow
+tables and Parquet / CSV files. For files the Parquet and CSV readers apply the
+sentinel while streaming, so nothing is materialized in Python. A NumPy array is
+never modified: when some value equals the sentinel, one corrected float32 copy
+is made inside the call.
+
+What the sentinel does and does not touch:
+
+- Sentinel values are skipped by the quantile sketch like `NaN`, so they never
+  become a bin boundary or shift the cuts; the resulting model is
+  bit-identical to training on the same data with the sentinel replaced by `NaN`.
+- Only **feature** values are affected. Labels and the weight column are read as
+  they are.
+- Categorical features: as in XGBoost, `missing` is compared with the integer
+  category codes too, so `missing=0` makes category code `0` a missing value.
+  Choose a sentinel outside your code range (for example `-1`).
+- The value is compared after conversion to `float32`, as in XGBoost.
+- `missing` must be `NaN` or a finite `float32` value. `inf`, `-inf`,
+  `numpy.finfo(numpy.float32).max` (which is reserved for split boundaries) and
+  values that overflow `float32` raise `ValueError`. XGBoost accepts `inf` as a
+  sentinel; FerrisBoost rejects it because infinite features are an error here.
+  Features equal to `+/-inf` or `float32` max are still rejected when a
+  sentinel is set.
+- **The model does not store `missing`** (nor does XGBoost's JSON), so predict
+  with the same `missing` you trained with; otherwise the sentinel is scored as
+  an ordinary number. The scikit-learn estimators hold it as a constructor
+  parameter and do this for you.
+- A persistent Parquet `cache_path` is bound to the `missing` value it was
+  built with; opening it with another value is an error rather than a silent
+  reuse of bins built for a different sentinel.
+
 ## Categorical features
 
 FerrisBoost splits categorical features the way XGBoost's `hist` method does.
@@ -625,8 +676,9 @@ all apply. With lossless binning (numeric columns with fewer distinct values tha
 
 Prediction handles category sets on every path (arrays, pandas / PyArrow, files,
 `predict_to_parquet`, multiclass). A pandas DataFrame or PyArrow table passed to
-`predict` is scored through its category codes, so it must carry the same
-categories in the same order as the training data. Prediction from a
+`Model.predict` is scored through its category codes, so it must carry the same
+categories in the same order as the training data (the scikit-learn estimators
+remember the training categories and re-code by value instead). Prediction from a
 categorical model runs on the CPU even with `use_gpu=True`.
 
 Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
@@ -759,13 +811,35 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
 ```
 
 - `fit(X, y, sample_weight=, eval_set=, sample_weight_eval_set=, verbose=)`,
-  `predict`, `predict_proba`, `score`, `get_params` / `set_params`, `clone`,
+  `predict`, `predict_proba`, `apply`, `score`, `get_params` / `set_params`, `clone`,
   pickling, `GridSearchCV`, `cross_val_score`, and `Pipeline` work. Constructor
   parameters use XGBoost's names (`n_estimators`, `learning_rate`, `max_depth`,
   `subsample`, `colsample_by*`, `reg_alpha`, `reg_lambda`, `n_jobs`,
   `random_state`, `eval_metric`, `early_stopping_rounds`, ...) plus FerrisBoost's
   `device`, `gpu_math`, `quantile_alpha`, `tweedie_variance_power`, and
   `huber_slope`. `None` means "use FerrisBoost's default".
+- `missing` (default `NaN`) is a constructor parameter as in XGBoost. It is
+  applied to the training data, every `eval_set`, and to `predict`,
+  `predict_proba`, and `apply`, so a fitted estimator always uses the value it
+  was trained with. After `load_model`, give the same `missing` to the
+  constructor (the model file does not store it). See
+  [Missing values](#missing-values-and-the-missing-sentinel) for the rules.
+- Categorical features: `enable_categorical`, `feature_types`,
+  `max_cat_to_onehot`, and `max_cat_threshold` are constructor parameters that
+  go to `ferrisboost.train`. pandas `category` columns work in `fit`,
+  `predict`, `predict_proba`, and `apply`, with `feature_names_in_` set as for
+  any frame; with `enable_categorical=False` such a column raises
+  `ValueError`. The estimator remembers the training categories and re-codes
+  later frames by value, so a different category order is harmless and a
+  category unseen in training goes the way XGBoost sends it. A model restored
+  with `load_model` has no category table and scores a frame by its own codes.
+  For plain arrays, mark categorical columns with `feature_types=["c", "q", ...]`.
+  `GridSearchCV`, `cross_val_score`, and `clone` work with categorical frames.
+- `apply(X, iteration_range=None)` returns the leaf node reached in every tree,
+  like `XGBModel.apply`: a `float32` array of shape `(n_samples, n_trees)` (a
+  multiclass model has `num_class` trees per boosting round). Without
+  `iteration_range`, a model trained with early stopping uses its
+  `best_iteration`. It is `Model.predict(..., pred_leaf=True)` underneath.
 - Binary classification uses `binary:logistic`; more than two classes switch to
   `multi:softprob` (or `multi:softmax` if you ask for it) and set `num_class`.
   Labels can be any sortable class values; they are encoded internally and
@@ -781,8 +855,7 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   XGBoost). `verbose` defaults to `False` (set it to see the validation metrics
   per round).
 - `load_model(path)` / `from_file(path)` read XGBoost-compatible JSON.
-- Not supported: XGBoost's `missing=` sentinel (only `NaN` is missing),
-  `booster=`, `tree_method=`, `enable_categorical`, and base margins.
+- Not supported: `booster=`, `tree_method=`, and base margins.
   `sample_weight` follows FerrisBoost's weighted-sketch semantics, so a weight of
   `k` is not the same as repeating a row `k` times.
 
@@ -1085,6 +1158,15 @@ Readers keep deterministic file/row order and bounded batches. In auto CPU mode,
 
 The direct-output path keeps a bounded two-batch channel between scoring and one ordered Parquet writer thread. The writer can overlap encoding/output with the next input batch while preserving file order and row order. Auto mode shares one process-visible CPU budget across ingest, scoring, and the writer; explicit ingest or prediction thread counts are preserved and produce an oversubscription warning when their total plus the writer exceeds that budget.
 
+### The `missing` sentinel in prediction
+
+`predict(data, missing=...)` and `predict_to_parquet(..., missing=...)` take the
+same `missing` as training (default `NaN`) and apply it to arrays, DataFrames,
+tables and files, including `pred_contribs`, `pred_interactions`, `pred_leaf`,
+`iteration_range`, and multiclass models. The model file does not record it, so
+pass the value you trained with. See
+[Missing values](#missing-values-and-the-missing-sentinel).
+
 ### In-memory array prediction
 
 Prediction also accepts a two-dimensional NumPy `float32` array with the same number and order of features used for training:
@@ -1250,6 +1332,7 @@ empty `evals_result()`.
 | `cache_path` | `None` | Persistent Parquet cache directory |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
+| `missing` | `NaN` | Feature value treated exactly like `NaN` (XGBoost's `DMatrix` `missing`), in training, validation, and prediction. Finite `float32` or `NaN`; `inf` and `float32` max are rejected. Not stored in the model: pass the same `missing` to `predict`. See [Missing values](#missing-values-and-the-missing-sentinel) |
 | `enable_categorical` | `False` | Detect pandas `category` and PyArrow dictionary columns as categorical features; see [Categorical features](#categorical-features) |
 | `max_cat_to_onehot` | `4` | Categorical features with fewer categories than this use one-vs-rest splits, the others sorted-partition splits (`>= 1`) |
 | `max_cat_threshold` | `64` | Most categories a partition split scans per direction (`>= 1`) |
@@ -1324,6 +1407,22 @@ split boundaries. Rescale or clip the feature, for example to
 `numpy.nextafter(numpy.float32(numpy.finfo(numpy.float32).max), 0)`, which is
 accepted. File prediction only reads the columns the model uses, so a value in
 a column the model never reads is not checked and cannot affect the result.
+
+### `missing` is rejected
+
+`missing` must be `NaN` or a finite `float32` value. `inf`, `-inf`,
+`numpy.finfo(numpy.float32).max`, and numbers that overflow `float32` raise
+`ValueError` naming `missing`, in `fb.train`, `Model.predict`,
+`predict_to_parquet`, and the scikit-learn constructors (at `fit`). Use a
+different sentinel such as `-999`. Setting a sentinel does not relax the other
+feature rules: a feature that is itself `+/-inf` or `float32` max is still an
+error.
+
+### A persistent cache is rejected with a `missing` message
+
+The cache was quantized with a different `missing` than the current call.
+Bins built for one sentinel are wrong for another, so use a new `cache_path` or
+remove the old cache.
 
 ### Training stops with a non-finite gradient error
 

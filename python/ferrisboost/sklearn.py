@@ -34,8 +34,20 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
 
 * 分类标签可以是任意可排序的类别(内部做 `LabelEncoder` 式编码,`classes_` 保存
   原始类别);XGBoost 要求标签恰好是 `0..K-1`。标签已经是 `0..K-1` 时两者行为一致。
-* 不支持 `missing=`(缺失值只认 NaN)、`booster=` / `tree_method=` 等 FerrisBoost
-  没有的选项;多分位数 `quantile_alpha`(多输出)不支持。
+* 不支持 `booster=` / `tree_method=` 等 FerrisBoost 没有的选项;多分位数
+  `quantile_alpha`(多输出)不支持。
+
+`missing`、类别特征和 `apply` 与 XGBoost 一致:
+
+* `missing=`(默认 NaN)传给训练(含 `eval_set`)、`predict` / `predict_proba` /
+  `apply`;模型里不保存它,所以同一个估计器自动用同一个值;`load_model` 之后要在
+  构造时再给同一个 `missing`。
+* `enable_categorical` / `feature_types` / `max_cat_to_onehot` / `max_cat_threshold`
+  转给 `ferrisboost.train`。pandas `category` 列在 `fit` / `predict` /
+  `predict_proba` / `apply` 里都可用;估计器记住训练时的类别表,预测时按**取值**
+  重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
+* `apply(X, iteration_range=None)` 返回每棵树的叶子节点号,形状 `(n_samples, n_trees)`,
+  float32,与 `XGBModel.apply` 相同;有早停时默认用到 best_iteration。
 """
 
 from __future__ import annotations
@@ -61,7 +73,7 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import Model, train
+from . import Model, _frame_matrix, _is_pandas_frame, train
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor"]
 
@@ -91,6 +103,10 @@ _PARAM_MAP = {
     "quantile_alpha": "quantile_alpha",
     "tweedie_variance_power": "tweedie_variance_power",
     "huber_slope": "huber_slope",
+    "missing": "missing",
+    "enable_categorical": "enable_categorical",
+    "max_cat_to_onehot": "max_cat_to_onehot",
+    "max_cat_threshold": "max_cat_threshold",
 }
 
 _IMPORTANCE_TYPES = ("weight", "gain", "cover", "total_gain", "total_cover")
@@ -109,6 +125,12 @@ def _check_X(est: Any, X: Any, y: Any = None, *, reset: bool, **kwargs: Any):
     return est._validate_data(  # pragma: no cover
         X, y, reset=reset, force_all_finite="allow-nan", **kwargs
     )
+
+
+def _has_category_column(frame: Any) -> bool:
+    import pandas as pd
+
+    return any(isinstance(dt, pd.CategoricalDtype) for dt in frame.dtypes)
 
 
 def _seed_of(random_state: Any) -> int | None:
@@ -156,6 +178,11 @@ class _FerrisBoostBase(BaseEstimator):
         tweedie_variance_power: float | None = None,
         huber_slope: float | None = None,
         importance_type: str | None = None,
+        missing: float = np.nan,
+        enable_categorical: bool = False,
+        feature_types: Any = None,
+        max_cat_to_onehot: int | None = None,
+        max_cat_threshold: int | None = None,
     ) -> None:
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -186,6 +213,11 @@ class _FerrisBoostBase(BaseEstimator):
         self.tweedie_variance_power = tweedie_variance_power
         self.huber_slope = huber_slope
         self.importance_type = importance_type
+        self.missing = missing
+        self.enable_categorical = enable_categorical
+        self.feature_types = feature_types
+        self.max_cat_to_onehot = max_cat_to_onehot
+        self.max_cat_threshold = max_cat_threshold
 
     # ------------------------------------------------------------------ tags
     def __sklearn_tags__(self):
@@ -216,6 +248,41 @@ class _FerrisBoostBase(BaseEstimator):
             params["nthread"] = 0
         return params
 
+    # ------------------------------------------------------------------ 输入
+    def _prepare_X(
+        self, X: Any, y: Any = None, *, reset: bool, **kwargs: Any
+    ) -> tuple[Any, Any, list[str] | None]:
+        """sklearn validation plus pandas `category` handling.
+
+        Returns `(X, y, feature_types)`: `X` is the validated float32 matrix
+        (category columns as their integer codes, NaN for a missing value) and
+        `feature_types` the per-feature "c" / "q" list detected from the frame
+        (None when the frame has no category column). Training stores the
+        categories; later calls re-code onto them by value.
+        """
+        flags = None
+        if _is_pandas_frame(X) and _has_category_column(X):
+            import pandas as pd
+
+            levels = None if reset else getattr(self, "_cat_levels_", None)
+            matrix, _, flag_list, new_levels = _frame_matrix(
+                X, bool(self.enable_categorical), levels, "X"
+            )
+            flags = ["c" if f else "q" for f in flag_list]
+            # A numeric stand-in with the same labels: sklearn then sets
+            # `n_features_in_` / `feature_names_in_` exactly as for any frame.
+            X = pd.DataFrame(matrix, columns=X.columns, index=X.index)
+            new = new_levels if reset else None
+        else:
+            new = {} if reset else None
+        if y is None:
+            X = _check_X(self, X, reset=reset, **kwargs)
+        else:
+            X, y = _check_X(self, X, y, reset=reset, **kwargs)
+        if new is not None:
+            self._cat_levels_ = new
+        return X, y, flags
+
     # ------------------------------------------------------------------ fit
     def _fit_booster(
         self,
@@ -227,6 +294,7 @@ class _FerrisBoostBase(BaseEstimator):
         sample_weight_eval_set: Any,
         verbose: Any,
         eval_labels: Any,
+        feature_types: Any = None,
     ) -> None:
         if sample_weight is not None:
             sample_weight = _check_sample_weight(sample_weight, X, dtype=np.float32)
@@ -241,7 +309,7 @@ class _FerrisBoostBase(BaseEstimator):
                 if len(pair) != 2:
                     raise ValueError("Each eval_set element must be an (X, y) pair")
                 ex, ey = pair
-                ex = _check_X(self, ex, reset=False)
+                ex, _, _ = self._prepare_X(ex, reset=False)
                 ey = eval_labels(ey)
                 ew = None if sample_weight_eval_set is None else sample_weight_eval_set[i]
                 if ew is None:
@@ -272,6 +340,7 @@ class _FerrisBoostBase(BaseEstimator):
             callbacks=self.callbacks,
             quiet=not verbose,
             weight=None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32),
+            feature_types=feature_types if self.feature_types is None else self.feature_types,
         )
         self.evals_result_ = result
 
@@ -343,11 +412,30 @@ class _FerrisBoostBase(BaseEstimator):
         iteration_range: tuple[int, int] | None = None,
     ) -> np.ndarray:
         check_is_fitted(self, "_Booster")
-        X = _check_X(self, X, reset=False)
+        X, _, _ = self._prepare_X(X, reset=False)
         return self._Booster.predict(
             np.ascontiguousarray(X, dtype=np.float32),
             output_margin=output_margin,
             iteration_range=self._iteration_range(iteration_range),
+            missing=self.missing,
+        )
+
+    def apply(
+        self, X: Any, iteration_range: tuple[int, int] | None = None
+    ) -> np.ndarray:
+        """Leaf node index reached in every tree, like `XGBModel.apply`.
+
+        Returns float32 `(n_samples, n_trees)` (a multiclass model has
+        `num_class` trees per boosting round). Without `iteration_range`, a model
+        trained with early stopping uses its `best_iteration` automatically.
+        """
+        check_is_fitted(self, "_Booster")
+        X, _, _ = self._prepare_X(X, reset=False)
+        return self._Booster.predict(
+            np.ascontiguousarray(X, dtype=np.float32),
+            pred_leaf=True,
+            iteration_range=self._iteration_range(iteration_range),
+            missing=self.missing,
         )
 
     # ------------------------------------------------------------------ 持久化
@@ -403,7 +491,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
     ) -> FerrisBoostRegressor:
         if y is None:
             raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
-        X, y = _check_X(self, X, y, reset=True, y_numeric=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
         params = self.get_ferrisboost_params()
         self._fit_booster(
             X,
@@ -414,6 +502,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
             sample_weight_eval_set,
             verbose,
             eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
+            feature_types=flags,
         )
         return self
 
@@ -439,6 +528,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
             raise ValueError("This is a multiclass model; use FerrisBoostClassifier.load_model")
         self.n_features_in_ = self._Booster.n_features
         self.evals_result_ = {}
+        self.__dict__.pop("_cat_levels_", None)
         return self
 
 
@@ -466,7 +556,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
 
         if y is None:
             raise ValueError("This FerrisBoostClassifier estimator requires y to be passed, but the target y is None.")
-        X, y = _check_X(self, X, y, reset=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, dtype=np.float32)
         check_classification_targets(y)
         classes, encoded = np.unique(y, return_inverse=True)
         if len(classes) < 2:
@@ -505,6 +595,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
             sample_weight_eval_set,
             verbose,
             eval_labels=encode_eval,
+            feature_types=flags,
         )
         self._objective_resolved = params["objective"]
         return self
@@ -559,6 +650,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         self.classes_ = np.arange(self.n_classes_)
         self.n_features_in_ = booster.n_features
         self.evals_result_ = {}
+        self.__dict__.pop("_cat_levels_", None)
         return self
 
     @classmethod

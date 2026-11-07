@@ -279,3 +279,239 @@ def test_gridsearch_parallel_pickles_estimators():
     X, y = make_classification(n_samples=300, n_features=6, random_state=0)
     grid = GridSearchCV(small_clf(), {"max_depth": [2, 3]}, cv=2, n_jobs=2).fit(X, y)
     assert grid.best_score_ > 0.7
+
+
+# ---------------------------------------------------------------- missing / apply / categorical
+def _int_data(n=900, m=5, seed=0, sentinel=-999.0, frac=0.15):
+    rng = np.random.default_rng(seed)
+    x = rng.integers(1, 9, size=(n, m)).astype(np.float32)
+    signal = 0.4 * (x[:, 0] - 4) + 0.3 * (x[:, 1] % 3)
+    y = (signal + rng.normal(0, 0.6, n) > 0).astype(int)
+    hole = rng.random(x.shape) < frac
+    xs, xn = x.copy(), x.copy()
+    xs[hole] = sentinel
+    xn[hole] = np.nan
+    return xs, xn, y
+
+
+def test_missing_is_a_constructor_param_and_passes_through():
+    xgb = pytest.importorskip("xgboost")
+    assert np.isnan(FerrisBoostClassifier().get_params()["missing"])
+    xs, xn, y = _int_data()
+    kw = {"n_estimators": 8, "max_depth": 4, "learning_rate": 0.3}
+    ours = FerrisBoostClassifier(n_jobs=1, missing=-999.0, **kw).fit(xs, y)
+    plain = FerrisBoostClassifier(n_jobs=1, **kw).fit(xn, y)
+    np.testing.assert_array_equal(ours.predict_proba(xs), plain.predict_proba(xn))
+    np.testing.assert_array_equal(ours.predict(xs), plain.predict(xn))
+    ref = xgb.XGBClassifier(tree_method="hist", n_jobs=1, missing=-999.0, **kw).fit(xs, y)
+    np.testing.assert_array_equal(ours.predict_proba(xs), ref.predict_proba(xs))
+    # regressor, eval_set (the sentinel applies to the validation data too)
+    yr = np.nan_to_num(xn[:, 0]) * 0.5
+    r = FerrisBoostRegressor(n_jobs=1, missing=-999.0, n_estimators=6, max_depth=3,
+                             eval_metric="rmse")
+    r.fit(xs, yr, eval_set=[(xs, yr)])
+    r2 = FerrisBoostRegressor(n_jobs=1, n_estimators=6, max_depth=3, eval_metric="rmse")
+    r2.fit(xn, yr, eval_set=[(xn, yr)])
+    assert r.evals_result() == r2.evals_result()
+    np.testing.assert_array_equal(r.predict(xs), r2.predict(xn))
+    # clone keeps it; pickle keeps it
+    assert clone(ours).missing == -999.0
+    np.testing.assert_array_equal(pickle.loads(pickle.dumps(ours)).predict_proba(xs),
+                                  ours.predict_proba(xs))
+
+
+def test_missing_with_multiclass_and_bad_values():
+    xs, xn, _ = _int_data()
+    y = np.digitize(np.nan_to_num(xn[:, 0]), [3, 6])
+    a = FerrisBoostClassifier(n_estimators=5, max_depth=3, n_jobs=1, missing=-999.0).fit(xs, y)
+    b = FerrisBoostClassifier(n_estimators=5, max_depth=3, n_jobs=1).fit(xn, y)
+    np.testing.assert_array_equal(a.predict_proba(xs), b.predict_proba(xn))
+    with pytest.raises(ValueError, match="missing"):
+        FerrisBoostClassifier(missing=np.inf).fit(xs, y)
+
+
+def test_apply_matches_xgboost_on_the_same_model(tmp_path):
+    xgb = pytest.importorskip("xgboost")
+    xs, xn, y = _int_data(seed=2)
+    kw = {"n_estimators": 7, "max_depth": 4, "learning_rate": 0.3}
+    ours = FerrisBoostClassifier(n_jobs=1, missing=-999.0, **kw).fit(xs, y)
+    ref = xgb.XGBClassifier(tree_method="hist", n_jobs=1, missing=-999.0, **kw).fit(xs, y)
+    leaves = ours.apply(xs)
+    expected = ref.apply(xs)
+    assert leaves.dtype == expected.dtype == np.float32
+    assert leaves.shape == expected.shape == (len(y), 7)
+    np.testing.assert_array_equal(leaves, expected)
+    # XGBoost's pred_leaf only accepts begin == 0; a nonzero begin here is the
+    # matching columns of the full result.
+    np.testing.assert_array_equal(ours.apply(xs, iteration_range=(0, 5)),
+                                  ref.apply(xs, iteration_range=(0, 5)))
+    np.testing.assert_array_equal(ours.apply(xs, iteration_range=(2, 5)), leaves[:, 2:5])
+    # the same saved model through XGBoost's own estimator
+    path = tmp_path / "m.json"
+    ours.save_model(path)
+    again = xgb.XGBClassifier()
+    again.load_model(str(path))
+    again.set_params(missing=-999.0)
+    np.testing.assert_array_equal(again.apply(xs), leaves)
+    # regressor and multiclass shapes
+    yr = np.nan_to_num(xn[:, 0]) + np.nan_to_num(xn[:, 1])
+    reg = FerrisBoostRegressor(n_jobs=1, missing=-999.0, **kw).fit(xs, yr)
+    xreg = xgb.XGBRegressor(tree_method="hist", n_jobs=1, missing=-999.0, **kw).fit(xs, yr)
+    np.testing.assert_array_equal(reg.apply(xs), xreg.apply(xs))
+    ym = np.digitize(np.nan_to_num(xn[:, 0]), [3, 6])
+    mc = FerrisBoostClassifier(n_jobs=1, missing=-999.0, **kw).fit(xs, ym)
+    xmc = xgb.XGBClassifier(tree_method="hist", n_jobs=1, missing=-999.0, **kw).fit(xs, ym)
+    assert mc.apply(xs).shape == xmc.apply(xs).shape
+    np.testing.assert_array_equal(mc.apply(xs), xmc.apply(xs))
+
+
+def test_apply_uses_best_iteration_with_early_stopping():
+    xgb = pytest.importorskip("xgboost")
+    rng = np.random.default_rng(1)
+    X = rng.integers(0, 9, size=(800, 6)).astype(np.float32)  # lossless binning
+    y = (X[:, 0] - X[:, 1] + rng.normal(0, 2.0, 800) > 0).astype(int)
+    kw = {"n_estimators": 60, "max_depth": 3, "learning_rate": 0.4, "early_stopping_rounds": 3}
+    ours = FerrisBoostClassifier(n_jobs=1, **kw).fit(X[:500], y[:500], eval_set=[(X[500:], y[500:])])
+    best = ours.best_iteration
+    assert ours.apply(X).shape == (800, best + 1)
+    assert ours.apply(X, iteration_range=(0, 0)).shape == (800, best + 1)
+    assert ours.apply(X, iteration_range=(0, 2)).shape == (800, 2)
+    ref = xgb.XGBClassifier(tree_method="hist", n_jobs=1, **kw)
+    ref.fit(X[:500], y[:500], eval_set=[(X[500:], y[500:])], verbose=False)
+    assert ref.best_iteration == best
+    np.testing.assert_array_equal(ours.apply(X), ref.apply(X))
+
+
+def test_apply_requires_a_fitted_estimator_and_matching_features():
+    from sklearn.exceptions import NotFittedError
+
+    with pytest.raises(NotFittedError):
+        small_clf().apply(np.zeros((2, 3)))
+    X, y = make_classification(n_samples=200, n_features=4, random_state=0)
+    clf = small_clf().fit(X, y)
+    with pytest.raises(ValueError, match="features"):
+        clf.apply(X[:, :3])
+
+
+def _cat_frame(n=1200, seed=0, missing_frac=0.1):
+    pd = pytest.importorskip("pandas")
+    rng = np.random.default_rng(seed)
+    colour = rng.choice(["red", "green", "blue", "pink", "grey", "teal", "gold"], n)
+    size = rng.choice(["S", "M", "L"], n)
+    x1 = rng.normal(size=n)
+    effect = {"red": 1.0, "green": -1.0, "blue": 0.5, "pink": 0.0, "grey": -0.5, "teal": 1.5,
+              "gold": -1.5}
+    score = np.array([effect[c] for c in colour]) + 0.8 * (size == "L") + 0.7 * x1
+    y = (score + rng.normal(0, 0.5, n) > 0).astype(int)
+    df = pd.DataFrame({"colour": pd.Categorical(colour), "size": pd.Categorical(size), "x1": x1})
+    df.loc[rng.random(n) < missing_frac, "colour"] = np.nan
+    return df, y, score
+
+
+def test_categorical_dataframe_end_to_end():
+    df, y, score = _cat_frame()
+    kw = {"n_estimators": 20, "max_depth": 4, "n_jobs": 1}
+    clf = FerrisBoostClassifier(enable_categorical=True, **kw).fit(df, y)
+    assert list(clf.feature_names_in_) == ["colour", "size", "x1"]
+    assert clf.n_features_in_ == 3
+    proba = clf.predict_proba(df)
+    assert proba.shape == (len(y), 2) and np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+    assert clf.score(df, y) > 0.85
+    # the codes are what was trained on: same as an explicit code matrix + feature_types
+    codes = np.stack([df["colour"].cat.codes.where(df["colour"].notna(), np.nan).to_numpy(np.float32),
+                      df["size"].cat.codes.to_numpy(np.float32), df["x1"].to_numpy(np.float32)], axis=1)
+    manual = FerrisBoostClassifier(feature_types=["c", "c", "q"], enable_categorical=True,
+                                   **kw).fit(codes, y)
+    np.testing.assert_array_equal(manual.predict_proba(codes), proba)
+    # prediction re-codes by value even when the frame's category order differs
+    shuffled = df.copy()
+    shuffled["colour"] = shuffled["colour"].cat.reorder_categories(
+        list(reversed(df["colour"].cat.categories)))
+    np.testing.assert_array_equal(clf.predict_proba(shuffled), proba)
+    # a category never seen in training does not crash
+    novel = df.copy()
+    novel["colour"] = novel["colour"].cat.add_categories(["purple"])
+    novel.loc[novel.index[:5], "colour"] = "purple"
+    assert clf.predict_proba(novel).shape == (len(y), 2)
+    # apply, regressor, early stopping with a validation frame
+    assert clf.apply(df).shape == (len(y), 20)
+    reg = FerrisBoostRegressor(enable_categorical=True, **kw).fit(df, score)
+    assert reg.predict(df).shape == (len(y),)
+    es = FerrisBoostClassifier(enable_categorical=True, early_stopping_rounds=3,
+                               **{**kw, "n_estimators": 80})
+    es.fit(df.iloc[:900], y[:900], eval_set=[(df.iloc[900:], y[900:])])
+    assert es.best_iteration is not None
+    assert es.apply(df).shape[1] == es.best_iteration + 1
+
+
+def test_categorical_dataframe_matches_xgboost():
+    xgb = pytest.importorskip("xgboost")
+    df, y, _ = _cat_frame(seed=3)
+    kw = {"n_estimators": 10, "max_depth": 4, "learning_rate": 0.3, "max_bin": 255}
+    # Lossless binning on the numeric column: both libraries must agree bit for bit.
+    df = df.copy()
+    df["x1"] = np.round(df["x1"] * 4).astype(np.float32)
+    ours = FerrisBoostClassifier(n_jobs=1, enable_categorical=True, **kw).fit(df, y)
+    ref = xgb.XGBClassifier(tree_method="hist", n_jobs=1, enable_categorical=True, **kw).fit(df, y)
+    np.testing.assert_array_equal(ours.predict_proba(df), ref.predict_proba(df))
+    np.testing.assert_array_equal(ours.apply(df), ref.apply(df))
+
+
+def test_categorical_constructor_params_are_forwarded():
+    df, y, _ = _cat_frame(seed=4)
+    kw = {"n_estimators": 6, "max_depth": 4, "n_jobs": 1, "enable_categorical": True}
+    default = FerrisBoostClassifier(**kw).fit(df, y)
+    onehot = FerrisBoostClassifier(max_cat_to_onehot=8, **kw).fit(df, y)
+    narrow = FerrisBoostClassifier(max_cat_threshold=1, **kw).fit(df, y)
+    assert not np.array_equal(default.predict_proba(df), onehot.predict_proba(df))
+    assert not np.array_equal(default.predict_proba(df), narrow.predict_proba(df))
+    assert onehot.get_params()["max_cat_to_onehot"] == 8
+    # feature_types as a constructor param for plain arrays
+    X = df["colour"].cat.codes.where(df["colour"].notna(), np.nan).to_numpy(np.float32)[:, None]
+    X = np.hstack([X, df[["x1"]].to_numpy(np.float32)])
+    a = FerrisBoostClassifier(feature_types=["c", "q"], enable_categorical=True, n_estimators=5,
+                              n_jobs=1).fit(X, y)
+    b = FerrisBoostClassifier(n_estimators=5, n_jobs=1).fit(X, y)
+    assert not np.array_equal(a.predict_proba(X), b.predict_proba(X))
+
+
+def test_category_columns_need_enable_categorical():
+    df, y, _ = _cat_frame()
+    with pytest.raises(ValueError, match="enable_categorical"):
+        small_clf().fit(df, y)
+
+
+def test_categorical_pickle_clone_and_loaded_model(tmp_path):
+    df, y, _ = _cat_frame(seed=5)
+    kw = {"n_estimators": 8, "max_depth": 3, "n_jobs": 1, "enable_categorical": True}
+    clf = FerrisBoostClassifier(**kw).fit(df, y)
+    again = pickle.loads(pickle.dumps(clf))
+    np.testing.assert_array_equal(again.predict_proba(df), clf.predict_proba(df))
+    assert clone(clf).get_params()["enable_categorical"] is True
+    path = tmp_path / "c.json"
+    clf.save_model(path)
+    loaded = FerrisBoostClassifier(**kw).load_model(path)
+    # a loaded model has no stored category table: the frame's own codes are used
+    np.testing.assert_array_equal(loaded.predict_proba(df), clf.predict_proba(df))
+
+
+def test_gridsearch_with_categorical_dataframe():
+    df, y, _ = _cat_frame(n=600, seed=6)
+    grid = GridSearchCV(
+        FerrisBoostClassifier(n_estimators=8, n_jobs=1, enable_categorical=True),
+        {"max_depth": [2, 4], "max_cat_to_onehot": [1, 8]},
+        cv=3,
+    )
+    grid.fit(df, y)
+    assert grid.best_score_ > 0.7
+    assert set(grid.best_params_) == {"max_depth", "max_cat_to_onehot"}
+    assert grid.predict(df).shape == (len(y),)
+    parallel = GridSearchCV(
+        FerrisBoostClassifier(n_estimators=5, n_jobs=1, enable_categorical=True),
+        {"max_depth": [2, 3]}, cv=2, n_jobs=2,
+    ).fit(df, y)
+    assert parallel.best_score_ > 0.7
+    scores = cross_val_score(
+        FerrisBoostRegressor(n_estimators=8, n_jobs=1, enable_categorical=True), df,
+        np.asarray(y, dtype=float), cv=3)
+    assert scores.shape == (3,)
