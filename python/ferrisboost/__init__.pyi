@@ -50,6 +50,10 @@ def train(
     of the last eval set, and retains all trees trained through the stopping
     round; best_iteration identifies the best round (a round index, so a
     multiclass model has (best_iteration + 1) * num_class trees up to it).
+    Features must be finite or NaN (missing); the exact largest float32 value
+    is reserved for split boundaries and rejected in training, validation and
+    prediction. If extreme inputs make a gradient or Hessian non-finite,
+    training raises an error instead of producing a corrupt model.
     Weights also shape the quantile sketch that sets bin boundaries, as in
     XGBoost.
     """

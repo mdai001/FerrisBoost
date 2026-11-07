@@ -1066,6 +1066,26 @@ with its variance power, such as `tweedie-nloglik@1.5`.
 `base_score` must be positive. The label mean is zero when every label is `0`,
 so pass an explicit positive value, for example `"base_score": 0.1`.
 
+### A feature equals the largest float32 value
+
+Feature values exactly equal to `numpy.finfo(numpy.float32).max` are rejected
+in training, validation and prediction, and the error names the feature
+column (or, for NumPy input, the row and column). That value is reserved for
+split boundaries. Rescale or clip the feature, for example to
+`numpy.nextafter(numpy.float32(numpy.finfo(numpy.float32).max), 0)`, which is
+accepted. File prediction only reads the columns the model uses, so a value in
+a column the model never reads is not checked and cannot affect the result.
+
+### Training stops with a non-finite gradient error
+
+Some valid but extreme inputs make a gradient or Hessian overflow to `inf` or
+`NaN` during training, for example `reg:gamma` with a tiny explicit
+`base_score`, very large sample weights, or huge labels with a log-link
+objective. Training then stops with an error mentioning a non-finite gradient
+or Hessian instead of producing a corrupt model. Reduce the extreme labels,
+weights, `base_score`, or objective parameters; the estimated default
+`base_score` avoids the most common case.
+
 ### Early stopping does not stop
 
 Early stopping requires at least one validation set. Without `evals`, there is

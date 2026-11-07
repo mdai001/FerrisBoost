@@ -40,6 +40,10 @@ class Model:
         objective's transform). predict_threads=0 selects auto CPU workers.
         use_gpu=True permits GPU 0 scoring in CUDA builds, with CPU selection
         for batches where GPU overhead is not worthwhile.
+
+        Feature values exactly equal to the largest float32 are rejected, as in
+        training (the value is reserved for split boundaries); +/-inf and NaN
+        follow the usual rules.
         """
         ...
     def predict_to_parquet(
