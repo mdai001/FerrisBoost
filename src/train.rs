@@ -54,6 +54,10 @@ pub mod prof {
         // 那些累加值的**共同上界**,也是这一段任何优化的**收益上限**。
         HIST_PHASE_WALL,
         GRAD,
+        // 行采样置零(每轮一次,墙钟)。
+        SAMPLE,
+        // build_tree 开头:root 梯度和 + root 行下标(每棵树一次,墙钟)。
+        TREE_SETUP,
         QUANTIZE,
         HIST,
         ENUM,
@@ -1355,22 +1359,33 @@ fn train_with_backend(
         // scale. CPU and explicit host quantization retain the host mask below.
         if cfg.params.subsample < 1.0 && !fast_math && !device_quant {
             let _phase = crate::diagnostic::Phase::new(b"fb.host.exact.subsample\0");
-            let kept = {
+            let kept = pool.install(|| {
+                let _t = prof::Timer::new(&prof::SAMPLE);
                 // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
+                //
+                // 采样身份只由 `(seed, tree, row)` 逐行独立哈希决定(见
+                // subsample 模块),行与行之间没有顺序依赖,所以按行并行
+                // 与串行逐位相同;`kept` 是整数求和,同样与顺序无关。
+                // 这一遍以前是串行的:1050 万次 SplitMix 哈希挂在训练线程上,
+                // 其余线程全程空等。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
-                let mut kept = 0usize;
-                for (i, g) in gpair_f32.iter_mut().enumerate() {
-                    if crate::subsample::row_selected(i as u64, th, cfg.params.seed, round as u64) {
-                        kept += 1;
-                    } else {
-                        *g = GradPair {
-                            grad: 0.0,
-                            hess: 0.0,
-                        };
-                    }
-                }
-                kept
-            };
+                let (seed, tree) = (cfg.params.seed, round as u64);
+                gpair_f32
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(i, g)| {
+                        if crate::subsample::row_selected(i as u64, th, seed, tree) {
+                            1usize
+                        } else {
+                            *g = GradPair {
+                                grad: 0.0,
+                                hess: 0.0,
+                            };
+                            0usize
+                        }
+                    })
+                    .sum::<usize>()
+            });
             if prof::enabled() && round == 0 {
                 eprintln!(
                     "SUBSAMPLE rate={} kept={kept}/{} ({:.1}%)",
@@ -2290,13 +2305,15 @@ fn build_tree(
     let n_blocks = plans.len();
 
     let mut t = Tree::default();
+    let setup_timer = prof::Timer::new(&prof::TREE_SETUP);
     let root_sum = dev_root_sum.unwrap_or_else(|| hist::node_sum(gpair, None));
     let root = t.push_leaf(leaf_of(root_sum, q, p), hess_of(root_sum, q));
 
     let root_rows = match gpu {
         Some(ctx) => NodeRows::Device(ctx.begin_tree_rows()?),
-        None => NodeRows::Host((0..source.n_rows() as RowId).collect()),
+        None => NodeRows::Host(identity_rows(source.n_rows())),
     };
+    drop(setup_timer);
     let mut level = vec![LevelNode {
         node: root,
         rows: root_rows,
@@ -2944,6 +2961,29 @@ fn build_tree(
     Ok(t)
 }
 
+/// `0..n` 的行下标。每棵树一次,1050 万行是 42 MB:串行 `collect()` 把
+/// 写入和首次触碰的缺页都压在一条线程上,所以按块并行填(与 XGBoost 的
+/// 并行 Iota 同形)。内容逐位相同。
+fn identity_rows(n: usize) -> Vec<RowId> {
+    const CHUNK: usize = 1 << 16;
+    let mut rows = vec![0 as RowId; n];
+    if n < 4 * CHUNK {
+        for (i, r) in rows.iter_mut().enumerate() {
+            *r = i as RowId;
+        }
+        return rows;
+    }
+    rows.par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(c, chunk)| {
+            let base = c * CHUNK;
+            for (i, r) in chunk.iter_mut().enumerate() {
+                *r = (base + i) as RowId;
+            }
+        });
+    rows
+}
+
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
 fn monotone_at(p: &TrainParams, bounds: split::NodeBounds) -> Option<split::Monotone<'_>> {
     p.uses_given_weight().then_some(split::Monotone {
@@ -3367,6 +3407,14 @@ fn update_predictions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_rows_matches_the_serial_range() {
+        for n in [0usize, 1, 7, (1 << 18) - 1, (1 << 18) + 5, 700_001] {
+            let expected: Vec<RowId> = (0..n as RowId).collect();
+            assert_eq!(super::identity_rows(n), expected, "n = {n}");
+        }
+    }
+
     /// `max_depth` 的公开契约是 **1..=14**,两个后端同一个数。
     ///
     /// 上限卡在 GPU:`part_totals` 由 `MAX_LEVEL_NODES = 8192` 兜着,
