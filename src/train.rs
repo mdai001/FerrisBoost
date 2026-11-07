@@ -3694,10 +3694,13 @@ mod tests {
             .collect();
         let src = DenseSource::from_row_major(&x, 40, 1, 255, 1);
         // 走加权均值(FitInterceptGlmLike)的 objective;gamma 要求标签为正,
-        // pseudohuber 走 Newton,另有测试。
-        let glm_like = Objective::ALL
-            .into_iter()
-            .filter(|o| !matches!(o, Objective::Gamma | Objective::PseudoHuber { .. }));
+        // pseudohuber 走 Newton,quantile 取分位数,各有自己的测试。
+        let glm_like = Objective::ALL.into_iter().filter(|o| {
+            !matches!(
+                o,
+                Objective::Gamma | Objective::PseudoHuber { .. } | Objective::Quantile { .. }
+            )
+        });
         for obj in glm_like {
             let cfg = TrainConfig::new(params(2, 1), obj);
             let m = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
