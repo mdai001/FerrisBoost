@@ -629,6 +629,11 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
         return _frame_matrix(data, True, what="predict data")[0]
     table = _arrow_table(data)
     if table is not None:
+        if names:
+            absent = [n for n in names if n not in table.column_names]
+            if absent:
+                raise ValueError(f"predict data 缺少模型的特征列 {absent}")
+            table = table.select(list(names))
         return _table_matrix(table, list(names) if names else None, True, what="predict data")[0]
     raise ValueError(
         "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、"
