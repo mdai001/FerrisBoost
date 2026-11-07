@@ -356,12 +356,16 @@ mod bind_tests {
 /// 训练和验证特征已经拒绝它(见 `arrow_source::for_each_feature_f32`)。
 /// 预测时若接受,原始比较 `v < MAX` 会把它路由到和训练不同的一侧。
 /// ±inf 在预测时仍按原来的规则接受。
-pub(crate) fn reject_reserved_max(rows: &[f32], n_features: usize, what: &str) -> Result<()> {
+///
+/// 文件预测只解码模型用到的列,所以这里的列号是「这一批里的位置」、行号是
+/// 批内行号,都不是文件里的坐标 —— 报错用这一批 schema 里的**列名**。
+/// 模型不读的列不解码,那里的值影响不了任何预测。
+pub(crate) fn reject_reserved_max(rows: &[f32], batch: &RecordBatch) -> Result<()> {
+    let n_features = batch.num_columns().max(1);
     if let Some(i) = rows.iter().position(|&v| v == f32::MAX) {
+        let name = batch.schema().field(i % n_features).name().clone();
         bail!(
-            "{what}第 {} 行第 {} 列是 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征",
-            i / n_features.max(1),
-            i % n_features.max(1)
+            "预测数据的特征列 {name:?} 含有 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征"
         );
     }
     Ok(())
@@ -449,7 +453,7 @@ fn batch_to_contiguous_rows(
         // Classify before resizing/writing so legacy error-time buffer state,
         // conversion policy and first unsupported column remain unchanged.
         batch_to_contiguous_rows_legacy(batch, n_features, rows)?;
-        return reject_reserved_max(rows, n_features, "预测数据");
+        return reject_reserved_max(rows, batch);
     };
     rows.resize(values, 0.0);
     // Division order avoids overflow in a hypothetical very large row width.
@@ -498,7 +502,7 @@ fn batch_to_contiguous_rows(
             }
         }
     }
-    reject_reserved_max(rows, n_features, "预测数据")
+    reject_reserved_max(rows, batch)
 }
 
 /// One converted column at a time, preserving the original conversion contract.
@@ -546,7 +550,7 @@ mod packing_tests {
         // fast path (all primitive columns)
         let fast = make(Arc::new(Float32Array::from(vec![0.5, 0.5, f32::INFINITY])));
         let err = batch_to_contiguous_rows(&fast, 2, &mut rows).unwrap_err();
-        assert!(err.to_string().contains("第 1 行第 0 列"), "{err}");
+        assert!(err.to_string().contains(r#"特征列 "a""#), "{err}");
         // +inf and the next value below MAX stay accepted
         let ok_schema = Arc::new(Schema::new(vec![Field::new(
             "a",

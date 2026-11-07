@@ -90,7 +90,9 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
                 visit(v);
             }
             if REJECT_MAX && any_max {
-                anyhow::bail!("feature column {col} contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
+                // 报列名:`col` 是这一批里的列号,文件只读了部分列时它不是文件里的列号。
+                let name = batch.schema().field(col).name().clone();
+                anyhow::bail!("feature column {name:?} contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
             }
             if REJECT_INF && any_inf {
                 let i = (0..n)

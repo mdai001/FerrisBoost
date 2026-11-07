@@ -282,7 +282,7 @@ def test_float32_max_is_rejected_at_file_prediction(tmp_path, fmt):
     bad = x.copy()
     bad[5, 1] = np.finfo(np.float32).max
     WRITERS[fmt](tmp_path / f"bad.{fmt}", bad, y)
-    with pytest.raises(Exception, match="f32::MAX"):
+    with pytest.raises(Exception, match=r'"f1".*f32::MAX'):
         m.predict(str(tmp_path / f"bad.{fmt}"))
     if fmt == "parquet":
         with pytest.raises(Exception, match="f32::MAX"):
@@ -299,3 +299,26 @@ def test_float32_max_is_rejected_at_multiclass_prediction():
     bad[0, 0] = np.finfo(np.float32).max
     with pytest.raises(ValueError, match="f32::MAX"):
         m.predict(bad)
+
+
+def test_file_prediction_names_the_feature_when_only_some_columns_are_read(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+    x, y = data(n=2000, m=6)
+    names = [f"f{i}" for i in range(6)]
+    pq.write_table(pa.table({**{n: x[:, i] for i, n in enumerate(names)}, "label": y}),
+                   str(tmp_path / "t.parquet"))
+    # depth-1, one round: the model reads only one or two of the six columns
+    m = fb.train({**BASE, "max_depth": 1}, str(tmp_path / "t.parquet"), label="label",
+                 num_boost_round=1, quiet=True)
+    used = m.predict(x, output_margin=True)  # sanity
+    assert used.shape == (2000,)
+    import json
+    m.save_model(str(tmp_path / "m.json"), quiet=True)
+    tree = json.load(open(tmp_path / "m.json"))["learner"]["gradient_booster"]["model"]["trees"][0]
+    feat = names[tree["split_indices"][0]]
+    bad = x.copy()
+    bad[1500, names.index(feat)] = np.finfo(np.float32).max
+    pq.write_table(pa.table({n: bad[:, i] for i, n in enumerate(names)}), str(tmp_path / "bad.parquet"))
+    with pytest.raises(Exception, match=f'"{feat}".*f32::MAX'):
+        m.predict(str(tmp_path / "bad.parquet"))
