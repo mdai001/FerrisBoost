@@ -16,6 +16,14 @@ class Model:
     def num_trees(self) -> int: ...
     @property
     def n_features(self) -> int: ...
+    @property
+    def objective(self) -> str:
+        """XGBoost objective name, for example "binary:logistic"."""
+        ...
+    @property
+    def num_class(self) -> int:
+        """Number of classes for multiclass models; 1 otherwise."""
+        ...
     def predict(
         self,
         x: NDArray[np.float32] | str | PathLike[str] | Sequence[str | PathLike[str]],
@@ -25,6 +33,7 @@ class Model:
         *,
         predict_threads: int = 0,
         use_gpu: bool = False,
+        iteration_range: tuple[int, int] | None = None,
     ) -> NDArray[np.float32]:
         """Return ordered float32 predictions from an array or path specs.
 
@@ -37,7 +46,11 @@ class Model:
         header=False for headerless CSV. All trees are used unless n_trees is
         set; n_trees counts trees, so a multiclass model uses num_class trees
         per boosting round. output_margin=True returns raw scores (before the
-        objective's transform). predict_threads=0 selects auto CPU workers.
+        objective's transform. iteration_range=(begin, end) uses the half-open
+        range of boosting rounds [begin, end) as XGBoost does (a multiclass round
+        is num_class trees); end=0 means up to the last round, an out-of-range
+        value raises ValueError, begin == end gives base_score only, and it cannot
+        be combined with n_trees). predict_threads=0 selects auto CPU workers.
         use_gpu=True permits GPU 0 scoring in CUDA builds, with CPU selection
         for batches where GPU overhead is not worthwhile.
 
@@ -56,6 +69,7 @@ class Model:
         *,
         predict_threads: int = 0,
         prediction_column: str = "prediction",
+        iteration_range: tuple[int, int] | None = None,
     ) -> int:
         """CPU-score file inputs and write ordered float32 predictions to Parquet.
 

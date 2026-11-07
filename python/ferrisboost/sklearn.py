@@ -1,0 +1,577 @@
+"""scikit-learn 风格的估计器:`FerrisBoostClassifier` / `FerrisBoostRegressor`。
+
+和 XGBoost 的 `XGBClassifier` / `XGBRegressor` 同一套用法,但**不占用 xgboost
+的名字**(两个库可以同时 import):
+
+=====================  ==============================
+XGBoost                FerrisBoost
+=====================  ==============================
+``XGBClassifier``      ``FerrisBoostClassifier``
+``XGBRegressor``       ``FerrisBoostRegressor``
+=====================  ==============================
+
+    from ferrisboost.sklearn import FerrisBoostClassifier
+
+    clf = FerrisBoostClassifier(n_estimators=200, learning_rate=0.1,
+                                early_stopping_rounds=10)
+    clf.fit(X, y, eval_set=[(Xv, yv)])
+    clf.predict_proba(Xv)
+
+scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
+``ferrisboost.FerrisBoostClassifier`` 或 import 本模块时才会导入 scikit-learn,
+缺了就给出明确的 ImportError。
+
+这一层只做参数搬运、标签编码和 sklearn 的校验约定,**不碰任何数值** ——
+训练和预测全部走 `ferrisboost.train` / `Model.predict`。与 XGBoost 一致的行为:
+
+* `predict` / `predict_proba` 在早停后**自动只用到 best_iteration**
+  (`Booster.predict` 则默认用全部树);
+* 二分类 `predict_proba` 是 `(n, 2)`;多分类用 `multi:softprob`;
+* `feature_importances_` 按 `importance_type` 归一化;
+* `evals_result()` 的键是 `validation_0`、`validation_1`……
+
+刻意的差异:
+
+* 分类标签可以是任意可排序的类别(内部做 `LabelEncoder` 式编码,`classes_` 保存
+  原始类别);XGBoost 要求标签恰好是 `0..K-1`。标签已经是 `0..K-1` 时两者行为一致。
+* 不支持 `missing=`(缺失值只认 NaN)、`booster=` / `tree_method=` 等 FerrisBoost
+  没有的选项;多分位数 `quantile_alpha`(多输出)不支持。
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from typing import Any
+
+import numpy as np
+
+try:  # pragma: no cover - 依赖缺失时的提示
+    from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+    from sklearn.utils.validation import _check_sample_weight, check_is_fitted
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "ferrisboost.sklearn needs scikit-learn; install it first (for example "
+        "`uv pip install scikit-learn`). The core ferrisboost.train / Model API does not "
+        "depend on scikit-learn."
+    ) from exc
+
+try:  # scikit-learn >= 1.6
+    from sklearn.utils.validation import validate_data as _validate_data
+except ImportError:  # pragma: no cover
+    _validate_data = None
+
+from . import Model, train
+
+__all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor"]
+
+# sklearn 构造参数 -> `ferrisboost.train` 的参数名。值为 None 的一律不传,
+# 让 FerrisBoost 自己的默认值生效(和 XGBoost 的 `None = 用库默认` 一致)。
+_PARAM_MAP = {
+    "max_depth": "max_depth",
+    "max_bin": "max_bin",
+    "learning_rate": "eta",
+    "n_jobs": "nthread",
+    "gamma": "gamma",
+    "min_child_weight": "min_child_weight",
+    "max_delta_step": "max_delta_step",
+    "subsample": "subsample",
+    "colsample_bytree": "colsample_bytree",
+    "colsample_bylevel": "colsample_bylevel",
+    "colsample_bynode": "colsample_bynode",
+    "reg_alpha": "alpha",
+    "reg_lambda": "lambda",
+    "scale_pos_weight": "scale_pos_weight",
+    "base_score": "base_score",
+    "monotone_constraints": "monotone_constraints",
+    "eval_metric": "eval_metric",
+    "device": "device",
+    "gpu_math": "gpu_math",
+    "cols_per_block": "cols_per_block",
+    "quantile_alpha": "quantile_alpha",
+    "tweedie_variance_power": "tweedie_variance_power",
+    "huber_slope": "huber_slope",
+}
+
+_IMPORTANCE_TYPES = ("weight", "gain", "cover", "total_gain", "total_cover")
+
+
+def _check_X(est: Any, X: Any, y: Any = None, *, reset: bool, **kwargs: Any):
+    """sklearn 的输入校验(NaN 当缺失值放行,inf 拒绝)。"""
+    if _validate_data is not None:
+        if y is None:
+            return _validate_data(est, X, reset=reset, ensure_all_finite="allow-nan", **kwargs)
+        return _validate_data(
+            est, X, y, reset=reset, ensure_all_finite="allow-nan", **kwargs
+        )
+    if y is None:  # pragma: no cover
+        return est._validate_data(X, reset=reset, force_all_finite="allow-nan", **kwargs)
+    return est._validate_data(  # pragma: no cover
+        X, y, reset=reset, force_all_finite="allow-nan", **kwargs
+    )
+
+
+def _seed_of(random_state: Any) -> int | None:
+    if random_state is None:
+        return None
+    if isinstance(random_state, np.random.RandomState):
+        return int(random_state.randint(np.iinfo(np.int32).max))
+    if isinstance(random_state, np.random.Generator):
+        return int(random_state.integers(np.iinfo(np.int32).max))
+    return int(random_state)
+
+
+class _FerrisBoostBase(BaseEstimator):
+    """两个估计器共用的参数、拟合和持久化逻辑。"""
+
+    def __init__(
+        self,
+        *,
+        n_estimators: int | None = None,
+        max_depth: int | None = None,
+        max_bin: int | None = None,
+        learning_rate: float | None = None,
+        objective: str | None = None,
+        n_jobs: int | None = None,
+        gamma: float | None = None,
+        min_child_weight: float | None = None,
+        max_delta_step: float | None = None,
+        subsample: float | None = None,
+        colsample_bytree: float | None = None,
+        colsample_bylevel: float | None = None,
+        colsample_bynode: float | None = None,
+        reg_alpha: float | None = None,
+        reg_lambda: float | None = None,
+        scale_pos_weight: float | None = None,
+        base_score: float | None = None,
+        random_state: Any = None,
+        monotone_constraints: Any = None,
+        eval_metric: str | list[str] | tuple[str, ...] | None = None,
+        early_stopping_rounds: int | None = None,
+        callbacks: list | None = None,
+        device: str | None = None,
+        gpu_math: str | None = None,
+        cols_per_block: int | None = None,
+        quantile_alpha: float | None = None,
+        tweedie_variance_power: float | None = None,
+        huber_slope: float | None = None,
+        importance_type: str | None = None,
+    ) -> None:
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.max_bin = max_bin
+        self.learning_rate = learning_rate
+        self.objective = objective
+        self.n_jobs = n_jobs
+        self.gamma = gamma
+        self.min_child_weight = min_child_weight
+        self.max_delta_step = max_delta_step
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.colsample_bylevel = colsample_bylevel
+        self.colsample_bynode = colsample_bynode
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
+        self.scale_pos_weight = scale_pos_weight
+        self.base_score = base_score
+        self.random_state = random_state
+        self.monotone_constraints = monotone_constraints
+        self.eval_metric = eval_metric
+        self.early_stopping_rounds = early_stopping_rounds
+        self.callbacks = callbacks
+        self.device = device
+        self.gpu_math = gpu_math
+        self.cols_per_block = cols_per_block
+        self.quantile_alpha = quantile_alpha
+        self.tweedie_variance_power = tweedie_variance_power
+        self.huber_slope = huber_slope
+        self.importance_type = importance_type
+
+    # ------------------------------------------------------------------ tags
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.allow_nan = True
+        return tags
+
+    # ------------------------------------------------------------------ params
+    def _default_objective(self) -> str:  # pragma: no cover - 子类实现
+        raise NotImplementedError
+
+    def get_num_boosting_rounds(self) -> int:
+        return 100 if self.n_estimators is None else int(self.n_estimators)
+
+    def get_ferrisboost_params(self) -> dict[str, Any]:
+        """翻译成 `ferrisboost.train` 的 params 字典(None 的不传)。"""
+        params: dict[str, Any] = {
+            "objective": self.objective if self.objective is not None else self._default_objective()
+        }
+        for name, target in _PARAM_MAP.items():
+            value = getattr(self, name)
+            if value is not None:
+                params[target] = value
+        seed = _seed_of(self.random_state)
+        if seed is not None:
+            params["seed"] = seed
+        if isinstance(params.get("n_jobs"), int) and params.get("nthread", 0) < 0:
+            params["nthread"] = 0
+        return params
+
+    # ------------------------------------------------------------------ fit
+    def _fit_booster(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        params: dict[str, Any],
+        sample_weight: Any,
+        eval_set: Any,
+        sample_weight_eval_set: Any,
+        verbose: Any,
+        eval_labels: Any,
+    ) -> None:
+        if sample_weight is not None:
+            sample_weight = _check_sample_weight(sample_weight, X, dtype=np.float32)
+        evals = []
+        if eval_set:
+            if sample_weight_eval_set is not None and len(sample_weight_eval_set) != len(eval_set):
+                raise ValueError(
+                    "sample_weight_eval_set must have the same length as eval_set: "
+                    f"{len(sample_weight_eval_set)} != {len(eval_set)}"
+                )
+            for i, pair in enumerate(eval_set):
+                if len(pair) != 2:
+                    raise ValueError("Each eval_set element must be an (X, y) pair")
+                ex, ey = pair
+                ex = _check_X(self, ex, reset=False)
+                ey = eval_labels(ey)
+                ew = None if sample_weight_eval_set is None else sample_weight_eval_set[i]
+                if ew is None:
+                    evals.append((ex, ey, f"validation_{i}"))
+                else:
+                    ew = _check_sample_weight(ew, ex, dtype=np.float32)
+                    evals.append((ex, ey, ew, f"validation_{i}"))
+        elif sample_weight_eval_set is not None:
+            raise ValueError("sample_weight_eval_set was given without eval_set")
+        if self.early_stopping_rounds is not None and not evals:
+            raise ValueError("early_stopping_rounds requires eval_set (at least one validation set)")
+        if verbose is True:
+            verbose_eval: bool | int = True
+        elif not verbose:
+            verbose_eval = False
+        else:
+            verbose_eval = int(verbose)
+        result: dict = {}
+        self._Booster = train(
+            params,
+            X,
+            label=y,
+            num_boost_round=self.get_num_boosting_rounds(),
+            evals=evals,
+            early_stopping_rounds=self.early_stopping_rounds,
+            evals_result=result,
+            verbose_eval=verbose_eval,
+            callbacks=self.callbacks,
+            quiet=not verbose,
+            weight=None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32),
+        )
+        self.evals_result_ = result
+
+    # ------------------------------------------------------------------ 访问器
+    def get_booster(self) -> Model:
+        """底层的 `ferrisboost.Model`(未拟合时抛 `NotFittedError`)。"""
+        check_is_fitted(self, "_Booster")
+        return self._Booster
+
+    @property
+    def best_iteration(self) -> int:
+        """早停选中的轮次(0 起)。没有早停时和 XGBoost 一样抛 `AttributeError`。"""
+        best = self.get_booster().best_iteration
+        if best is None:
+            raise AttributeError("`best_iteration` is only available on a model trained with early stopping")
+        return int(best)
+
+    @property
+    def best_score(self) -> float:
+        best = self.get_booster().best_score
+        if best is None:
+            raise AttributeError("`best_score` is only available on a model trained with early stopping")
+        return float(best)
+
+    def evals_result(self) -> dict[str, dict[str, list[float]]]:
+        """`{"validation_0": {"logloss": [...]}, ...}`;没有 eval_set 时是空字典。"""
+        check_is_fitted(self, "evals_result_")
+        return self.evals_result_
+
+    @property
+    def n_estimators_(self) -> int:
+        """实际训练了多少轮(早停时包含 best_iteration 之后的那些)。"""
+        model = self.get_booster()
+        return model.num_trees // max(1, getattr(model, "num_class", 1) or 1)
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        """按 `importance_type`(默认 `gain`)归一化的特征重要性,长度 `n_features_in_`。
+
+        依赖 `Model.get_score`;当前构建没有它时抛 `NotImplementedError`。
+        """
+        model = self.get_booster()
+        get_score = getattr(model, "get_score", None)
+        if get_score is None:
+            raise NotImplementedError(
+                "feature_importances_ needs Model.get_score, which this build does not have yet"
+            )
+        kind = self.importance_type or "gain"
+        if kind not in _IMPORTANCE_TYPES:
+            raise ValueError(f"importance_type must be one of {_IMPORTANCE_TYPES}, got {kind!r}")
+        score = get_score(importance_type=kind)
+        names = getattr(self, "feature_names_in_", None)
+        out = np.zeros(self.n_features_in_, dtype=np.float32)
+        for key, value in score.items():
+            if names is not None and key in list(names):
+                out[list(names).index(key)] = value
+            elif isinstance(key, str) and key.startswith("f") and key[1:].isdigit():
+                out[int(key[1:])] = value
+            elif isinstance(key, int):
+                out[key] = value
+        total = out.sum()
+        return out / total if total > 0 else out
+
+    # ------------------------------------------------------------------ 预测
+    def _iteration_range(self, iteration_range: tuple[int, int] | None) -> tuple[int, int]:
+        """XGBoost `_get_iteration_range`:没给(或 end == 0)且有早停,就用到最佳轮次。"""
+        if iteration_range is None or iteration_range[1] == 0:
+            best = self.get_booster().best_iteration
+            if best is not None:
+                return (0, int(best) + 1)
+            return (0, 0)
+        return (int(iteration_range[0]), int(iteration_range[1]))
+
+    def _raw_predict(
+        self,
+        X: Any,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        check_is_fitted(self, "_Booster")
+        X = _check_X(self, X, reset=False)
+        return self._Booster.predict(
+            np.ascontiguousarray(X, dtype=np.float32),
+            output_margin=output_margin,
+            iteration_range=self._iteration_range(iteration_range),
+        )
+
+    # ------------------------------------------------------------------ 持久化
+    def save_model(self, fname: str | os.PathLike) -> None:
+        """写 XGBoost 兼容的 JSON(只含 booster)。"""
+        self.get_booster().save_model(os.fspath(fname), quiet=True)
+
+    def _load_booster(self, fname: str | os.PathLike) -> Model:
+        return Model.load_model(os.fspath(fname), quiet=True)
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        booster = state.pop("_Booster", None)
+        if booster is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "model.json")
+                booster.save_model(path, quiet=True)
+                with open(path, "rb") as fh:
+                    state["_booster_json"] = fh.read()
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        state = dict(state)
+        raw = state.pop("_booster_json", None)
+        self.__dict__.update(state)
+        if raw is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "model.json")
+                with open(path, "wb") as fh:
+                    fh.write(raw)
+                self._Booster = self._load_booster(path)
+
+
+class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
+    """回归估计器(对应 `xgboost.XGBRegressor`),默认 `reg:squarederror`。
+
+    支持 `reg:squarederror`、`count:poisson`、`reg:gamma`、`reg:tweedie`、
+    `reg:pseudohubererror`、`reg:quantileerror`(需要标量 `quantile_alpha`)。
+    """
+
+    def _default_objective(self) -> str:
+        return "reg:squarederror"
+
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        sample_weight: Any = None,
+        eval_set: Any = None,
+        sample_weight_eval_set: Any = None,
+        verbose: bool | int | None = False,
+    ) -> FerrisBoostRegressor:
+        if y is None:
+            raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
+        X, y = _check_X(self, X, y, reset=True, y_numeric=True, dtype=np.float32)
+        params = self.get_ferrisboost_params()
+        self._fit_booster(
+            X,
+            np.asarray(y, dtype=np.float32),
+            params,
+            sample_weight,
+            eval_set,
+            sample_weight_eval_set,
+            verbose,
+            eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
+        )
+        return self
+
+    def predict(
+        self,
+        X: Any,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        return self._raw_predict(X, output_margin, iteration_range)
+
+    @classmethod
+    def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostRegressor:
+        est = cls(**params)
+        est.load_model(fname)
+        return est
+
+    def load_model(self, fname: str | os.PathLike) -> FerrisBoostRegressor:
+        """读 XGBoost 兼容的 JSON(也能读 XGBoost 训的单输出回归模型)。"""
+        self._Booster = self._load_booster(fname)
+        if self._Booster.num_class > 1:
+            raise ValueError("This is a multiclass model; use FerrisBoostClassifier.load_model")
+        self.n_features_in_ = self._Booster.n_features
+        self.evals_result_ = {}
+        return self
+
+
+class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
+    """分类估计器(对应 `xgboost.XGBClassifier`),默认 `binary:logistic`。
+
+    类别数 > 2 时自动切到 `multi:softprob`(或你指定的 `multi:softmax`)并设置
+    `num_class`。标签可以是任意可排序类别,`classes_` 保存原始类别。
+    """
+
+    def _default_objective(self) -> str:
+        return "binary:logistic"
+
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        sample_weight: Any = None,
+        eval_set: Any = None,
+        sample_weight_eval_set: Any = None,
+        verbose: bool | int | None = False,
+    ) -> FerrisBoostClassifier:
+        from sklearn.utils.multiclass import check_classification_targets
+
+        if y is None:
+            raise ValueError("This FerrisBoostClassifier estimator requires y to be passed, but the target y is None.")
+        X, y = _check_X(self, X, y, reset=True, dtype=np.float32)
+        check_classification_targets(y)
+        classes, encoded = np.unique(y, return_inverse=True)
+        if len(classes) < 2:
+            raise ValueError(
+                "Classification needs samples of at least 2 classes, but the data contains "
+                f"only one class: {classes[0]!r}"
+            )
+        self.classes_ = classes
+        self.n_classes_ = len(classes)
+        params = self.get_ferrisboost_params()
+        if self.n_classes_ > 2:
+            if params["objective"] != "multi:softmax":
+                params["objective"] = "multi:softprob"
+            params["num_class"] = self.n_classes_
+        elif params["objective"].startswith("multi:"):
+            raise ValueError(
+                f"objective={params['objective']!r} needs more than 2 classes, "
+                f"but the labels contain {self.n_classes_}"
+            )
+
+        def encode_eval(ey: Any) -> np.ndarray:
+            ey = np.asarray(ey).ravel()
+            idx = np.searchsorted(self.classes_, ey)
+            idx = np.clip(idx, 0, self.n_classes_ - 1)
+            if not (self.classes_[idx] == ey).all():
+                unseen = np.unique(ey[self.classes_[idx] != ey])
+                raise ValueError(f"eval_set contains classes not seen in training: {unseen}")
+            return idx.astype(np.float32)
+
+        self._fit_booster(
+            X,
+            encoded.astype(np.float32),
+            params,
+            sample_weight,
+            eval_set,
+            sample_weight_eval_set,
+            verbose,
+            eval_labels=encode_eval,
+        )
+        self._objective_resolved = params["objective"]
+        return self
+
+    def _decode(self, index: np.ndarray) -> np.ndarray:
+        return self.classes_[np.asarray(index, dtype=np.intp)]
+
+    def predict(
+        self,
+        X: Any,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        check_is_fitted(self, "_Booster")
+        raw = self._raw_predict(X, output_margin, iteration_range)
+        if output_margin:
+            return raw
+        if raw.ndim == 2:  # multi:softprob
+            return self._decode(np.argmax(raw, axis=1))
+        if self._objective_resolved == "multi:softmax":
+            return self._decode(raw.astype(np.intp))
+        return self._decode((raw > 0.5).astype(np.intp))
+
+    def predict_proba(
+        self,
+        X: Any,
+        *,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        """每个类别的概率,形状 `(n_samples, n_classes_)`。"""
+        check_is_fitted(self, "_Booster")
+        if self._objective_resolved == "multi:softmax":
+            margin = self._raw_predict(X, True, iteration_range)
+            shifted = margin - margin.max(axis=1, keepdims=True)
+            expd = np.exp(shifted)
+            return expd / expd.sum(axis=1, keepdims=True)
+        raw = self._raw_predict(X, False, iteration_range)
+        if raw.ndim == 2:
+            return raw
+        return np.vstack((1.0 - raw, raw)).T
+
+    def load_model(self, fname: str | os.PathLike) -> FerrisBoostClassifier:
+        """读 XGBoost 兼容的 JSON(binary:logistic / multi:softprob / multi:softmax)。"""
+        booster = self._load_booster(fname)
+        name = booster.objective
+        if name not in ("binary:logistic", "multi:softprob", "multi:softmax"):
+            raise ValueError(f"{name} is not a classification model; use FerrisBoostRegressor.load_model")
+        self._Booster = booster
+        self._objective_resolved = name
+        self.n_classes_ = booster.num_class if booster.num_class > 1 else 2
+        self.classes_ = np.arange(self.n_classes_)
+        self.n_features_in_ = booster.n_features
+        self.evals_result_ = {}
+        return self
+
+    @classmethod
+    def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostClassifier:
+        est = cls(**params)
+        est.load_model(fname)
+        return est

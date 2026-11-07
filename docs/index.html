@@ -97,6 +97,14 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
+      <h3>0.0.6 (unreleased)</h3>
+      <ul>
+        <li>Added objective <code>reg:quantileerror</code> with a scalar <code>quantile_alpha</code> (XGBoost 3.4.1's smoothed pinball loss) and the <code>quantile</code> metric, on CPU and GPU (<code>gpu_math="exact"</code> is byte-identical to CPU; <code>gpu_math="fast"</code> is rejected with an error for this objective). Several quantiles (multi-output) are not supported.</li>
+        <li>Added <code>colsample_bylevel</code> and <code>colsample_bynode</code> with XGBoost's nested sampling semantics (bytree, then bylevel, then bynode) and deterministic seeding that does not depend on threads, blocking, or backend. The random sequence is FerrisBoost's own, so the chosen features differ from XGBoost's for the same seed, as already with <code>colsample_bytree</code>. On GPU they use the host split search and are byte-identical to CPU under <code>gpu_math="exact"</code>.</li>
+        <li>Added <code>predict(..., iteration_range=(begin, end))</code> with XGBoost semantics (boosting rounds, so multiclass uses <code>num_class</code> trees per round), next to <code>n_trees</code>.</li>
+        <li>Added scikit-learn estimators <code>FerrisBoostClassifier</code> and <code>FerrisBoostRegressor</code> (<code>fit</code>, <code>predict</code>, <code>predict_proba</code>, <code>eval_set</code>, early stopping, <code>evals_result()</code>, <code>save_model</code> / <code>load_model</code>). scikit-learn stays an optional dependency.</li>
+        <li>Added <code>Model.objective</code> and <code>Model.num_class</code> properties.</li>
+      </ul>
       <h3>0.0.5</h3>
       <ul>
         <li>Changed: when <code>base_score</code> is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for <code>reg:pseudohubererror</code> and when <code>scale_pos_weight</code> is not <code>1</code>; per-class log-frequency margins for multiclass). Default models of <code>binary:logistic</code> and <code>reg:squarederror</code> therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit <code>base_score</code> behaves as before, and <code>binary:logistic</code> accepts <code>base_score</code> in <code>[0, 1]</code>, so all-0 or all-1 labels train.</li>

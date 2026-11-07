@@ -242,6 +242,14 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.6 (unreleased)
+
+- Added objective `reg:quantileerror` with a scalar `quantile_alpha` (XGBoost 3.4.1's smoothed pinball loss) and the `quantile` metric, on CPU and GPU (`gpu_math="exact"` is byte-identical to CPU; `gpu_math="fast"` is rejected with an error for this objective). Several quantiles (multi-output) are not supported.
+- Added `colsample_bylevel` and `colsample_bynode` with XGBoost's nested sampling semantics (bytree, then bylevel, then bynode) and deterministic seeding that does not depend on threads, blocking, or backend. The random sequence is FerrisBoost's own, so the chosen features differ from XGBoost's for the same seed, as already with `colsample_bytree`. On GPU they use the host split search and are byte-identical to CPU under `gpu_math="exact"`.
+- Added `predict(..., iteration_range=(begin, end))` with XGBoost semantics (boosting rounds, so multiclass uses `num_class` trees per round), next to `n_trees`.
+- Added scikit-learn estimators `FerrisBoostClassifier` and `FerrisBoostRegressor` (`fit`, `predict`, `predict_proba`, `eval_set`, early stopping, `evals_result()`, `save_model` / `load_model`). scikit-learn stays an optional dependency.
+- Added `Model.objective` and `Model.num_class` properties.
+
 ### 0.0.5
 
 - Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.

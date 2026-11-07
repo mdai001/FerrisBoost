@@ -1,6 +1,8 @@
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ._core import Model as Model
+from .sklearn import FerrisBoostClassifier as FerrisBoostClassifier
+from .sklearn import FerrisBoostRegressor as FerrisBoostRegressor
 
 __version__: str
 
@@ -28,11 +30,13 @@ def train(
 
     params["objective"] is one of binary:logistic, reg:squarederror,
     count:poisson, reg:gamma, reg:tweedie, reg:pseudohubererror,
-    multi:softprob, multi:softmax. Multiclass objectives require
+    reg:quantileerror, multi:softprob, multi:softmax. Multiclass objectives require
     params["num_class"] (>= 2) and integer labels in [0, num_class); each
     round builds num_class trees. Objective-specific parameters:
-    tweedie_variance_power (default 1.5, in [1, 2)) and huber_slope (default 1,
-    non-zero). Other regularization parameters follow XGBoost: alpha (alias
+    tweedie_variance_power (default 1.5, in [1, 2)), huber_slope (default 1,
+    non-zero) and quantile_alpha (required for reg:quantileerror: one quantile
+    in [0, 1]; several quantiles are rejected; gpu_math="fast" is rejected for
+    this objective). Other regularization parameters follow XGBoost: alpha (alias
     reg_alpha), max_delta_step (count:poisson defaults to 0.7 when unset) and
     scale_pos_weight (binary:logistic, reg:squarederror, reg:gamma only).
     When params["base_score"] is unset it is estimated from the training
@@ -40,11 +44,16 @@ def train(
 
     params["eval_metric"] takes a metric name or list of names: rmse, mae,
     mape, mphe, logloss, error, error@t, auc, aucpr, poisson-nloglik,
-    gamma-nloglik, gamma-deviance, tweedie-nloglik@rho, mlogloss, merror.
+    gamma-nloglik, gamma-deviance, tweedie-nloglik@rho, quantile, mlogloss, merror.
     Multiclass objectives accept only mlogloss and merror. Without
     eval_metric the objective picks the default metric. params["monotone_constraints"]
     takes 1 / -1 / 0 per feature as a tuple, list, "(1,-1,0)" string, or
     {feature_name: direction} dict.
+
+    colsample_bytree, colsample_bylevel and colsample_bynode (each in (0, 1])
+    nest as in XGBoost (tree set, then per-level subset, then per-node subset);
+    the random sequence is FerrisBoost's own and independent of threads and
+    backend. bylevel/bynode only narrow the split search.
 
     Early stopping takes effect with validation data, watches the last metric
     of the last eval set, and retains all trees trained through the stopping

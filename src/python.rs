@@ -1453,7 +1453,52 @@ pub struct PyModel {
     class_views: Mutex<Option<Arc<Vec<PyModel>>>>,
 }
 
+/// `iteration_range` 的执行方式:`begin == 0` 是树的前缀(不拷贝),否则是
+/// 只含这些轮的模型切片(同样的 base_score / objective)。
+enum IterationPlan {
+    Prefix(usize),
+    Slice(PyModel),
+}
+
 impl PyModel {
+    /// XGBoost `iteration_range=(begin, end)` 的语义:半开区间 `[begin, end)` 的
+    /// **轮次**(多分类一轮 `num_class` 棵树);`end == 0` 表示到最后一轮;
+    /// 越界或 `begin > end` 报错;`begin == end` 是空区间,只剩 base_score。
+    /// 和 `n_trees`(树的前缀,不是轮次)互斥。
+    fn plan_iteration_range(
+        &self,
+        (begin, end): (usize, usize),
+        n_trees: Option<usize>,
+    ) -> PyResult<IterationPlan> {
+        if n_trees.is_some() {
+            return Err(PyValueError::new_err(
+                "iteration_range 和 n_trees 不能同时给:前者按轮次,后者按树的个数",
+            ));
+        }
+        let k = self.inner.num_outputs();
+        let rounds = self.inner.trees.len() / k;
+        let end = if end == 0 { rounds } else { end };
+        if end > rounds {
+            return Err(PyValueError::new_err(format!(
+                "iteration_range 的 end = {end} 超出了模型的 {rounds} 轮"
+            )));
+        }
+        if begin > end {
+            return Err(PyValueError::new_err(format!(
+                "iteration_range 的 begin = {begin} 大于 end = {end}"
+            )));
+        }
+        if begin == 0 {
+            return Ok(IterationPlan::Prefix(end * k));
+        }
+        Ok(IterationPlan::Slice(PyModel::plain(
+            self.inner.slice_rounds(begin, end),
+            self.quiet,
+            self.model_io_threads,
+            self.ingest_threads,
+        )))
+    }
+
     /// 不带训练历史的普通包装(多分类的类视图用)。
     fn plain(inner: Model, quiet: bool, model_io_threads: usize, ingest_threads: usize) -> Self {
         PyModel {
@@ -1523,7 +1568,8 @@ impl PyModel {
         let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
         for (c, view) in views.iter().enumerate() {
             let nt = self.inner.class_tree_count(upto, c);
-            let out = view.predict(py, data, true, Some(nt), header, predict_threads, use_gpu)?;
+            let out =
+                view.predict(py, data, true, Some(nt), header, predict_threads, use_gpu, None)?;
             let arr = out
                 .cast::<PyArray1<f32>>()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1777,7 +1823,7 @@ impl PyModel {
     /// 和 XGBoost 的 `Booster.predict()` 一样,**默认用全部树**,
     /// 即使早停记了 best_iteration。要截断传 `n_trees`。
     #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, use_gpu=false))]
+                        predict_threads=0, use_gpu=false, iteration_range=None))]
     /// 预测。`data` 可以是:
     ///
     /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
@@ -1795,8 +1841,27 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
+        iteration_range: Option<(usize, usize)>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_gpu_prediction_available(use_gpu)?;
+        let mut n_trees = n_trees;
+        if let Some(range) = iteration_range {
+            match self.plan_iteration_range(range, n_trees)? {
+                IterationPlan::Prefix(n) => n_trees = Some(n),
+                IterationPlan::Slice(sliced) => {
+                    return sliced.predict(
+                        py,
+                        data,
+                        output_margin,
+                        None,
+                        header,
+                        predict_threads,
+                        use_gpu,
+                        None,
+                    );
+                }
+            }
+        }
         if self.inner.num_outputs() > 1 {
             return self.predict_multiclass(
                 py,
@@ -2261,7 +2326,8 @@ impl PyModel {
     /// deterministic row-parallel workers; one ordered writer thread overlaps
     /// Parquet encoding/output with the next ingest/score batch.
     #[pyo3(signature = (data, output_path, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, prediction_column="prediction"))]
+                        predict_threads=0, prediction_column="prediction",
+                        iteration_range=None))]
     #[allow(clippy::too_many_arguments)] // Public output/lifecycle options are independently specified.
     fn predict_to_parquet(
         &self,
@@ -2273,7 +2339,27 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         prediction_column: &str,
+        iteration_range: Option<(usize, usize)>,
     ) -> PyResult<usize> {
+        let mut n_trees = n_trees;
+        if let Some(range) = iteration_range {
+            match self.plan_iteration_range(range, n_trees)? {
+                IterationPlan::Prefix(n) => n_trees = Some(n),
+                IterationPlan::Slice(sliced) => {
+                    return sliced.predict_to_parquet(
+                        py,
+                        data,
+                        output_path,
+                        output_margin,
+                        None,
+                        header,
+                        predict_threads,
+                        prediction_column,
+                        None,
+                    );
+                }
+            }
+        }
         guard(|| {
             let path_specs = path_specs_of(data)?.ok_or_else(|| {
                 PyValueError::new_err(
@@ -2390,6 +2476,18 @@ impl PyModel {
     #[getter]
     fn n_features(&self) -> usize {
         self.inner.n_features
+    }
+
+    /// XGBoost objective 名字(如 `binary:logistic`)。
+    #[getter]
+    fn objective(&self) -> &'static str {
+        self.inner.objective.name()
+    }
+
+    /// 多分类的类别数;其它模型是 1。
+    #[getter]
+    fn num_class(&self) -> usize {
+        self.inner.num_outputs()
     }
 
     /// evals_result:{eval 名: {metric 名: [每轮的值]}}
@@ -2569,6 +2667,13 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     // 没给时 XGBoost 的 learner 对 count:poisson 把它设成 0.7(两边都是),
     // 其它 objective 树上是 0。
     let max_delta_step: Option<f32> = get!("max_delta_step");
+    let quantile_alpha: Option<f32> = get!("quantile_alpha");
+    if objective == "reg:quantileerror" && quantile_alpha.is_none() {
+        return Err(PyValueError::new_err(
+            "reg:quantileerror 需要 quantile_alpha(单个 [0, 1] 内的分位数,例如 0.9);\
+             XGBoost 没有默认值",
+        ));
+    }
     let objective = Objective::from_name(&objective)
         .filter(|_| objective != "reg:linear")
         .ok_or_else(|| {
@@ -2585,7 +2690,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                 let k: Option<u32> = get!("num_class");
                 k.unwrap_or(0)
             },
-        );
+       )
+        .with_quantile_alpha(quantile_alpha.unwrap_or(0.5));
     objective
         .validate_params()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -2603,6 +2709,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             scale_pos_weight: get!("scale_pos_weight"),
             subsample: get!("subsample"),
             colsample_bytree: get!("colsample_bytree"),
+            colsample_bylevel: get!("colsample_bylevel"),
+            colsample_bynode: get!("colsample_bynode"),
             // 占位:真正的值要等拿到 schema 才能定,见 BlockingPlan。
             cols_per_block: 0,
             nthread: get!("nthread"),

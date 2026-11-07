@@ -25,6 +25,10 @@ pub const POISSON_DEFAULT_MAX_DELTA_STEP: f32 = 0.7;
 pub const TWEEDIE_DEFAULT_VARIANCE_POWER: f32 = 1.5;
 /// `reg:pseudohubererror` 的 `huber_slope` 默认值。
 pub const HUBER_DEFAULT_SLOPE: f32 = 1.0;
+/// `reg:quantileerror` 的内部平滑常数(XGBoost 3.4.1 `quantile_obj.cu` 的
+/// `kSmoothingScale` / `kMinSurrogateRatio`,都不是用户参数)。
+const QUANTILE_SMOOTHING_SCALE: f32 = 0.04;
+const QUANTILE_MIN_SURROGATE_RATIO: f32 = 3.0e-4;
 
 /// XGBoost 的 sigmoid(f32)。训练梯度、预测变换共用同一个表达式,
 /// 保证两边逐位一致。
@@ -76,7 +80,7 @@ fn json_param(rest: &BTreeMap<String, serde_json::Value>, block: &str, key: &str
 
 impl Objective {
     /// 全部支持的 objective(参数取默认值),用于报错和测试遍历。
-    pub const ALL: [Objective; 6] = [
+    pub const ALL: [Objective; 7] = [
         Objective::SquaredError,
         Objective::Logistic,
         Objective::Poisson {
@@ -89,6 +93,8 @@ impl Objective {
         Objective::PseudoHuber {
             slope: HUBER_DEFAULT_SLOPE,
         },
+        // alpha 在 `ALL` 里只是占位(XGBoost 没有默认值,必须由用户给)。
+        Objective::Quantile { alpha: 0.5 },
     ];
 
     /// XGBoost 的 objective 名字(写进模型 JSON、出现在报错里)。
@@ -102,6 +108,7 @@ impl Objective {
             Objective::PseudoHuber { .. } => "reg:pseudohubererror",
             Objective::Softprob { .. } => "multi:softprob",
             Objective::Softmax { .. } => "multi:softmax",
+            Objective::Quantile { .. } => "reg:quantileerror",
         }
     }
 
@@ -141,6 +148,19 @@ impl Objective {
     /// 是不是多分类(每轮 `num_class` 棵树、预测按行做 softmax)。
     pub fn is_multiclass(self) -> bool {
         matches!(self, Objective::Softprob { .. } | Objective::Softmax { .. })
+    }
+
+    /// `reg:quantileerror`:梯度依赖每轮全体行预测归约出的标量 scale。
+    pub fn is_quantile(self) -> bool {
+        matches!(self, Objective::Quantile { .. })
+    }
+
+    /// 带上 `quantile_alpha`(只对 `reg:quantileerror` 生效)。
+    pub fn with_quantile_alpha(self, alpha: f32) -> Objective {
+        match self {
+            Objective::Quantile { .. } => Objective::Quantile { alpha },
+            other => other,
+        }
     }
 
     /// 带上用户参数。`max_delta_step` 是用户**显式**给的值(`None` = 没给):
@@ -196,6 +216,10 @@ impl Objective {
                 slope.is_finite() && slope != 0.0,
                 "huber_slope 必须是非 0 的有限值"
             ),
+            Objective::Quantile { alpha } => anyhow::ensure!(
+                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                "quantile_alpha 必须在 [0, 1] 内,给的是 {alpha}"
+            ),
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
                 anyhow::ensure!(
                     num_class >= 2,
@@ -228,6 +252,7 @@ impl Objective {
             // ProbToMargin 是恒等)。
             Objective::SquaredError
             | Objective::PseudoHuber { .. }
+            | Objective::Quantile { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => base_score,
             // logit(0.5) = 0.0
@@ -260,6 +285,11 @@ impl Objective {
         grad_weights: Option<&[f32]>,
         scale_pos_weight: f32,
     ) -> f32 {
+        if let Objective::Quantile { alpha } = self {
+            // XGBoost `QuantileRegression::InitEstimation`:标签的 alpha 分位数
+            // (无权重:线性插值;有权重:阶梯函数)。权重是样本权重本身。
+            return quantile_intercept(alpha, labels, weights);
+        }
         let newton = match self {
             Objective::PseudoHuber { .. } => true,
             o if o.uses_scale_pos_weight() => (scale_pos_weight - 1.0).abs() > K_RT_EPS,
@@ -342,6 +372,9 @@ impl Objective {
             Objective::Softprob { .. } | Objective::Softmax { .. } => {
                 unreachable!("多分类梯度按行算,走 Objective::softmax_gradients")
             }
+            Objective::Quantile { .. } => {
+                unreachable!("quantile 梯度依赖每轮的全局 scale,走 Objective::quantile_gradient")
+            }
             // PseudoHuberRegression::GetGradient
             Objective::PseudoHuber { slope } => {
                 let z = pred - label;
@@ -364,6 +397,7 @@ impl Objective {
             // 单个 margin 原样返回。
             Objective::SquaredError
             | Objective::PseudoHuber { .. }
+            | Objective::Quantile { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => margin,
             Objective::Logistic => sigmoid(margin),
@@ -379,6 +413,7 @@ impl Objective {
             self,
             Objective::SquaredError
                 | Objective::PseudoHuber { .. }
+                | Objective::Quantile { .. }
                 | Objective::Softprob { .. }
                 | Objective::Softmax { .. }
         )
@@ -388,7 +423,9 @@ impl Objective {
     pub fn validate_labels(self, labels: &[f32], what: &str) -> anyhow::Result<()> {
         let name = self.name();
         match self {
-            Objective::SquaredError | Objective::PseudoHuber { .. } => {}
+            Objective::SquaredError
+            | Objective::PseudoHuber { .. }
+            | Objective::Quantile { .. } => {}
             Objective::Logistic => anyhow::ensure!(
                 labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
                 "{what}的 {name} 标签必须在 [0, 1]"
@@ -418,7 +455,7 @@ impl Objective {
         let name = self.name();
         match self {
             Objective::SquaredError | Objective::PseudoHuber { .. } => {}
-            Objective::Softprob { .. } | Objective::Softmax { .. } => {
+            Objective::Quantile { .. } | Objective::Softprob { .. } | Objective::Softmax { .. } => {
                 anyhow::ensure!(base_score.is_finite(), "{name} 的 base_score 必须是有限值")
             }
             // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
@@ -450,7 +487,15 @@ impl Objective {
             // 多分类不走这个单输出 kernel:fast 用 softmax_row_stats /
             // softmax_class_gradient / add_class_delta(见 histogram.cu)。
             Objective::Softprob { .. } | Objective::Softmax { .. } => u32::MAX,
+            // quantile 的梯度要先对全体行归约一个 scale,单趟逐行 kernel 做不了。
+            Objective::Quantile { .. } => u32::MAX,
         }
+    }
+
+    /// `gpu_math="fast"` 的单输出梯度 kernel 或多分类 kernel 能不能算这个
+    /// objective。quantile 不能(需要每轮的全局归约),`fast` 对它显式报错。
+    pub fn supports_gpu_fast(self) -> bool {
+        !self.is_quantile()
     }
 
     /// fast kernel 的 objective 参数(没有参数的 objective 传 0)。
@@ -488,6 +533,12 @@ impl Objective {
             Objective::PseudoHuber { slope } => {
                 json_block("pseudo_huber_param", "huber_slope", slope.to_string())
             }
+            // XGBoost 存的是 ParamArray<float> 的 JSON 数组字符串。
+            Objective::Quantile { alpha } => json_block(
+                "quantile_loss_param",
+                "quantile_alpha",
+                format!("[{alpha}]"),
+            ),
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => json_block(
                 "softmax_multiclass_param",
                 "num_class",
@@ -519,6 +570,9 @@ impl Objective {
             Objective::PseudoHuber { slope } => Objective::PseudoHuber {
                 slope: json_param(rest, "pseudo_huber_param", "huber_slope").unwrap_or(slope),
             },
+            Objective::Quantile { .. } => Objective::Quantile {
+                alpha: quantile_alpha_from_json(rest)?,
+            },
             Objective::Softprob { .. } => Objective::Softprob {
                 num_class: json_param(rest, "softmax_multiclass_param", "num_class")? as u32,
             },
@@ -527,6 +581,130 @@ impl Objective {
             },
             other => other,
         })
+    }
+}
+
+// ---------------------------------------------------------------- quantile
+//
+// XGBoost 3.4.1 `QuantileRegression`(`src/objective/quantile_obj.cu`):
+// 平滑 pinball 损失 + MM 曲率。每轮先算一个全局 scale
+//
+//     S = (Σ w·sqrtf(|pred − label|) / Σ w)²
+//
+// (f32 逐行乘积、f64 串行累加 = XGBoost `nthread=1` 的算术),再逐行
+//
+//     x = r / (0.04·S),  g = w·S/2·(tanh x + 1 − 2α),  h = w/(2·0.04)·max(tanh x / x, 3e-4)
+//
+// S ≤ 0 或 w == 0 时 (g, h) = (0, 0)。
+
+/// 解析 `quantile_loss_param.quantile_alpha`("[0.9]"、"0.9"、"(0.9)")。
+/// 向量(多输出)返回 `None`:不支持。
+fn quantile_alpha_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<f32> {
+    let raw = rest.get("quantile_loss_param")?.get("quantile_alpha")?;
+    let text = match raw {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(a) if a.len() == 1 => return a[0].as_f64().map(|v| v as f32),
+        _ => return None,
+    };
+    let inner = text
+        .trim_start_matches(['[', '('])
+        .trim_end_matches([']', ')']);
+    if inner.contains(',') {
+        return None;
+    }
+    inner.trim().parse().ok()
+}
+
+/// XGBoost `common::Quantile` / `WeightedQuantile`(CPU 路径,`InitEstimation`)。
+fn quantile_intercept(alpha: f32, labels: &[f32], weights: Option<&[f32]>) -> f32 {
+    let n = labels.len();
+    if n == 0 {
+        return DEFAULT_BASE_SCORE;
+    }
+    // 稳定排序(并列保持原顺序),和 XGBoost `StableSort` 一致。
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&l, &r| labels[l].total_cmp(&labels[r]));
+    let val = |i: usize| labels[idx[i]];
+    let alpha = f64::from(alpha);
+    match weights {
+        None => {
+            let nf = n as f64;
+            if alpha <= 1.0 / (nf + 1.0) {
+                return val(0);
+            }
+            if alpha >= nf / (nf + 1.0) {
+                return val(n - 1);
+            }
+            let x = alpha * (nf + 1.0);
+            let k = x.floor() - 1.0;
+            let d = (x - 1.0) - k;
+            let v0 = val(k as usize);
+            let v1 = val(k as usize + 1);
+            // `v0 + d * (v1 - v0)`:f32 差,f64 乘加,最后收成 f32。
+            (f64::from(v0) + d * f64::from(v1 - v0)) as f32
+        }
+        Some(w) => {
+            let mut cdf = vec![0.0f32; n];
+            cdf[0] = w[idx[0]];
+            for i in 1..n {
+                cdf[i] = cdf[i - 1] + w[idx[i]];
+            }
+            let thresh = (f64::from(cdf[n - 1]) * alpha) as f32;
+            // lower_bound:第一个 cdf >= thresh。
+            let at = cdf.partition_point(|&c| c < thresh).min(n - 1);
+            val(at)
+        }
+    }
+}
+
+impl Objective {
+    /// 每轮的全局 scale `S`(`reg:quantileerror` 专用)。`preds` 是 raw margin
+    /// (恒等链接,即预测值)。串行 f64 累加:结果与线程数无关,并与 XGBoost
+    /// `nthread=1` 逐位相同。
+    pub fn quantile_scale(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f32 {
+        let mut stat = 0.0f64;
+        let mut sum_w = 0.0f64;
+        match weights {
+            None => {
+                for (&p, &y) in preds.iter().zip(labels) {
+                    stat += f64::from((p - y).abs().sqrt());
+                }
+                sum_w = preds.len() as f64;
+            }
+            Some(w) => {
+                for ((&p, &y), &wi) in preds.iter().zip(labels).zip(w) {
+                    stat += f64::from(wi * (p - y).abs().sqrt());
+                    sum_w += f64::from(wi);
+                }
+            }
+        }
+        if sum_w.abs() < 1e-6 {
+            return 0.0;
+        }
+        let root_mean = stat / sum_w;
+        (root_mean * root_mean) as f32
+    }
+
+    /// 单行的 quantile 梯度(**未乘**样本权重)。`scale` 来自
+    /// [`Objective::quantile_scale`];scale 不为正时返回 (0, 0)。
+    #[inline]
+    pub fn quantile_gradient(alpha: f32, scale: f32, pred: f32, label: f32) -> GradPair {
+        if !(scale > 0.0) {
+            return GradPair {
+                grad: 0.0,
+                hess: 0.0,
+            };
+        }
+        let residual = pred - label;
+        let x = residual / (QUANTILE_SMOOTHING_SCALE * scale);
+        let tanh_x = x.tanh();
+        let ratio = if x == 0.0 { 1.0 } else { tanh_x / x };
+        let ratio = ratio.max(QUANTILE_MIN_SURROGATE_RATIO);
+        GradPair {
+            grad: 0.5 * scale * (tanh_x + 1.0 - 2.0 * alpha),
+            hess: 0.5 / QUANTILE_SMOOTHING_SCALE * ratio,
+        }
     }
 }
 
@@ -695,8 +873,39 @@ mod tests {
 
     #[test]
     fn device_codes_are_distinct() {
-        let codes: Vec<u32> = Objective::ALL.iter().map(|o| o.device_code()).collect();
+        let codes: Vec<u32> = Objective::ALL
+            .iter()
+            .filter(|o| o.supports_gpu_fast())
+            .map(|o| o.device_code())
+            .collect();
         assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            Objective::Quantile { alpha: 0.5 }.device_code(),
+            u32::MAX,
+            "quantile 不进单趟 fast kernel"
+        );
+    }
+
+    #[test]
+    fn quantile_intercept_matches_xgboost_rules() {
+        // n = 4:alpha <= 1/5 取最小值,>= 4/5 取最大值,否则线性插值。
+        let y = [4.0f32, 1.0, 3.0, 2.0];
+        assert_eq!(quantile_intercept(0.1, &y, None), 1.0);
+        assert_eq!(quantile_intercept(0.9, &y, None), 4.0);
+        // x = 0.5 * 5 = 2.5,k = 1,d = 0.5:2 + 0.5 * (3 - 2)
+        assert_eq!(quantile_intercept(0.5, &y, None), 2.5);
+        // 加权:阶梯函数,cdf = [1, 2, 3, 4],thresh = 2 → 第二个。
+        let w = [1.0f32; 4];
+        assert_eq!(quantile_intercept(0.5, &y, Some(&w)), 2.0);
+    }
+
+    #[test]
+    fn quantile_zero_scale_gives_zero_gradient() {
+        let g = Objective::quantile_gradient(0.3, 0.0, 1.0, 2.0);
+        assert_eq!((g.grad, g.hess), (0.0, 0.0));
+        // 预测恰好等于标签:scale = 0。
+        assert_eq!(Objective::quantile_scale(&[1.0, 2.0], &[1.0, 2.0], None), 0.0);
+        assert!(Objective::quantile_scale(&[0.0, 0.0], &[1.0, 4.0], None) > 0.0);
     }
 
     #[test]

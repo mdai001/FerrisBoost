@@ -31,6 +31,17 @@ from ._core import Model
 __all__ = ["train", "Model", "__version__"]
 __version__ = _core.__version__
 
+_SKLEARN_NAMES = ("FerrisBoostClassifier", "FerrisBoostRegressor")
+
+
+def __getattr__(name: str) -> Any:
+    """scikit-learn 估计器按需导入:scikit-learn 是可选依赖,`import ferrisboost` 不需要它。"""
+    if name in _SKLEARN_NAMES:
+        from . import sklearn as _sk
+
+        return getattr(_sk, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 # 规范名 -> 默认值。**未知参数报错**,不像 XGBoost 那样静默忽略 ——
 # 参数名打错了不给任何提示,是最难查的一类问题。
 _DEFAULTS: dict[str, Any] = {
@@ -46,12 +57,18 @@ _DEFAULTS: dict[str, Any] = {
     "max_delta_step": None,
     "tweedie_variance_power": 1.5,
     "huber_slope": 1.0,
+    # reg:quantileerror 必须给:单个 [0, 1] 内的分位数(长度 1 的列表也收)。
+    # 向量(多分位数 = 多输出)不支持。
+    "quantile_alpha": None,
     # multi:softprob / multi:softmax 必须给;其它 objective 忽略。
     "num_class": None,
     "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
     "colsample_bytree": 1.0,
+    # XGBoost 的嵌套采样(bytree → bylevel → bynode)。只限制 split 枚举。
+    "colsample_bylevel": 1.0,
+    "colsample_bynode": 1.0,
     # None = 自动:等拿到 schema 再按 nthread / max_bin 选块宽。
     # 显式给一个正整数就完全按用户的来,启发式不参与。
     "cols_per_block": None,
@@ -106,7 +123,8 @@ _ALIASES = {
 }
 
 _OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
-               "reg:tweedie", "reg:pseudohubererror", "multi:softprob", "multi:softmax")
+               "reg:tweedie", "reg:pseudohubererror", "reg:quantileerror", "multi:softprob",
+               "multi:softmax")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
@@ -218,9 +236,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             raise ValueError("num_class 不能是负数")
     if out["max_delta_step"] is not None:
         out["max_delta_step"] = float(out["max_delta_step"])
+    out["quantile_alpha"] = _normalize_quantile_alpha(out["quantile_alpha"], out["objective"])
     for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "tweedie_variance_power",
                 "huber_slope", "scale_pos_weight", "subsample",
-                "colsample_bytree"):
+                "colsample_bytree", "colsample_bylevel", "colsample_bynode"):
         out[key] = float(out[key])
     if out["base_score"] is not None:
         out["base_score"] = float(out["base_score"])
@@ -243,6 +262,28 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         out["eval_metric"] = names
     out["monotone_constraints"] = _normalize_monotone(out["monotone_constraints"])
     return out
+
+
+def _normalize_quantile_alpha(value: Any, objective: str) -> float | None:
+    """`quantile_alpha` -> float | None。长度 1 的序列等价于标量;多个值是多输出,不支持。"""
+    if value is None:
+        if objective == "reg:quantileerror":
+            raise ValueError(
+                "reg:quantileerror 需要 quantile_alpha(单个 [0, 1] 内的分位数,例如 0.9)"
+            )
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        flat = np.asarray(value, dtype=np.float64).ravel()
+        if flat.size != 1:
+            raise ValueError(
+                f"quantile_alpha 给了 {flat.size} 个值;多分位数(多输出)不支持,"
+                "请每个分位数训一个模型"
+            )
+        value = flat[0]
+    alpha = float(value)
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"quantile_alpha 要在 [0, 1] 内,给的是 {alpha}")
+    return alpha
 
 
 def _monotone_sign(value: Any, where: str) -> int:
