@@ -1855,6 +1855,23 @@ impl PyModel {
                     self.inner.n_features
                 )));
             }
+            // 和训练一样拒绝保留值 f32::MAX(CPU 和 GPU 预测都走这里)。
+            let has_max = if x.is_c_contiguous() {
+                x.as_slice()?.contains(&f32::MAX)
+            } else {
+                x.as_array().iter().any(|&v| v == f32::MAX)
+            };
+            if has_max {
+                let view = x.as_array();
+                let (r, c) = view
+                    .indexed_iter()
+                    .find(|(_, &v)| v == f32::MAX)
+                    .map(|(ix, _)| ix)
+                    .expect("found above");
+                return Err(PyValueError::new_err(format!(
+                    "预测数据第 {r} 行第 {c} 列是 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征"
+                )));
+            }
             let upto = n_trees.unwrap_or(self.inner.trees.len());
             let work_per_row = prediction_work_per_row(&self.inner, upto);
             let inference = if use_gpu {

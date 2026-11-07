@@ -341,7 +341,8 @@ arrays have no column names and are matched by position.
 
 Feature values must be finite or missing (`NaN`). The exact largest `float32`
 value (`numpy.finfo(numpy.float32).max`) is reserved for split boundaries and is
-rejected in training and validation features; rescale such a feature first.
+rejected in training, validation and prediction features alike, so the two can
+never route it differently; rescale such a feature first.
 Finite values that overflow while computing gradients or Hessians produce a
 training error instead of being silently converted to fixed-point integers.
 Values of `±inf` are rejected

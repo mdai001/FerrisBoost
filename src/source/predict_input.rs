@@ -352,6 +352,21 @@ mod bind_tests {
 
 /// Borrow numeric columns and pack cache-sized row tiles. Extra scratch is
 /// O(features), not another materialized batch; fallback keeps the old errors.
+/// 预测特征同样拒绝 `f32::MAX`:它是缺失/非缺失分裂的有限上界哨兵,
+/// 训练和验证特征已经拒绝它(见 `arrow_source::for_each_feature_f32`)。
+/// 预测时若接受,原始比较 `v < MAX` 会把它路由到和训练不同的一侧。
+/// ±inf 在预测时仍按原来的规则接受。
+pub(crate) fn reject_reserved_max(rows: &[f32], n_features: usize, what: &str) -> Result<()> {
+    if let Some(i) = rows.iter().position(|&v| v == f32::MAX) {
+        bail!(
+            "{what}第 {} 行第 {} 列是 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征",
+            i / n_features.max(1),
+            i % n_features.max(1)
+        );
+    }
+    Ok(())
+}
+
 fn batch_to_contiguous_rows(
     batch: &RecordBatch,
     n_features: usize,
@@ -433,7 +448,8 @@ fn batch_to_contiguous_rows(
     let Some(columns) = classify(batch) else {
         // Classify before resizing/writing so legacy error-time buffer state,
         // conversion policy and first unsupported column remain unchanged.
-        return batch_to_contiguous_rows_legacy(batch, n_features, rows);
+        batch_to_contiguous_rows_legacy(batch, n_features, rows)?;
+        return reject_reserved_max(rows, n_features, "预测数据");
     };
     rows.resize(values, 0.0);
     // Division order avoids overflow in a hypothetical very large row width.
@@ -482,7 +498,7 @@ fn batch_to_contiguous_rows(
             }
         }
     }
-    Ok(())
+    reject_reserved_max(rows, n_features, "预测数据")
 }
 
 /// One converted column at a time, preserving the original conversion contract.
@@ -511,6 +527,42 @@ fn batch_to_contiguous_rows_legacy(
 #[cfg(test)]
 mod packing_tests {
     use super::{batch_to_contiguous_rows, batch_to_contiguous_rows_legacy};
+
+    #[test]
+    fn reserved_max_is_rejected_when_packing_prediction_batches() {
+        use arrow::array::{ArrayRef, Float32Array};
+        use arrow::datatypes::{Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        let make = |second: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", arrow::datatypes::DataType::Float32, true),
+                Field::new("b", second.data_type().clone(), true),
+            ]));
+            let first: ArrayRef = Arc::new(Float32Array::from(vec![1.0, f32::MAX, 3.0]));
+            RecordBatch::try_new(schema, vec![first, second]).unwrap()
+        };
+        let mut rows = Vec::new();
+        // fast path (all primitive columns)
+        let fast = make(Arc::new(Float32Array::from(vec![0.5, 0.5, f32::INFINITY])));
+        let err = batch_to_contiguous_rows(&fast, 2, &mut rows).unwrap_err();
+        assert!(err.to_string().contains("第 1 行第 0 列"), "{err}");
+        // +inf and the next value below MAX stay accepted
+        let ok_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Float32,
+            true,
+        )]));
+        let ok = RecordBatch::try_new(
+            ok_schema,
+            vec![Arc::new(Float32Array::from(vec![
+                f32::INFINITY,
+                f32::MAX.next_down(),
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        batch_to_contiguous_rows(&ok, 1, &mut rows).unwrap();
+    }
     use arrow::array::{
         Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     };

@@ -251,3 +251,51 @@ def test_weight_sum_overflowing_f32_is_rejected():
     w = np.full(len(y), 1e36, np.float32)
     with pytest.raises(Exception, match="权重总和"):
         fb.train(BASE, x, label=y, weight=w, num_boost_round=1, quiet=True)
+
+
+# ------------------------------------------------- f32::MAX:训练和预测一致拒绝
+def _max_model():
+    x, y = data()
+    return fb.train(BASE, x, label=y, num_boost_round=2, quiet=True), x
+
+
+def test_float32_max_is_rejected_at_numpy_prediction():
+    m, x = _max_model()
+    bad = x.copy()
+    bad[7, 2] = np.finfo(np.float32).max
+    with pytest.raises(ValueError, match=r"第 7 行第 2 列.*f32::MAX"):
+        m.predict(bad)
+    with pytest.raises(ValueError, match="f32::MAX"):
+        m.predict(np.asfortranarray(bad))  # 非 C 连续路径
+    # 相邻的最大有限值和 ±inf 仍按原来的规则接受
+    ok = x.copy()
+    ok[7, 2] = np.nextafter(np.finfo(np.float32).max, 0, dtype=np.float32)
+    ok[8, 1] = np.inf
+    assert np.isfinite(m.predict(ok)).all()
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "csv"])
+def test_float32_max_is_rejected_at_file_prediction(tmp_path, fmt):
+    x, y = data()
+    WRITERS[fmt](tmp_path / f"t.{fmt}", x, y)
+    m = fb.train(BASE, str(tmp_path / f"t.{fmt}"), label="label", num_boost_round=2, quiet=True)
+    bad = x.copy()
+    bad[5, 1] = np.finfo(np.float32).max
+    WRITERS[fmt](tmp_path / f"bad.{fmt}", bad, y)
+    with pytest.raises(Exception, match="f32::MAX"):
+        m.predict(str(tmp_path / f"bad.{fmt}"))
+    if fmt == "parquet":
+        with pytest.raises(Exception, match="f32::MAX"):
+            m.predict_to_parquet(str(tmp_path / "bad.parquet"), str(tmp_path / "out.parquet"))
+        assert not (tmp_path / "out.parquet").exists()
+
+
+def test_float32_max_is_rejected_at_multiclass_prediction():
+    x, y = data()
+    y3 = (np.arange(len(y)) % 3).astype(np.float32)
+    m = fb.train({**BASE, "objective": "multi:softprob", "num_class": 3}, x, label=y3,
+                 num_boost_round=2, quiet=True)
+    bad = x.copy()
+    bad[0, 0] = np.finfo(np.float32).max
+    with pytest.raises(ValueError, match="f32::MAX"):
+        m.predict(bad)
