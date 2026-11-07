@@ -269,18 +269,16 @@ fn build_nodes_with_span(
         .all(|((rows, _), &c)| c == rows.len()));
 }
 
-/// 一个 tile 的 bin 字节预算。一个 tile 覆盖的行 id 区间是
-/// `预算 / 块内特征数` 行:窄块(HIGGS 4 列)区间长,宽块(Epsilon 63 列)
-/// 区间短,被所有节点复用的那份 bin 恒约 1 MiB。
+/// 节点交错累加时一个 tile 覆盖的行 id 区间(行数)。
 ///
-/// 合成基准(1 线程,最好 3 次):HIGGS 形状 4 列/块,区间 64Ki–256Ki 行
-/// 最好、16Ki 行明显差、1Mi 行回退;Epsilon 形状 63 列/块,8Ki–64Ki 行最好、
-/// 4Ki 和 128Ki 行回退。1 MiB 预算落在两者的平台上。
-fn node_span_rows(n_feats: usize) -> usize {
-    const SPAN_BYTES: usize = 1 << 20;
-    const GRAIN: usize = 4096;
-    let rows = SPAN_BYTES / n_feats.max(1);
-    (rows / GRAIN).max(1) * GRAIN
+/// 合成基准(最好 3–7 次,同一份节点行集):HIGGS 形状(4 列/块)1 线程下
+/// 64Ki–256Ki 行最好,8 线程下 64Ki/128Ki 行最好(逐节点 833 ms →
+/// 409 ms)、256Ki 行回退到 544 ms、16Ki 行也差;Epsilon 形状(63 列/块)
+/// 1 线程下 8Ki–64Ki 行都比逐节点快近一倍,但 8 线程下已和逐节点持平
+/// (422 / 415 / 383 ms,16Ki / 64Ki 行)。固定 64Ki 行同时落在两种形状的
+/// 平台上:窄块里被所有节点复用的 bin 只有 256 KiB,宽块里是 4 MiB 但不亏。
+const fn node_span_rows(_n_feats: usize) -> usize {
+    1 << 16
 }
 
 /// 行分块的块大小。
