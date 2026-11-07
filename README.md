@@ -242,6 +242,10 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.6 (unreleased)
+
+- Added categorical features with XGBoost semantics: `feature_types=["c", "q", ...]`, `params["enable_categorical"]` for pandas `category` and PyArrow dictionary columns, and `max_cat_to_onehot` / `max_cat_threshold`. Categories are integer codes `0..=254` (at most 255 per feature in this version). One-hot and sorted-partition splits match XGBoost `hist` exactly where binning is lossless; models interchange with XGBoost in both directions; prediction (arrays, files, `predict_to_parquet`, multiclass) follows the category sets. On GPU, `gpu_math="exact"` stays byte-identical to CPU; split search for categorical features runs on the host, so categorical GPU training does not use the resident split cache.
+
 ### 0.0.5
 
 - Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.

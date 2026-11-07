@@ -44,6 +44,11 @@ class Model:
         Feature values exactly equal to the largest float32 are rejected, as in
         training (the value is reserved for split boundaries); +/-inf and NaN
         follow the usual rules.
+
+        pandas DataFrames and PyArrow tables are accepted too; categorical
+        columns are scored through their category codes, so they must carry the
+        training categories in the training order. Models with categorical
+        splits always score on the CPU, even with use_gpu=True.
         """
         ...
     def predict_to_parquet(
@@ -96,7 +101,11 @@ def train_dense(
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
     weight: NDArray[np.float32] | None = ...,
 ) -> Model:
-    """Train a dense model; early stopping needs evals and retains all trained trees."""
+    """Train a dense model; early stopping needs evals and retains all trained trees.
+
+    params["_feature_types"] is an optional list of bools (True = categorical,
+    one per feature); ferrisboost.train fills it from feature_types and dtypes.
+    """
     ...
 def train_file(
     path: Sequence[str],

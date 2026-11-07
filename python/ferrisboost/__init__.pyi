@@ -17,6 +17,7 @@ def train(
     header: bool = ...,
     quiet: bool = ...,
     weight: Any = ...,
+    feature_types: Sequence[str] | None = ...,
 ) -> Model:
     """Train a model from arrays, file paths, or a PyArrow table.
 
@@ -56,5 +57,15 @@ def train(
     training raises an error instead of producing a corrupt model.
     Weights also shape the quantile sketch that sets bin boundaries, as in
     XGBoost.
+
+    Categorical features follow XGBoost's hist semantics. feature_types gives
+    "c" (categorical) or "q" (numeric) per feature, for arrays, tables, and
+    files (positional over the feature columns). With
+    params["enable_categorical"] = True, pandas category and PyArrow dictionary
+    columns are detected as categorical; Parquet dictionary columns of integers
+    are always categorical. Category values are integer codes in 0..=254
+    (NaN / null = missing), so a feature has at most 255 categories in this
+    version; anything else raises ValueError. params["max_cat_to_onehot"]
+    (default 4) and params["max_cat_threshold"] (default 64) match XGBoost.
     """
     ...

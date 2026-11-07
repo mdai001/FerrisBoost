@@ -501,6 +501,84 @@ weights. CPU and `gpu_math="exact"` GPU models stay byte-identical. The
 constraints are not stored in the saved model, as in XGBoost; prediction does
 not need them.
 
+## Categorical features
+
+FerrisBoost splits categorical features the way XGBoost's `hist` method does.
+A categorical feature holds **integer category codes**, one bin per code, and a
+split sends a chosen set of categories to the right child and every other
+category to the left.
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "max_cat_to_onehot": 4, "max_cat_threshold": 64},
+    X,                                  # NumPy array of floats
+    label=y,
+    feature_types=["q", "c", "c", "q"],  # "c" = categorical, "q" = numeric
+    num_boost_round=100,
+)
+```
+
+How a feature is declared:
+
+- **`feature_types`** (`fb.train` argument): one `"c"` or `"q"` per feature, as in
+  XGBoost's `DMatrix`. It works for NumPy arrays, PyArrow tables, and Parquet
+  or CSV files. For files the list is positional over the feature columns (the
+  label and weight columns are not features).
+- **pandas `category` columns and PyArrow dictionary columns** are detected
+  automatically when `params["enable_categorical"]` is `True`; without it they
+  are rejected so a categorical column is never trained as one by accident.
+  A category becomes its integer code (its position in the dictionary);
+  missing values stay missing. An explicit `feature_types` overrides detection.
+- **Parquet dictionary columns** are categorical automatically if their values
+  are integers. Dictionaries of strings are rejected in files, because the
+  codes of a string dictionary differ between row groups; encode the categories
+  as integers upstream, or train from an in-memory pandas or PyArrow table.
+
+Category codes must be integers in `0..=254`, with `NaN` / null for a missing
+value; negative, fractional, or larger values raise `ValueError`. The limit
+exists because the largest bin is reserved for missing values, so one feature
+can have at most 255 categories in this version (XGBoost has no such limit).
+Codes need not be contiguous, but each code up to the feature's largest costs one
+histogram bin, so prefer compact codes.
+
+Validation sets use the training codes. A category that never appeared in
+training is "not in any set" and goes to the left child, as it does in XGBoost;
+for pandas and PyArrow validation data the categories are first re-coded onto
+the training categories.
+
+Split search follows XGBoost:
+
+- a feature with fewer than `max_cat_to_onehot` categories (default 4) is split
+  one-versus-rest;
+- otherwise the categories are sorted by their leaf weight and prefixes of that
+  order are scanned, at most `max_cat_threshold` (default 64) per direction;
+- both missing-value directions are tried, and ties resolve to the earlier
+  candidate, so training is deterministic and does not depend on thread count.
+
+`lambda`, `alpha`, `max_delta_step`, `min_child_weight`, `gamma`, sample weights,
+`monotone_constraints` on the numeric features, `subsample` and `colsample_bytree`
+all apply. With lossless binning (numeric columns with fewer distinct values than
+`max_bin`, categorical codes) the trees and predictions match XGBoost
+`tree_method="hist"` exactly, for regression, binary, and multiclass objectives.
+
+Prediction handles category sets on every path (arrays, pandas / PyArrow, files,
+`predict_to_parquet`, multiclass). A pandas DataFrame or PyArrow table passed to
+`predict` is scored through its category codes, so it must carry the same
+categories in the same order as the training data. Prediction from a
+categorical model runs on the CPU even with `use_gpu=True`.
+
+Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
+`feature_types` list) and load in XGBoost in both directions. A loaded XGBoost
+model may use category ids above 254; prediction follows its sets, with
+unknown or invalid values going left.
+
+On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
+CPU) and `"fast"`. The device split kernels only know ordered bins, so a
+categorical run enumerates splits on the host from downloaded histograms (the
+same exact fallback used for streaming) and does not use the resident GPU split
+cache; histogram building, row partitioning, and gradients stay on the device.
+Expect categorical GPU training to be slower than numeric GPU training.
+
 ## Multiclass classification
 
 Use `multi:softprob` or `multi:softmax` with `num_class`, the number of classes
@@ -819,6 +897,8 @@ memory budget, without manual chunk or batch tuning:
   byte-identical to CPU. Support for the newer regression objectives is a
   first version; it is correct, and its speed will be optimized in 0.0.6.
 - **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported (device softmax gradients); optimization continues in 0.0.6.
+- **Categorical features**: supported with both `gpu_math` modes. Split search
+  for them runs on the host (see [Categorical features](#categorical-features)).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
@@ -1005,6 +1085,9 @@ empty `evals_result()`.
 | `cache_path` | `None` | Persistent Parquet cache directory |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
+| `enable_categorical` | `False` | Detect pandas `category` and PyArrow dictionary columns as categorical features; see [Categorical features](#categorical-features) |
+| `max_cat_to_onehot` | `4` | Categorical features with fewer categories than this use one-vs-rest splits, the others sorted-partition splits (`>= 1`) |
+| `max_cat_threshold` | `64` | Most categories a partition split scans per direction (`>= 1`) |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
 
@@ -1018,6 +1101,7 @@ Call options accepted by `fb.train()`, `fb.Model.save_model()`, and `fb.Model.lo
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
 - `weight` (`fb.train()` only): per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
+- `feature_types` (`fb.train()` only): `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
 
 ## Common errors
 

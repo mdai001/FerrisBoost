@@ -97,6 +97,10 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
+      <h3>0.0.6 (unreleased)</h3>
+      <ul>
+        <li>Added categorical features with XGBoost semantics: <code>feature_types=["c", "q", ...]</code>, <code>params["enable_categorical"]</code> for pandas <code>category</code> and PyArrow dictionary columns, and <code>max_cat_to_onehot</code> / <code>max_cat_threshold</code>. Categories are integer codes <code>0..=254</code> (at most 255 per feature in this version). One-hot and sorted-partition splits match XGBoost <code>hist</code> exactly where binning is lossless; models interchange with XGBoost in both directions; prediction (arrays, files, <code>predict_to_parquet</code>, multiclass) follows the category sets. On GPU, <code>gpu_math="exact"</code> stays byte-identical to CPU; split search for categorical features runs on the host, so categorical GPU training does not use the resident split cache.</li>
+      </ul>
       <h3>0.0.5</h3>
       <ul>
         <li>Changed: when <code>base_score</code> is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for <code>reg:pseudohubererror</code> and when <code>scale_pos_weight</code> is not <code>1</code>; per-class log-frequency margins for multiclass). Default models of <code>binary:logistic</code> and <code>reg:squarederror</code> therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit <code>base_score</code> behaves as before, and <code>binary:logistic</code> accepts <code>base_score</code> in <code>[0, 1]</code>, so all-0 or all-1 labels train.</li>
