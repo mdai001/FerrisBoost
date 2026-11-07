@@ -1691,6 +1691,10 @@ impl BlockSource for ParquetBlockSource {
 
     /// 内存 cache 直接借出列,零拷贝;落盘 cache 返回 `None`,调用方走
     /// `feature_column` 的部分读(那条路本来就要读进一份新内存)。
+    fn has_resident_columns(&self) -> bool {
+        matches!(self.cache, QuantizedCache::Memory(_))
+    }
+
     fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
         let QuantizedCache::Memory(blocks) = &self.cache else {
             return None;

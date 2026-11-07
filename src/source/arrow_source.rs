@@ -615,6 +615,10 @@ impl crate::train::BlockSource for ArrowSource {
     }
 
     /// 驻留的块直接借出列,零拷贝(见 trait 文档)。
+    fn has_resident_columns(&self) -> bool {
+        true
+    }
+
     fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
         self.blocks.iter().find_map(|b| {
             b.feat_ids
