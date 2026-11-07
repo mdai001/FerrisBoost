@@ -367,20 +367,23 @@ fn open_many_impl(
                     cols
                 })
                 .collect();
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_weighted(
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
                 dataset_reader(owned.clone(), sc.clone(), proj, has_header, reader_threads),
                 max_bins as usize,
                 transform_threads,
                 true,
+                targets.categorical.unwrap_or(&[]),
             )?;
             (cuts, Some(n_rows))
         }
         None => {
             let _profile = crate::source::openprof::start("cuts");
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_with_nthread(
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
                 feats()?,
                 max_bins as usize,
                 transform_threads,
+                false,
+                targets.categorical.unwrap_or(&[]),
             )?;
             (cuts, Some(n_rows))
         }

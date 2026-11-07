@@ -516,12 +516,16 @@ fn cuts_only_observed<'a>(
         feat_cols.len(),
     );
     observe("cuts", reader_threads, transform_threads);
+    let categorical = targets.categorical.unwrap_or(&[]);
     let Some(weight) = targets.weight else {
-        return crate::source::arrow_source::build_cuts_with_nthread(
+        return crate::source::arrow_source::build_cuts_and_count_typed(
             parallel_row_groups(path, feat_cols, BATCH_SIZE, reader_threads)?,
             max_bins as usize,
             transform_threads,
-        );
+            false,
+            categorical,
+        )
+        .map(|(cuts, _)| cuts);
     };
     // 加权分箱:权重列跟在特征后面一起读。Parquet 投影按文件物理顺序
     // 返回,所以要投影后重排,保证权重是最后一列。
@@ -530,11 +534,12 @@ fn cuts_only_observed<'a>(
     let (mask, order) = crate::source::input::projection_and_order(&cols);
     let batches = parallel_row_groups(path, mask, BATCH_SIZE, reader_threads)?
         .map(move |b| b.map(|b| crate::source::input::reorder(&b, &order)));
-    crate::source::arrow_source::build_cuts_and_count_weighted(
+    crate::source::arrow_source::build_cuts_and_count_typed(
         batches,
         max_bins as usize,
         transform_threads,
         true,
+        categorical,
     )
     .map(|(cuts, _)| cuts)
 }
@@ -707,11 +712,12 @@ pub(crate) fn open_many_observed<'a>(
                     cols
                 })
                 .collect();
-            let (c, _) = crate::source::arrow_source::build_cuts_and_count_weighted(
+            let (c, _) = crate::source::arrow_source::build_cuts_and_count_typed(
                 dataset_reader(owned.clone(), proj, BATCH_SIZE, cuts_plan.0),
                 max_bins as usize,
                 cuts_plan.1,
                 true,
+                targets.categorical.unwrap_or(&[]),
             )?;
             Some(c)
         }
@@ -721,12 +727,13 @@ pub(crate) fn open_many_observed<'a>(
         Some(c) => {
             ArrowSource::with_cuts_and_nthread(|| feats(true), c, cols_per_block, bins_plan.1)?
         }
-        None => ArrowSource::new_with_phase_threads(
+        None => ArrowSource::new_typed_with_phase_threads(
             feats,
             max_bins,
             cols_per_block,
             cuts_plan.1,
             bins_plan.1,
+            targets.categorical.unwrap_or(&[]),
         )?,
     };
 
@@ -841,6 +848,10 @@ struct CacheManifest {
     cuts_values_bits: Vec<u32>,
     cuts_offsets: Vec<u32>,
     cuts_hash: String,
+    /// Categorical flag per feature; absent in caches written before
+    /// categorical support (= all numeric).
+    #[serde(default)]
+    categorical: Vec<bool>,
     groups: Vec<Vec<FeatId>>,
     /// BLAKE3 of each `block-{i}.bin`, in `groups` order.
     block_hashes: Vec<String>,
@@ -1323,6 +1334,7 @@ impl ParquetBlockSource {
             cuts_values_bits: self.cuts.values.iter().map(|v| v.to_bits()).collect(),
             cuts_offsets: self.cuts.offsets.clone(),
             cuts_hash: cuts_hash(&self.cuts),
+            categorical: self.cuts.categorical_flags().to_vec(),
             groups: self.groups.clone(),
             block_hashes,
         })
@@ -1387,6 +1399,16 @@ impl ParquetBlockSource {
                 && manifest.cuts_offsets.windows(2).all(|w| w[0] <= w[1]),
             "缓存 cuts offsets 损坏"
         );
+        // A run that declares feature types must match the cached binning:
+        // a categorical feature and a numeric one bin differently.
+        if let Some(flags) = targets.categorical {
+            let cached = |f: usize| manifest.categorical.get(f).copied().unwrap_or(false);
+            anyhow::ensure!(
+                flags.len() == manifest.n_features
+                    && (0..flags.len()).all(|f| flags[f] == cached(f)),
+                "缓存的特征类型(categorical)和本次 feature_types 不一致"
+            );
+        }
         let cuts = BinCuts::new(
             manifest
                 .cuts_values_bits
@@ -1394,7 +1416,9 @@ impl ParquetBlockSource {
                 .map(|&v| f32::from_bits(v))
                 .collect(),
             manifest.cuts_offsets.clone(),
-        );
+        )
+        .with_categorical(&manifest.categorical)
+        .map_err(|e| anyhow::anyhow!("缓存的类别特征元数据损坏:{e}"))?;
         anyhow::ensure!(
             cuts_hash(&cuts) == manifest.cuts_hash,
             "缓存 cuts 哈希不一致"
@@ -1480,6 +1504,14 @@ fn cuts_hash(cuts: &BinCuts) -> String {
     for offset in &cuts.offsets {
         for byte in offset.to_le_bytes() {
             hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    // Mixed in only when present, so numeric caches keep their old hash.
+    for (f, &categorical) in cuts.categorical_flags().iter().enumerate() {
+        if categorical {
+            for byte in (f as u32).to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+            }
         }
     }
     format!("{hash:016x}")

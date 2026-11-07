@@ -501,6 +501,13 @@ pub struct TrainParams {
     /// 全 0 和空完全等价(XGBoost `HasMonotone()` 同样只看有没有非 0),
     /// 走原来的无约束路径,模型逐字节不变。
     pub monotone_constraints: Vec<i8>,
+    /// XGBoost `max_cat_to_onehot`: a categorical feature with fewer than this
+    /// many categories (bins) is split one-vs-rest; with at least this many it
+    /// uses sorted-partition splits. Default 4.
+    pub max_cat_to_onehot: u32,
+    /// XGBoost `max_cat_threshold`: the most categories a partition split
+    /// scan considers on each side of the sorted order. Default 64.
+    pub max_cat_threshold: u32,
 }
 
 impl TrainParams {
@@ -552,6 +559,8 @@ impl Default for TrainParams {
             device_quantize: None,
             seed: 0,
             monotone_constraints: Vec::new(),
+            max_cat_to_onehot: 4,
+            max_cat_threshold: 64,
         }
     }
 }

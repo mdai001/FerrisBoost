@@ -342,6 +342,23 @@ pub mod cuda {
         ) -> Result<usize> {
             match self.0 {}
         }
+        pub fn partition_categorical(
+            &mut self,
+            _span: GpuRowSpan,
+            _cats: &crate::categorical::CatBits,
+            _missing_left: bool,
+        ) -> Result<usize> {
+            match self.0 {}
+        }
+        pub fn partition_resident_categorical(
+            &mut self,
+            _span: GpuRowSpan,
+            _feat: usize,
+            _cats: &crate::categorical::CatBits,
+            _missing_left: bool,
+        ) -> Result<usize> {
+            match self.0 {}
+        }
         pub fn timing(&self) -> GpuSegmentTiming {
             match self.0 {}
         }

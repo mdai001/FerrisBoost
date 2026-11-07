@@ -1797,6 +1797,8 @@ impl PyModel {
         use_gpu: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_gpu_prediction_available(use_gpu)?;
+        // The device predictor has no categorical decision: such models score on the CPU.
+        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
         if self.inner.num_outputs() > 1 {
             return self.predict_multiclass(
                 py,
@@ -1820,11 +1822,23 @@ impl PyModel {
                 use_gpu,
             );
         }
-        let x: PyReadonlyArray2<'py, f32> = data.extract().map_err(|_| {
-            PyValueError::new_err(
-                "predict 只接受文件路径(单个 / 列表 / 目录 / glob)或二维 f32 numpy 数组",
-            )
-        })?;
+        let x: PyReadonlyArray2<'py, f32> = match data.extract() {
+            Ok(x) => x,
+            Err(_) => {
+                // pandas DataFrame / PyArrow Table: the Python layer turns them
+                // into the f32 matrix (categorical columns become their codes).
+                let converted = py
+                    .import("ferrisboost")?
+                    .getattr("_as_predict_matrix")?
+                    .call1((data,))?;
+                converted.extract().map_err(|_| {
+                    PyValueError::new_err(
+                        "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、\
+                         pandas DataFrame 或 pyarrow Table",
+                    )
+                })?
+            }
+        };
         self.predict_array(py, x, output_margin, n_trees, predict_threads, use_gpu)
             .map(Bound::into_any)
     }
@@ -1842,6 +1856,8 @@ impl PyModel {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
             ensure_gpu_prediction_available(use_gpu)?;
+            // The device predictor has no categorical decision: such models score on the CPU.
+            let use_gpu = use_gpu && !self.inner.has_categorical_splits();
             if self.inner.num_outputs() > 1 {
                 return Err(PyValueError::new_err(
                     "多分类模型的预测是二维的,请用 Model.predict()",
@@ -1978,6 +1994,8 @@ impl PyModel {
     ) -> PyResult<Bound<'py, PyAny>> {
         use crate::tree::SchemaMode;
         ensure_gpu_prediction_available(use_gpu)?;
+        // The device predictor has no categorical decision: such models score on the CPU.
+        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -2458,6 +2476,10 @@ struct Parsed {
     weighted: bool,
     /// XGBoost `monotone_constraints`,还没按 schema 解析。见 `resolve_monotone`。
     monotone: Option<MonotoneSpec>,
+    /// Declared categorical features (`feature_types`), one flag per feature in
+    /// input order; empty = none declared. Arrow dictionary columns in file
+    /// inputs are categorical even when this is empty.
+    categorical: Vec<bool>,
 }
 
 /// Python 层归一后的单调约束:按位置,或按列名(要等拿到列名才能解析)。
@@ -2589,7 +2611,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     objective
         .validate_params()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(Parsed {
+    let mut parsed = Parsed {
         params: TrainParams {
             n_rounds: get!("num_boost_round"),
             max_depth: get!("max_depth"),
@@ -2630,6 +2652,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             seed: get!("seed"),
             // 占位:按名字给的约束要等拿到 schema 才能解析,见 `MonotoneSpec`。
             monotone_constraints: Vec::new(),
+            max_cat_to_onehot: get!("max_cat_to_onehot"),
+            max_cat_threshold: get!("max_cat_threshold"),
         },
         requested_cols_per_block: get!("cols_per_block"),
         device: {
@@ -2667,6 +2691,10 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             names
         },
         weighted: false,
+        categorical: {
+            let flags: Option<Vec<bool>> = get!("_feature_types");
+            flags.unwrap_or_default()
+        },
         monotone: {
             match d.get_item("monotone_constraints")? {
                 None => None,
@@ -2690,7 +2718,14 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                 }
             }
         },
-    })
+    };
+    // The device split kernels only know ordered bins, so categorical training
+    // keeps the exact host split search and allocates no resident split cache.
+    // Plan memory with the same decision the runtime makes.
+    if parsed.categorical.iter().any(|&c| c) {
+        parsed.params.gpu_split_cache = false;
+    }
+    Ok(parsed)
 }
 
 /// 组装 callbacks:早停和 verbose 在 Rust 侧,用户的函数包一层。
@@ -2755,6 +2790,11 @@ fn build_callbacks(
 fn path_specs_of(obj: &Bound<'_, PyAny>) -> PyResult<Option<Vec<String>>> {
     // numpy 数组优先排除:它可迭代,但显然不是路径。
     if obj.extract::<PyReadonlyArray2<f32>>().is_ok() {
+        return Ok(None);
+    }
+    // pandas DataFrames iterate over their column names, and PyArrow tables are
+    // tables: neither is a path spec.
+    if obj.hasattr("columns")? || obj.hasattr("column_names")? {
         return Ok(None);
     }
     if let Ok(s) = obj.extract::<String>() {
@@ -2845,6 +2885,37 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     }
 }
 
+/// Training categorical columns must hold integer codes `0..=254` (NaN =
+/// missing). Report the first offender by feature index before binning.
+fn check_categorical_codes(
+    data: &[f32],
+    n_rows: usize,
+    n_features: usize,
+    flags: &[bool],
+) -> PyResult<()> {
+    if flags.is_empty() {
+        return Ok(());
+    }
+    if flags.len() != n_features {
+        return Err(PyValueError::new_err(format!(
+            "feature_types 有 {} 项,数据有 {n_features} 个特征",
+            flags.len()
+        )));
+    }
+    for (f, _) in flags.iter().enumerate().filter(|(_, &c)| c) {
+        for r in 0..n_rows {
+            let v = data[r * n_features + f];
+            if !v.is_nan() && crate::categorical::invalid_code(v) {
+                return Err(PyValueError::new_err(format!(
+                    "{} (row {r})",
+                    crate::categorical::invalid_code_message(&format!("#{f}"), v)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
@@ -2900,13 +2971,21 @@ fn train_dense(
         }
     }
     reject_inf(x.as_slice()?, n_features, "训练集")?;
+    check_categorical_codes(x.as_slice()?, n_rows, n_features, &cfg.categorical)?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     let train_src = DenseSource::new_weighted_with_nthread(
         x.as_slice()?,
         n_rows,
         n_features,
-        BinningStrategy::Sketch {
-            max_bins: cfg.params.max_bin as usize,
+        if cfg.categorical.iter().any(|&c| c) {
+            BinningStrategy::SketchTyped {
+                max_bins: cfg.params.max_bin as usize,
+                categorical: &cfg.categorical,
+            }
+        } else {
+            BinningStrategy::Sketch {
+                max_bins: cfg.params.max_bin as usize,
+            }
         },
         plan.effective,
         cfg.params.nthread,
@@ -3148,6 +3227,16 @@ fn train_file(
         other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
     }
     .map_err(|e| PyValueError::new_err(format!("读 {path} 的 schema 失败:{e}")))?;
+    // Declared feature types are positional over the resolved features (label
+    // and weight excluded), like XGBoost's `feature_types`.
+    if !cfg.categorical.is_empty() && cfg.categorical.len() != n_features {
+        return Err(PyValueError::new_err(format!(
+            "feature_types 有 {} 项,文件有 {n_features} 个特征列(不含标签/权重列)",
+            cfg.categorical.len()
+        )));
+    }
+    let categorical_flags = cfg.categorical.clone();
+    let targets = targets.with_categorical(&categorical_flags);
     // 行数同样要在 open 之前拿到 —— 显存模型的每一项都按它走。
     // parquet 从 footer 读,不解压任何数据;CSV 不扫全文件就是不知道。
     // ⚠️ **规划器要看到整个数据集的行数,不是第一个文件的。** 只报第一个

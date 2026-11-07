@@ -118,7 +118,15 @@ impl DenseSource {
         );
         assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
 
+        let (binning, categorical): (BinningStrategy, &[bool]) = match binning {
+            BinningStrategy::SketchTyped {
+                max_bins,
+                categorical,
+            } => (BinningStrategy::Sketch { max_bins }, categorical),
+            other => (other, &[]),
+        };
         let cuts = match binning {
+            BinningStrategy::SketchTyped { .. } => unreachable!("normalized above"),
             BinningStrategy::Sketch { max_bins } => {
                 assert!(
                     max_bins as u32 <= MAX_BIN_LIMIT,
@@ -138,11 +146,16 @@ impl DenseSource {
                 // 两个值隔着 n_features 个 f32)。宽数据上这不划算,
                 // 但它换来的是零同步。
                 let pool = crate::threading::build_pool(nthread).expect("分箱线程池创建失败");
-                let per_feat: Vec<Vec<f32>> = pool.install(|| {
+                let per_feat: Vec<(Vec<f32>, Option<f32>)> = pool.install(|| {
                     (0..n_features)
                         .into_par_iter()
                         .map(|f| {
-                            let mut sk = FeatureSketch::new(max_bins);
+                            let is_cat = categorical.get(f).copied().unwrap_or(false);
+                            let mut sk = if is_cat {
+                                FeatureSketch::new_categorical()
+                            } else {
+                                FeatureSketch::new(max_bins)
+                            };
                             match weights {
                                 None => {
                                     for r in 0..n_rows {
@@ -155,7 +168,7 @@ impl DenseSource {
                                     }
                                 }
                             }
-                            sk.cuts(max_bins)
+                            (sk.cuts(max_bins), sk.invalid_category())
                         })
                         .collect()
                 });
@@ -163,11 +176,22 @@ impl DenseSource {
                 let mut values = Vec::new();
                 let mut offsets = Vec::with_capacity(n_features + 1);
                 offsets.push(0u32);
-                for c in per_feat {
+                for (f, (c, bad)) in per_feat.into_iter().enumerate() {
+                    if let Some(bad) = bad {
+                        panic!(
+                            "{}",
+                            crate::categorical::invalid_code_message(&format!("#{f}"), bad)
+                        );
+                    }
                     values.extend_from_slice(&c);
                     offsets.push(values.len() as u32);
                 }
+                let flags: Vec<bool> = (0..n_features)
+                    .map(|f| categorical.get(f).copied().unwrap_or(false))
+                    .collect();
                 BinCuts::new(values, offsets)
+                    .with_categorical(&flags)
+                    .expect("categorical cuts are consecutive codes by construction")
             }
             BinningStrategy::Provided(cuts) => {
                 assert_eq!(cuts.n_feats(), n_features, "给定的 cuts 特征数和数据对不上");

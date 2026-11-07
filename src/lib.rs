@@ -6,6 +6,7 @@
 
 pub mod backend;
 pub mod callback;
+pub mod categorical;
 pub mod colsample;
 pub mod columns;
 pub mod comm;

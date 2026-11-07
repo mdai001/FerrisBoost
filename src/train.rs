@@ -1095,7 +1095,8 @@ fn train_with_backend(
         validate_source_metadata(ev.source, &format!("验证集 {:?}", ev.name))?;
         anyhow::ensure!(
             ev.source.cuts().offsets == source.cuts().offsets
-                && ev.source.cuts().values == source.cuts().values,
+                && ev.source.cuts().values == source.cuts().values
+                && ev.source.cuts().categorical_flags() == source.cuts().categorical_flags(),
             "验证集 {:?} 没有复用训练集的 cuts",
             ev.name
         );
@@ -1116,6 +1117,7 @@ fn train_with_backend(
         schema_mode: None,
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
+        feature_types: source.cuts().categorical_flags().to_vec(),
         best_iteration: None,
         best_score: None,
     };
@@ -1164,7 +1166,11 @@ fn train_with_backend(
                     // 规划之后这个字段保存的是**生效值**(见 TrainParams 文档)。
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
-                    gpu_split_cache: cfg.params.gpu_split_cache,
+                    // Categorical features are enumerated on the host (the device
+                    // split kernels only know ordered bins), so a categorical
+                    // training run keeps the exact host fallback and allocates
+                    // no resident split cache. See `gpu_split_cache_enabled`.
+                    gpu_split_cache: gpu_split_cache_enabled(&cfg.params, source.cuts()),
                     gpu_math: cfg.params.gpu_math,
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
@@ -1611,6 +1617,10 @@ pub fn train_gpu_one_tree(
     );
 
     let cuts = source.cuts();
+    anyhow::ensure!(
+        !cuts.has_categorical(),
+        "train_gpu_one_tree does not support categorical features"
+    );
     let mut best: Option<SplitCandidate> = None;
     for b in 0..source.n_blocks() {
         let block_best = source.with_block_ret(b, |block| {
@@ -1645,6 +1655,7 @@ pub fn train_gpu_one_tree(
             schema_mode: None,
             class_base_margins: Vec::new(),
             scale_pos_weight: cfg.params.scale_pos_weight,
+            feature_types: Vec::new(),
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -1692,6 +1703,7 @@ pub fn train_gpu_one_tree(
         schema_mode: None,
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
+        feature_types: Vec::new(),
         trees: vec![tree],
         base_score,
         objective: cfg.objective,
@@ -1994,11 +2006,27 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         .nodes
         .iter()
         .map(|n| {
-            if n.is_leaf {
+            if n.is_leaf || n.cats.is_some() {
                 0
             } else {
                 tree::split_bin(cuts, n.feat, n.split_cond)
             }
+        })
+        .collect();
+    // Categorical nodes compare the bin (= category code) against a set.
+    let node_cats: Vec<Option<crate::categorical::CatBits>> = t
+        .nodes
+        .iter()
+        .map(|n| {
+            n.cats.as_ref().map(|words| {
+                let mut bits = crate::categorical::CatBits::empty();
+                for cat in crate::categorical::categories_from_words(words) {
+                    if cat < 256 {
+                        bits.set(cat);
+                    }
+                }
+                bits
+            })
         })
         .collect();
 
@@ -2087,6 +2115,8 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                         let bin = block.column(local)[row as usize];
                         let go_left = if bin == MISSING_BIN {
                             n.default_left
+                        } else if let Some(cats) = &node_cats[*node as usize] {
+                            !cats.contains(bin as u32)
                         } else {
                             (bin as u32) < thresholds[*node as usize]
                         };
@@ -2564,7 +2594,7 @@ fn build_tree(
                             if gpu_done[i] {
                                 return gpu_candidates[i];
                             }
-                            split::best_split_in_block_constrained(
+                            split::best_split_in_block_typed(
                                 &per_node[i],
                                 &plan.hist_feats,
                                 &plan.hist_offsets,
@@ -2573,6 +2603,7 @@ fn build_tree(
                                 p,
                                 sampled,
                                 monotone_at(p, ln.bounds),
+                                cuts.has_categorical().then(|| cuts.categorical_flags()),
                             )
                         })
                         .collect();
@@ -2687,6 +2718,22 @@ fn build_tree(
             for (block, nodes) in resident_groups {
                 if let Some(mut session) = ctx.partition_session_resident(block, 0)? {
                     let started = std::time::Instant::now();
+                    // The batched kernel only knows ordered bins. Categorical
+                    // nodes take the single-node route (same stream, same stable
+                    // partition), numeric nodes keep the batch.
+                    let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
+                        .into_iter()
+                        .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
+                    for (i, local) in cat_nodes {
+                        let c = chosen[i].expect("resident group contains chosen nodes");
+                        let cats = c.cats.expect("partitioned by categorical");
+                        part_tokens[i] = Some(session.partition_resident_categorical(
+                            level[i].rows.device(),
+                            local,
+                            &cats,
+                            c.missing_left,
+                        )?);
+                    }
                     for chunk in nodes.chunks(crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY) {
                         let requests: Vec<_> = chunk
                             .iter()
@@ -2743,8 +2790,16 @@ fn build_tree(
                 let mut session = ctx.partition_session(&col)?;
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    part_tokens[i] =
-                        Some(session.partition(level[i].rows.device(), c.bin, c.missing_left)?);
+                    part_tokens[i] = Some(match &c.cats {
+                        Some(cats) => session.partition_categorical(
+                            level[i].rows.device(),
+                            cats,
+                            c.missing_left,
+                        )?,
+                        None => {
+                            session.partition(level[i].rows.device(), c.bin, c.missing_left)?
+                        }
+                    });
                 }
                 let timing = session.timing();
                 drop(session);
@@ -2807,7 +2862,11 @@ fn build_tree(
             let (left_node, right_node) = t.split_leaf(
                 ln.node,
                 c.feat,
-                tree::split_threshold(cuts, c.feat, c.bin),
+                if c.cats.is_some() {
+                    0.0
+                } else {
+                    tree::split_threshold(cuts, c.feat, c.bin)
+                },
                 c.missing_left,
                 c.gain,
                 children.left_value,
@@ -2815,6 +2874,9 @@ fn build_tree(
                 children.right_value,
                 hess_of(c.right, q),
             );
+            if let Some(cats) = &c.cats {
+                t.set_categories(ln.node, cats);
+            }
 
             let (left_rows, right_rows) = partitions[i].take().expect("上面按块分好了");
 
@@ -2908,6 +2970,19 @@ fn build_tree(
     }
 
     Ok(t)
+}
+
+/// Whether the bounded resident GPU split cache is used for this run.
+///
+/// The device split kernels enumerate ordered bins only. A categorical
+/// feature needs XGBoost's one-hot / sorted-partition enumeration, which runs
+/// on the host over the downloaded histograms (the same exact fallback that
+/// already serves cache overflow and streaming). Keeping that single code path
+/// is what makes `gpu_math = "exact"` byte-identical to the CPU for
+/// categorical data; the price is one histogram download per node, so a
+/// categorical GPU run does not get the split-cache speedup.
+pub fn gpu_split_cache_enabled(params: &TrainParams, cuts: &BinCuts) -> bool {
+    params.gpu_split_cache && !cuts.has_categorical()
 }
 
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
@@ -3075,6 +3150,9 @@ fn partition_rows(
             let bin = col[r as usize];
             let go_left = if bin == MISSING_BIN {
                 c.missing_left
+            } else if let Some(cats) = &c.cats {
+                // Categorical: the set goes right, every other category left.
+                !cats.contains(bin as u32)
             } else {
                 (bin as u32) < c.bin
             };
@@ -3422,7 +3500,7 @@ mod tests {
 
     use super::*;
     use crate::callback::{EarlyStopping, RecordHistory, RoundMetrics, VerboseEval};
-    use crate::columns::{BinCuts, ColumnBlock};
+    use crate::columns::{BinCuts, BinningStrategy, ColumnBlock};
     use crate::comm::Local;
     use crate::metrics::{LogLoss, Metric, Rmse};
     use crate::source::DenseSource;
@@ -3491,6 +3569,114 @@ mod tests {
                 "行 {row} {raw:?}:量化下降 {got} != 浮点下降 {by_floats}"
             );
         }
+    }
+
+    /// Two numeric columns, then two categorical code columns (5 and 12
+    /// levels). The label depends on category membership, so categorical
+    /// splits are worth taking.
+    fn categorical_data(n: usize) -> (Vec<f32>, Vec<f32>, usize, Vec<bool>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            let a = ((i * 7) % 9) as f32;
+            let b = if i % 11 == 0 { MISSING } else { ((i * 5) % 6) as f32 };
+            let c1 = ((i * 3 + i / 7) % 5) as f32;
+            let c2 = if i % 13 == 0 { MISSING } else { ((i * 17 + i / 5) % 12) as f32 };
+            let up = matches!(c1 as i32, 1 | 3) || matches!(c2 as i32, 2 | 5 | 9);
+            x.extend([a, b, c1, c2]);
+            y.push(if up { 1.0 } else { 0.0 } + 0.05 * a);
+        }
+        (x, y, 4, vec![false, false, true, true])
+    }
+
+    fn train_categorical(
+        x: &[f32],
+        y: &[f32],
+        nf: usize,
+        flags: &[bool],
+        p: TrainParams,
+    ) -> (Model, DenseSource) {
+        let src = DenseSource::new(
+            x,
+            y.len(),
+            nf,
+            BinningStrategy::SketchTyped {
+                max_bins: p.max_bin as usize,
+                categorical: flags,
+            },
+            p.cols_per_block,
+        );
+        let cfg = TrainConfig::new(p, Objective::SquaredError);
+        let model = train(&src, y, &[], &cfg, &mut [], &Local).unwrap();
+        (model, src)
+    }
+
+    #[test]
+    fn categorical_bin_descent_matches_float_descent() {
+        let (x, y, nf, flags) = categorical_data(400);
+        let (model, src) = train_categorical(&x, &y, nf, &flags, params(4, 6));
+        assert_eq!(model.feature_types, flags);
+        assert!(model.has_categorical_splits(), "the data rewards categorical splits");
+        let by_bins = predict_on(&model, &src).unwrap();
+        for (row, got) in by_bins.iter().enumerate() {
+            let raw = &x[row * nf..(row + 1) * nf];
+            assert_eq!(got.to_bits(), model.predict_margin(raw).to_bits(), "row {row} {raw:?}");
+        }
+    }
+
+    #[test]
+    fn categorical_training_ignores_block_width_and_threads() {
+        let (x, y, nf, flags) = categorical_data(600);
+        let mut reference = None;
+        for (cols, nthread) in [(1usize, 1usize), (2, 2), (4, 3)] {
+            let p = TrainParams {
+                cols_per_block: cols,
+                nthread,
+                ..params(4, 4)
+            };
+            let (m, _) = train_categorical(&x, &y, nf, &flags, p);
+            let json = m.to_xgboost_json().unwrap();
+            match &reference {
+                None => reference = Some(json),
+                Some(r) => assert_eq!(&json, r, "cols {cols} threads {nthread}"),
+            }
+        }
+    }
+
+    #[test]
+    fn categorical_validation_set_with_an_unseen_code_is_scored_left() {
+        let (x, y, nf, flags) = categorical_data(300);
+        let (model, train_src) = train_categorical(&x, &y, nf, &flags, params(3, 4));
+        // Same rows with the last column's codes pushed past the trained range.
+        let mut vx = x.clone();
+        for row in 0..y.len() {
+            vx[row * nf + 3] = 40.0;
+        }
+        let valid = DenseSource::with_cuts(&vx, y.len(), nf, train_src.cuts().clone(), 2);
+        let by_bins = predict_on(&model, &valid).unwrap();
+        for (row, got) in by_bins.iter().enumerate() {
+            let raw = &vx[row * nf..(row + 1) * nf];
+            assert_eq!(got.to_bits(), model.predict_margin(raw).to_bits(), "row {row}");
+        }
+    }
+
+    #[test]
+    fn invalid_categorical_codes_are_rejected_when_binning_the_training_data() {
+        let (mut x, y, nf, flags) = categorical_data(50);
+        x[2] = 2.5;
+        let r = std::panic::catch_unwind(|| {
+            DenseSource::new(
+                &x,
+                y.len(),
+                nf,
+                BinningStrategy::SketchTyped {
+                    max_bins: 16,
+                    categorical: &flags,
+                },
+                2,
+            )
+        });
+        assert!(r.is_err());
     }
 
     #[test]
@@ -3701,6 +3887,7 @@ mod tests {
                 left: GradPairFixed::default(),
                 right: GradPairFixed::default(),
                 missing_left,
+                cats: None,
             };
             let run = |nthread| {
                 crate::threading::build_pool(nthread)

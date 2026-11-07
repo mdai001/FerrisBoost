@@ -27,6 +27,10 @@ pub struct Targets<'a> {
     /// 给了就**按列名**取特征,并排成这个顺序(验证集要和训练集的
     /// 特征一一对上)。`None` 时按文件里的物理顺序。
     pub features: Option<&'a [String]>,
+    /// Categorical flag per feature, in the resolved feature order (label and
+    /// weight excluded). `None` = none declared; Arrow dictionary columns are
+    /// categorical regardless.
+    pub categorical: Option<&'a [bool]>,
 }
 
 impl<'a> Targets<'a> {
@@ -39,7 +43,17 @@ impl<'a> Targets<'a> {
             label,
             weight,
             features: None,
+            categorical: None,
         })
+    }
+
+    /// Declare categorical features, one flag per feature in the resolved
+    /// feature order. An empty slice means none declared.
+    pub fn with_categorical(self, flags: &'a [bool]) -> Self {
+        Self {
+            categorical: (!flags.is_empty()).then_some(flags),
+            ..self
+        }
     }
 
     /// 要求文件里的特征列正好是 `names`(按名字绑定,顺序随 `names`)。
@@ -111,6 +125,7 @@ impl<'a> From<&'a str> for Targets<'a> {
             label,
             weight: None,
             features: None,
+            categorical: None,
         }
     }
 }
@@ -121,6 +136,7 @@ impl<'a> From<&'a String> for Targets<'a> {
             label: label.as_str(),
             weight: None,
             features: None,
+            categorical: None,
         }
     }
 }

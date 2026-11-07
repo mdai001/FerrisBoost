@@ -50,6 +50,13 @@ pub struct BinCuts {
     /// hist_offsets[feat] = 前面所有特征的 bin 数之和。
     /// 预计算的前缀和,直方图索引每次都要用,不能现算。
     hist_offsets: Vec<u32>,
+    /// Per-feature categorical flag; empty = every feature is numeric.
+    ///
+    /// A categorical feature's cuts are `[1, 2, .., max_code]`, so its bin is
+    /// the category code (`n_bins = max_code + 1`, absent codes included, as
+    /// in XGBoost). Quantization goes through `find_bin`, which maps unseen
+    /// codes to a bin that is in no category set.
+    categorical: Vec<bool>,
 }
 
 impl BinCuts {
@@ -90,7 +97,57 @@ impl BinCuts {
             values,
             offsets,
             hist_offsets,
+            categorical: Vec::new(),
         }
+    }
+
+    /// Cuts of a categorical feature whose largest code is `max_code`:
+    /// `[1, 2, .., max_code]`, i.e. `max_code + 1` bins, one per code.
+    pub fn categorical_cuts(max_code: u32) -> Vec<f32> {
+        (1..=max_code).map(|c| c as f32).collect()
+    }
+
+    /// Mark features as categorical. Every flagged feature's cuts must be the
+    /// consecutive codes `[1, .., max_code]` (see [`Self::categorical_cuts`]).
+    /// An all-false list leaves the cuts untouched.
+    pub fn with_categorical(mut self, flags: &[bool]) -> anyhow::Result<Self> {
+        if !flags.iter().any(|&f| f) {
+            return Ok(self);
+        }
+        anyhow::ensure!(
+            flags.len() == self.n_feats(),
+            "categorical flags cover {} features, cuts have {}",
+            flags.len(),
+            self.n_feats()
+        );
+        for (f, _) in flags.iter().enumerate().filter(|(_, &c)| c) {
+            let cuts = self.cuts_for(f as FeatId);
+            anyhow::ensure!(
+                cuts.len() < crate::types::MISSING_BIN as usize
+                    && cuts.iter().enumerate().all(|(i, &c)| c == (i + 1) as f32),
+                "categorical feature {f} needs consecutive code cuts [1..max_code]"
+            );
+        }
+        self.categorical = flags.to_vec();
+        Ok(self)
+    }
+
+    /// Whether this feature is categorical.
+    pub fn is_categorical(&self, feat: FeatId) -> bool {
+        self.categorical
+            .get(feat as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether any feature is categorical.
+    pub fn has_categorical(&self) -> bool {
+        self.categorical.iter().any(|&c| c)
+    }
+
+    /// Per-feature categorical flags (empty when all features are numeric).
+    pub fn categorical_flags(&self) -> &[bool] {
+        &self.categorical
     }
 
     /// 直方图的总长度(所有特征的 bin 数之和)。
@@ -185,6 +242,9 @@ impl BinCuts {
     /// NaN(缺失)不走这里 —— 它在训练时由 default direction 决定
     /// 去向,不占 bin。调用方负责先判断。
     pub fn find_bin(&self, feat: FeatId, value: f32) -> u8 {
+        if self.is_categorical(feat) {
+            return crate::categorical::code_to_bin(value, self.n_bins(feat));
+        }
         let cuts = self.cuts_for(feat);
         cuts.partition_point(|&c| c <= value) as u8
     }
@@ -202,6 +262,13 @@ impl BinCuts {
 pub enum BinningStrategy<'a> {
     /// 自己建草图算(默认)
     Sketch { max_bins: usize },
+    /// Like `Sketch`, with `categorical[f]` marking feature `f` as categorical:
+    /// its values are integer codes `0..=254` binned one per code (no sketch).
+    /// A shorter (or empty) list leaves the remaining features numeric.
+    SketchTyped {
+        max_bins: usize,
+        categorical: &'a [bool],
+    },
     /// 用外部给定的切分点
     Provided(&'a BinCuts),
 }

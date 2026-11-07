@@ -1,5 +1,6 @@
 //! 分裂枚举。
 
+use crate::categorical::CatBits;
 use crate::hist::Histogram;
 use crate::types::{FeatId, GradPairFixed, GradQuantizer, TrainParams};
 
@@ -37,6 +38,12 @@ pub struct SplitCandidate {
     /// 缺失值走左还是右。每个分裂独立学,不是简单填补 ——
     /// 这是 XGBoost 精度的重要来源,也是最容易写错的地方。
     pub missing_left: bool,
+    /// Categorical split: the categories that go RIGHT (everything else goes
+    /// left, XGBoost's convention). `None` for numeric splits. For a
+    /// categorical split `bin` is unused (0), `left` is the stats of the
+    /// categories outside the set (plus missing rows when `missing_left`) and
+    /// `right` those of the set (plus missing rows otherwise).
+    pub cats: Option<CatBits>,
 }
 
 /// 叶子权重。f64 算完再降到 f32 —— 除法只做一次,不累积。
@@ -295,6 +302,39 @@ pub fn best_split_in_block_constrained(
     sampled: Option<&[FeatId]>,
     monotone: Option<Monotone<'_>>,
 ) -> Option<SplitCandidate> {
+    best_split_in_block_typed(
+        hist,
+        feat_ids,
+        feat_offsets,
+        node_sum,
+        q,
+        p,
+        sampled,
+        monotone,
+        None,
+    )
+}
+
+/// `best_split_in_block_constrained` with categorical features.
+///
+/// `categorical` is indexed by **global** feature id (`BinCuts::categorical_flags`);
+/// `None` or an empty slice means every feature is numeric, and the result is
+/// then bit-identical to the numeric-only path. A categorical feature is
+/// enumerated like XGBoost's `EnumerateOneHot` / `EnumeratePart` (see
+/// [`enumerate_categorical`]) and competes with the numeric features under the
+/// same strict-greater, ascending-feature rule.
+#[allow(clippy::too_many_arguments)] // The constrained signature plus the feature types.
+pub fn best_split_in_block_typed(
+    hist: &Histogram,
+    feat_ids: &[FeatId],
+    feat_offsets: &[u32],
+    node_sum: GradPairFixed,
+    q: &GradQuantizer,
+    p: &TrainParams,
+    sampled: Option<&[FeatId]>,
+    monotone: Option<Monotone<'_>>,
+    categorical: Option<&[bool]>,
+) -> Option<SplitCandidate> {
     debug_assert_eq!(feat_offsets.len(), feat_ids.len() + 1);
     debug_assert_eq!(hist.len(), feat_offsets[feat_ids.len()] as usize);
 
@@ -330,6 +370,11 @@ pub fn best_split_in_block_constrained(
         let hi = feat_offsets[local + 1] as usize;
         let bins = &hist.bins[lo..hi];
 
+        if categorical.is_some_and(|c| c.get(feat as usize) == Some(&true)) {
+            enumerate_categorical(feat, bins, node_sum, q, p, &candidate_gain, &mut best);
+            continue;
+        }
+
         // ---- 正向扫描:缺失走右 ----
         //
         // 左边是前 i+1 个 bin,右边由 node_sum 反推。缺失行不在任何
@@ -352,6 +397,7 @@ pub fn best_split_in_block_constrained(
                     left,
                     right,
                     missing_left: false,
+                    cats: None,
                 },
             );
         }
@@ -401,12 +447,127 @@ pub fn best_split_in_block_constrained(
                     left,
                     right,
                     missing_left: true,
+                    cats: None,
                 },
             );
         }
     }
 
     best
+}
+
+/// Categorical split enumeration for one feature, ported from XGBoost 3.4.1
+/// `HistEvaluator::EnumerateOneHot` / `EnumeratePart` (`tree/hist/evaluate_splits.h`).
+///
+/// `bins` holds one histogram slot per category code `0..n` (codes that never
+/// occur are zero slots, exactly as XGBoost's cuts list every integer up to the
+/// largest category). The categories that go RIGHT form the candidate's set.
+///
+/// * **One-hot** when `n < max_cat_to_onehot`: each category alone is the right
+///   side. For each one, missing rows are tried on the left first, then on the
+///   right (`default_left = true` wins a tie).
+/// * **Partition** otherwise: categories are stable-sorted by the unregularised
+///   leaf weight of their stats (`CalcWeightCat`, which still honours alpha and
+///   `max_delta_step`), then prefixes of that order are scanned. The forward scan
+///   puts the first `k` categories right with missing on the left; the backward
+///   scan puts the first `j` right with missing on the right. At most
+///   `max_cat_threshold - 1` prefixes are tried per direction, and a prefix that
+///   would hold every category is never tried.
+///
+/// Candidates are offered in XGBoost's order (one-hot: category ascending,
+/// missing-left then missing-right; partition: forward then backward) under the
+/// usual strict-greater rule, so ties resolve to the earlier candidate.
+fn enumerate_categorical<F>(
+    feat: FeatId,
+    bins: &[GradPairFixed],
+    node_sum: GradPairFixed,
+    q: &GradQuantizer,
+    p: &TrainParams,
+    candidate_gain: &F,
+    best: &mut Option<SplitCandidate>,
+) where
+    F: Fn(FeatId, (f64, f64), (f64, f64)) -> Option<f32>,
+{
+    let n = bins.len();
+    let mut offer =
+        |left: GradPairFixed, right: GradPairFixed, missing_left: bool, cats: CatBits| {
+            let (lf, rf) = (q.to_f64(left), q.to_f64(right));
+            if let Some(gain) = candidate_gain(feat, lf, rf) {
+                update_best(
+                    best,
+                    SplitCandidate {
+                        feat,
+                        bin: 0,
+                        gain,
+                        left,
+                        right,
+                        missing_left,
+                        cats: Some(cats),
+                    },
+                );
+            }
+        };
+
+    if (n as u64) < p.max_cat_to_onehot as u64 {
+        let mut feature_sum = GradPairFixed::default();
+        for &b in bins {
+            feature_sum += b;
+        }
+        let missing = node_sum - feature_sum;
+        for (i, &b) in bins.iter().enumerate() {
+            let mut set = CatBits::empty();
+            set.set(i as u32);
+            // Missing rows go with the other categories.
+            offer(node_sum - b, b, true, set);
+            // Missing rows go with the chosen category.
+            let mut right = b;
+            right += missing;
+            offer(node_sum - right, right, false, set);
+        }
+        return;
+    }
+
+    // Partition-based: sort categories by weight, then scan prefixes.
+    let weights: Vec<f32> = bins
+        .iter()
+        .map(|&b| {
+            let (g, h) = q.to_f64(b);
+            xgb_weight(g, h, p)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    // `<` comparison with a stable sort, as `std::stable_sort` with `<`:
+    // equal weights (including -0.0 vs 0.0) keep ascending category order.
+    order.sort_by(|&a, &b| {
+        weights[a]
+            .partial_cmp(&weights[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n_scan = (p.max_cat_threshold as usize).min(n);
+    if n_scan < 2 {
+        return;
+    }
+
+    // Forward: the first `k` sorted categories are the set (right); missing left.
+    let mut set = CatBits::empty();
+    let mut right = GradPairFixed::default();
+    for &cat in &order[..n_scan - 1] {
+        right += bins[cat];
+        set.set(cat as u32);
+        offer(node_sum - right, right, true, set);
+    }
+
+    // Backward: the sorted tail accumulates on the left; its complement (the
+    // first `j` sorted categories) is the set, with missing rows on the right.
+    let mut left = GradPairFixed::default();
+    for j in (n - (n_scan - 1)..n).rev() {
+        left += bins[order[j]];
+        let mut set = CatBits::empty();
+        for &cat in &order[..j] {
+            set.set(cat as u32);
+        }
+        offer(left, node_sum - left, false, set);
+    }
 }
 
 /// 跨块归约:各块的最优候选里取全局最优。
@@ -527,6 +688,8 @@ mod tests {
                 let b = self.block[local * self.n_rows + row];
                 let goes_left = if b == MISSING_BIN {
                     c.missing_left
+                } else if let Some(cats) = &c.cats {
+                    !cats.contains(b as u32)
                 } else {
                     (b as u32) < c.bin
                 };
@@ -599,6 +762,7 @@ mod tests {
                         left: GradPairFixed::default(),
                         right: GradPairFixed::default(),
                         missing_left,
+                        cats: None,
                     };
                     let (l, r) = case.partition(&cand);
                     let (lf, rf) = (case.f(l), case.f(r));
@@ -1054,6 +1218,7 @@ mod tests {
                 left: GradPairFixed::default(),
                 right: GradPairFixed::default(),
                 missing_left: false,
+                cats: None,
             })
         };
 
@@ -1066,5 +1231,259 @@ mod tests {
         assert_eq!(reduce_best(&[mk(3, 2.0), mk(9, 2.0)]).unwrap().feat, 3);
         // 低于 eps 的候选一个都不该留下
         assert!(reduce_best(&[mk(3, 1e-9)]).is_none());
+    }
+
+    // ------------------------------------------------------------ categorical
+
+    /// A one-feature block whose bins are category codes `0..n_cats`, with
+    /// `missing_pct`% missing rows. Gradients depend on the category so that
+    /// some categories are clearly "positive" and others "negative".
+    fn categorical_case(seed: u64, n_rows: usize, n_cats: usize, missing_pct: u32) -> Case {
+        let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7));
+        let mut block = vec![0 as Bin; n_rows];
+        let mut float = Vec::with_capacity(n_rows);
+        for slot in block.iter_mut() {
+            let missing = rng.next_u32() % 100 < missing_pct;
+            let cat = rng.next_u32() as usize % n_cats;
+            *slot = if missing { MISSING_BIN } else { cat as Bin };
+            let signal = if cat % 3 == 0 { 0.6 } else { -0.4 };
+            float.push(GradPair {
+                grad: signal + 0.3 * rng.next_signed(),
+                hess: 0.1 + 0.2 * (rng.next_u32() % 1000) as f32 / 1000.0,
+            });
+        }
+        Case::new(block, n_rows, vec![0], vec![0, n_cats as u32], float)
+    }
+
+    fn best_categorical(case: &Case, p: &TrainParams) -> Option<SplitCandidate> {
+        let flags = vec![true];
+        best_split_in_block_typed(
+            &case.hist(),
+            &case.feat_ids,
+            &case.feat_offsets,
+            case.node_sum(),
+            &case.q,
+            p,
+            None,
+            None,
+            Some(&flags),
+        )
+    }
+
+    /// The gain of a candidate recomputed from its own row partition.
+    fn recomputed_gain(case: &Case, c: &SplitCandidate, p: &TrainParams) -> f32 {
+        let node = case.f(case.node_sum());
+        let parent = node.0 * node.0 / (node.1 + p.lambda as f64);
+        let (l, r) = case.partition(c);
+        assert_eq!((l, r), (c.left, c.right), "candidate sums must match its partition");
+        let (lf, rf) = (case.f(l), case.f(r));
+        (lf.0 * lf.0 / (lf.1 + p.lambda as f64) + rf.0 * rf.0 / (rf.1 + p.lambda as f64)
+            - parent
+            - p.gamma as f64) as f32
+    }
+
+    #[test]
+    fn one_hot_matches_brute_force_over_single_categories() {
+        // n_cats < max_cat_to_onehot (4): the split is one category vs the rest.
+        for seed in 0..30u64 {
+            for &missing_pct in &[0u32, 15, 60] {
+                let case = categorical_case(seed, 80, 3, missing_pct);
+                let p = TrainParams {
+                    min_child_weight: 0.0,
+                    ..TrainParams::default()
+                };
+                let got = best_categorical(&case, &p);
+                // Brute force: every category alone on the right, both missing sides.
+                let mut want: Option<(f32, u32, bool)> = None;
+                for cat in 0..3u32 {
+                    for &missing_left in &[true, false] {
+                        let mut set = CatBits::empty();
+                        set.set(cat);
+                        let cand = SplitCandidate {
+                            feat: 0,
+                            bin: 0,
+                            gain: 0.0,
+                            left: GradPairFixed::default(),
+                            right: GradPairFixed::default(),
+                            missing_left,
+                            cats: Some(set),
+                        };
+                        let (l, r) = case.partition(&cand);
+                        let (lf, rf) = (case.f(l), case.f(r));
+                        if lf.1 < p.min_child_weight as f64 || rf.1 < p.min_child_weight as f64 {
+                            continue;
+                        }
+                        let g = recomputed_gain(&case, &SplitCandidate { left: l, right: r, ..cand }, &p);
+                        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                        if !(g > MIN_GAIN_EPS) {
+                            continue;
+                        }
+                        if want.is_none_or(|(w, _, _)| g > w) {
+                            want = Some((g, cat, missing_left));
+                        }
+                    }
+                }
+                match (got, want) {
+                    (None, None) => {}
+                    (Some(c), Some((g, cat, missing_left))) => {
+                        assert_eq!(c.gain, g, "seed {seed} missing {missing_pct}");
+                        assert_eq!(c.cats.unwrap().iter().collect::<Vec<_>>(), vec![cat]);
+                        assert_eq!(c.missing_left, missing_left);
+                    }
+                    other => panic!("one-hot mismatch: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_split_is_self_consistent_and_sorted_by_weight() {
+        for seed in 0..40u64 {
+            for &missing_pct in &[0u32, 10, 40] {
+                let case = categorical_case(seed, 200, 9, missing_pct);
+                let p = TrainParams {
+                    min_child_weight: 0.0,
+                    ..TrainParams::default()
+                };
+                let Some(c) = best_categorical(&case, &p) else {
+                    continue;
+                };
+                let cats = c.cats.expect("categorical candidate carries its set");
+                assert!(cats.count() >= 1 && (cats.count() as usize) < 9);
+                // The candidate's sums and gain agree with its own partition.
+                assert_eq!(c.gain, recomputed_gain(&case, &c, &p));
+                // The set is a prefix or a suffix of the weight order: no
+                // outside category has a smaller weight than an inside one on
+                // both sides of it. Equivalent check: the sets split the
+                // categories by a threshold on g/(h+lambda).
+                let hist = case.hist();
+                let w: Vec<f64> = hist
+                    .bins
+                    .iter()
+                    .map(|&b| {
+                        let (g, h) = case.f(b);
+                        -g / (h + p.lambda as f64)
+                    })
+                    .collect();
+                let inside_max = (0..9u32).filter(|&k| cats.contains(k)).map(|k| w[k as usize]).fold(f64::MIN, f64::max);
+                let inside_min = (0..9u32).filter(|&k| cats.contains(k)).map(|k| w[k as usize]).fold(f64::MAX, f64::min);
+                let outside_max = (0..9u32).filter(|&k| !cats.contains(k)).map(|k| w[k as usize]).fold(f64::MIN, f64::max);
+                let outside_min = (0..9u32).filter(|&k| !cats.contains(k)).map(|k| w[k as usize]).fold(f64::MAX, f64::min);
+                assert!(
+                    inside_min >= outside_max || inside_max <= outside_min,
+                    "seed {seed}: set is not contiguous in weight order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partition_split_finds_the_obvious_grouping() {
+        // Categories 0..6: even ones push the prediction up, odd ones down.
+        let n_rows = 6 * 40;
+        let mut block = Vec::new();
+        let mut float = Vec::new();
+        for cat in 0..6u8 {
+            for _ in 0..40 {
+                block.push(cat);
+                float.push(GradPair {
+                    grad: if cat % 2 == 0 { -1.0 } else { 1.0 },
+                    hess: 0.25,
+                });
+            }
+        }
+        let case = Case::new(block, n_rows, vec![0], vec![0, 6], float);
+        let p = TrainParams {
+            max_cat_to_onehot: 4,
+            ..TrainParams::default()
+        };
+        let c = best_categorical(&case, &p).expect("a clear split exists");
+        let set: Vec<u32> = c.cats.unwrap().iter().collect();
+        assert!(set == vec![0, 2, 4] || set == vec![1, 3, 5], "got {set:?}");
+        assert!(!c.missing_left || c.missing_left, "no missing rows: direction is free");
+    }
+
+    #[test]
+    fn no_missing_rows_make_the_forward_scan_win_ties() {
+        // Without missing data the forward (default-left) and backward
+        // (default-right) scans produce mirror partitions with equal gain;
+        // XGBoost's EnumeratePart has no skip for that, so default_left wins.
+        let case = categorical_case(3, 120, 7, 0);
+        let c = best_categorical(&case, &TrainParams::default()).expect("split");
+        assert!(c.missing_left);
+        // One-hot likewise evaluates missing-left first.
+        let case = categorical_case(4, 120, 3, 0);
+        let c = best_categorical(&case, &TrainParams::default()).expect("split");
+        assert!(c.missing_left);
+    }
+
+    #[test]
+    fn max_cat_threshold_limits_the_scan() {
+        // 20 categories, threshold 3: at most 2 prefix sizes per direction, so
+        // the set holds <= 2 categories (forward) or >= 18 (backward).
+        let case = categorical_case(11, 400, 20, 5);
+        let p = TrainParams {
+            max_cat_threshold: 3,
+            min_child_weight: 0.0,
+            ..TrainParams::default()
+        };
+        let c = best_categorical(&case, &p).expect("split");
+        let n = c.cats.unwrap().count();
+        assert!(n <= 2 || n >= 18, "set size {n}");
+        // Threshold 1 scans nothing.
+        let p1 = TrainParams {
+            max_cat_threshold: 1,
+            ..p.clone()
+        };
+        assert!(best_categorical(&case, &p1).is_none());
+    }
+
+    #[test]
+    fn onehot_threshold_switches_enumeration() {
+        // 5 categories: partition by default, one-hot once max_cat_to_onehot > 5.
+        let case = categorical_case(5, 300, 5, 0);
+        let part = best_categorical(&case, &TrainParams::default()).unwrap();
+        let onehot = best_categorical(
+            &case,
+            &TrainParams {
+                max_cat_to_onehot: 6,
+                ..TrainParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(onehot.cats.unwrap().count(), 1);
+        assert!(part.gain >= onehot.gain, "partition sees a superset of one-hot splits here");
+    }
+
+    #[test]
+    fn categorical_enumeration_is_reproducible() {
+        let case = categorical_case(9, 150, 12, 20);
+        let p = TrainParams::default();
+        let a = best_categorical(&case, &p).unwrap();
+        let b = best_categorical(&case, &p).unwrap();
+        assert_eq!((a.gain, a.cats, a.left, a.right), (b.gain, b.cats, b.left, b.right));
+    }
+
+    #[test]
+    fn numeric_only_flags_leave_the_numeric_path_untouched() {
+        let case = random_case(5, 64, 4, 10);
+        let p = TrainParams::default();
+        let flags = vec![false; 20];
+        let typed = best_split_in_block_typed(
+            &case.hist(),
+            &case.feat_ids,
+            &case.feat_offsets,
+            case.node_sum(),
+            &case.q,
+            &p,
+            None,
+            None,
+            Some(&flags),
+        );
+        let plain = case.best(&p);
+        assert_eq!(
+            typed.map(|c| (c.feat, c.bin, c.gain, c.missing_left)),
+            plain.map(|c| (c.feat, c.bin, c.gain, c.missing_left))
+        );
     }
 }

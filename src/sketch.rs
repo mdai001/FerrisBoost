@@ -54,6 +54,18 @@ pub struct FeatureSketch {
     /// 每层 summary 压缩后的容量。
     limit: usize,
     total_weight: f32,
+    /// `Some` for a categorical feature: no quantile summary is kept, only the
+    /// largest code and the first invalid value.
+    cat: Option<CatState>,
+}
+
+/// What a categorical feature's scan has seen so far.
+#[derive(Clone, Copy, Debug)]
+struct CatState {
+    /// Largest valid category code, `-1` while none has been seen.
+    max_code: i32,
+    /// The first value that is not a valid code (NaN is missing, not invalid).
+    bad: Option<f32>,
 }
 
 impl FeatureSketch {
@@ -64,7 +76,28 @@ impl FeatureSketch {
             levels: Vec::new(),
             limit,
             total_weight: 0.0,
+            cat: None,
         }
+    }
+
+    /// A categorical feature: values are category codes, binned one per code
+    /// (no sketch). Zero-weight rows still count, like XGBoost's category set.
+    pub fn new_categorical() -> Self {
+        Self {
+            buffer: Vec::new(),
+            levels: Vec::new(),
+            limit: 0,
+            total_weight: 0.0,
+            cat: Some(CatState {
+                max_code: -1,
+                bad: None,
+            }),
+        }
+    }
+
+    /// The first invalid category value seen, if this is a categorical feature.
+    pub fn invalid_category(&self) -> Option<f32> {
+        self.cat.and_then(|c| c.bad)
     }
 
     pub fn total_weight(&self) -> f32 {
@@ -76,6 +109,16 @@ impl FeatureSketch {
     /// NaN 直接丢弃 —— 缺失值不参与分箱,训练时走 default direction,
     /// 不占 bin。这一点和 XGBoost 一致。
     pub fn push(&mut self, value: f32, weight: f32) {
+        if let Some(cat) = &mut self.cat {
+            if !value.is_nan() {
+                if crate::categorical::invalid_code(value) {
+                    cat.bad.get_or_insert(value);
+                } else {
+                    cat.max_code = cat.max_code.max(value as i32);
+                }
+            }
+            return;
+        }
         if value.is_nan() || weight <= 0.0 {
             return;
         }
@@ -143,6 +186,13 @@ impl FeatureSketch {
 
     /// 合并另一个草图。多线程、多机、分批处理都走这条。
     pub fn merge(&mut self, other: &FeatureSketch) {
+        if let (Some(a), Some(b)) = (&mut self.cat, &other.cat) {
+            a.max_code = a.max_code.max(b.max_code);
+            if a.bad.is_none() {
+                a.bad = b.bad;
+            }
+            return;
+        }
         let mut tmp = other.snapshot();
         let b: Vec<Entry> = tmp.collapse().to_vec();
         let a: Vec<Entry> = self.collapse().to_vec();
@@ -163,6 +213,7 @@ impl FeatureSketch {
             limit: self.limit,
             // 权重由调用方累加,这里置零免得重复计
             total_weight: 0.0,
+            cat: self.cat,
         }
     }
 
@@ -173,6 +224,10 @@ impl FeatureSketch {
     // Keep the current closure form until the crate's supported Rust version is explicit.
     #[allow(clippy::unnecessary_map_or)]
     pub fn cuts(&mut self, max_bins: usize) -> Vec<f32> {
+        if let Some(cat) = self.cat {
+            // One bin per code `0..=max_code`, independent of `max_bins`.
+            return BinCuts::categorical_cuts(cat.max_code.max(0) as u32);
+        }
         let n_cuts = max_bins.saturating_sub(1);
         if n_cuts == 0 {
             return Vec::new();
@@ -383,6 +438,23 @@ impl SketchSet {
         }
     }
 
+    /// Like [`Self::new`], with `categorical[f]` marking feature `f` as
+    /// categorical. A shorter (or empty) list leaves the rest numeric.
+    pub fn with_categorical(n_feats: usize, max_bins: usize, categorical: &[bool]) -> Self {
+        Self {
+            per_feat: (0..n_feats)
+                .map(|f| {
+                    if categorical.get(f).copied().unwrap_or(false) {
+                        FeatureSketch::new_categorical()
+                    } else {
+                        FeatureSketch::new(max_bins)
+                    }
+                })
+                .collect(),
+            max_bins,
+        }
+    }
+
     /// 喂入一行(稠密)。NaN 表示缺失,会被 push 丢弃。
     /// 特征数。流式输入时用来校验各批的列数一致。
     pub fn n_feats(&self) -> usize {
@@ -430,18 +502,36 @@ impl SketchSet {
     }
 
     /// 拼接成扁平的 BinCuts。
-    pub fn finalize(mut self) -> BinCuts {
+    ///
+    /// Panics if a categorical feature saw an invalid code; callers that
+    /// accept categorical features use [`Self::finalize_checked`].
+    pub fn finalize(self) -> BinCuts {
+        self.finalize_checked(&[])
+            .expect("categorical feature with an invalid code; use finalize_checked")
+    }
+
+    /// 拼接成扁平的 BinCuts,并把类别特征的非法取值变成错误。
+    /// `names` (when it covers the feature) names the offending column.
+    pub fn finalize_checked(mut self, names: &[String]) -> anyhow::Result<BinCuts> {
         let max_bins = self.max_bins;
         let mut values = Vec::new();
         let mut offsets = Vec::with_capacity(self.per_feat.len() + 1);
         offsets.push(0u32);
+        let mut categorical = Vec::with_capacity(self.per_feat.len());
 
-        for sk in self.per_feat.iter_mut() {
+        for (f, sk) in self.per_feat.iter_mut().enumerate() {
+            if let Some(bad) = sk.invalid_category() {
+                let label = names
+                    .get(f)
+                    .map_or_else(|| format!("#{f}"), |n| format!("{n:?}"));
+                anyhow::bail!(crate::categorical::invalid_code_message(&label, bad));
+            }
+            categorical.push(sk.cat.is_some());
             values.extend_from_slice(&sk.cuts(max_bins));
             offsets.push(values.len() as u32);
         }
 
-        BinCuts::new(values, offsets)
+        BinCuts::new(values, offsets).with_categorical(&categorical)
     }
 }
 
