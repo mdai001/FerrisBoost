@@ -44,6 +44,17 @@ pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
     }
 }
 
+/// `gpu_math = "fast"` 的 reg:quantileerror 归约形状。block 数是**固定常量**
+/// (不随行数/设备变化),这是逐次运行逐位确定的前提;必须和 `histogram.cu`
+/// 的 `QUANTILE_REDUCE_BLOCKS` 相同(有单测对拍源码)。
+pub(crate) const QUANTILE_REDUCE_BLOCKS: u32 = 256;
+
+/// fast 模式的归约暂存:`QUANTILE_REDUCE_BLOCKS` 个 block 各一对 f64 partial
+/// (`Σ w·sqrt|p-y|`、`Σ w`),外加 1 个 f64 的 scale。训练级一次分配、整个训练复用,
+/// O(block 数),与行数无关。规划器(`StreamingMemModel::new`)和
+/// `GpuTrainCtx::new` 用同一个常量计费。
+pub(crate) const FAST_QUANTILE_SCRATCH_BYTES: u64 = (QUANTILE_REDUCE_BLOCKS as u64 * 2 + 1) * 8;
+
 /// Shared row-major staging policy for planning and runtime allocation.
 pub(crate) const RM_STAGE_BYTES: u64 = 32 * 1024 * 1024;
 const RM_STAGE_MIN_PER_SLOT: u64 = 4 * 1024 * 1024;
@@ -113,8 +124,12 @@ impl StreamingMemModel {
         let partition_scratch = n_rows + partition_arrays.max(8 * 1024 * 1024);
         let prediction = n_rows * 4;
         let gpair_f32 = if device_quantize { n_rows * 2 * 4 } else { 0 };
-        // fast 模式:常驻 prediction + label,各 4 B/行。
-        let fast = if fast_math { n_rows * 4 * 2 } else { 0 };
+        // fast 模式:常驻 prediction + label,各 4 B/行,外加固定大小的 quantile 归约暂存。
+        let fast = if fast_math {
+            n_rows * 4 * 2 + FAST_QUANTILE_SCRATCH_BYTES
+        } else {
+            0
+        };
         let stage = if row_major { rm_stage_bytes } else { 0 };
 
         let fixed_bytes = gpair
@@ -1087,6 +1102,25 @@ mod resolve_tests {
             p.physical_blocks >= 2,
             "不该塌成 1 块:{} 块",
             p.physical_blocks
+        );
+    }
+
+    #[test]
+    fn fast_mode_charges_the_quantile_reduction_scratch() {
+        let rows = 1_000_000u64;
+        let exact = StreamingMemModel::new(rows, 255, 1, 16, true, false, true, 0);
+        let fast = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        // 8 B/行 常驻 prediction + label,外加与行数无关的固定归约暂存。
+        assert_eq!(
+            fast.fixed_bytes - exact.fixed_bytes,
+            rows * 8 + FAST_QUANTILE_SCRATCH_BYTES
+        );
+        assert_eq!(FAST_QUANTILE_SCRATCH_BYTES, (256 * 2 + 1) * 8);
+        // 归约形状常量必须和 kernel 里的 #define 一致。
+        let cu = include_str!("backend/cuda/histogram.cu");
+        assert!(
+            cu.contains(&format!("#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u")),
+            "histogram.cu 的 QUANTILE_REDUCE_BLOCKS 与 gpu_mem_plan 不一致"
         );
     }
 

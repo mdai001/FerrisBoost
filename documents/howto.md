@@ -257,10 +257,12 @@ distinct values than `max_bin` and `nthread=1` (the global scale is summed
 serially here, so results do not depend on the thread count).
 
 Limits: several `quantile_alpha` values (multi-output) are rejected, one model
-per quantile is the supported pattern. `gpu_math="fast"` is rejected with an
-error for this objective because the scale needs a reduction over all rows
-before the per-row gradients; use `gpu_math="exact"`, which is byte-identical
-to the CPU.
+per quantile is the supported pattern. `gpu_math="fast"` is supported: the
+scale is reduced on the device in a fixed shape (fixed block count, per-block
+partial sums, one final single-block reduction in a fixed order, no float
+atomics), so a fast run is deterministic from run to run, but it is not
+byte-identical to the CPU (the summation order and the device `tanh` differ);
+`gpu_math="exact"` stays byte-identical to the CPU.
 
 ## Regularization and class imbalance
 
@@ -1012,7 +1014,9 @@ memory budget, without manual chunk or batch tuning:
   `reg:pseudohubererror`. It is deterministic from run to run but not
   byte-identical to CPU. Support for the newer regression objectives is a
   first version; it is correct, and its speed will be optimized in 0.0.6.
-- **`gpu_math="fast"` and `reg:quantileerror`**: not supported (clear error); its gradients need a global reduction first. Use `gpu_math="exact"`.
+- **`gpu_math="fast"` and `reg:quantileerror`**: supported. The global scale is
+  reduced on the device in a fixed shape, so it is deterministic from run to run
+  but not byte-identical to CPU. `gpu_math="exact"` stays byte-identical.
 - **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
 - **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported (device softmax gradients); optimization continues in 0.0.6.
 - **Categorical features**: supported with both `gpu_math` modes. Split search

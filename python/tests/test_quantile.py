@@ -177,8 +177,19 @@ def test_gpu_exact_matches_cpu(tmp_path, alpha):
 
 
 @cuda
-def test_gpu_fast_is_rejected_with_a_clear_error():
-    x, y = make(n=500)
-    with pytest.raises(Exception, match="gpu_math"):
-        fb.train({"objective": "reg:quantileerror", "quantile_alpha": 0.5, "device": "cuda",
-                  "gpu_math": "fast"}, x, label=y, num_boost_round=2, quiet=True)
+@pytest.mark.parametrize("alpha", [0.1, 0.5, 0.9])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_gpu_fast_is_deterministic_and_calibrated(tmp_path, alpha, weighted):
+    x, y = make(n=6000, seed=21)
+    w = np.random.default_rng(21).uniform(0.2, 3, len(y)).astype(np.float32) if weighted else None
+    p = {"objective": "reg:quantileerror", "quantile_alpha": alpha, "max_depth": 5,
+         "device": "cuda", "gpu_math": "fast"}
+    runs = [fb.train(p, x, label=y, weight=w, num_boost_round=20, quiet=True) for _ in range(2)]
+    # fast: byte-identical from run to run (not necessarily equal to the CPU).
+    assert model_bytes(runs[0], tmp_path, "a") == model_bytes(runs[1], tmp_path, "b")
+    exact = fb.train({**p, "gpu_math": "exact"}, x, label=y, weight=w, num_boost_round=20,
+                     quiet=True)
+    cover = float(np.mean(y <= runs[0].predict(x)))
+    cover_exact = float(np.mean(y <= exact.predict(x)))
+    assert abs(cover - alpha) < 0.06
+    assert abs(cover - cover_exact) < 0.03
