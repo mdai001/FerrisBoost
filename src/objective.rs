@@ -487,15 +487,12 @@ impl Objective {
             // 多分类不走这个单输出 kernel:fast 用 softmax_row_stats /
             // softmax_class_gradient / add_class_delta(见 histogram.cu)。
             Objective::Softprob { .. } | Objective::Softmax { .. } => u32::MAX,
-            // quantile 的梯度要先对全体行归约一个 scale,单趟逐行 kernel 做不了。
-            Objective::Quantile { .. } => u32::MAX,
+            // quantile 不走单趟 `apply_delta_and_gradient`:梯度要先对全体行归约一个
+            // scale,fast 用专门的三个 kernel(`quantile_apply_delta_partials` →
+            // `quantile_reduce_scale` → `quantile_gradient_rows`,alpha 经
+            // `device_param` 传入)。这个编号只用来在 host 侧分派,kernel 不读它。
+            Objective::Quantile { .. } => 6,
         }
-    }
-
-    /// `gpu_math="fast"` 的单输出梯度 kernel 或多分类 kernel 能不能算这个
-    /// objective。quantile 不能(需要每轮的全局归约),`fast` 对它显式报错。
-    pub fn supports_gpu_fast(self) -> bool {
-        !self.is_quantile()
     }
 
     /// fast kernel 的 objective 参数(没有参数的 objective 传 0)。
@@ -504,6 +501,7 @@ impl Objective {
             Objective::Poisson { max_delta_step } => max_delta_step,
             Objective::Tweedie { variance_power } => variance_power,
             Objective::PseudoHuber { slope } => slope,
+            Objective::Quantile { alpha } => alpha,
             _ => 0.0,
         }
     }
@@ -875,14 +873,14 @@ mod tests {
     fn device_codes_are_distinct() {
         let codes: Vec<u32> = Objective::ALL
             .iter()
-            .filter(|o| o.supports_gpu_fast())
+            .filter(|o| !o.is_multiclass())
             .map(|o| o.device_code())
             .collect();
-        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            Objective::Quantile { alpha: 0.5 }.device_code(),
-            u32::MAX,
-            "quantile 不进单趟 fast kernel"
+            Objective::Quantile { alpha: 0.3 }.device_param(),
+            0.3,
+            "quantile 的 alpha 经 device_param 传给 fast kernel"
         );
     }
 
