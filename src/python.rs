@@ -26,6 +26,8 @@ use crate::source::parquet_source::{ParquetBlockSource, QuantizedCacheOptions};
 use crate::source::{csv_source, parquet_source, DenseSource};
 use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 
+mod explain;
+
 fn on_off(flag: bool) -> &'static str {
     if flag {
         "on"
@@ -1523,7 +1525,19 @@ impl PyModel {
         let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
         for (c, view) in views.iter().enumerate() {
             let nt = self.inner.class_tree_count(upto, c);
-            let out = view.predict(py, data, true, Some(nt), header, predict_threads, use_gpu)?;
+            let out = view.predict(
+                py,
+                data,
+                true,
+                Some(nt),
+                header,
+                predict_threads,
+                use_gpu,
+                false,
+                false,
+                false,
+                false,
+            )?;
             let arr = out
                 .cast::<PyArray1<f32>>()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1777,7 +1791,8 @@ impl PyModel {
     /// 和 XGBoost 的 `Booster.predict()` 一样,**默认用全部树**,
     /// 即使早停记了 best_iteration。要截断传 `n_trees`。
     #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, use_gpu=false))]
+                        predict_threads=0, use_gpu=false, pred_contribs=false,
+                        approx_contribs=false, pred_interactions=false, pred_leaf=false))]
     /// 预测。`data` 可以是:
     ///
     /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
@@ -1795,7 +1810,30 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         use_gpu: bool,
+        pred_contribs: bool,
+        approx_contribs: bool,
+        pred_interactions: bool,
+        pred_leaf: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // SHAP contributions / interactions / leaf indices (CPU only; `use_gpu`
+        // does not apply). Single code path for all objectives and inputs.
+        let explain = explain::ExplainRequest {
+            contribs: pred_contribs,
+            approx: approx_contribs,
+            interactions: pred_interactions,
+            leaf: pred_leaf,
+        };
+        if explain.any() {
+            return self.predict_explain(
+                py,
+                data,
+                explain,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+            );
+        }
         ensure_gpu_prediction_available(use_gpu)?;
         if self.inner.num_outputs() > 1 {
             return self.predict_multiclass(
@@ -2390,6 +2428,19 @@ impl PyModel {
     #[getter]
     fn n_features(&self) -> usize {
         self.inner.n_features
+    }
+
+    /// Feature importance with XGBoost's `Booster.get_score` semantics:
+    /// `importance_type` is "weight", "gain", "cover", "total_gain" or
+    /// "total_cover". Features never used in a split are omitted; names are
+    /// the model's feature names, or `f0`, `f1`, ... when it has none.
+    #[pyo3(signature = (importance_type="weight"))]
+    fn get_score<'py>(
+        &self,
+        py: Python<'py>,
+        importance_type: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.feature_score_dict(py, importance_type)
     }
 
     /// evals_result:{eval 名: {metric 名: [每轮的值]}}

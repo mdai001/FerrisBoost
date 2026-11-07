@@ -909,6 +909,36 @@ print(model.best_score)
 print(model.evals_result())
 ```
 
+## Feature importance, SHAP values, and leaf indices
+
+These follow XGBoost 3.4.1 (`Booster.get_score` and the `pred_contribs`, `approx_contribs`, `pred_interactions`, and `pred_leaf` options of `Booster.predict`) and work on models trained by FerrisBoost or loaded from XGBoost JSON.
+
+```python
+model.get_score()                           # {"f0": 12.0, "f3": 7.0, ...}
+model.get_score(importance_type="gain")
+
+contribs = model.predict(X_test, pred_contribs=True)          # (n, n_features + 1)
+saabas = model.predict(X_test, pred_contribs=True, approx_contribs=True)
+inter = model.predict(X_test, pred_interactions=True)         # (n, n_features + 1, n_features + 1)
+leaves = model.predict(X_test, pred_leaf=True)                # (n, n_trees)
+```
+
+`get_score(importance_type=...)` returns `{feature_name: score}` for every feature used in at least one split, in feature order; features that are never used are omitted. `importance_type` is one of:
+
+- `"weight"` (default): the number of splits that use the feature across all trees.
+- `"gain"` / `"total_gain"`: the average / summed split gain of those splits.
+- `"cover"` / `"total_cover"`: the average / summed Hessian sum (`sum_hessian`) of the split nodes.
+
+Names are the model's feature names (from a named file or table schema), or `f0`, `f1`, ... when the model was trained from a NumPy array. The scores come from the gain and Hessian sum that every tree node stores, so they also work on models loaded from XGBoost JSON.
+
+`predict(..., pred_contribs=True)` returns exact TreeSHAP values in margin space. Every row sums to the raw margin (`output_margin=True`), and the last column is the bias term: the model's `base_score` (as a margin) plus the cover-weighted mean of the trees. With `approx_contribs=True` it returns the faster Saabas attribution instead. Multiclass models return `(n, num_class, n_features + 1)`, one attribution matrix per class.
+
+`pred_interactions=True` returns SHAP interaction values `(n, n_features + 1, n_features + 1)` (multiclass: `(n, num_class, n_features + 1, n_features + 1)`). The matrices are symmetric, each row sums to the matching `pred_contribs` row, and the whole matrix sums to the margin. Memory grows with `n * (n_features + 1)^2`, so score wide data in batches. Combining `pred_interactions=True` with `approx_contribs=True` raises an error: XGBoost 3.4.1 returns a diagonal-only matrix there.
+
+`pred_leaf=True` returns, for every row, the node index of the leaf it reaches in each tree, as `float32` like XGBoost; indices are node ids within the tree. The result has shape `(n, n_trees)` (a multiclass model has `num_class` trees per round).
+
+These options accept the same inputs as normal prediction: a two-dimensional `float32` array, or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU, and `base_margin` per-row offsets are not supported because FerrisBoost prediction has no such input.
+
 ## Save, load, and exchange models with XGBoost
 
 FerrisBoost saves XGBoost-compatible JSON:

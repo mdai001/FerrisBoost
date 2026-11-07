@@ -242,6 +242,10 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.6 (unreleased)
+
+- Added `Model.get_score(importance_type)` (`weight`, `gain`, `cover`, `total_gain`, `total_cover`) and `predict(..., pred_contribs=True)` (exact TreeSHAP, bias last), `approx_contribs=True` (Saabas), `pred_interactions=True`, and `pred_leaf=True`, with XGBoost 3.4.1 semantics and output shapes, for numpy and file inputs, binary, regression, and multiclass models, and models loaded from XGBoost JSON. They run on the CPU, row-parallel and deterministic across thread counts, and honor `n_trees`.
+
 ### 0.0.5
 
 - Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.
