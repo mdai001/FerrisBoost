@@ -328,6 +328,26 @@ impl Model {
         }
     }
 
+    /// 只含第 `[begin, end)` **轮**的模型(每轮 `num_outputs()` 棵树),
+    /// base_score / objective / 特征信息原样保留。`iteration_range` 的实现。
+    pub fn slice_rounds(&self, begin: usize, end: usize) -> Model {
+        let k = self.num_outputs();
+        assert!(begin <= end && end * k <= self.trees.len(), "轮次区间越界");
+        Model {
+            trees: self.trees[begin * k..end * k].to_vec(),
+            base_score: self.base_score,
+            objective: self.objective,
+            n_features: self.n_features,
+            best_iteration: None,
+            best_score: None,
+            feature_names: self.feature_names.clone(),
+            schema_mode: self.schema_mode,
+            class_base_margins: self.class_base_margins.clone(),
+            scale_pos_weight: self.scale_pos_weight,
+            feature_types: self.feature_types.clone(),
+        }
+    }
+
     /// 总树数前缀 `n_trees` 里属于第 `class` 类的棵数。
     pub fn class_tree_count(&self, n_trees: usize, class: usize) -> usize {
         let k = self.num_outputs();

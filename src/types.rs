@@ -383,6 +383,11 @@ pub struct TrainParams {
     pub scale_pos_weight: f32,
     pub subsample: f32,
     pub colsample_bytree: f32,
+    /// XGBoost `colsample_bylevel`:每层从 bytree 集合里再采一次(同层所有节点
+    /// 共用)。只限制 **split 枚举**,不减少直方图/IO(与 XGBoost 一致)。
+    pub colsample_bylevel: f32,
+    /// XGBoost `colsample_bynode`:每个节点从层集合里再采一次。同上。
+    pub colsample_bynode: f32,
     /// 每个列块包含多少个特征。决定内存工作集和并行粒度。
     ///
     /// 注意它同时是**并行度的上限**:并行维度就是列块,
@@ -548,6 +553,8 @@ impl Default for TrainParams {
             scale_pos_weight: 1.0,
             subsample: 1.0,
             colsample_bytree: 1.0,
+            colsample_bylevel: 1.0,
+            colsample_bynode: 1.0,
             cols_per_block: 64,
             nthread: 0,
             hist_streams: None,
@@ -594,6 +601,13 @@ pub enum Objective {
     /// `multi:softmax`:同上,预测是概率最大的类别下标(f32)。
     Softmax {
         num_class: u32,
+    },
+    /// `reg:quantileerror`,单个 `quantile_alpha` ∈ [0, 1]。XGBoost 3.4.1 的
+    /// 实现是**平滑 pinball 损失**,梯度依赖每轮由全体行的预测归约出的标量
+    /// scale,所以它是唯一一个梯度不是逐行纯函数的 objective(见
+    /// `Objective::quantile_scale`)。向量 alpha(多输出)不支持。
+    Quantile {
+        alpha: f32,
     },
 }
 

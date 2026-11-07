@@ -225,6 +225,59 @@ def test_numeric_models_keep_their_json_unchanged(tmp_path):
         assert t["categories"] == [] and set(t["split_type"]) <= {0}
 
 
+# --------------------------------------------------------------------------- explanations
+SHAP_ATOL = 2e-5
+
+
+@pytest.mark.parametrize("objective, extra", [("reg:squarederror", {}),
+                                              ("multi:softprob", {"num_class": 3})])
+def test_explanations_on_a_categorical_model_match_xgboost(tmp_path, objective, extra):
+    x, y, ft = make_data(n=800, cat_levels=(7, 3, 20), seed=30, missing=0.1, objective=objective)
+    params = {"objective": objective, "max_depth": 4, **extra}
+    ours = fb_train(x, y, ft, params, 5)
+    path = str(tmp_path / "m.json")
+    ours.save_model(path, quiet=True)
+    bst = xgb.Booster(model_file=path)
+    d = xgb.DMatrix(x, feature_types=ft, enable_categorical=True)
+    probe = x[:120].copy()
+    probe[::7, 2] = 9.0       # a category absent from the training codes of that column
+    probe[3, 3] = np.nan
+    dp = xgb.DMatrix(probe, feature_types=ft, enable_categorical=True)
+    np.testing.assert_allclose(ours.predict(probe, pred_contribs=True),
+                               bst.predict(dp, pred_contribs=True), rtol=0, atol=SHAP_ATOL)
+    np.testing.assert_allclose(ours.predict(probe, pred_contribs=True, approx_contribs=True),
+                               bst.predict(dp, pred_contribs=True, approx_contribs=True),
+                               rtol=0, atol=SHAP_ATOL)
+    np.testing.assert_array_equal(ours.predict(probe, pred_leaf=True),
+                                  bst.predict(dp, pred_leaf=True))
+    if objective == "reg:squarederror":
+        np.testing.assert_allclose(ours.predict(probe, pred_interactions=True),
+                                   bst.predict(dp, pred_interactions=True), rtol=0, atol=SHAP_ATOL)
+    for kind in ("weight", "gain", "cover", "total_gain", "total_cover"):
+        got, want = ours.get_score(importance_type=kind), bst.get_score(importance_type=kind)
+        assert got.keys() == want.keys()
+        for k in got:
+            assert got[k] == pytest.approx(want[k], rel=2e-6)
+    # Contributions sum to the margin.
+    contribs = ours.predict(probe, pred_contribs=True)
+    margin = ours.predict(probe, output_margin=True)
+    np.testing.assert_allclose(contribs.sum(axis=-1), margin, rtol=0, atol=1e-4)
+
+
+def test_explanations_on_a_loaded_xgboost_categorical_model():
+    x, y, ft = make_data(n=800, cat_levels=(7, 40), seed=31, missing=0.1)
+    bst, d = xgb_train(x, y, ft, {"objective": "reg:squarederror", "max_depth": 5}, 5)
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "x.json")
+        bst.save_model(path)
+        ours = fb.Model.load_model(path, quiet=True)
+    np.testing.assert_allclose(ours.predict(x[:100], pred_contribs=True),
+                               bst.predict(xgb.DMatrix(x[:100], feature_types=ft,
+                                                       enable_categorical=True),
+                                           pred_contribs=True), rtol=0, atol=SHAP_ATOL)
+
+
 # --------------------------------------------------------------------------- inputs
 def frame_data(n=600, seed=0):
     pd = pytest.importorskip("pandas")

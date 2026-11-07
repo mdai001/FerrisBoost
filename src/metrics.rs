@@ -385,6 +385,7 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
             Box::new(Elementwise::new(Ew::TweedieNll(variance_power), obj))
         }
         Objective::PseudoHuber { slope } => Box::new(Elementwise::new(Ew::Mphe(slope), obj)),
+        Objective::Quantile { alpha } => Box::new(Elementwise::new(Ew::Quantile(alpha), obj)),
         Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
             Box::new(MultiClass::new(MultiKind::LogLoss, num_class as usize))
         }
@@ -444,7 +445,7 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
 /// 报错里列出的全部 metric 名字。
 pub const SUPPORTED_METRICS: &str =
     "rmse / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
-poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / mlogloss / merror";
+poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / quantile / mlogloss / merror";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
     match name {
@@ -485,6 +486,8 @@ pub enum Ew {
     TweedieNll(f32),
     /// `error@t`(t ≠ 0.5 时名字带阈值)
     Error(f32),
+    /// `quantile`,参数是 objective 的 `quantile_alpha`(pinball 损失)。
+    Quantile(f32),
 }
 
 impl Ew {
@@ -514,6 +517,14 @@ impl Ew {
                 Objective::PseudoHuber { slope } => slope,
                 _ => crate::objective::HUBER_DEFAULT_SLOPE,
             })),
+            "quantile" => match obj {
+                Objective::Quantile { alpha } => no_param(Ew::Quantile(alpha)),
+                _ => Err(
+                    "eval_metric \"quantile\" 需要 objective=\"reg:quantileerror\"(它的 alpha \
+                     来自 quantile_alpha)"
+                        .into(),
+                ),
+            },
             "poisson-nloglik" => no_param(Ew::PoissonNll),
             "gamma-deviance" => no_param(Ew::GammaDeviance),
             "gamma-nloglik" => no_param(Ew::GammaNll),
@@ -550,6 +561,7 @@ impl Ew {
             Ew::GammaDeviance => "gamma-deviance".into(),
             Ew::GammaNll => "gamma-nloglik".into(),
             Ew::TweedieNll(rho) => format!("tweedie-nloglik@{}", xgb_float(rho)),
+            Ew::Quantile(_) => "quantile".into(),
             Ew::Error(0.5) => "error".into(),
             Ew::Error(t) => format!("error@{}", xgb_float(t)),
         }
@@ -596,6 +608,12 @@ impl Ew {
                 } else {
                     y
                 }
+            }
+            // XGBoost `QuantileError`:`(a·sign·d) − (1−a)·(1−sign)·d`,d = y − p。
+            Ew::Quantile(a) => {
+                let d = y - p;
+                let sign = f32::from(d >= 0.0);
+                (a * sign * d) - (1.0 - a) * (1.0 - sign) * d
             }
         }
     }

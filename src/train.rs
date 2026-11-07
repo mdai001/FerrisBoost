@@ -957,6 +957,14 @@ fn train_with_backend(
     }
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
+    anyhow::ensure!(
+        gpu_device.is_none()
+            || cfg.params.gpu_math != crate::types::GpuMath::Fast
+            || cfg.objective.supports_gpu_fast(),
+        "{} 不支持 gpu_math=\"fast\":它的梯度要先对全体行归约一个 scale,\
+         单趟 device 梯度 kernel 做不了;请用 gpu_math=\"exact\"(CPU/GPU 逐字节相同)",
+        cfg.objective.name()
+    );
     let num_class = cfg.objective.num_outputs();
     // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
     // (XGBoost 把标量复制成 K 份),否则按类别频率估计。
@@ -1050,6 +1058,16 @@ fn train_with_backend(
         p.colsample_bytree > 0.0 && p.colsample_bytree <= 1.0 && p.colsample_bytree.is_finite(),
         "colsample_bytree 必须在 (0, 1],收到 {}",
         p.colsample_bytree
+    );
+    anyhow::ensure!(
+        p.colsample_bylevel > 0.0 && p.colsample_bylevel <= 1.0 && p.colsample_bylevel.is_finite(),
+        "colsample_bylevel 必须在 (0, 1],收到 {}",
+        p.colsample_bylevel
+    );
+    anyhow::ensure!(
+        p.colsample_bynode > 0.0 && p.colsample_bynode <= 1.0 && p.colsample_bynode.is_finite(),
+        "colsample_bynode 必须在 (0, 1],收到 {}",
+        p.colsample_bynode
     );
     for ev in evals {
         anyhow::ensure!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
@@ -1300,6 +1318,20 @@ fn train_with_backend(
             pool.install(|| -> anyhow::Result<()> {
                 let _t = prof::Timer::new(&prof::GRAD);
                 ctx.with_prediction_delta(&mut |delta| {
+                    if obj.is_quantile() {
+                        // 梯度依赖全体行的更新后预测(全局 scale):先施加 delta
+                        // 再整体求梯度,不能边施加边算。
+                        predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .for_each(|(p, d)| *p += *d);
+                        let qs = Objective::quantile_scale(&predictions, labels, weights);
+                        out = match grad_weights {
+                            None => compute_gradients(&predictions, labels, obj, qs),
+                            Some(w) => compute_gradients_weighted(&predictions, labels, w, obj, qs),
+                        };
+                        return;
+                    }
                     out = match grad_weights {
                         None => predictions
                             .par_iter_mut()
@@ -1307,7 +1339,7 @@ fn train_with_backend(
                             .zip(labels.par_iter())
                             .map(|((p, d), &y)| {
                                 *p += *d;
-                                gradient_of(*p, y, obj)
+                                gradient_of(*p, y, obj, 0.0)
                             })
                             .collect(),
                         Some(w) => predictions
@@ -1316,7 +1348,7 @@ fn train_with_backend(
                             .zip(labels.par_iter().zip(w.par_iter()))
                             .map(|((p, d), (&y, &w))| {
                                 *p += *d;
-                                weighted(gradient_of(*p, y, obj), w)
+                                weighted(gradient_of(*p, y, obj, 0.0), w)
                             })
                             .collect(),
                     };
@@ -1327,9 +1359,18 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
+                // quantile 的 scale 是对全体行预测的串行 f64 归约(其它
+                // objective 不用,传 0)。
+                let qs = if cfg.objective.is_quantile() {
+                    Objective::quantile_scale(&predictions, labels, weights)
+                } else {
+                    0.0
+                };
                 match grad_weights {
-                    None => compute_gradients(&predictions, labels, cfg.objective),
-                    Some(w) => compute_gradients_weighted(&predictions, labels, w, cfg.objective),
+                    None => compute_gradients(&predictions, labels, cfg.objective, qs),
+                    Some(w) => {
+                        compute_gradients_weighted(&predictions, labels, w, cfg.objective, qs)
+                    }
                 }
             })
         };
@@ -1475,6 +1516,12 @@ fn train_with_backend(
                 comm,
                 gpu.as_ref(),
                 sampled.as_deref(),
+                crate::colsample::NestedSampler::new(
+                    cfg.params.colsample_bylevel,
+                    cfg.params.colsample_bynode,
+                    cfg.params.seed,
+                    round,
+                ),
             )
         })?;
         // GPU 路径的叶子增量留在 device buffer 里没有施加,记一笔债;
@@ -1606,7 +1653,12 @@ pub fn train_gpu_one_tree(
     let base_score = cfg.resolve_base_score(labels, None);
     let margin = base_margin(cfg.objective, base_score);
     let predictions = vec![margin; source.n_rows()];
-    let gpair = compute_gradients(&predictions, labels, cfg.objective);
+    let qs = if cfg.objective.is_quantile() {
+        Objective::quantile_scale(&predictions, labels, None)
+    } else {
+        0.0
+    };
+    let gpair = compute_gradients(&predictions, labels, cfg.objective, qs);
     let quantizer = GradQuantizer::try_new(&gpair, source.n_rows())?;
     let fixed: Vec<GradPairFixed> = gpair.iter().map(|&g| quantizer.to_fixed(g)).collect();
     let root_sum = hist::node_sum(&fixed, None);
@@ -1873,6 +1925,12 @@ fn train_multiclass_rounds(
                     comm,
                     gpu,
                     sampled.as_deref(),
+                    crate::colsample::NestedSampler::new(
+                        cfg.params.colsample_bylevel,
+                        cfg.params.colsample_bynode,
+                        cfg.params.seed,
+                        tree_index as usize,
+                    ),
                 )
             })?;
             // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
@@ -2203,6 +2261,9 @@ fn build_tree(
     gpu: Option<&crate::backend::cuda::GpuTrainCtx>,
     // 本棵树的采样特征集(全局 id,升序)。`None` = 全选。
     sampled: Option<&[FeatId]>,
+    // `colsample_bylevel` / `colsample_bynode`:只缩小 split 枚举的特征集,
+    // 直方图仍按 `sampled` 建。`None` = 两者都是 1。
+    nested: Option<crate::colsample::NestedSampler>,
 ) -> anyhow::Result<Tree> {
     let p = &cfg.params;
 
@@ -2323,11 +2384,41 @@ fn build_tree(
     }];
     // 上一层的直方图,[列块][槽位]。兄弟相减要用,所以整层都得留着。
     let mut parent_hists: Vec<Vec<Histogram>> = Vec::new();
+    // bylevel / bynode 的起点:本树的 bytree 集合(没采样 = 全部特征)。
+    let tree_features: Vec<FeatId> = match (nested, sampled) {
+        (Some(_), Some(s)) => s.to_vec(),
+        (Some(_), None) => (0..source.n_features() as FeatId).collect(),
+        (None, _) => Vec::new(),
+    };
 
     for depth in 0..p.max_depth {
         if level.is_empty() {
             break;
         }
+        // ---- 本层每个节点的 split 枚举特征集 ----
+        //
+        // 层集合每层采一次,节点集合每节点采一次(嵌套:节点 ⊂ 层 ⊂ 树)。
+        // 种子只看 (seed, 树, 深度 / 节点号),CPU 与 GPU 同一个集合。
+        // 嵌套采样激活时 GPU 绕开 device split cache(它只有树级的特征掩码),
+        // 改用下载的直方图 + host 枚举 —— 与 cache 路径逐位等价的既有回退。
+        let level_set: Option<Vec<FeatId>> = nested.map(|n| n.level_set(&tree_features, depth));
+        let node_sets: Option<Vec<Vec<FeatId>>> = match (nested, level_set.as_deref()) {
+            (Some(n), Some(ls)) if n.samples_nodes() => Some(
+                level
+                    .iter()
+                    .map(|ln| n.node_set(ls, ln.node))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        // 节点 i 枚举用的特征集:节点集 > 层集 > bytree 集。
+        let enum_features = |i: usize| -> Option<&[FeatId]> {
+            match (&node_sets, &level_set) {
+                (Some(ns), _) => Some(ns[i].as_slice()),
+                (None, Some(ls)) => Some(ls.as_slice()),
+                (None, None) => sampled,
+            }
+        };
         // ★ 外层列块、内层节点。反过来写(外层节点、内层列块)每个
         // 节点都要重新过一遍所有列块,传输量从 O(数据) 变成
         // O(节点数 × 数据) —— 整个方案就没意义了。改这里要特别小心。
@@ -2440,7 +2531,7 @@ fn build_tree(
                         // 节点也必须走它。
                         let must_batch = session.requires_batched_hist();
                         #[cfg(feature = "cuda")]
-                        if session.begin_split_level(depth)? {
+                        if nested.is_none() && session.begin_split_level(depth)? {
                             use crate::backend::cuda::GpuSplitGroup;
                             let mut groups = Vec::new();
                             if depth == 0 {
@@ -2601,7 +2692,7 @@ fn build_tree(
                                 ln.sum,
                                 q,
                                 p,
-                                sampled,
+                                enum_features(i),
                                 monotone_at(p, ln.bounds),
                                 cuts.has_categorical().then(|| cuts.categorical_flags()),
                             )
@@ -3304,10 +3395,16 @@ pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
     obj.base_margin(base_score)
 }
 
-/// 单行的梯度;定义在 `Objective::gradient`。
+/// 单行的梯度;定义在 `Objective::gradient`。`quantile_scale` 只给
+/// `reg:quantileerror` 用(每轮的全局 scale),其它 objective 忽略。
 #[inline]
-fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
-    obj.gradient(pred, label)
+fn gradient_of(pred: f32, label: f32, obj: Objective, quantile_scale: f32) -> GradPair {
+    match obj {
+        Objective::Quantile { alpha } => {
+            Objective::quantile_gradient(alpha, quantile_scale, pred, label)
+        }
+        _ => obj.gradient(pred, label),
+    }
 }
 
 /// 训练会不会有一份逐行的梯度权重(样本权重,或折进 `scale_pos_weight`
@@ -3360,10 +3457,11 @@ fn compute_gradients_weighted(
     label: &[f32],
     weight: &[f32],
     obj: Objective,
+    quantile_scale: f32,
 ) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter().zip(weight.par_iter()))
-        .map(|(&p, (&y, &w))| weighted(gradient_of(p, y, obj), w))
+        .map(|(&p, (&y, &w))| weighted(gradient_of(p, y, obj, quantile_scale), w))
         .collect()
 }
 
@@ -3374,10 +3472,15 @@ fn compute_gradients_weighted(
 /// 它们只随行数走、完全不进列块那一维,所以以前无论开多少线程都是单线程跑。
 /// GPU 路径上尤其明显 —— HIGGS 1050 万行时 GRAD + QUANTIZE 合计约
 /// 145 ms/轮,占整轮 0.345 s 的四成以上,而那时 GPU 在干等。
-fn compute_gradients(pred: &[f32], label: &[f32], obj: Objective) -> Vec<GradPair> {
+fn compute_gradients(
+    pred: &[f32],
+    label: &[f32],
+    obj: Objective,
+    quantile_scale: f32,
+) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter())
-        .map(|(&p, &y)| gradient_of(p, y, obj))
+        .map(|(&p, &y)| gradient_of(p, y, obj, quantile_scale))
         .collect()
 }
 
@@ -3777,10 +3880,13 @@ mod tests {
             .collect();
         let src = DenseSource::from_row_major(&x, 40, 1, 255, 1);
         // 走加权均值(FitInterceptGlmLike)的 objective;gamma 要求标签为正,
-        // pseudohuber 走 Newton,另有测试。
-        let glm_like = Objective::ALL
-            .into_iter()
-            .filter(|o| !matches!(o, Objective::Gamma | Objective::PseudoHuber { .. }));
+        // pseudohuber 走 Newton,quantile 取分位数,各有自己的测试。
+        let glm_like = Objective::ALL.into_iter().filter(|o| {
+            !matches!(
+                o,
+                Objective::Gamma | Objective::PseudoHuber { .. } | Objective::Quantile { .. }
+            )
+        });
         for obj in glm_like {
             let cfg = TrainConfig::new(params(2, 1), obj);
             let m = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
@@ -4641,6 +4747,73 @@ mod tests {
             LogLoss.eval_weighted(&pred, &label, Some(&w)),
             (ll / wsum) as f32
         );
+    }
+
+    // ------------------------------------------------- quantile / 嵌套列采样
+
+    #[test]
+    fn quantile_objective_trains_reproducibly_and_tracks_the_quantile() {
+        let (x, y, nf) = wiggly_data(2000, 4);
+        for alpha in [0.1f32, 0.5, 0.9] {
+            let obj = Objective::Quantile { alpha };
+            let mut p = params(4, 30);
+            p.nthread = 1;
+            let (a, src) = train_on(&x, &y, nf, p.clone(), obj);
+            p.nthread = 3;
+            let (b, _) = train_on(&x, &y, nf, p, obj);
+            assert_eq!(json(&a), json(&b), "alpha={alpha}: 线程数不能改变模型");
+            let pred = predict_on(&a, &src).unwrap();
+            let below = y.iter().zip(&pred).filter(|(y, p)| *y <= *p).count();
+            let frac = below as f32 / y.len() as f32;
+            assert!((frac - alpha).abs() < 0.12, "alpha={alpha} frac={frac}");
+        }
+    }
+
+    #[test]
+    fn nested_column_sampling_is_thread_and_blocking_invariant() {
+        let (x, y, nf) = wiggly_data(1500, 6);
+        let mut base = params(5, 6);
+        base.seed = 9;
+        let full = {
+            let (m, _) = train_on(&x, &y, nf, base.clone(), Objective::SquaredError);
+            json(&m)
+        };
+        for (bylevel, bynode) in [(0.6f32, 1.0f32), (1.0, 0.6), (0.8, 0.5)] {
+            let mut p = base.clone();
+            p.colsample_bylevel = bylevel;
+            p.colsample_bynode = bynode;
+            p.nthread = 1;
+            let reference = {
+                let (m, _) = train_on(&x, &y, nf, p.clone(), Objective::SquaredError);
+                json(&m)
+            };
+            assert_ne!(reference, full, "({bylevel}, {bynode}) 应该改变模型");
+            for (threads, cols) in [(4usize, 2usize), (2, 1), (3, 5)] {
+                let mut q = p.clone();
+                q.nthread = threads;
+                q.cols_per_block = cols;
+                let (m, _) = train_on(&x, &y, nf, q, Objective::SquaredError);
+                assert_eq!(
+                    json(&m),
+                    reference,
+                    "({bylevel}, {bynode}) threads={threads} cols_per_block={cols}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_nested_rates_are_rejected() {
+        let (x, y, nf) = wiggly_data(100, 1);
+        for (bylevel, bynode) in [(0.0f32, 1.0f32), (1.0, 0.0), (1.5, 1.0), (1.0, f32::NAN)] {
+            let mut p = params(2, 1);
+            p.colsample_bylevel = bylevel;
+            p.colsample_bynode = bynode;
+            let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+            let cfg = TrainConfig::new(p, Objective::SquaredError);
+            let err = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap_err();
+            assert!(err.to_string().contains("colsample_by"), "{err}");
+        }
     }
 
     // ------------------------------------------------------------ 单调约束
