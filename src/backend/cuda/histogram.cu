@@ -799,6 +799,156 @@ extern "C" __global__ void add_class_delta(
     }
 }
 
+// ---------------------------------------------------------------- quantile fast
+//
+// `gpu_math = "fast"` 的 reg:quantileerror。梯度依赖每轮的全局 scale
+// `S = (Σ w·sqrt|p-y| / Σ w)^2`(XGBoost 3.4.1 quantile_obj.cu),所以一轮是三个 kernel:
+//   1. `quantile_apply_delta_partials` —— 施加叶子增量,同时对每个 block 归约
+//      `Σ w·sqrtf|p-y|` 与 `Σ w`(f64),写进 partials[2*block + {0,1}];
+//   2. `quantile_reduce_scale` —— 单 block 按固定顺序归约 partials,写出 S;
+//   3. `quantile_gradient_rows` —— 读 S,逐行出 grad/hess(含样本权重和行采样)。
+//
+// 归约形状是**固定**的:grid = QUANTILE_REDUCE_BLOCKS、block = QUANTILE_REDUCE_THREADS,
+// 每个线程按 grid-stride 访问固定的行并在 f64 里顺序累加,block 内用固定步长的
+// 共享内存树归约,block 间由单 block kernel 按固定的线程分工/树形顺序归约。
+// 没有任何浮点原子操作,也不依赖 block 的调度顺序,所以逐次运行逐位相同。
+// 不保证与 host 的串行 f64 求和逐位相同(求和顺序不同,CUDA tanhf 也不同于 libm)。
+#define QUANTILE_REDUCE_BLOCKS 256u
+#define QUANTILE_REDUCE_THREADS 256u
+
+extern "C" __global__ void quantile_apply_delta_partials(
+    float* pred,
+    const float* delta,
+    const float* label,
+    const float* weight,
+    uint32_t has_weight,
+    uint32_t n_rows,
+    double* scratch) {
+    // scratch = [per-block (Σ w·sqrt|p-y|, Σ w) × QUANTILE_REDUCE_BLOCKS][scale]
+    double* partials = scratch;
+    __shared__ double rs[QUANTILE_REDUCE_THREADS];
+    __shared__ double rw[QUANTILE_REDUCE_THREADS];
+    double stat = 0.0;
+    double sum_w = 0.0;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        // 预测更新无条件执行(采样掩码不是预测掩码)。
+        const float p = __fadd_rn(pred[i], delta[i]);
+        pred[i] = p;
+        const float r = __fsqrt_rn(fabsf(__fsub_rn(p, label[i])));
+        if (has_weight) {
+            const float w = weight[i];
+            stat = __dadd_rn(stat, (double)__fmul_rn(w, r));
+            sum_w = __dadd_rn(sum_w, (double)w);
+        } else {
+            stat = __dadd_rn(stat, (double)r);
+        }
+    }
+    rs[threadIdx.x] = stat;
+    rw[threadIdx.x] = sum_w;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            rs[threadIdx.x] = __dadd_rn(rs[threadIdx.x], rs[threadIdx.x + s]);
+            rw[threadIdx.x] = __dadd_rn(rw[threadIdx.x], rw[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        partials[(uint64_t)blockIdx.x * 2] = rs[0];
+        partials[(uint64_t)blockIdx.x * 2 + 1] = rw[0];
+    }
+}
+
+// 单 block(blockDim.x == QUANTILE_REDUCE_THREADS):线程 t 按 b = t, t+T, ... 的固定顺序
+// 累加 partials,再做固定树归约。S(已舍入成 f32 的值,存成 double)写到 partials 之后的那个槽。
+extern "C" __global__ void quantile_reduce_scale(
+    double* scratch,
+    uint32_t n_partials,
+    uint32_t n_rows,
+    uint32_t has_weight) {
+    const double* partials = scratch;
+    double* scale_out = scratch + (uint64_t)n_partials * 2;
+    __shared__ double rs[QUANTILE_REDUCE_THREADS];
+    __shared__ double rw[QUANTILE_REDUCE_THREADS];
+    double stat = 0.0;
+    double sum_w = 0.0;
+    for (uint32_t b = threadIdx.x; b < n_partials; b += blockDim.x) {
+        stat = __dadd_rn(stat, partials[(uint64_t)b * 2]);
+        sum_w = __dadd_rn(sum_w, partials[(uint64_t)b * 2 + 1]);
+    }
+    rs[threadIdx.x] = stat;
+    rw[threadIdx.x] = sum_w;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            rs[threadIdx.x] = __dadd_rn(rs[threadIdx.x], rs[threadIdx.x + s]);
+            rw[threadIdx.x] = __dadd_rn(rw[threadIdx.x], rw[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const double total_w = has_weight ? rw[0] : (double)n_rows;
+        float scale = 0.0f;
+        if (!(fabs(total_w) < 1e-6)) {
+            const double root_mean = __ddiv_rn(rs[0], total_w);
+            scale = __double2float_rn(__dmul_rn(root_mean, root_mean));
+        }
+        scale_out[0] = (double)scale;
+    }
+}
+
+// 逐行 quantile 梯度,逐步对应 `Objective::quantile_gradient`(显式 _rn,不允许 FMA 收缩)。
+// scale 不为正(含 NaN)时输出 (0, 0),与 host 相同。
+extern "C" __global__ void quantile_gradient_rows(
+    const float* pred,
+    const float* label,
+    const float* weight,
+    uint32_t has_weight,
+    uint32_t n_rows,
+    float alpha,
+    const double* scratch,
+    uint32_t n_partials,
+    float* gpair_out,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
+    const float scale = (float)scratch[(uint64_t)n_partials * 2];
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        float g = 0.0f;
+        float h = 0.0f;
+        if (scale > 0.0f) {
+            const float residual = __fsub_rn(pred[i], label[i]);
+            const float x = __fdiv_rn(residual, __fmul_rn(0.04f, scale));
+            const float t = tanhf(x);
+            float ratio = (x == 0.0f) ? 1.0f : __fdiv_rn(t, x);
+            ratio = fmaxf(ratio, 3.0e-4f);
+            g = __fmul_rn(__fmul_rn(0.5f, scale),
+                          __fsub_rn(__fadd_rn(t, 1.0f), __fmul_rn(2.0f, alpha)));
+            h = __fmul_rn(__fdiv_rn(0.5f, 0.04f), ratio);
+            if (has_weight) {
+                const float w = weight[i];
+                g = __fmul_rn(g, w);
+                h = __fmul_rn(h, w);
+            }
+        }
+        if (subsample_threshold != ~0ULL) {
+            const unsigned long long hsh = fb_mix(
+                subsample_seed
+                ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
+                   | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
+                ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
+            if ((hsh >> 11) >= subsample_threshold) {
+                g = 0.0f;
+                h = 0.0f;
+            }
+        }
+        gpair_out[(uint64_t)i * 2] = g;
+        gpair_out[(uint64_t)i * 2 + 1] = h;
+    }
+}
+
 extern "C" __global__ void gpair_max_abs(
     float* gpair,
     uint32_t n_rows,

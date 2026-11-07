@@ -957,14 +957,6 @@ fn train_with_backend(
     }
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
-    anyhow::ensure!(
-        gpu_device.is_none()
-            || cfg.params.gpu_math != crate::types::GpuMath::Fast
-            || cfg.objective.supports_gpu_fast(),
-        "{} 不支持 gpu_math=\"fast\":它的梯度要先对全体行归约一个 scale,\
-         单趟 device 梯度 kernel 做不了;请用 gpu_math=\"exact\"(CPU/GPU 逐字节相同)",
-        cfg.objective.name()
-    );
     let num_class = cfg.objective.num_outputs();
     // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
     // (XGBoost 把标量复制成 K 份),否则按类别频率估计。

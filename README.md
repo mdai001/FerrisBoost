@@ -244,7 +244,7 @@ logging, and the complete parameter reference.
 
 ### 0.0.6 (unreleased)
 
-- Added objective `reg:quantileerror` with a scalar `quantile_alpha` (XGBoost 3.4.1's smoothed pinball loss) and the `quantile` metric, on CPU and GPU (`gpu_math="exact"` is byte-identical to CPU; `gpu_math="fast"` is rejected with an error for this objective). Several quantiles (multi-output) are not supported.
+- Added objective `reg:quantileerror` with a scalar `quantile_alpha` (XGBoost 3.4.1's smoothed pinball loss) and the `quantile` metric, on CPU and GPU (`gpu_math="exact"` is byte-identical to CPU; `gpu_math="fast"` computes the per-round global scale with a fixed-shape device reduction, so it is deterministic from run to run but not byte-identical to CPU). Several quantiles (multi-output) are not supported.
 - Added `colsample_bylevel` and `colsample_bynode` with XGBoost's nested sampling semantics (bytree, then bylevel, then bynode) and deterministic seeding that does not depend on threads, blocking, or backend. The random sequence is FerrisBoost's own, so the chosen features differ from XGBoost's for the same seed, as already with `colsample_bytree`. On GPU they use the host split search and are byte-identical to CPU under `gpu_math="exact"`.
 - Added `predict(..., iteration_range=(begin, end))` with XGBoost semantics (boosting rounds, so multiclass uses `num_class` trees per round), next to `n_trees`.
 - Added scikit-learn estimators `FerrisBoostClassifier` and `FerrisBoostRegressor` (`fit`, `predict`, `predict_proba`, `eval_set`, early stopping, `evals_result()`, `save_model` / `load_model`). scikit-learn stays an optional dependency.

@@ -387,6 +387,9 @@ struct GpuBuffers {
     /// 多分类 fast:已经建完、但 delta 还没加进 `pred_resident` 的那一类。
     /// delta 并进下一个 stats / gradient kernel(见 histogram.cu),`None` = 全部已施加。
     mc_pending_class: Option<usize>,
+    /// fast quantile:`QUANTILE_REDUCE_BLOCKS` 对 f64 per-block partial + 末尾 1 个 f64 scale。
+    /// 训练级一次分配、每轮复用(没有 per-round 分配)。
+    qt_scratch: Option<CudaSlice<f64>>,
     /// 当前节点的行索引。
     rows: CudaSlice<u32>,
     part_col: CudaSlice<u8>,
@@ -550,6 +553,9 @@ pub struct GpuTrainCtx {
     mc_stats_fn: Option<CudaFunction>,
     mc_grad_fn: Option<CudaFunction>,
     mc_delta_fn: Option<CudaFunction>,
+    qt_partials_fn: Option<CudaFunction>,
+    qt_reduce_fn: Option<CudaFunction>,
+    qt_grad_fn: Option<CudaFunction>,
     /// 每行输出数 K(多分类 = `num_class`,其余 1)。决定常驻 prediction 的
     /// 形状 `K × n`;规划器按同一个数计费。
     n_outputs: usize,
@@ -758,6 +764,22 @@ impl GpuTrainCtx {
         let mc_stats_fn = load_mc("softmax_row_stats")?;
         let mc_grad_fn = load_mc("softmax_class_gradient")?;
         let mc_delta_fn = load_mc("add_class_delta")?;
+        // quantile fast 的三个 kernel:fast 下总是加载(不依赖 objective,几个 handle 而已),
+        // 只在 quantile objective 时才被 launch。
+        let load_qt = |name: &str| -> Result<Option<CudaFunction>> {
+            if !fast_math {
+                return Ok(None);
+            }
+            Ok(Some(
+                state
+                    .module
+                    .load_function(name)
+                    .with_context(|| format!("PTX 中找不到 {name}"))?,
+            ))
+        };
+        let qt_partials_fn = load_qt("quantile_apply_delta_partials")?;
+        let qt_reduce_fn = load_qt("quantile_reduce_scale")?;
+        let qt_grad_fn = load_qt("quantile_gradient_rows")?;
         // GPU-local row-major 原型。**只是 GPU 侧的表示**:Parquet / Arrow /
         // host 量化 cache / FFI 一个都不动,列块照旧按列主序上传,上传后在
         // device 上转置一次。
@@ -1375,6 +1397,15 @@ impl GpuTrainCtx {
         } else {
             (None, None)
         };
+        let qt_scratch = if fast_math {
+            Some(
+                stream
+                    .alloc_zeros::<f64>(crate::gpu_mem_plan::QUANTILE_REDUCE_BLOCKS as usize * 2 + 1)
+                    .context("fast quantile 归约暂存分配")?,
+            )
+        } else {
+            None
+        };
         let multiclass_bytes = if fast_math {
             crate::gpu_mem_plan::fast_multiclass_extra_bytes(n_rows as u64, n_outputs as u64)
                 as usize
@@ -1397,7 +1428,11 @@ impl GpuTrainCtx {
         };
         // 行主序转置的落地区:H2D 先进这里(列主序),转置后写进 slot.bins
         let budget = GpuMemoryBudget {
-            fast_math_bytes: if fast_math { n_rows * 4 * 2 } else { 0 } + fast_weight_bytes,
+            fast_math_bytes: if fast_math {
+                n_rows * 4 * 2 + crate::gpu_mem_plan::FAST_QUANTILE_SCRATCH_BYTES as usize
+            } else {
+                0
+            } + fast_weight_bytes,
             multiclass_bytes,
             rm_stage_bytes: if row_major {
                 rm_stage_len * rm_bufs * rm_slot_count
@@ -1496,6 +1531,9 @@ impl GpuTrainCtx {
             mc_stats_fn,
             mc_grad_fn,
             mc_delta_fn,
+            qt_partials_fn,
+            qt_reduce_fn,
+            qt_grad_fn,
             n_outputs,
             gpu_math,
             state: state.clone(),
@@ -1537,6 +1575,7 @@ impl GpuTrainCtx {
                 mc_wmax,
                 mc_wsum,
                 mc_pending_class: None,
+                qt_scratch,
                 gpair,
                 rows,
                 part_col,
@@ -2073,6 +2112,17 @@ impl GpuTrainCtx {
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let obj_code: u32 = objective.device_code();
         let obj_param: f32 = objective.device_param();
+        if objective.is_quantile() {
+            self.launch_quantile_round(
+                &mut buf,
+                obj_param,
+                subsample_threshold,
+                subsample_seed,
+                subsample_tree,
+            )?;
+            // The quantile gradient kernel already masked this pair.
+            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false);
+        }
         {
             // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
             // 归约几何(grid-stride,和 `gpair_quantize` 一致)。
@@ -2122,6 +2172,109 @@ impl GpuTrainCtx {
         // The objective kernel already masked this pair and reduced its max.
         // Do not resample it and do not rescan it for the max.
         self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
+    }
+
+    /// fast quantile 一轮的三个 kernel(见 `histogram.cu` 的 quantile 一节):
+    /// 施加叶子增量并出 per-block partial → 单 block 固定顺序归约出 scale →
+    /// 逐行梯度。全部在同一条 stream 上串行,scale 留在 device,没有 host 往返,
+    /// 没有 per-round 分配,没有浮点原子操作。
+    fn launch_quantile_round(
+        &self,
+        buf: &mut GpuBuffers,
+        alpha: f32,
+        subsample_threshold: u64,
+        subsample_seed: u64,
+        subsample_tree: u64,
+    ) -> Result<()> {
+        let partials_fn = self
+            .qt_partials_fn
+            .as_ref()
+            .context("quantile fast kernel 未加载")?;
+        let reduce_fn = self
+            .qt_reduce_fn
+            .as_ref()
+            .context("quantile fast kernel 未加载")?;
+        let grad_fn = self
+            .qt_grad_fn
+            .as_ref()
+            .context("quantile fast kernel 未加载")?;
+        let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
+        // 固定的归约形状:与行数无关(逐次运行确定性的前提)。
+        const THREADS: u32 = 256;
+        let n_blocks = crate::gpu_mem_plan::QUANTILE_REDUCE_BLOCKS;
+        let GpuBuffers {
+            pred_resident,
+            label_resident,
+            weight_resident,
+            prediction_delta,
+            gpair_f32,
+            qt_scratch,
+            ..
+        } = &mut *buf;
+        let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
+        let label = label_resident
+            .as_ref()
+            .context("fast label buffer 未分配")?;
+        let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+        let scratch = qt_scratch
+            .as_mut()
+            .context("fast quantile 归约暂存未分配")?;
+        let has_weight: u32 = weight_resident.is_some().into();
+        let weight = weight_resident.as_ref().unwrap_or(label);
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (n_blocks, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(partials_fn);
+            launch
+                .arg(&mut *pred)
+                .arg(&*prediction_delta)
+                .arg(label)
+                .arg(weight)
+                .arg(&has_weight)
+                .arg(&n_rows_u32)
+                .arg(&mut *scratch);
+            unsafe { launch.launch(cfg) }.context("launch quantile_apply_delta_partials")?;
+        }
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(reduce_fn);
+            launch
+                .arg(&mut *scratch)
+                .arg(&n_blocks)
+                .arg(&n_rows_u32)
+                .arg(&has_weight);
+            unsafe { launch.launch(cfg) }.context("launch quantile_reduce_scale")?;
+        }
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (n_rows_u32.div_ceil(THREADS).min(65535), 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(grad_fn);
+            launch
+                .arg(&*pred)
+                .arg(label)
+                .arg(weight)
+                .arg(&has_weight)
+                .arg(&n_rows_u32)
+                .arg(&alpha)
+                .arg(&*scratch)
+                .arg(&n_blocks)
+                .arg(out)
+                .arg(&subsample_threshold)
+                .arg(&subsample_seed)
+                .arg(&subsample_tree);
+            unsafe { launch.launch(cfg) }.context("launch quantile_gradient_rows")?;
+        }
+        Ok(())
     }
 
     /// 多分类 fast 一轮的开头:读 K 列旧 prediction,每行算一次 softmax 的
