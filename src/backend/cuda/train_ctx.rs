@@ -378,6 +378,9 @@ struct GpuBuffers {
     /// 同一轮里 K 个类的梯度 kernel 共用。
     mc_wmax: Option<CudaSlice<f32>>,
     mc_wsum: Option<CudaSlice<f32>>,
+    /// 多分类 fast:已经建完、但 delta 还没加进 `pred_resident` 的那一类。
+    /// delta 并进下一个 stats / gradient kernel(见 histogram.cu),`None` = 全部已施加。
+    mc_pending_class: Option<usize>,
     /// 当前节点的行索引。
     rows: CudaSlice<u32>,
     part_col: CudaSlice<u8>,
@@ -1482,6 +1485,7 @@ impl GpuTrainCtx {
                 weight_resident,
                 mc_wmax,
                 mc_wsum,
+                mc_pending_class: None,
                 gpair,
                 rows,
                 part_col,
@@ -1979,6 +1983,7 @@ impl GpuTrainCtx {
             subsample_threshold,
             subsample_seed,
             subsample_tree,
+            false,
         )
     }
 
@@ -2016,14 +2021,18 @@ impl GpuTrainCtx {
         let obj_code: u32 = objective.device_code();
         let obj_param: f32 = objective.device_param();
         {
-            let threads = 256u32;
-            let blocks = n_rows_u32.div_ceil(threads).min(65535);
+            // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
+            // 归约几何(grid-stride,和 `gpair_quantize` 一致)。
+            let threads = GPAIR_THREADS as u32;
+            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
+                .context("归约 block 数超过 u32")?;
             let GpuBuffers {
                 pred_resident,
                 label_resident,
                 weight_resident,
                 prediction_delta,
                 gpair_f32,
+                gpair_max,
                 ..
             } = &mut *buf;
             let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
@@ -2031,6 +2040,7 @@ impl GpuTrainCtx {
                 .as_ref()
                 .context("fast label buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            let max_out = gpair_max.as_mut().context("gpair max buffer 未分配")?;
             // 无权重时传 label 作占位指针:kernel 只在 has_weight 时读它。
             let has_weight: u32 = weight_resident.is_some().into();
             let weight = weight_resident.as_ref().unwrap_or(label);
@@ -2052,11 +2062,13 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch apply_delta_and_gradient")?;
         }
-        // The objective kernel already masked this pair. Do not resample it.
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
+        // The objective kernel already masked this pair and reduced its max.
+        // Do not resample it and do not rescan it for the max.
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
     /// 多分类 fast 一轮的开头:读 K 列旧 prediction,每行算一次 softmax 的
@@ -2075,18 +2087,23 @@ impl GpuTrainCtx {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        // 上一轮最后一棵树的 delta 在这个 kernel 里并进 prediction。
+        let pending: u32 = buf.mc_pending_class.take().map_or(u32::MAX, |c| c as u32);
         let GpuBuffers {
             pred_resident,
+            prediction_delta,
             mc_wmax,
             mc_wsum,
             ..
         } = &mut *buf;
-        let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+        let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
         let wmax = mc_wmax.as_mut().context("softmax wmax buffer 未分配")?;
         let wsum = mc_wsum.as_mut().context("softmax wsum buffer 未分配")?;
         let mut launch = self.stream.launch_builder(stats_fn);
         launch
             .arg(pred)
+            .arg(&*prediction_delta)
+            .arg(&pending)
             .arg(&n_rows_u32)
             .arg(&n_classes)
             .arg(wmax)
@@ -2116,14 +2133,23 @@ impl GpuTrainCtx {
             self.n_outputs
         );
         let mut buf = self.lock()?;
+        // 待施加的 delta 并进这个 kernel;正常流程里它是第 class-1 类。如果撞上
+        // 要算梯度的这一类(只会是 API 误用),先单独 flush,保证读到的是已更新的列。
+        if buf.mc_pending_class == Some(class) {
+            self.flush_multiclass_delta_locked(&mut buf)?;
+        }
+        let pending: u32 = buf.mc_pending_class.take().map_or(u32::MAX, |c| c as u32);
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let class_id = class as u32;
         {
-            let threads = 256u32;
+            // 同时产出每 block 的 max,launch 几何 = 归约几何。
+            let threads = GPAIR_THREADS as u32;
+            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
+                .context("归约 block 数超过 u32")?;
             let cfg = LaunchConfig {
-                grid_dim: (n_rows_u32.div_ceil(threads).min(65535), 1, 1),
+                grid_dim: (blocks, 1, 1),
                 block_dim: (threads, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -2131,23 +2157,28 @@ impl GpuTrainCtx {
                 pred_resident,
                 label_resident,
                 weight_resident,
+                prediction_delta,
                 mc_wmax,
                 mc_wsum,
                 gpair_f32,
+                gpair_max,
                 ..
             } = &mut *buf;
-            let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+            let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
             let label = label_resident
                 .as_ref()
                 .context("fast label buffer 未分配")?;
             let wmax = mc_wmax.as_ref().context("softmax wmax buffer 未分配")?;
             let wsum = mc_wsum.as_ref().context("softmax wsum buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            let max_out = gpair_max.as_mut().context("gpair max buffer 未分配")?;
             let has_weight: u32 = weight_resident.is_some().into();
             let weight = weight_resident.as_ref().unwrap_or(label);
             let mut launch = self.stream.launch_builder(grad_fn);
             launch
                 .arg(pred)
+                .arg(&*prediction_delta)
+                .arg(&pending)
                 .arg(wmax)
                 .arg(wsum)
                 .arg(label)
@@ -2158,26 +2189,47 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch softmax_class_gradient")?;
         }
-        // gradient kernel 已经按行采样置零;量化尾巴不再采样。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
+        // gradient kernel 已经按行采样置零并归约了 max;量化尾巴不再采样、不再扫 max。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
-    /// 多分类 fast:把刚建完的那棵树的叶子增量加到第 `class` 类的 device
-    /// prediction 上(device 是权威副本,host 不更新)。
+    /// 多分类 fast:记下刚建完的那棵树(第 `class` 类)的叶子增量**待施加**。
+    /// 增量还在 `prediction_delta` 里,下一个 stats / gradient kernel 会顺手把它
+    /// 加到第 `class` 列(device 是权威副本,host 不更新)—— 不再单独 launch。
+    /// 在下一棵树建完之前 delta buffer 不会被覆盖,所以这个延迟不改变任何数值。
+    /// 如果上一棵树的 delta 还没被并走(连续两次 apply),先 flush 它。
     pub fn fast_multiclass_apply_delta(&self, class: usize) -> Result<()> {
-        let delta_fn = self
-            .mc_delta_fn
-            .as_ref()
-            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
+        ensure!(
+            self.mc_delta_fn.is_some(),
+            "多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)"
+        );
         ensure!(
             class < self.n_outputs,
             "类别 {class} 超出 {}",
             self.n_outputs
         );
         let mut buf = self.lock()?;
+        if buf.mc_pending_class.is_some() {
+            self.flush_multiclass_delta_locked(&mut buf)?;
+        }
+        buf.mc_pending_class = Some(class);
+        Ok(())
+    }
+
+    /// 把待施加的 delta 用独立 kernel 加到 prediction 上。只在训练结束读
+    /// prediction 之前、或 API 误用时走这条;训练循环里 delta 并进下一个 kernel。
+    fn flush_multiclass_delta_locked(&self, buf: &mut GpuBuffers) -> Result<()> {
+        let Some(class) = buf.mc_pending_class.take() else {
+            return Ok(());
+        };
+        let delta_fn = self
+            .mc_delta_fn
+            .as_ref()
+            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let class_id = class as u32;
         let threads = 256u32;
@@ -2190,7 +2242,7 @@ impl GpuTrainCtx {
             pred_resident,
             prediction_delta,
             ..
-        } = &mut *buf;
+        } = buf;
         let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
         let mut launch = self.stream.launch_builder(delta_fn);
         launch
@@ -2232,7 +2284,9 @@ impl GpuTrainCtx {
                 self.n_rows * self.n_outputs
             );
         }
-        let buf = self.lock()?;
+        let mut buf = self.lock()?;
+        // 多分类 fast:最后一棵树的 delta 可能还没并进 prediction。
+        self.flush_multiclass_delta_locked(&mut buf)?;
         let pred = buf
             .pred_resident
             .as_ref()
@@ -2327,6 +2381,9 @@ impl GpuTrainCtx {
         subsample_threshold: u64,
         subsample_seed: u64,
         subsample_tree: u64,
+        // fast:梯度 kernel 已经把每 block 的 max 写进 `gpair_max`,不再扫一遍 gpair_f32。
+        // exact:gpair 是 host 上传的,max(及行采样)由 `gpair_max_abs` 完成。
+        max_fused: bool,
     ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
         let max_fn = self
             .gpair_max_fn
@@ -2340,7 +2397,7 @@ impl GpuTrainCtx {
         let threads = GPAIR_THREADS as u32;
         let blocks =
             u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
-        {
+        if !max_fused {
             let GpuBuffers {
                 gpair_f32,
                 gpair_max,
