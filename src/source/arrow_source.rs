@@ -753,6 +753,20 @@ impl crate::train::BlockSource for ArrowSource {
         anyhow::bail!("特征 {feat} 不在任何列块里,共 {} 个特征", self.n_features)
     }
 
+    /// 驻留的块直接借出列,零拷贝(见 trait 文档)。
+    fn has_resident_columns(&self) -> bool {
+        true
+    }
+
+    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+        self.blocks.iter().find_map(|b| {
+            b.feat_ids
+                .iter()
+                .position(|&x| x == feat)
+                .map(|local| b.column(local))
+        })
+    }
+
     /// 量化结果全量持有,直接借出去,**零拷贝**。ArrowSource 收的是
     /// "喂进来的 batch",没有回头再读的能力,所以做不了按需加载 ——
     /// 那是 `ParquetBlockSource` 的事(它能按 column chunk 重新读)。

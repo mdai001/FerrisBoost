@@ -54,6 +54,10 @@ pub mod prof {
         // 那些累加值的**共同上界**,也是这一段任何优化的**收益上限**。
         HIST_PHASE_WALL,
         GRAD,
+        // 行采样置零(每轮一次,墙钟)。
+        SAMPLE,
+        // build_tree 开头:root 梯度和 + root 行下标(每棵树一次,墙钟)。
+        TREE_SETUP,
         QUANTIZE,
         HIST,
         ENUM,
@@ -790,6 +794,25 @@ pub trait BlockSource: Send + Sync {
     /// 现在编译器会逼每个新 source 想清楚这件事。
     fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>>;
 
+    /// 直接借出**驻留在内存里的**单个特征整列;拿不到(落盘 cache 等)返回
+    /// `None`,调用方退回 `feature_column`。
+    ///
+    /// 行重分区每层对每个选中的特征取一次列,而且只读。`feature_column`
+    /// 交出所有权,所以全量驻留的 source 也要为一次只读的 gather 复制
+    /// n_rows 字节(HIGGS:每棵树约 30 次 × 10.5 MB,串行 memcpy,外加
+    /// 每次一块新分配的缺页)。驻留的 source 覆盖本方法零拷贝借出;
+    /// 默认 `None`,所以只能交出拷贝的 source(落盘 cache、测试里的
+    /// 包装器)行为和以前完全一样。
+    fn resident_feature_column(&self, _feat: FeatId) -> Option<&[Bin]> {
+        None
+    }
+
+    /// 是否**每一列**都能通过 `resident_feature_column` 借出(全量驻留的
+    /// source)。训练据此决定能不能对零梯度行做随机访问下降。
+    fn has_resident_columns(&self) -> bool {
+        false
+    }
+
     /// 第 i 块持有哪些特征。**只是元数据,不该碰数据。**
     ///
     /// 同样没有默认实现:默认实现只能是「加载整块再读 `feat_ids`」,
@@ -1381,22 +1404,33 @@ fn train_with_backend(
         // scale. CPU and explicit host quantization retain the host mask below.
         if cfg.params.subsample < 1.0 && !fast_math && !device_quant {
             let _phase = crate::diagnostic::Phase::new(b"fb.host.exact.subsample\0");
-            let kept = {
+            let kept = pool.install(|| {
+                let _t = prof::Timer::new(&prof::SAMPLE);
                 // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
+                //
+                // 采样身份只由 `(seed, tree, row)` 逐行独立哈希决定(见
+                // subsample 模块),行与行之间没有顺序依赖,所以按行并行
+                // 与串行逐位相同;`kept` 是整数求和,同样与顺序无关。
+                // 这一遍以前是串行的:1050 万次 SplitMix 哈希挂在训练线程上,
+                // 其余线程全程空等。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
-                let mut kept = 0usize;
-                for (i, g) in gpair_f32.iter_mut().enumerate() {
-                    if crate::subsample::row_selected(i as u64, th, cfg.params.seed, round as u64) {
-                        kept += 1;
-                    } else {
-                        *g = GradPair {
-                            grad: 0.0,
-                            hess: 0.0,
-                        };
-                    }
-                }
-                kept
-            };
+                let (seed, tree) = (cfg.params.seed, round as u64);
+                gpair_f32
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(i, g)| {
+                        if crate::subsample::row_selected(i as u64, th, seed, tree) {
+                            1usize
+                        } else {
+                            *g = GradPair {
+                                grad: 0.0,
+                                hess: 0.0,
+                            };
+                            0usize
+                        }
+                    })
+                    .sum::<usize>()
+            });
             if prof::enabled() && round == 0 {
                 eprintln!(
                     "SUBSAMPLE rate={} kept={kept}/{} ({:.1}%)",
@@ -1842,15 +1876,20 @@ fn train_multiclass_rounds(
             };
             // 行采样:和单输出相同的确定性掩码,键是树序号。
             if cfg.params.subsample < 1.0 && !device_quant && !fast_math {
+                // 逐行独立哈希,按行并行与串行逐位相同(见单输出路径)。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
-                for (i, g) in gpair_f32.iter_mut().enumerate() {
-                    if !crate::subsample::row_selected(i as u64, th, cfg.params.seed, tree_index) {
-                        *g = GradPair {
-                            grad: 0.0,
-                            hess: 0.0,
-                        };
-                    }
-                }
+                let seed = cfg.params.seed;
+                pool.install(|| {
+                    let _t = prof::Timer::new(&prof::SAMPLE);
+                    gpair_f32.par_iter_mut().enumerate().for_each(|(i, g)| {
+                        if !crate::subsample::row_selected(i as u64, th, seed, tree_index) {
+                            *g = GradPair {
+                                grad: 0.0,
+                                hess: 0.0,
+                            };
+                        }
+                    });
+                });
             }
             let (quantizer, fixed, dev_root_sum) = if fast_math {
                 // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
@@ -2360,13 +2399,35 @@ fn build_tree(
     let n_blocks = plans.len();
 
     let mut t = Tree::default();
+    let setup_timer = prof::Timer::new(&prof::TREE_SETUP);
     let root_sum = dev_root_sum.unwrap_or_else(|| hist::node_sum(gpair, None));
     let root = t.push_leaf(leaf_of(root_sum, q, p), hess_of(root_sum, q));
 
+    // 梯度全零的行(行采样没选中的行,或梯度恰好为零)对每个直方图 bin 和
+    // 每个节点和都贡献零,建树只靠这些和,所以它们不必进入行集合:
+    // 直方图和分区都只处理其余的行,而最终模型逐位相同。它们照常拿到
+    // 这棵树的预测增量(采样掩码不是预测掩码),只是建完树之后沿树
+    // 一次性下降,而不是随每层分区一起搬 —— 见 `apply_dropped_rows`。
+    // 只在 CPU、source 的每一列都能随机访问、且确实能省下可观的行数时启用。
+    let kept_rows: Option<Vec<RowId>> = if gpu.is_none() && source.has_resident_columns() {
+        let kept = nonzero_rows(gpair);
+        (kept.len() <= gpair.len() - gpair.len() / 8).then_some(kept)
+    } else {
+        None
+    };
+    let drop_zero_rows = kept_rows.is_some();
+    // 每个已分裂节点的 (特征, 分区用的 bin 边界, 缺失走左):下降必须和分区
+    // 用同一套比较,不经过浮点阈值往返。
+    let mut split_info: Vec<DropSplit> = Vec::new();
+
     let root_rows = match gpu {
         Some(ctx) => NodeRows::Device(ctx.begin_tree_rows()?),
-        None => NodeRows::Host((0..source.n_rows() as RowId).collect()),
+        None => NodeRows::Host(match kept_rows {
+            Some(kept) => kept,
+            None => identity_rows(source.n_rows()),
+        }),
     };
+    drop(setup_timer);
     let mut level = vec![LevelNode {
         node: root,
         rows: root_rows,
@@ -2617,26 +2678,38 @@ fn build_tree(
                         );
                     } else {
                         let block = block.context("CPU histogram requires source payload")?;
-                        for (i, ln) in level.iter().enumerate() {
-                            if matches!(ln.hist_from, HistFrom::Accumulate) {
-                                // 根节点走 None 那条路:少一层行下标的间接寻址,
-                                // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                                let rows = if depth == 0 {
-                                    None
-                                } else {
-                                    Some(ln.rows.host())
-                                };
-                                let _t = prof::Timer::new(&prof::HIST);
-                                hist::build(
-                                    &block.data,
-                                    block.n_rows,
-                                    block.n_feats(),
-                                    &plan.hist_offsets,
-                                    gpair,
-                                    rows,
-                                    &mut per_node[i].bins,
-                                );
-                            }
+                        let _t = prof::Timer::new(&prof::HIST);
+                        if depth == 0 && !drop_zero_rows {
+                            // 根节点走 None 那条路:少一层行下标的间接寻址,
+                            // 结果和传全部行完全一样(hist.rs 有断言钉着)。
+                            hist::build(
+                                &block.data,
+                                block.n_rows,
+                                block.n_feats(),
+                                &plan.hist_offsets,
+                                gpair,
+                                None,
+                                &mut per_node[0].bins,
+                            );
+                        } else {
+                            // 本层所有要实际累加的节点一起走:行 id 区间在外、
+                            // 节点在内,同一段 bin/gpair 被所有节点复用
+                            // (见 `hist::build_nodes`)。逐位结果与逐节点
+                            // 调 `build` 相同。
+                            let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
+                                .iter()
+                                .zip(per_node.iter_mut())
+                                .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
+                                .map(|(ln, h)| (ln.rows.host(), h.bins.as_mut_slice()))
+                                .collect();
+                            hist::build_nodes(
+                                &block.data,
+                                block.n_rows,
+                                block.n_feats(),
+                                &plan.hist_offsets,
+                                gpair,
+                                &mut targets,
+                            );
                         }
                     }
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
@@ -2852,9 +2925,18 @@ fn build_tree(
             if node_idxs.is_empty() {
                 continue;
             }
-            let t = prof::Timer::new(&prof::PART_FETCH);
-            let col = source.feature_column(feat)?;
-            drop(t);
+            // 只读借用这一列:驻留 source 零拷贝;落盘 cache 等只能交出拷贝的
+            // source 照旧付那份拷贝(PART_FETCH 只计这部分)。
+            let fetch_timer = prof::Timer::new(&prof::PART_FETCH);
+            let owned_col;
+            let col: &[Bin] = match source.resident_feature_column(feat) {
+                Some(col) => col,
+                None => {
+                    owned_col = source.feature_column(feat)?;
+                    &owned_col
+                }
+            };
+            drop(fetch_timer);
             if prof::enabled() {
                 use std::sync::atomic::Ordering;
                 prof::PART_COLS.fetch_add(1, Ordering::Relaxed);
@@ -2870,7 +2952,7 @@ fn build_tree(
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
-                let mut session = ctx.partition_session(&col)?;
+                let mut session = ctx.partition_session(col)?;
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
                     part_tokens[i] = Some(match &c.cats {
@@ -2879,9 +2961,7 @@ fn build_tree(
                             cats,
                             c.missing_left,
                         )?,
-                        None => {
-                            session.partition(level[i].rows.device(), c.bin, c.missing_left)?
-                        }
+                        None => session.partition(level[i].rows.device(), c.bin, c.missing_left)?,
                     });
                 }
                 let timing = session.timing();
@@ -2898,7 +2978,7 @@ fn build_tree(
             } else {
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    let (left, right) = partition_rows(level[i].rows.host(), &col, &c, comm);
+                    let (left, right) = partition_rows(level[i].rows.host(), col, &c, comm);
                     partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
                 }
             }
@@ -2942,6 +3022,7 @@ fn build_tree(
             };
 
             let children = child_leaves(&c, q, p, ln.bounds);
+            let ln_node = ln.node;
             let (left_node, right_node) = t.split_leaf(
                 ln.node,
                 c.feat,
@@ -2961,6 +3042,17 @@ fn build_tree(
                 t.set_categories(ln.node, cats);
             }
 
+            if drop_zero_rows {
+                if split_info.len() <= ln_node {
+                    split_info.resize(ln_node + 1, DropSplit::default());
+                }
+                split_info[ln_node] = DropSplit {
+                    feat: c.feat,
+                    bin: c.bin,
+                    missing_left: c.missing_left,
+                    cats: c.cats,
+                };
+            }
             let (left_rows, right_rows) = partitions[i].take().expect("上面按块分好了");
 
             // 行少的那个真算,另一个用父 - 兄弟。省下来的是整个训练
@@ -3052,7 +3144,139 @@ fn build_tree(
         }
     }
 
+    if drop_zero_rows {
+        apply_dropped_rows(&t, &split_info, source, gpair, predictions)?;
+    }
+
     Ok(t)
+}
+
+/// `apply_dropped_rows` 需要的、和分区完全同一套的分裂判定。
+#[derive(Clone, Copy, Default)]
+struct DropSplit {
+    feat: FeatId,
+    bin: u32,
+    missing_left: bool,
+    cats: Option<crate::categorical::CatBits>,
+}
+
+/// 沿已建好的树给**没进行集合**的行(梯度全零的行)施加叶子值。
+///
+/// 每行一次随机访问下降,最多 `max_depth` 步;分裂用的比较和分区那一遍
+/// 完全相同(`bin < 边界`,缺失走记下的方向),所以每行落到的叶子、
+/// 以及对 `predictions` 的那一次加法都和「随每层分区一起搬」逐位相同。
+/// 按行块并行,每块独占自己那段 `predictions`。
+fn apply_dropped_rows(
+    t: &Tree,
+    split_info: &[DropSplit],
+    source: &dyn BlockSource,
+    gpair: &[GradPairFixed],
+    predictions: &mut [f32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(gpair.len() == predictions.len());
+    let mut cols: Vec<&[Bin]> = vec![&[]; source.n_features()];
+    for n in t.nodes.iter().filter(|n| !n.is_leaf) {
+        cols[n.feat as usize] = source
+            .resident_feature_column(n.feat)
+            .context("零梯度行下降需要驻留的列")?;
+    }
+    const CHUNK: usize = 1 << 15;
+    predictions
+        .par_chunks_mut(CHUNK)
+        .zip(gpair.par_chunks(CHUNK))
+        .enumerate()
+        .for_each(|(c, (pred, g))| {
+            let base = c * CHUNK;
+            for (i, (p, gp)) in pred.iter_mut().zip(g).enumerate() {
+                if *gp != GradPairFixed::default() {
+                    continue;
+                }
+                let row = base + i;
+                let mut node = 0usize;
+                loop {
+                    let n = &t.nodes[node];
+                    if n.is_leaf {
+                        *p += n.leaf_value;
+                        break;
+                    }
+                    let sp = &split_info[node];
+                    let bin = cols[sp.feat as usize][row];
+                    // 与 `partition_rows` 逐条相同:缺失走记下的方向;类别分裂
+                    // 里集合走右、其余(含未见过的编码)走左;数值分裂比 bin。
+                    let go_left = if bin == MISSING_BIN {
+                        sp.missing_left
+                    } else if let Some(cats) = &sp.cats {
+                        !cats.contains(bin as u32)
+                    } else {
+                        (bin as u32) < sp.bin
+                    };
+                    node = if go_left { n.left } else { n.right } as usize;
+                }
+            }
+        });
+    Ok(())
+}
+
+/// 梯度不全为零的行下标(升序)。按块并行:先数、再前缀和、最后各块写
+/// 自己那一段,结果与串行 `filter` 逐位相同。
+fn nonzero_rows(gpair: &[GradPairFixed]) -> Vec<RowId> {
+    const CHUNK: usize = 1 << 16;
+    let zero = GradPairFixed::default();
+    let counts: Vec<usize> = gpair
+        .par_chunks(CHUNK)
+        .map(|c| c.iter().filter(|g| **g != zero).count())
+        .collect();
+    let mut offsets = Vec::with_capacity(counts.len() + 1);
+    offsets.push(0usize);
+    for &c in &counts {
+        offsets.push(offsets.last().unwrap() + c);
+    }
+    let mut rows = vec![0 as RowId; *offsets.last().unwrap()];
+    let mut parts: Vec<&mut [RowId]> = Vec::with_capacity(counts.len());
+    let mut rest = rows.as_mut_slice();
+    for &c in &counts {
+        let (head, tail) = rest.split_at_mut(c);
+        parts.push(head);
+        rest = tail;
+    }
+    parts
+        .into_par_iter()
+        .zip(gpair.par_chunks(CHUNK))
+        .enumerate()
+        .for_each(|(ci, (out, g))| {
+            let base = ci * CHUNK;
+            let mut k = 0usize;
+            for (i, gp) in g.iter().enumerate() {
+                if *gp != zero {
+                    out[k] = (base + i) as RowId;
+                    k += 1;
+                }
+            }
+        });
+    rows
+}
+
+/// `0..n` 的行下标。每棵树一次,1050 万行是 42 MB:串行 `collect()` 把
+/// 写入和首次触碰的缺页都压在一条线程上,所以按块并行填(与 XGBoost 的
+/// 并行 Iota 同形)。内容逐位相同。
+fn identity_rows(n: usize) -> Vec<RowId> {
+    const CHUNK: usize = 1 << 16;
+    let mut rows = vec![0 as RowId; n];
+    if n < 4 * CHUNK {
+        for (i, r) in rows.iter_mut().enumerate() {
+            *r = i as RowId;
+        }
+        return rows;
+    }
+    rows.par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(c, chunk)| {
+            let base = c * CHUNK;
+            for (i, r) in chunk.iter_mut().enumerate() {
+                *r = (base + i) as RowId;
+            }
+        });
+    rows
 }
 
 /// Whether the bounded resident GPU split cache is used for this run.
@@ -3506,6 +3730,14 @@ fn update_predictions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_rows_matches_the_serial_range() {
+        for n in [0usize, 1, 7, (1 << 18) - 1, (1 << 18) + 5, 700_001] {
+            let expected: Vec<RowId> = (0..n as RowId).collect();
+            assert_eq!(super::identity_rows(n), expected, "n = {n}");
+        }
+    }
+
     /// `max_depth` 的公开契约是 **1..=14**,两个后端同一个数。
     ///
     /// 上限卡在 GPU:`part_totals` 由 `MAX_LEVEL_NODES = 8192` 兜着,
@@ -3674,9 +3906,17 @@ mod tests {
         let mut y = Vec::new();
         for i in 0..n {
             let a = ((i * 7) % 9) as f32;
-            let b = if i % 11 == 0 { MISSING } else { ((i * 5) % 6) as f32 };
+            let b = if i % 11 == 0 {
+                MISSING
+            } else {
+                ((i * 5) % 6) as f32
+            };
             let c1 = ((i * 3 + i / 7) % 5) as f32;
-            let c2 = if i % 13 == 0 { MISSING } else { ((i * 17 + i / 5) % 12) as f32 };
+            let c2 = if i % 13 == 0 {
+                MISSING
+            } else {
+                ((i * 17 + i / 5) % 12) as f32
+            };
             let up = matches!(c1 as i32, 1 | 3) || matches!(c2 as i32, 2 | 5 | 9);
             x.extend([a, b, c1, c2]);
             y.push(if up { 1.0 } else { 0.0 } + 0.05 * a);
@@ -3711,11 +3951,18 @@ mod tests {
         let (x, y, nf, flags) = categorical_data(400);
         let (model, src) = train_categorical(&x, &y, nf, &flags, params(4, 6));
         assert_eq!(model.feature_types, flags);
-        assert!(model.has_categorical_splits(), "the data rewards categorical splits");
+        assert!(
+            model.has_categorical_splits(),
+            "the data rewards categorical splits"
+        );
         let by_bins = predict_on(&model, &src).unwrap();
         for (row, got) in by_bins.iter().enumerate() {
             let raw = &x[row * nf..(row + 1) * nf];
-            assert_eq!(got.to_bits(), model.predict_margin(raw).to_bits(), "row {row} {raw:?}");
+            assert_eq!(
+                got.to_bits(),
+                model.predict_margin(raw).to_bits(),
+                "row {row} {raw:?}"
+            );
         }
     }
 
@@ -3751,7 +3998,11 @@ mod tests {
         let by_bins = predict_on(&model, &valid).unwrap();
         for (row, got) in by_bins.iter().enumerate() {
             let raw = &vx[row * nf..(row + 1) * nf];
-            assert_eq!(got.to_bits(), model.predict_margin(raw).to_bits(), "row {row}");
+            assert_eq!(
+                got.to_bits(),
+                model.predict_margin(raw).to_bits(),
+                "row {row}"
+            );
         }
     }
 
@@ -4558,6 +4809,173 @@ mod tests {
 
     fn json(m: &Model) -> String {
         m.to_xgboost_json().unwrap()
+    }
+
+    /// Hides the resident-column accessors, forcing the pre-skip row flow.
+    struct Opaque(DenseSource);
+    impl BlockSource for Opaque {
+        fn n_blocks(&self) -> usize {
+            self.0.n_blocks()
+        }
+        fn n_rows(&self) -> usize {
+            self.0.n_rows()
+        }
+        fn n_features(&self) -> usize {
+            self.0.n_features()
+        }
+        fn cuts(&self) -> &BinCuts {
+            self.0.cuts()
+        }
+        fn block_features(&self, i: usize) -> anyhow::Result<Vec<FeatId>> {
+            self.0.block_features(i)
+        }
+        fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
+            self.0.with_block(i, f)
+        }
+        fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+            self.0.feature_column(f)
+        }
+    }
+
+    /// 梯度全零的行不进行集合、建完树再沿树下降:模型必须和「所有行随每层
+    /// 分区一起走」逐字节相同(后者靠一个不暴露驻留列的包装 source 触发)。
+    /// 覆盖行采样、权重为零的行、缺失值,以及 monotone 约束。
+    #[test]
+    fn dropping_zero_gradient_rows_keeps_models_byte_identical() {
+        let (n_rows, nf) = (4000usize, 6usize);
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u32
+        };
+        let mut x = Vec::with_capacity(n_rows * nf);
+        let mut y = Vec::with_capacity(n_rows);
+        let mut w = Vec::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let row: Vec<f32> = (0..nf)
+                .map(|_| {
+                    if next() % 13 == 0 {
+                        f32::NAN
+                    } else {
+                        (next() % 17) as f32
+                    }
+                })
+                .collect();
+            let signal = (row[0].max(0.0) - row[1].max(0.0)) / 4.0;
+            let p_pos = 1.0 / (1.0 + (-signal).exp());
+            y.push(if (next() % 1000) as f32 / 1000.0 < p_pos {
+                1.0
+            } else {
+                0.0
+            });
+            // 约三成的行权重为零 → 梯度全零,即使不做行采样也会被丢出行集合。
+            w.push(if next() % 10 < 3 { 0.0f32 } else { 1.0 });
+            x.extend_from_slice(&row);
+        }
+        for (subsample, use_weights, monotone) in [
+            (0.5f32, false, false),
+            (0.7, true, false),
+            (1.0, true, false),
+            (0.6, false, true),
+        ] {
+            let mut p = params(5, 5);
+            p.subsample = subsample;
+            p.seed = 11;
+            p.colsample_bytree = 0.8;
+            if monotone {
+                p.monotone_constraints = vec![1, -1, 0, 0, 0, 0];
+            }
+            let dense = DenseSource::from_row_major(&x, n_rows, nf, p.max_bin, p.cols_per_block);
+            let opaque = Opaque(DenseSource::from_row_major(
+                &x,
+                n_rows,
+                nf,
+                p.max_bin,
+                p.cols_per_block,
+            ));
+            assert!(dense.has_resident_columns() && !opaque.has_resident_columns());
+            let weights = use_weights.then_some(w.as_slice());
+            for threads in [1usize, 4] {
+                let mut q = p.clone();
+                q.nthread = threads;
+                let cfg = TrainConfig::new(q, Objective::Logistic);
+                let a = train_weighted(&dense, &y, weights, &[], &cfg, &mut [], &Local).unwrap();
+                let b = train_weighted(&opaque, &y, weights, &[], &cfg, &mut [], &Local).unwrap();
+                assert_eq!(
+                    json(&a),
+                    json(&b),
+                    "subsample={subsample} weights={use_weights} monotone={monotone} threads={threads}"
+                );
+            }
+        }
+    }
+
+    /// The zero-gradient row skip must also hold for categorical splits
+    /// (set membership goes right, unseen / invalid codes left, NaN follows
+    /// the learned direction) and for `reg:quantileerror` (global scale from
+    /// all rows' predictions, per-round deltas for dropped rows).
+    #[test]
+    fn dropping_zero_gradient_rows_is_categorical_and_quantile_safe() {
+        let (x, y, nf, flags) = categorical_data(3000);
+        let n_rows = y.len();
+        let w: Vec<f32> = (0..n_rows)
+            .map(|i| if i % 7 < 2 { 0.0 } else { 1.0 })
+            .collect();
+        for (objective, subsample, use_weights) in [
+            (Objective::SquaredError, 0.5f32, false),
+            (Objective::SquaredError, 0.7, true),
+            (Objective::Logistic, 0.6, true),
+            (Objective::Quantile { alpha: 0.7 }, 0.5, false),
+            (Objective::Quantile { alpha: 0.3 }, 0.8, true),
+        ] {
+            let mut p = params(5, 5);
+            p.subsample = subsample;
+            p.seed = 5;
+            p.colsample_bytree = 0.75;
+            p.colsample_bylevel = 0.8;
+            p.colsample_bynode = 0.8;
+            let make = || {
+                DenseSource::new(
+                    &x,
+                    n_rows,
+                    nf,
+                    BinningStrategy::SketchTyped {
+                        max_bins: p.max_bin as usize,
+                        categorical: &flags,
+                    },
+                    p.cols_per_block,
+                )
+            };
+            let dense = make();
+            let opaque = Opaque(make());
+            assert!(dense.has_resident_columns() && !opaque.has_resident_columns());
+            let labels: Vec<f32> = if matches!(objective, Objective::Logistic) {
+                y.iter().map(|&v| if v > 0.5 { 1.0 } else { 0.0 }).collect()
+            } else {
+                y.clone()
+            };
+            let weights = use_weights.then_some(w.as_slice());
+            for threads in [1usize, 4] {
+                let mut q = p.clone();
+                q.nthread = threads;
+                let cfg = TrainConfig::new(q, objective);
+                let a =
+                    train_weighted(&dense, &labels, weights, &[], &cfg, &mut [], &Local).unwrap();
+                let b =
+                    train_weighted(&opaque, &labels, weights, &[], &cfg, &mut [], &Local).unwrap();
+                assert!(
+                    objective.is_quantile() || a.has_categorical_splits(),
+                    "{objective:?}: the data rewards categorical splits"
+                );
+                assert_eq!(
+                    json(&a),
+                    json(&b),
+                    "{objective:?} subsample={subsample} weights={use_weights} threads={threads}"
+                );
+            }
+        }
     }
 
     #[test]
