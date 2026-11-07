@@ -539,6 +539,47 @@ __device__ __forceinline__ unsigned long long fb_mix(unsigned long long z) {
     return z ^ (z >> 31);
 }
 
+// Per-block max-abs reduction for the fused fast gradient kernels. Every thread
+// of the block must call it (no early return before it). The non-finite
+// mapping to +inf is done by the caller, so no NaN can reach fmax. max is
+// order independent, so this is bit-identical to the old separate
+// `gpair_max_abs` pass over the written f32 gpair.
+__device__ __forceinline__ void fb_block_max_pair(double mg, double mh, double* out_max) {
+    __shared__ double wg[32];
+    __shared__ double wh[32];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mg = fmax(mg, __shfl_down_sync(0xffffffffu, mg, o));
+        mh = fmax(mh, __shfl_down_sync(0xffffffffu, mh, o));
+    }
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        wg[warp] = mg;
+        wh[warp] = mh;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const uint32_t nw = (blockDim.x + 31u) >> 5;
+        mg = lane < nw ? wg[lane] : 0.0;
+        mh = lane < nw ? wh[lane] : 0.0;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            mg = fmax(mg, __shfl_down_sync(0xffffffffu, mg, o));
+            mh = fmax(mh, __shfl_down_sync(0xffffffffu, mh, o));
+        }
+        if (lane == 0) {
+            out_max[(uint64_t)blockIdx.x * 2] = mg;
+            out_max[(uint64_t)blockIdx.x * 2 + 1] = mh;
+        }
+    }
+}
+
+__device__ __forceinline__ double fb_bound(float v) {
+    const double d = (double)v;
+    return isfinite(d) ? fabs(d) : INFINITY;
+}
+
 extern "C" __global__ void apply_delta_and_gradient(
     float* pred,
     const float* delta,
@@ -557,7 +598,11 @@ extern "C" __global__ void apply_delta_and_gradient(
     // 所以不可能因为浮点差异选出不同的行。`~0ull` = 全选。
     unsigned long long subsample_threshold,
     unsigned long long subsample_seed,
-    unsigned long long subsample_tree) {
+    unsigned long long subsample_tree,
+    // 每个 block 一对 (max|g|, max|h|),host 在小 D2H 之后归约。
+    double* max_out) {
+    double mg = 0.0;
+    double mh = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
         // ⚠️⚠️ **预测更新永远无条件执行。**
@@ -625,7 +670,11 @@ extern "C" __global__ void apply_delta_and_gradient(
         }
         gpair_out[(uint64_t)i * 2] = g;
         gpair_out[(uint64_t)i * 2 + 1] = h;
+        // 采样置零之后的值进 max(和原来单独的 gpair_max_abs 看到的一样)。
+        mg = fmax(mg, fb_bound(g));
+        mh = fmax(mh, fb_bound(h));
     }
+    fb_block_max_pair(mg, mh, max_out);
 }
 
 
@@ -639,7 +688,11 @@ extern "C" __global__ void apply_delta_and_gradient(
 //   2. 对每个类 k:`softmax_class_gradient` 只读 pred 的第 k 列 + 上面两个统计量,
 //      写出 interleaved [grad, hess] 的 f32 gpair(并按行采样置零),走通用的
 //      max → scale → 定点量化尾巴,建第 k 棵树;
-//   3. `add_class_delta` 把这棵树的叶子增量加到第 k 列。
+//   3. 这棵树的叶子增量加到第 k 列 —— 不再单独 launch:它并进「下一个」kernel
+//      (第 k+1 类的 `softmax_class_gradient`,或下一轮的 `softmax_row_stats`),
+//      在那里顺手 `pred[k] += delta`。delta buffer 在下一棵树建完之前不会被覆盖,
+//      而被并进去的那列不是该 kernel 读来算梯度的那列,所以数值和单独 launch 逐位相同。
+//      `add_class_delta` 只剩训练结束 flush 最后一个待施加 delta 时使用。
 // 第 k 类的梯度只依赖「这一轮开始时」的 K 个 margin。第 k 列在第 k 棵树之前不会变,
 // 其余列 wmax / wsum 已经固化在统计量里,所以第 k 棵树之后立刻施加 delta,
 // 不会改变同一轮里后面各类的梯度 —— 和 XGBoost「一轮一次 GetGradient」一致。
@@ -650,13 +703,20 @@ extern "C" __global__ void apply_delta_and_gradient(
 // 不保证与 host 逐位相同(CUDA expf),但每步算术用显式 _rn,不允许编译器 FMA 收缩;
 // 没有浮点原子操作,每行只有一个写者,所以结果逐次运行确定。
 extern "C" __global__ void softmax_row_stats(
-    const float* pred,
+    float* pred,
+    const float* delta,
+    // 上一轮最后一棵树的 delta 还没施加:在这里并进来(`~0u` = 没有待施加的)。
+    uint32_t pending_class,
     uint32_t n_rows,
     uint32_t n_classes,
     float* wmax_out,
     float* wsum_out) {
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
+        if (pending_class < n_classes) {
+            float* slot = pred + (uint64_t)pending_class * n_rows + i;
+            *slot = __fadd_rn(*slot, delta[i]);
+        }
         float wmax = 1.17549435e-38f;  // FLT_MIN
         for (uint32_t k = 0; k < n_classes; ++k) {
             wmax = fmaxf(pred[(uint64_t)k * n_rows + i], wmax);
@@ -671,7 +731,12 @@ extern "C" __global__ void softmax_row_stats(
 }
 
 extern "C" __global__ void softmax_class_gradient(
-    const float* pred,
+    float* pred,
+    const float* delta,
+    // 前一棵树(第 class_id-1 类)的 delta 在这里顺手加到它自己的那一列:
+    // 本 kernel 只读第 class_id 列,所以不会改变自己的梯度。`~0u` = 没有。
+    // host 保证 pending_class != class_id。
+    uint32_t pending_class,
     const float* wmax,
     const float* wsum,
     const float* label,
@@ -682,10 +747,17 @@ extern "C" __global__ void softmax_class_gradient(
     float* gpair_out,
     unsigned long long subsample_threshold,
     unsigned long long subsample_seed,
-    unsigned long long subsample_tree) {
+    unsigned long long subsample_tree,
+    double* max_out) {
+    double mg = 0.0;
+    double mh = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
         const float m = pred[(uint64_t)class_id * n_rows + i];
+        if (pending_class != ~0u) {
+            float* slot = pred + (uint64_t)pending_class * n_rows + i;
+            *slot = __fadd_rn(*slot, delta[i]);
+        }
         float p = __fdiv_rn(expf(__fsub_rn(m, wmax[i])), wsum[i]);
         const float w = has_weight ? weight[i] : 1.0f;
         float h = fmaxf(
@@ -707,9 +779,14 @@ extern "C" __global__ void softmax_class_gradient(
         }
         gpair_out[(uint64_t)i * 2] = g;
         gpair_out[(uint64_t)i * 2 + 1] = h;
+        mg = fmax(mg, fb_bound(g));
+        mh = fmax(mh, fb_bound(h));
     }
+    fb_block_max_pair(mg, mh, max_out);
 }
 
+// 只在需要 flush 待施加 delta 时用(训练结束读 prediction 之前)。训练循环里
+// delta 已经并进下一个 stats / gradient kernel,不再单独 launch。
 extern "C" __global__ void add_class_delta(
     float* pred,
     const float* delta,
@@ -942,6 +1019,105 @@ extern "C" __global__ void gpair_quantize(
     extern __shared__ long long sred[];
     long long* sg = sred;
     long long* sh = sred + blockDim.x;
+
+    long long acc_g = 0;
+    long long acc_h = 0;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        const long long gi =
+            (long long)round((double)gpair[(uint64_t)i * 2] * grad_scale);
+        const long long hi =
+            (long long)round((double)gpair[(uint64_t)i * 2 + 1] * hess_scale);
+        out_fixed[(uint64_t)i * 2] = gi;
+        out_fixed[(uint64_t)i * 2 + 1] = hi;
+        acc_g += gi;
+        acc_h += hi;
+    }
+    sg[threadIdx.x] = acc_g;
+    sh[threadIdx.x] = acc_h;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sg[threadIdx.x] += sg[threadIdx.x + s];
+            sh[threadIdx.x] += sh[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_sum[(uint64_t)blockIdx.x * 2] = sg[0];
+        out_sum[(uint64_t)blockIdx.x * 2 + 1] = sh[0];
+    }
+}
+
+// ---------------------------------------------------------------- fast 量化尾巴
+//
+// `gpu_math = "fast"` 专用:把「归约 max → host 求 pow2 scale → 量化」之间那次
+// host 往返去掉。max 的块间归约、pow2 scale、量化都留在 device,host 只在最后
+// 和 root sum 一起做**一次**小 D2H + 一次同步,再用自己的 `GradQuantizer` 校验。
+//
+// scale 的公式逐步对应 `types::pow2_scale`(预算 2^62/n,向下取 2 的幂);
+// device 上用 ilogb 取 floor(log2),只有 raw 恰在 2 的幂正下方 1 ULP 内时才可能和
+// host 的 `log2().floor()` 差一档 —— host 拿到结果后会逐位比对 scale,不一致就用
+// host 的 scale 重新量化(行为退回到旧路径),所以这里永远不会静默用错 scale。
+// 非有限 / 非法 max 时 scale = 1.0;host 随后据 max 报错,不会往下用这棵树。
+__device__ __forceinline__ double fb_pow2_scale(double max_abs, uint32_t n_rows) {
+    if (!(max_abs > 0.0) || !isfinite(max_abs)) {
+        return 1.0;
+    }
+    const double budget = __ddiv_rn(4611686018427387904.0, (double)(n_rows > 0u ? n_rows : 1u));
+    const double raw = __ddiv_rn(budget, max_abs);
+    if (!isfinite(raw) || raw <= 0.0) {
+        return 1.0;
+    }
+    int k = ilogb(raw);
+    k = k < -1000 ? -1000 : (k > 1000 ? 1000 : k);
+    return ldexp(1.0, k);
+}
+
+// 单 block。out = [grad_scale, hess_scale, max_grad, max_hess]。
+extern "C" __global__ void gpair_scale_finalize(
+    const double* block_max,
+    uint32_t n_blocks,
+    uint32_t n_rows,
+    double* out) {
+    __shared__ double rg[256];
+    __shared__ double rh[256];
+    double mg = 0.0;
+    double mh = 0.0;
+    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        mg = fmax(mg, block_max[(uint64_t)b * 2]);
+        mh = fmax(mh, block_max[(uint64_t)b * 2 + 1]);
+    }
+    rg[threadIdx.x] = mg;
+    rh[threadIdx.x] = mh;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            rg[threadIdx.x] = fmax(rg[threadIdx.x], rg[threadIdx.x + s]);
+            rh[threadIdx.x] = fmax(rh[threadIdx.x], rh[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[0] = fb_pow2_scale(rg[0], n_rows);
+        out[1] = fb_pow2_scale(rh[0], n_rows);
+        out[2] = rg[0];
+        out[3] = rh[0];
+    }
+}
+
+// 与 `gpair_quantize` 逐字相同,只是 scale 从 device 读(`gpair_scale_finalize` 的输出)。
+extern "C" __global__ void gpair_quantize_dscale(
+    const float* gpair,
+    uint32_t n_rows,
+    const double* scales,
+    long long* out_fixed,
+    long long* out_sum) {
+    extern __shared__ long long sred[];
+    long long* sg = sred;
+    long long* sh = sred + blockDim.x;
+    const double grad_scale = scales[0];
+    const double hess_scale = scales[1];
 
     long long acc_g = 0;
     long long acc_h = 0;

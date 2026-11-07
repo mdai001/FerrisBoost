@@ -189,8 +189,10 @@ fn fast_quantile_scratch_is_budgeted() {
     let scratch = (256 * 2 + 1) * 8;
     assert_eq!(fast.budget().fast_math_bytes, n_rows * 8 + scratch);
     assert_eq!(exact.budget().fast_math_bytes, 0);
+    // Fast also keeps the 4-word device quantization scale result (gpair_f32 term).
+    let quant_scale = 4 * 8;
     assert_eq!(
         fast.budget().total() - exact.budget().total(),
-        n_rows * 8 + scratch
+        n_rows * 8 + scratch + quant_scale
     );
 }

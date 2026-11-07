@@ -1085,13 +1085,14 @@ memory budget, without manual chunk or batch tuning:
 - **`gpu_math="fast"` and objectives**: `"fast"` supports `reg:squarederror`,
   `binary:logistic`, `count:poisson`, `reg:gamma`, `reg:tweedie`, and
   `reg:pseudohubererror`. It is deterministic from run to run but not
-  byte-identical to CPU. Support for the newer regression objectives is a
-  first version; it is correct, and its speed will be optimized in 0.0.6.
+  byte-identical to CPU. For all of them the gradient, the fixed-point
+  quantization scale and the prediction update stay on the device, with one
+  host round trip and fewer kernel launches per tree than in 0.0.5.
 - **`gpu_math="fast"` and `reg:quantileerror`**: supported. The global scale is
   reduced on the device in a fixed shape, so it is deterministic from run to run
   but not byte-identical to CPU. `gpu_math="exact"` stays byte-identical.
 - **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
-- **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported (device softmax gradients); optimization continues in 0.0.6.
+- **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported. The softmax statistics are computed once per round on the device, and each tree's prediction update is folded into the next gradient kernel instead of a separate launch.
 - **Categorical features**: supported with both `gpu_math` modes. Split search
   for them runs on the host (see [Categorical features](#categorical-features)).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and

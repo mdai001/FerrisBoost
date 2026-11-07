@@ -22,6 +22,7 @@ use cudarc::driver::{
     sys, CudaEvent, CudaFunction, CudaSlice, CudaStream, HostSlice, LaunchConfig, PinnedHostSlice,
     PushKernelArg, SyncOnDrop,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::categorical::CatBits;
@@ -33,6 +34,8 @@ use super::{device_state, DeviceState, SharedHistogramConfig};
 /// grid-stride,所以 block 数只要够填满卡,不随行数线性增长。
 const GPAIR_THREADS: usize = 256;
 const GPAIR_BLOCKS: usize = 1024;
+/// fast 的 device scale 结果:`[grad_scale, hess_scale, max_grad, max_hess]`。
+const GPAIR_SCALE_WORDS: usize = 4;
 
 /// 诊断/实验开关的统一判定。
 ///
@@ -366,6 +369,9 @@ struct GpuBuffers {
     gpair_sum: Option<CudaSlice<i64>>,
     gpair_max_host: Vec<f64>,
     gpair_sum_host: Vec<i64>,
+    /// fast:`[grad_scale, hess_scale, max_grad, max_hess]`(device 算出,和 root sum 一起取回)。
+    gpair_scale: Option<CudaSlice<f64>>,
+    gpair_scale_host: [f64; 4],
     /// selected-row packing:`原始行号 → 压实下标`,每棵树上传一次。
     /// 未启用时为 None。
     /// `gpu_math = "fast"`:raw-margin prediction 常驻 device,不再每轮 D2H。
@@ -378,6 +384,9 @@ struct GpuBuffers {
     /// 同一轮里 K 个类的梯度 kernel 共用。
     mc_wmax: Option<CudaSlice<f32>>,
     mc_wsum: Option<CudaSlice<f32>>,
+    /// 多分类 fast:已经建完、但 delta 还没加进 `pred_resident` 的那一类。
+    /// delta 并进下一个 stats / gradient kernel(见 histogram.cu),`None` = 全部已施加。
+    mc_pending_class: Option<usize>,
     /// fast quantile:`QUANTILE_REDUCE_BLOCKS` 对 f64 per-block partial + 末尾 1 个 f64 scale。
     /// 训练级一次分配、每轮复用(没有 per-round 分配)。
     qt_scratch: Option<CudaSlice<f64>>,
@@ -560,6 +569,9 @@ pub struct GpuTrainCtx {
     gpu_math: crate::types::GpuMath,
     gpair_max_fn: Option<CudaFunction>,
     gpair_quantize_fn: Option<CudaFunction>,
+    /// `gpu_math = "fast"`:device 上完成 max 终归约 + pow2 scale + 量化(一次 host 往返)。
+    gpair_scale_fn: Option<CudaFunction>,
+    gpair_quantize_dscale_fn: Option<CudaFunction>,
     count_fn: CudaFunction,
     scan_fn: CudaFunction,
     scatter_layer_fn: CudaFunction,
@@ -585,6 +597,9 @@ pub struct GpuTrainCtx {
     /// 是否记录分段耗时。打开会在 H2D/D2H 前后显式同步,产生额外 sync ——
     /// 所以默认关闭,只在 `FB_PROFILE=1` 时打开。
     timing: bool,
+    /// fast 量化尾巴里「device scale 与 host 校验不一致、退回 host scale 重量化」的次数。
+    /// 正常恒为 0;测试用它钉住 device scale 公式没有悄悄漂移。
+    scale_fallbacks: AtomicU64,
     /// Opt-in diagnostic only. It records a CUDA event pair around **every**
     /// histogram launch, which serializes them — so it must never be on in a
     /// normal training run, and never on the same event pair as `timing`.
@@ -850,6 +865,27 @@ impl GpuTrainCtx {
         } else {
             (None, None)
         };
+        // fast 的量化尾巴:max 终归约 + scale 在 device 上。kernel 加载与 buffer 分配
+        // 用同一个条件(fast 且 device quantization 已启用)。
+        let fast_tail = fast_math && gpair_quantize_fn.is_some();
+        let (gpair_scale_fn, gpair_quantize_dscale_fn) = if fast_tail {
+            (
+                Some(
+                    state
+                        .module
+                        .load_function("gpair_scale_finalize")
+                        .context("PTX 中找不到 gpair_scale_finalize")?,
+                ),
+                Some(
+                    state
+                        .module
+                        .load_function("gpair_quantize_dscale")
+                        .context("PTX 中找不到 gpair_quantize_dscale")?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
         let count_fn = state
             .module
             .load_function("partition_count")
@@ -1108,6 +1144,16 @@ impl GpuTrainCtx {
             )
         } else {
             (None, None, None)
+        };
+        // fast 的 device scale 结果(4 个 f64),计入 `gpair_f32_bytes` 预算项。
+        let gpair_scale = if fast_math_wanted && device_quantize {
+            Some(
+                stream
+                    .alloc_zeros::<f64>(GPAIR_SCALE_WORDS)
+                    .context("gpair scale buffer 分配")?,
+            )
+        } else {
+            None
         };
         // 同一 binary 的严格 A/B 开关。HIGGS 实测 pinned 的 DMA 只快 2%，
         // 却多付 110 ms/轮的 pageable→pinned staging，并锁住 441 MB host
@@ -1407,6 +1453,11 @@ impl GpuTrainCtx {
                     n_gpair_blocks * 2 * (8 + 8)
                 } else {
                     0
+                }
+                + if fast_math && device_quantize {
+                    GPAIR_SCALE_WORDS * 8
+                } else {
+                    0
                 },
             partition_scratch_bytes: n_rows
                 + (n_part_blocks + n_part_offsets * 2 + n_part_descriptors) * 4
@@ -1493,6 +1544,8 @@ impl GpuTrainCtx {
             hist_batched_fn,
             gpair_max_fn,
             gpair_quantize_fn,
+            gpair_scale_fn,
+            gpair_quantize_dscale_fn,
             count_fn,
             scan_fn,
             scatter_layer_fn,
@@ -1510,6 +1563,7 @@ impl GpuTrainCtx {
             n_rows,
             partition_threads,
             timing,
+            scale_fallbacks: AtomicU64::new(0),
             bucket_profile,
             use_pinned,
             budget,
@@ -1520,6 +1574,7 @@ impl GpuTrainCtx {
                 weight_resident,
                 mc_wmax,
                 mc_wsum,
+                mc_pending_class: None,
                 qt_scratch,
                 gpair,
                 rows,
@@ -1541,6 +1596,8 @@ impl GpuTrainCtx {
                 gpair_sum,
                 gpair_max_host: vec![0.0; n_gpair_blocks * 2],
                 gpair_sum_host: vec![0; n_gpair_blocks * 2],
+                gpair_scale,
+                gpair_scale_host: [0.0; 4],
                 gpair_host,
             }),
             hist_slots,
@@ -2018,6 +2075,7 @@ impl GpuTrainCtx {
             subsample_threshold,
             subsample_seed,
             subsample_tree,
+            false,
         )
     }
 
@@ -2063,17 +2121,21 @@ impl GpuTrainCtx {
                 subsample_tree,
             )?;
             // The quantile gradient kernel already masked this pair.
-            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0);
+            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false);
         }
         {
-            let threads = 256u32;
-            let blocks = n_rows_u32.div_ceil(threads).min(65535);
+            // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
+            // 归约几何(grid-stride,和 `gpair_quantize` 一致)。
+            let threads = GPAIR_THREADS as u32;
+            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
+                .context("归约 block 数超过 u32")?;
             let GpuBuffers {
                 pred_resident,
                 label_resident,
                 weight_resident,
                 prediction_delta,
                 gpair_f32,
+                gpair_max,
                 ..
             } = &mut *buf;
             let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
@@ -2081,6 +2143,7 @@ impl GpuTrainCtx {
                 .as_ref()
                 .context("fast label buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            let max_out = gpair_max.as_mut().context("gpair max buffer 未分配")?;
             // 无权重时传 label 作占位指针:kernel 只在 has_weight 时读它。
             let has_weight: u32 = weight_resident.is_some().into();
             let weight = weight_resident.as_ref().unwrap_or(label);
@@ -2102,11 +2165,13 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch apply_delta_and_gradient")?;
         }
-        // The objective kernel already masked this pair. Do not resample it.
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
+        // The objective kernel already masked this pair and reduced its max.
+        // Do not resample it and do not rescan it for the max.
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
     /// fast quantile 一轮的三个 kernel(见 `histogram.cu` 的 quantile 一节):
@@ -2228,18 +2293,23 @@ impl GpuTrainCtx {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        // 上一轮最后一棵树的 delta 在这个 kernel 里并进 prediction。
+        let pending: u32 = buf.mc_pending_class.take().map_or(u32::MAX, |c| c as u32);
         let GpuBuffers {
             pred_resident,
+            prediction_delta,
             mc_wmax,
             mc_wsum,
             ..
         } = &mut *buf;
-        let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+        let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
         let wmax = mc_wmax.as_mut().context("softmax wmax buffer 未分配")?;
         let wsum = mc_wsum.as_mut().context("softmax wsum buffer 未分配")?;
         let mut launch = self.stream.launch_builder(stats_fn);
         launch
             .arg(pred)
+            .arg(&*prediction_delta)
+            .arg(&pending)
             .arg(&n_rows_u32)
             .arg(&n_classes)
             .arg(wmax)
@@ -2269,14 +2339,23 @@ impl GpuTrainCtx {
             self.n_outputs
         );
         let mut buf = self.lock()?;
+        // 待施加的 delta 并进这个 kernel;正常流程里它是第 class-1 类。如果撞上
+        // 要算梯度的这一类(只会是 API 误用),先单独 flush,保证读到的是已更新的列。
+        if buf.mc_pending_class == Some(class) {
+            self.flush_multiclass_delta_locked(&mut buf)?;
+        }
+        let pending: u32 = buf.mc_pending_class.take().map_or(u32::MAX, |c| c as u32);
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let class_id = class as u32;
         {
-            let threads = 256u32;
+            // 同时产出每 block 的 max,launch 几何 = 归约几何。
+            let threads = GPAIR_THREADS as u32;
+            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
+                .context("归约 block 数超过 u32")?;
             let cfg = LaunchConfig {
-                grid_dim: (n_rows_u32.div_ceil(threads).min(65535), 1, 1),
+                grid_dim: (blocks, 1, 1),
                 block_dim: (threads, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -2284,23 +2363,28 @@ impl GpuTrainCtx {
                 pred_resident,
                 label_resident,
                 weight_resident,
+                prediction_delta,
                 mc_wmax,
                 mc_wsum,
                 gpair_f32,
+                gpair_max,
                 ..
             } = &mut *buf;
-            let pred = pred_resident.as_ref().context("fast pred buffer 未分配")?;
+            let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
             let label = label_resident
                 .as_ref()
                 .context("fast label buffer 未分配")?;
             let wmax = mc_wmax.as_ref().context("softmax wmax buffer 未分配")?;
             let wsum = mc_wsum.as_ref().context("softmax wsum buffer 未分配")?;
             let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+            let max_out = gpair_max.as_mut().context("gpair max buffer 未分配")?;
             let has_weight: u32 = weight_resident.is_some().into();
             let weight = weight_resident.as_ref().unwrap_or(label);
             let mut launch = self.stream.launch_builder(grad_fn);
             launch
                 .arg(pred)
+                .arg(&*prediction_delta)
+                .arg(&pending)
                 .arg(wmax)
                 .arg(wsum)
                 .arg(label)
@@ -2311,26 +2395,47 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch softmax_class_gradient")?;
         }
-        // gradient kernel 已经按行采样置零;量化尾巴不再采样。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0)
+        // gradient kernel 已经按行采样置零并归约了 max;量化尾巴不再采样、不再扫 max。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
-    /// 多分类 fast:把刚建完的那棵树的叶子增量加到第 `class` 类的 device
-    /// prediction 上(device 是权威副本,host 不更新)。
+    /// 多分类 fast:记下刚建完的那棵树(第 `class` 类)的叶子增量**待施加**。
+    /// 增量还在 `prediction_delta` 里,下一个 stats / gradient kernel 会顺手把它
+    /// 加到第 `class` 列(device 是权威副本,host 不更新)—— 不再单独 launch。
+    /// 在下一棵树建完之前 delta buffer 不会被覆盖,所以这个延迟不改变任何数值。
+    /// 如果上一棵树的 delta 还没被并走(连续两次 apply),先 flush 它。
     pub fn fast_multiclass_apply_delta(&self, class: usize) -> Result<()> {
-        let delta_fn = self
-            .mc_delta_fn
-            .as_ref()
-            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
+        ensure!(
+            self.mc_delta_fn.is_some(),
+            "多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)"
+        );
         ensure!(
             class < self.n_outputs,
             "类别 {class} 超出 {}",
             self.n_outputs
         );
         let mut buf = self.lock()?;
+        if buf.mc_pending_class.is_some() {
+            self.flush_multiclass_delta_locked(&mut buf)?;
+        }
+        buf.mc_pending_class = Some(class);
+        Ok(())
+    }
+
+    /// 把待施加的 delta 用独立 kernel 加到 prediction 上。只在训练结束读
+    /// prediction 之前、或 API 误用时走这条;训练循环里 delta 并进下一个 kernel。
+    fn flush_multiclass_delta_locked(&self, buf: &mut GpuBuffers) -> Result<()> {
+        let Some(class) = buf.mc_pending_class.take() else {
+            return Ok(());
+        };
+        let delta_fn = self
+            .mc_delta_fn
+            .as_ref()
+            .context("多分类 fast 未启用(需要 gpu_math=fast 且 num_class > 1)")?;
         let n_rows_u32 = u32::try_from(self.n_rows).context("行数超过 u32")?;
         let class_id = class as u32;
         let threads = 256u32;
@@ -2343,7 +2448,7 @@ impl GpuTrainCtx {
             pred_resident,
             prediction_delta,
             ..
-        } = &mut *buf;
+        } = buf;
         let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
         let mut launch = self.stream.launch_builder(delta_fn);
         launch
@@ -2353,6 +2458,11 @@ impl GpuTrainCtx {
             .arg(&class_id);
         unsafe { launch.launch(cfg) }.context("launch add_class_delta")?;
         Ok(())
+    }
+
+    /// fast 量化尾巴退回 host scale 的次数(见 `quantize_fused_device_scale`)。
+    pub fn device_scale_fallbacks(&self) -> u64 {
+        self.scale_fallbacks.load(Ordering::Relaxed)
     }
 
     pub fn fast_math_enabled(&self) -> bool {
@@ -2385,7 +2495,9 @@ impl GpuTrainCtx {
                 self.n_rows * self.n_outputs
             );
         }
-        let buf = self.lock()?;
+        let mut buf = self.lock()?;
+        // 多分类 fast:最后一棵树的 delta 可能还没并进 prediction。
+        self.flush_multiclass_delta_locked(&mut buf)?;
         let pred = buf
             .pred_resident
             .as_ref()
@@ -2480,6 +2592,9 @@ impl GpuTrainCtx {
         subsample_threshold: u64,
         subsample_seed: u64,
         subsample_tree: u64,
+        // fast:梯度 kernel 已经把每 block 的 max 写进 `gpair_max`,不再扫一遍 gpair_f32。
+        // exact:gpair 是 host 上传的,max(及行采样)由 `gpair_max_abs` 完成。
+        max_fused: bool,
     ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
         let max_fn = self
             .gpair_max_fn
@@ -2493,7 +2608,10 @@ impl GpuTrainCtx {
         let threads = GPAIR_THREADS as u32;
         let blocks =
             u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
-        {
+        if max_fused && self.gpair_scale_fn.is_some() {
+            return self.quantize_fused_device_scale(buf, started, n_rows_u32, blocks);
+        }
+        if !max_fused {
             let GpuBuffers {
                 gpair_f32,
                 gpair_max,
@@ -2585,6 +2703,155 @@ impl GpuTrainCtx {
             };
         }
 
+        self.sync_if_timing()?;
+        let elapsed = if self.timing {
+            started.elapsed().as_secs_f32() * 1e3
+        } else {
+            0.0
+        };
+        Ok((quantizer, root_sum, elapsed))
+    }
+
+    /// fast 的量化尾巴:每 block 的 max 已经由梯度 kernel 写好 → device 上终归约并算
+    /// pow2 scale → 用 device 上的 scale 量化 → **一次** D2H(scale/max + 每 block 的
+    /// root sum)和一次同步。比 exact 共用的尾巴少一次 host 往返。
+    ///
+    /// host 拿到结果后照旧用 `GradQuantizer::try_from_bounds` 校验 max(非有限梯度在这里
+    /// 报错,这棵树不会被用)并**逐位比对** device 的 scale;不一致(只可能是 raw 恰在
+    /// 2 的幂正下方 1 ULP 内,host 的 `log2` 与 device 的 `ilogb` 差一档)就用 host 的
+    /// scale 用旧 kernel 重新量化 —— 永远不会静默使用不同的 scale。
+    fn quantize_fused_device_scale(
+        &self,
+        buf: &mut GpuBuffers,
+        started: std::time::Instant,
+        n_rows_u32: u32,
+        blocks: u32,
+    ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        let scale_fn = self
+            .gpair_scale_fn
+            .as_ref()
+            .context("device scale kernel 未加载")?;
+        let quant_fn = self
+            .gpair_quantize_dscale_fn
+            .as_ref()
+            .context("device scale 量化 kernel 未加载")?;
+        let threads = GPAIR_THREADS as u32;
+        {
+            let GpuBuffers {
+                gpair_max,
+                gpair_scale,
+                ..
+            } = &mut *buf;
+            let maxima = gpair_max.as_ref().context("gpair max buffer 未分配")?;
+            let scales = gpair_scale.as_mut().context("gpair scale buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(scale_fn);
+            launch.arg(maxima).arg(&blocks).arg(&n_rows_u32).arg(scales);
+            unsafe { launch.launch(cfg) }.context("launch gpair_scale_finalize")?;
+        }
+        {
+            let GpuBuffers {
+                gpair_f32,
+                gpair: gpair_dev,
+                gpair_sum,
+                gpair_scale,
+                ..
+            } = &mut *buf;
+            let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
+            let sums = gpair_sum.as_mut().context("gpair sum buffer 未分配")?;
+            let scales = gpair_scale.as_ref().context("gpair scale buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: threads * 2 * std::mem::size_of::<i64>() as u32,
+            };
+            let mut launch = self.stream.launch_builder(quant_fn);
+            launch
+                .arg(src)
+                .arg(&n_rows_u32)
+                .arg(scales)
+                .arg(gpair_dev)
+                .arg(sums);
+            unsafe { launch.launch(cfg) }.context("launch gpair_quantize_dscale")?;
+        }
+        {
+            let GpuBuffers {
+                gpair_scale,
+                gpair_scale_host,
+                gpair_sum,
+                gpair_sum_host,
+                ..
+            } = &mut *buf;
+            let scales = gpair_scale.as_ref().context("gpair scale buffer 未分配")?;
+            self.stream
+                .memcpy_dtoh(scales, gpair_scale_host.as_mut_slice())
+                .context("gpair scale D2H")?;
+            let sums = gpair_sum.as_ref().context("gpair sum buffer 未分配")?;
+            self.stream
+                .memcpy_dtoh(sums, gpair_sum_host.as_mut_slice())
+                .context("gpair sum D2H")?;
+        }
+        self.stream
+            .synchronize()
+            .context("等待 gpair scale/sum D2H")?;
+
+        let [dev_grad_scale, dev_hess_scale, max_grad, max_hess] = buf.gpair_scale_host;
+        let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, self.n_rows)?;
+        if quantizer.grad_scale().to_bits() != dev_grad_scale.to_bits()
+            || quantizer.hess_scale().to_bits() != dev_hess_scale.to_bits()
+        {
+            // 极罕见的 log2/ilogb 分歧:用 host 的 scale 走旧 kernel 重新量化。
+            self.scale_fallbacks.fetch_add(1, Ordering::Relaxed);
+            let quant_fn = self
+                .gpair_quantize_fn
+                .as_ref()
+                .context("device quantization 未启用")?;
+            let grad_scale = quantizer.grad_scale();
+            let hess_scale = quantizer.hess_scale();
+            let GpuBuffers {
+                gpair_f32,
+                gpair: gpair_dev,
+                gpair_sum,
+                gpair_sum_host,
+                ..
+            } = &mut *buf;
+            let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
+            let sums = gpair_sum.as_mut().context("gpair sum buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: threads * 2 * std::mem::size_of::<i64>() as u32,
+            };
+            {
+                let mut launch = self.stream.launch_builder(quant_fn);
+                launch
+                    .arg(src)
+                    .arg(&n_rows_u32)
+                    .arg(&grad_scale)
+                    .arg(&hess_scale)
+                    .arg(gpair_dev)
+                    .arg(&mut *sums);
+                unsafe { launch.launch(cfg) }.context("launch gpair_quantize (host scale)")?;
+            }
+            self.stream
+                .memcpy_dtoh(&*sums, gpair_sum_host.as_mut_slice())
+                .context("gpair sum D2H (host scale)")?;
+            self.stream
+                .synchronize()
+                .context("等待 gpair sum D2H (host scale)")?;
+        }
+        // 用 `+=`(AddAssign)而不是 wrapping_add:debug 下仍然检查溢出。
+        let mut root_sum = GradPairFixed::default();
+        for pair in buf.gpair_sum_host.as_chunks::<2>().0 {
+            root_sum += GradPairFixed {
+                grad: pair[0],
+                hess: pair[1],
+            };
+        }
         self.sync_if_timing()?;
         let elapsed = if self.timing {
             started.elapsed().as_secs_f32() * 1e3
