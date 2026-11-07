@@ -201,12 +201,14 @@ def test_pandas_feature_names_and_feature_importances():
     p = clf.predict_proba(df)
     with pytest.raises(ValueError, match="feature names"):
         clf.predict_proba(df.rename(columns={"a": "z"}))
-    if hasattr(fb.Model, "get_score"):
-        imp = clf.feature_importances_
-        assert imp.shape == (5,) and abs(imp.sum() - 1.0) < 1e-5
-    else:
-        with pytest.raises(NotImplementedError):
-            clf.feature_importances_  # noqa: B018
+    imp = clf.feature_importances_
+    assert imp.shape == (5,) and abs(imp.sum() - 1.0) < 1e-5
+    score = clf.get_booster().get_score(importance_type="gain")
+    total = sum(score.values())
+    for i in range(5):
+        np.testing.assert_allclose(imp[i], score.get(f"f{i}", 0.0) / total, rtol=1e-5)
+    other = small_clf(importance_type="weight").fit(df, y).feature_importances_
+    assert abs(other.sum() - 1.0) < 1e-5 and not np.allclose(other, imp)
     del p
 
 

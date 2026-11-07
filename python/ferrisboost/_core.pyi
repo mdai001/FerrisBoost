@@ -34,6 +34,10 @@ class Model:
         predict_threads: int = 0,
         use_gpu: bool = False,
         iteration_range: tuple[int, int] | None = None,
+        pred_contribs: bool = False,
+        approx_contribs: bool = False,
+        pred_interactions: bool = False,
+        pred_leaf: bool = False,
     ) -> NDArray[np.float32]:
         """Return ordered float32 predictions from an array or path specs.
 
@@ -57,6 +61,31 @@ class Model:
         Feature values exactly equal to the largest float32 are rejected, as in
         training (the value is reserved for split boundaries); +/-inf and NaN
         follow the usual rules.
+
+        Explanations (XGBoost 3.4.1 semantics; at most one per call, not
+        combinable with output_margin; always computed on the CPU, use_gpu is
+        ignored; n_trees and predict_threads apply; array and file inputs):
+
+        * pred_contribs=True: exact TreeSHAP in margin space, shape
+          (n, n_features + 1) with the bias last, or (n, num_class,
+          n_features + 1) for multiclass. Each row sums to the raw margin.
+        * approx_contribs=True (with pred_contribs): Saabas attribution
+          instead of TreeSHAP. Ignored unless pred_contribs is set; raises
+          with pred_interactions, where XGBoost 3.4.1 returns only a diagonal.
+        * pred_interactions=True: SHAP interaction values, shape
+          (n, n_features + 1, n_features + 1), multiclass adds a class axis
+          after the row axis. Memory is n * (n_features + 1) ** 2 floats.
+        * pred_leaf=True: float32 node index of the leaf reached in each
+          tree, shape (n, n_trees).
+        """
+        ...
+    def get_score(self, importance_type: str = "weight") -> dict[str, float]:
+        """Feature importance as in XGBoost's Booster.get_score.
+
+        importance_type is "weight" (split count), "gain", "cover" (averages
+        per split), "total_gain" or "total_cover". Features never used in a
+        split are omitted; keys are the model's feature names, or "f0",
+        "f1", ... when it has none.
         """
         ...
     def predict_to_parquet(

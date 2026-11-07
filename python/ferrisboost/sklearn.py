@@ -309,29 +309,20 @@ class _FerrisBoostBase(BaseEstimator):
 
     @property
     def feature_importances_(self) -> np.ndarray:
-        """按 `importance_type`(默认 `gain`)归一化的特征重要性,长度 `n_features_in_`。
+        """Feature importances normalized to sum to 1, one entry per input feature.
 
-        依赖 `Model.get_score`;当前构建没有它时抛 `NotImplementedError`。
+        Uses `Model.get_score(importance_type)`; `importance_type` defaults to
+        "gain" as in XGBoost's sklearn layer. Multiclass importances are
+        accumulated over all classes' trees. All zeros when no split exists.
         """
-        model = self.get_booster()
-        get_score = getattr(model, "get_score", None)
-        if get_score is None:
-            raise NotImplementedError(
-                "feature_importances_ needs Model.get_score, which this build does not have yet"
-            )
         kind = self.importance_type or "gain"
         if kind not in _IMPORTANCE_TYPES:
             raise ValueError(f"importance_type must be one of {_IMPORTANCE_TYPES}, got {kind!r}")
-        score = get_score(importance_type=kind)
-        names = getattr(self, "feature_names_in_", None)
-        out = np.zeros(self.n_features_in_, dtype=np.float32)
-        for key, value in score.items():
-            if names is not None and key in list(names):
-                out[list(names).index(key)] = value
-            elif isinstance(key, str) and key.startswith("f") and key[1:].isdigit():
-                out[int(key[1:])] = value
-            elif isinstance(key, int):
-                out[key] = value
+        score = self.get_booster().get_score(importance_type=kind)
+        # The booster is trained from arrays, so its keys are positional (f0, f1, ...).
+        out = np.array(
+            [score.get(f"f{i}", 0.0) for i in range(self.n_features_in_)], dtype=np.float32
+        )
         total = out.sum()
         return out / total if total > 0 else out
 

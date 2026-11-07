@@ -249,6 +249,7 @@ logging, and the complete parameter reference.
 - Added `predict(..., iteration_range=(begin, end))` with XGBoost semantics (boosting rounds, so multiclass uses `num_class` trees per round), next to `n_trees`.
 - Added scikit-learn estimators `FerrisBoostClassifier` and `FerrisBoostRegressor` (`fit`, `predict`, `predict_proba`, `eval_set`, early stopping, `evals_result()`, `save_model` / `load_model`). scikit-learn stays an optional dependency.
 - Added `Model.objective` and `Model.num_class` properties.
+- Added `Model.get_score(importance_type)` (`weight`, `gain`, `cover`, `total_gain`, `total_cover`) and `predict(..., pred_contribs=True)` (exact TreeSHAP, bias last), `approx_contribs=True` (Saabas), `pred_interactions=True`, and `pred_leaf=True`, with XGBoost 3.4.1 semantics and output shapes, for numpy and file inputs, binary, regression, and multiclass models, and models loaded from XGBoost JSON. They run on the CPU, row-parallel and deterministic across thread counts, and honor `n_trees`.
 
 ### 0.0.5
 
