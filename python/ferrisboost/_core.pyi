@@ -155,6 +155,7 @@ def train_dense(
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
     weight: NDArray[np.float32] | None = ...,
+    feature_names: Sequence[str] | None = ...,
 ) -> Model:
     """Train a dense model; early stopping needs evals and retains all trained trees.
 

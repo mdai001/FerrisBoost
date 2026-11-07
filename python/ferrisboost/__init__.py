@@ -605,17 +605,31 @@ def _merge_flags(auto: list[bool] | None, explicit: list[bool] | None, n: int) -
     return list(flags)
 
 
-def _as_predict_matrix(data: Any) -> np.ndarray:
+def _is_named_table(data: Any) -> bool:
+    """True for a pandas DataFrame or a PyArrow Table / RecordBatch."""
+    return _is_pandas_frame(data) or _arrow_table(data) is not None
+
+
+def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndarray:
     """Convert a pandas DataFrame / PyArrow Table to the f32 matrix `Model.predict` scores.
 
+    With `names` (the model's feature names), columns are selected and ordered
+    by name, as XGBoost does for a DataFrame; extra columns are ignored and a
+    missing one is an error. Without names the columns are taken in order.
     Categorical columns use their codes, so the frame must carry the same
     categories (in the same order) as the training data.
     """
     if _is_pandas_frame(data):
+        if names:
+            cols = [str(c) for c in data.columns]
+            absent = [n for n in names if n not in cols]
+            if absent:
+                raise ValueError(f"predict data 缺少模型的特征列 {absent}")
+            data = data[[c for n in names for c in data.columns if str(c) == n]]
         return _frame_matrix(data, True, what="predict data")[0]
     table = _arrow_table(data)
     if table is not None:
-        return _table_matrix(table, None, True, what="predict data")[0]
+        return _table_matrix(table, list(names) if names else None, True, what="predict data")[0]
     raise ValueError(
         "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、"
         "pandas DataFrame 或 pyarrow Table"
@@ -762,7 +776,8 @@ def train(
                 ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")
             eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name)))
         model = _core.train_dense(x, y, p, eval_specs, early_stopping_rounds,
-                                  verbose, cb_list, weight=w)
+                                  verbose, cb_list, weight=w,
+                                  feature_names=None if names is None else [str(n) for n in names])
 
     if evals_result is not None:
         evals_result.clear()

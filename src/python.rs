@@ -1900,6 +1900,9 @@ impl PyModel {
         // sentinel into the reader.
         let missing = crate::source::validate_missing(missing)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // A pandas DataFrame / pyarrow Table is bound to the model's feature
+        // names (when it has them) before anything else, like evals in training.
+        let data = &bind_named_table(py, data, &self.inner.feature_names)?;
         let data = &normalize_array_input(py, data, missing)?;
         // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
         // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
@@ -3104,6 +3107,28 @@ fn array_input<'py>(
     }
 }
 
+/// Convert a pandas DataFrame / pyarrow Table to an f32 matrix whose columns
+/// are selected and ordered by the model's feature names. Other inputs (paths,
+/// numpy arrays), and any input for a model without names, pass through.
+fn bind_named_table<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    names: &[String],
+) -> PyResult<Bound<'py, PyAny>> {
+    if names.is_empty()
+        || path_specs_of(data)?.is_some()
+        || data.extract::<PyReadonlyArray2<f32>>().is_ok()
+    {
+        return Ok(data.clone());
+    }
+    let fb = py.import("ferrisboost")?;
+    let is_table = fb.getattr("_is_named_table")?.call1((data,))?.is_truthy()?;
+    if !is_table {
+        return Ok(data.clone());
+    }
+    fb.getattr("_as_predict_matrix")?.call1((data, names.to_vec()))
+}
+
 /// Apply the XGBoost `missing` sentinel to array-like prediction input.
 ///
 /// Path inputs, and any input when `missing` is NaN, are returned untouched
@@ -3175,7 +3200,7 @@ fn check_categorical_codes(
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None, weight=None))]
+                    verbose_eval=None, callbacks=None, weight=None, feature_names=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_dense(
     py: Python<'_>,
@@ -3187,6 +3212,7 @@ fn train_dense(
     verbose_eval: Option<usize>,
     callbacks: Option<&Bound<'_, PyList>>,
     weight: Option<PyReadonlyArray1<'_, f32>>,
+    feature_names: Option<Vec<String>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
@@ -3369,11 +3395,28 @@ fn train_dense(
 
     // 回调里抛的异常在这儿冒出来
     raise_callback_error(&cb_error)?;
-    // numpy 入口没有列名 —— 位置模式。
+    // numpy 入口没有列名 —— 位置模式;pandas / pyarrow 入口带列名 —— 命名模式
+    // (get_score / feature_importances_ 用真名,按文件 / DataFrame 预测按列名绑定)。
+    let feature_names = match feature_names {
+        None => Vec::new(),
+        Some(names) => {
+            if names.len() != n_features {
+                return Err(PyValueError::new_err(format!(
+                    "feature_names 有 {} 个,数据有 {n_features} 列",
+                    names.len()
+                )));
+            }
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = names.iter().find(|n| !seen.insert(n.as_str())) {
+                return Err(PyValueError::new_err(format!("特征列名重复:{dup:?}")));
+            }
+            names
+        }
+    };
     Ok(finish(
         model,
         handle,
-        Vec::new(),
+        feature_names,
         cfg.quiet,
         cfg.model_io_threads,
         cfg.ingest_threads,

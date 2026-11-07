@@ -226,11 +226,8 @@ impl PyModel {
                 return self.explain_array(py, out, kind, rows, upto);
             }
 
-            let x: PyReadonlyArray2<'py, f32> = data.extract().map_err(|_| {
-                PyValueError::new_err(
-                    "predict 只接受文件路径(单个 / 列表 / 目录 / glob)或二维 f32 numpy 数组",
-                )
-            })?;
+            // Same in-memory inputs as plain predict: f32 arrays, pandas, pyarrow.
+            let x: PyReadonlyArray2<'py, f32> = array_input(py, data)?;
             let shape = x.shape();
             let (n_rows, cols) = (shape[0], shape[1]);
             if cols != n_features {
