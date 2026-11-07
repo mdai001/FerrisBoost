@@ -125,24 +125,162 @@ pub fn build(
                 start = end;
             }
         }
-        Some(rows) => {
-            // 行下标是升序的(来自上一层的分区),所以一个 tile 里的
-            // 梯度访问也集中在一段地址里。
-            for chunk in rows.chunks(tile) {
-                for f in 0..n_feats {
-                    let col = &block_data[f * block_n_rows..(f + 1) * block_n_rows];
-                    let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
-                    for &r in chunk {
-                        let b = col[r as usize];
-                        if b == MISSING_BIN {
-                            continue;
-                        }
-                        hist[b as usize] += gpair[r as usize];
-                    }
+        Some(rows) => build_rows(
+            block_data,
+            block_n_rows,
+            n_feats,
+            feat_offsets,
+            gpair,
+            rows,
+            out,
+        ),
+    }
+}
+
+/// `build` 的行子集分支:按 tile 分块,块内「外层特征、内层行」。
+fn build_rows(
+    block_data: &[Bin],
+    block_n_rows: usize,
+    n_feats: usize,
+    feat_offsets: &[u32],
+    gpair: &[GradPairFixed],
+    rows: &[RowId],
+    out: &mut [GradPairFixed],
+) {
+    let tile = tile_rows();
+    // 行下标是升序的(来自上一层的分区),所以一个 tile 里的
+    // 梯度访问也集中在一段地址里。
+    for chunk in rows.chunks(tile) {
+        for f in 0..n_feats {
+            let col = &block_data[f * block_n_rows..(f + 1) * block_n_rows];
+            let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
+            for &r in chunk {
+                let b = col[r as usize];
+                if b == MISSING_BIN {
+                    continue;
                 }
+                hist[b as usize] += gpair[r as usize];
             }
         }
     }
+}
+
+/// 同一列块、同一层的**多个节点**一起累加:外层按行 id 分块(tile),
+/// 内层才是节点。每个节点的输出 `out` 进来时必须已清零(同 [`build`])。
+///
+/// 为什么不是逐节点调 [`build`]:列主序下,深层节点的行集合很稀疏
+/// (HIGGS 第 5 层每个小节点只占全部行的 ~1/40),节点内一个 bin 字节
+/// 就要拉一整条 cache line,而且**每个节点各拉一遍同一批 line** ——
+/// 块比缓存大得多,节点之间毫无复用,流量约是「块大小 × 节点数」。
+/// 把循环换成「一个行 id 区间内先后服务所有节点」之后,这段区间的 bin 和
+/// gpair 在缓存里被所有节点复用,每层只从内存流过一遍。
+///
+/// 每个节点的 `rows` 必须**升序**(训练里来自稳定分区,恒成立):
+/// 每个节点持有一个游标,按升序推进。定点累加按模 2^64 精确、与顺序无关,
+/// 每个节点自己的累加顺序也和 [`build`] 完全一样,所以结果**逐位相同**。
+pub fn build_nodes(
+    block_data: &[Bin],
+    block_n_rows: usize,
+    n_feats: usize,
+    feat_offsets: &[u32],
+    gpair: &[GradPairFixed],
+    nodes: &mut [(&[RowId], &mut [GradPairFixed])],
+) {
+    build_nodes_with_span(
+        block_data,
+        block_n_rows,
+        n_feats,
+        feat_offsets,
+        gpair,
+        nodes,
+        node_span_rows(n_feats),
+    );
+}
+
+fn build_nodes_with_span(
+    block_data: &[Bin],
+    block_n_rows: usize,
+    n_feats: usize,
+    feat_offsets: &[u32],
+    gpair: &[GradPairFixed],
+    nodes: &mut [(&[RowId], &mut [GradPairFixed])],
+    span: usize,
+) {
+    debug_assert_eq!(block_data.len(), n_feats * block_n_rows);
+    debug_assert_eq!(feat_offsets.len(), n_feats + 1);
+    debug_assert_eq!(gpair.len(), block_n_rows);
+    debug_assert!(span > 0);
+    debug_assert!(
+        nodes
+            .iter()
+            .all(|(rows, _)| rows.windows(2).all(|w| w[0] <= w[1])),
+        "build_nodes 要求每个节点的行下标升序"
+    );
+    if crate::train::prof::enabled() {
+        let rows: usize = nodes.iter().map(|(r, _)| r.len()).sum();
+        crate::train::prof::HIST_UPDATES.fetch_add(
+            (rows * n_feats) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    if nodes.len() <= 1 {
+        // 单节点没有跨节点复用可言,保持原来的循环。
+        for (rows, out) in nodes.iter_mut() {
+            build_rows(
+                block_data,
+                block_n_rows,
+                n_feats,
+                feat_offsets,
+                gpair,
+                rows,
+                out,
+            );
+        }
+        return;
+    }
+    let mut cursors = vec![0usize; nodes.len()];
+    let mut start = 0usize;
+    while start < block_n_rows {
+        let end = start.saturating_add(span).min(block_n_rows);
+        for ((rows, out), cursor) in nodes.iter_mut().zip(cursors.iter_mut()) {
+            let from = *cursor;
+            if from >= rows.len() {
+                continue;
+            }
+            let to = from + rows[from..].partition_point(|&r| (r as usize) < end);
+            *cursor = to;
+            if to > from {
+                build_rows(
+                    block_data,
+                    block_n_rows,
+                    n_feats,
+                    feat_offsets,
+                    gpair,
+                    &rows[from..to],
+                    out,
+                );
+            }
+        }
+        start = end;
+    }
+    debug_assert!(nodes
+        .iter()
+        .zip(&cursors)
+        .all(|((rows, _), &c)| c == rows.len()));
+}
+
+/// 一个 tile 的 bin 字节预算。一个 tile 覆盖的行 id 区间是
+/// `预算 / 块内特征数` 行:窄块(HIGGS 4 列)区间长,宽块(Epsilon 63 列)
+/// 区间短,被所有节点复用的那份 bin 恒约 1 MiB。
+///
+/// 合成基准(1 线程,最好 3 次):HIGGS 形状 4 列/块,区间 64Ki–256Ki 行
+/// 最好、16Ki 行明显差、1Mi 行回退;Epsilon 形状 63 列/块,8Ki–64Ki 行最好、
+/// 4Ki 和 128Ki 行回退。1 MiB 预算落在两者的平台上。
+fn node_span_rows(n_feats: usize) -> usize {
+    const SPAN_BYTES: usize = 1 << 20;
+    const GRAIN: usize = 4096;
+    let rows = SPAN_BYTES / n_feats.max(1);
+    (rows / GRAIN).max(1) * GRAIN
 }
 
 /// 行分块的块大小。
@@ -408,6 +546,104 @@ mod tests {
             &out,
             &reference(&block, n_rows, n_feats, &offs, &gpair, &all),
         );
+    }
+
+    /// 多节点按行 id 区间交错累加,必须和逐节点 `build` / 参考实现逐位相同:
+    /// 覆盖空节点、单行节点、重叠不了的稀疏集合、缺失 bin、跨 tile 边界,
+    /// 以及比块还小 / 比块大的区间。
+    #[test]
+    fn build_nodes_matches_per_node_build_and_reference() {
+        let n_rows = 1000usize;
+        let n_feats = 3usize;
+        let offs: Vec<u32> = vec![0, 7, 20, 22];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let widths = [7u64, 13, 2];
+        let mut block: Vec<Bin> = Vec::with_capacity(n_rows * n_feats);
+        for f in 0..n_feats {
+            for _ in 0..n_rows {
+                let r = next();
+                block.push(if r % 11 == 0 {
+                    MISSING_BIN
+                } else {
+                    ((r >> 8) % widths[f]) as Bin
+                });
+            }
+        }
+        let gpair: Vec<GradPairFixed> = (0..n_rows)
+            .map(|_| {
+                let r = next();
+                GradPairFixed {
+                    grad: (r % 2001) as i64 - 1000,
+                    hess: ((r >> 20) % 501) as i64,
+                }
+            })
+            .collect();
+        // 升序、互不相交的节点行集:按行随机分给 6 个桶(+ 一个空桶、一个单行桶)。
+        let mut buckets: Vec<Vec<RowId>> = vec![Vec::new(); 8];
+        for r in 0..n_rows as RowId {
+            let b = (next() % 6) as usize;
+            buckets[b].push(r);
+        }
+        buckets[6].clear();
+        buckets[7] = vec![999];
+        buckets[0].retain(|&r| r != 999);
+        buckets[1].retain(|&r| r != 999);
+        buckets[2].retain(|&r| r != 999);
+        buckets[3].retain(|&r| r != 999);
+        buckets[4].retain(|&r| r != 999);
+        buckets[5].retain(|&r| r != 999);
+        let width = 22usize;
+        for span in [1usize, 3, 64, 97, 1000, 5000] {
+            let mut outs: Vec<Vec<GradPairFixed>> =
+                vec![vec![GradPairFixed::default(); width]; buckets.len()];
+            {
+                let mut nodes: Vec<(&[RowId], &mut [GradPairFixed])> = buckets
+                    .iter()
+                    .zip(outs.iter_mut())
+                    .map(|(r, o)| (r.as_slice(), o.as_mut_slice()))
+                    .collect();
+                build_nodes_with_span(&block, n_rows, n_feats, &offs, &gpair, &mut nodes, span);
+            }
+            for (rows, out) in buckets.iter().zip(&outs) {
+                let mut single = vec![GradPairFixed::default(); width];
+                build(
+                    &block,
+                    n_rows,
+                    n_feats,
+                    &offs,
+                    &gpair,
+                    Some(rows),
+                    &mut single,
+                );
+                assert_eq!(out, &single, "span {span}: 与逐节点 build 不一致");
+                assert_same(
+                    out,
+                    &reference(&block, n_rows, n_feats, &offs, &gpair, rows),
+                );
+            }
+        }
+        // 默认区间(含单节点分支)同样一致。
+        let mut outs: Vec<Vec<GradPairFixed>> =
+            vec![vec![GradPairFixed::default(); width]; buckets.len()];
+        let mut nodes: Vec<(&[RowId], &mut [GradPairFixed])> = buckets
+            .iter()
+            .zip(outs.iter_mut())
+            .map(|(r, o)| (r.as_slice(), o.as_mut_slice()))
+            .collect();
+        build_nodes(&block, n_rows, n_feats, &offs, &gpair, &mut nodes);
+        drop(nodes);
+        for (rows, out) in buckets.iter().zip(&outs) {
+            assert_same(
+                out,
+                &reference(&block, n_rows, n_feats, &offs, &gpair, rows),
+            );
+        }
     }
 
     #[test]

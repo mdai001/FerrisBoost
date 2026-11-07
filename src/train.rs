@@ -2517,26 +2517,38 @@ fn build_tree(
                         );
                     } else {
                         let block = block.context("CPU histogram requires source payload")?;
-                        for (i, ln) in level.iter().enumerate() {
-                            if matches!(ln.hist_from, HistFrom::Accumulate) {
-                                // 根节点走 None 那条路:少一层行下标的间接寻址,
-                                // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                                let rows = if depth == 0 {
-                                    None
-                                } else {
-                                    Some(ln.rows.host())
-                                };
-                                let _t = prof::Timer::new(&prof::HIST);
-                                hist::build(
-                                    &block.data,
-                                    block.n_rows,
-                                    block.n_feats(),
-                                    &plan.hist_offsets,
-                                    gpair,
-                                    rows,
-                                    &mut per_node[i].bins,
-                                );
-                            }
+                        let _t = prof::Timer::new(&prof::HIST);
+                        if depth == 0 {
+                            // 根节点走 None 那条路:少一层行下标的间接寻址,
+                            // 结果和传全部行完全一样(hist.rs 有断言钉着)。
+                            hist::build(
+                                &block.data,
+                                block.n_rows,
+                                block.n_feats(),
+                                &plan.hist_offsets,
+                                gpair,
+                                None,
+                                &mut per_node[0].bins,
+                            );
+                        } else {
+                            // 本层所有要实际累加的节点一起走:行 id 区间在外、
+                            // 节点在内,同一段 bin/gpair 被所有节点复用
+                            // (见 `hist::build_nodes`)。逐位结果与逐节点
+                            // 调 `build` 相同。
+                            let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
+                                .iter()
+                                .zip(per_node.iter_mut())
+                                .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
+                                .map(|(ln, h)| (ln.rows.host(), h.bins.as_mut_slice()))
+                                .collect();
+                            hist::build_nodes(
+                                &block.data,
+                                block.n_rows,
+                                block.n_feats(),
+                                &plan.hist_offsets,
+                                gpair,
+                                &mut targets,
+                            );
                         }
                     }
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
