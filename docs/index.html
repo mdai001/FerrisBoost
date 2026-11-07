@@ -97,7 +97,7 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
-      <h3>0.0.5 (unreleased)</h3>
+      <h3>0.0.5</h3>
       <ul>
         <li>Changed: when <code>base_score</code> is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for <code>reg:pseudohubererror</code> and when <code>scale_pos_weight</code> is not <code>1</code>; per-class log-frequency margins for multiclass). Default models of <code>binary:logistic</code> and <code>reg:squarederror</code> therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit <code>base_score</code> behaves as before, and <code>binary:logistic</code> accepts <code>base_score</code> in <code>[0, 1]</code>, so all-0 or all-1 labels train.</li>
         <li>Added <code>alpha</code> (alias <code>reg_alpha</code>), <code>max_delta_step</code>, and <code>scale_pos_weight</code>, with XGBoost semantics, on CPU and GPU. For <code>count:poisson</code>, an unset <code>max_delta_step</code> becomes <code>0.7</code>, as in XGBoost.</li>
@@ -105,6 +105,10 @@ prediction = model.predict("test.parquet")</code></pre>
         <li>Added multiclass objectives <code>multi:softprob</code> and <code>multi:softmax</code> (<code>num_class</code>): <code>predict</code> returns <code>(n, num_class)</code> probabilities or margins, or class indices for <code>multi:softmax</code>. Multiclass models interchange with XGBoost in both directions. In this version, <code>predict_to_parquet</code> for multiclass models builds its output in memory before writing.</li>
         <li>Added metrics <code>mae</code>, <code>mape</code>, <code>mphe</code>, <code>poisson-nloglik</code>, <code>gamma-nloglik</code>, <code>gamma-deviance</code>, <code>tweedie-nloglik@rho</code>, <code>error@t</code>, <code>aucpr</code>, <code>mlogloss</code>, and <code>merror</code>. <code>rmse</code> and the other pointwise metrics are computed on transformed predictions.</li>
         <li>GPU: <code>gpu_math="exact"</code> stays byte-identical to CPU for all new objectives and parameters. <code>gpu_math="fast"</code> supports the new regression objectives and multiclass (device softmax gradients); it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.</li>
+        <li>Improved: CPU training applies leaf values to the training predictions in parallel; models are unchanged.</li>
+        <li>Changed: feature values exactly equal to the largest <code>float32</code> (<code>numpy.finfo(numpy.float32).max</code>) are rejected in training, validation and prediction, because that value is reserved for split boundaries and was previously routed differently at prediction. Rescale such a feature; other values, including the next smaller one, are unaffected.</li>
+        <li>Fixed: training now stops with a clear error when extreme inputs (for example <code>reg:gamma</code> with a tiny <code>base_score</code>) produce non-finite gradients, instead of failing inside fixed-point conversion.</li>
+        <li>Fixed: the GPU memory plan now counts the per-slot row-major staging buffers, so narrow column blocks with many resident blocks stay within the memory budget, and counts the device weight buffer that <code>gpu_math="fast"</code> allocates when <code>scale_pos_weight</code> is not <code>1</code>.</li>
       </ul>
       <h3>0.0.4</h3>
       <ul>

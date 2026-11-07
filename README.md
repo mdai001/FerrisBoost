@@ -242,7 +242,7 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
-### 0.0.5 (unreleased)
+### 0.0.5
 
 - Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.
 - Added `alpha` (alias `reg_alpha`), `max_delta_step`, and `scale_pos_weight`, with XGBoost semantics, on CPU and GPU. For `count:poisson`, an unset `max_delta_step` becomes `0.7`, as in XGBoost.
@@ -250,6 +250,10 @@ logging, and the complete parameter reference.
 - Added multiclass objectives `multi:softprob` and `multi:softmax` (`num_class`): `predict` returns `(n, num_class)` probabilities or margins, or class indices for `multi:softmax`. Multiclass models interchange with XGBoost in both directions. In this version, `predict_to_parquet` for multiclass models builds its output in memory before writing.
 - Added metrics `mae`, `mape`, `mphe`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `error@t`, `aucpr`, `mlogloss`, and `merror`. `rmse` and the other pointwise metrics are computed on transformed predictions.
 - GPU: `gpu_math="exact"` stays byte-identical to CPU for all new objectives and parameters. `gpu_math="fast"` supports the new regression objectives and multiclass (device softmax gradients); it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.
+- Improved: CPU training applies leaf values to the training predictions in parallel; models are unchanged.
+- Changed: feature values exactly equal to the largest `float32` (`numpy.finfo(numpy.float32).max`) are rejected in training, validation and prediction, because that value is reserved for split boundaries and was previously routed differently at prediction. Rescale such a feature; other values, including the next smaller one, are unaffected.
+- Fixed: training now stops with a clear error when extreme inputs (for example `reg:gamma` with a tiny `base_score`) produce non-finite gradients, instead of failing inside fixed-point conversion.
+- Fixed: the GPU memory plan now counts the per-slot row-major staging buffers, so narrow column blocks with many resident blocks stay within the memory budget, and counts the device weight buffer that `gpu_math="fast"` allocates when `scale_pos_weight` is not `1`.
 
 ### 0.0.4
 
