@@ -24,6 +24,7 @@ use cudarc::driver::{
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use crate::categorical::CatBits;
 use crate::types::{Bin, GradPair, GradPairFixed, GradQuantizer, RowId};
 
 use super::{device_state, DeviceState, SharedHistogramConfig};
@@ -3978,12 +3979,71 @@ impl GpuPartitionSession<'_> {
         Ok(tokens)
     }
 
+    /// Categorical variant of [`Self::partition`]: rows whose bin is in `cats`
+    /// go right, every other non-missing bin goes left, missing rows follow
+    /// `missing_left`. Row order within each side is stable, as for numeric
+    /// splits. The session's column is the split feature's bins.
+    pub fn partition_categorical(
+        &mut self,
+        span: GpuRowSpan,
+        cats: &CatBits,
+        missing_left: bool,
+    ) -> Result<PartitionToken> {
+        self.partition_impl(span, 0, missing_left, Some(cats))
+    }
+
+    /// Categorical split on one feature of this resident block (`feat` is the
+    /// original block-local index). Same validation as a one-request
+    /// [`Self::partition_resident_batch`]; the batched kernel is numeric-only,
+    /// so categorical nodes always take this single-node route.
+    pub fn partition_resident_categorical(
+        &mut self,
+        span: GpuRowSpan,
+        feat: usize,
+        cats: &CatBits,
+        missing_left: bool,
+    ) -> Result<PartitionToken> {
+        let feats = self
+            .resident
+            .as_ref()
+            .context("categorical partition requires a resident block")?
+            .0
+            .resident_feats;
+        ensure!(
+            span.offset <= self.ctx.n_rows && span.len <= self.ctx.n_rows - span.offset,
+            "partition device row span out of bounds: {span:?}"
+        );
+        ensure!(
+            feat < feats,
+            "resident feature {feat} exceeds block width {feats}"
+        );
+        ensure!(
+            span.len <= self.ctx.n_rows - self.buf.next_rows_cursor,
+            "next partition row arena overflow"
+        );
+        let previous_feat = self.resident.as_ref().expect("validated resident").1;
+        self.resident.as_mut().expect("validated resident").1 = feat;
+        let result = self.partition_impl(span, 0, missing_left, Some(cats));
+        self.resident.as_mut().expect("validated resident").1 = previous_feat;
+        result
+    }
+
     /// 稳定地把 device row span 分到下一层 arena；只把左右计数传回 host。
     pub fn partition(
         &mut self,
         span: GpuRowSpan,
         split_bin: u32,
         missing_left: bool,
+    ) -> Result<PartitionToken> {
+        self.partition_impl(span, split_bin, missing_left, None)
+    }
+
+    fn partition_impl(
+        &mut self,
+        span: GpuRowSpan,
+        split_bin: u32,
+        missing_left: bool,
+        cats: Option<&CatBits>,
     ) -> Result<PartitionToken> {
         if span.len == 0 {
             self.buf.part_pending.push(PendingPartition {
@@ -4008,6 +4068,21 @@ impl GpuPartitionSession<'_> {
                 .context("记录 partition 起始 event")?;
         }
         let missing_left_u32 = missing_left as u32;
+        // A categorical split ships its 256-bit right-going set to the first 8
+        // words of the (stream-ordered) descriptor buffer; the batched kernels
+        // that also use that buffer rewrite it before each of their launches.
+        let split_bin = match cats {
+            Some(cats) => {
+                let words = cats.words8();
+                let mut dst = self.buf.part_descriptors.slice_mut(..8);
+                self.ctx
+                    .stream
+                    .memcpy_htod(&words, &mut dst)
+                    .context("partition category set H2D")?;
+                u32::MAX
+            }
+            None => split_bin,
+        };
         // 本节点在整层 totals 收集区里的槽位。
         let slot = self.buf.part_pending.len();
         anyhow::ensure!(
@@ -4021,6 +4096,7 @@ impl GpuPartitionSession<'_> {
                 rows: rows_dev,
                 part_flags,
                 part_block_counts,
+                part_descriptors,
                 ..
             } = &mut *self.buf;
             // resident 命中就直接看常驻 bins 里的那一列,不用 `part_col`。
@@ -4076,7 +4152,8 @@ impl GpuPartitionSession<'_> {
                         .arg(&split_bin)
                         .arg(&missing_left_u32)
                         .arg(&mut flags_view)
-                        .arg(&mut counts_view);
+                        .arg(&mut counts_view)
+                        .arg(&*part_descriptors);
                     unsafe { launch.launch(cfg) }.context("launch partition_count_rm")?;
                 }
                 None => {
@@ -4089,7 +4166,8 @@ impl GpuPartitionSession<'_> {
                         .arg(&split_bin)
                         .arg(&missing_left_u32)
                         .arg(&mut flags_view)
-                        .arg(&mut counts_view);
+                        .arg(&mut counts_view)
+                        .arg(&*part_descriptors);
                     // 行下标已在上面验过范围,列 buffer 就是本层选中的整列,
                     // 三个输出 view 长度都按 n_selected / n_blocks 裁好。
                     unsafe { launch.launch(cfg) }.context("launch partition_count")?;

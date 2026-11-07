@@ -234,6 +234,33 @@ pub fn partition_rows_gpu(
     .0)
 }
 
+/// [`partition_rows_gpu`] for a categorical split: rows whose bin is in `cats`
+/// go right, every other non-missing bin goes left.
+#[allow(clippy::too_many_arguments)]
+pub fn partition_rows_gpu_categorical(
+    device_ordinal: usize,
+    block_data: &[Bin],
+    block_n_rows: usize,
+    feature: usize,
+    rows: &[RowId],
+    cats: &crate::categorical::CatBits,
+    missing_left: bool,
+    threads_per_block: u32,
+) -> Result<(Vec<RowId>, Vec<RowId>)> {
+    Ok(partition_rows_gpu_impl(
+        device_ordinal,
+        block_data,
+        block_n_rows,
+        feature,
+        rows,
+        0,
+        Some(cats),
+        missing_left,
+        threads_per_block,
+    )?
+    .0)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)] // Profile remains paired with the two stable partitions.
 pub fn partition_rows_gpu_with_profile(
@@ -243,6 +270,32 @@ pub fn partition_rows_gpu_with_profile(
     feature: usize,
     rows: &[RowId],
     split_bin: u32,
+    missing_left: bool,
+    threads_per_block: u32,
+) -> Result<((Vec<RowId>, Vec<RowId>), PartitionProfile)> {
+    partition_rows_gpu_impl(
+        device_ordinal,
+        block_data,
+        block_n_rows,
+        feature,
+        rows,
+        split_bin,
+        None,
+        missing_left,
+        threads_per_block,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)] // Profile remains paired with the two stable partitions.
+fn partition_rows_gpu_impl(
+    device_ordinal: usize,
+    block_data: &[Bin],
+    block_n_rows: usize,
+    feature: usize,
+    rows: &[RowId],
+    split_bin: u32,
+    cats: Option<&crate::categorical::CatBits>,
     missing_left: bool,
     threads_per_block: u32,
 ) -> Result<((Vec<RowId>, Vec<RowId>), PartitionProfile)> {
@@ -314,6 +367,15 @@ pub fn partition_rows_gpu_with_profile(
         shared_mem_bytes: threads_per_block * 4,
     };
     let missing_left_u32 = missing_left as u32;
+    // Categorical split: `u32::MAX` selects the set test and `cat_mask` is the
+    // 256-bit right-going set. A numeric split never reads the mask.
+    let (split_bin, mask_words) = match cats {
+        Some(cats) => (u32::MAX, cats.words8()),
+        None => (split_bin, [0u32; 8]),
+    };
+    let cat_mask_dev = stream
+        .clone_htod(&mask_words)
+        .context("partition category mask H2D")?;
     let mut launch = stream.launch_builder(&count_fn);
     launch
         .arg(&col_dev)
@@ -323,7 +385,8 @@ pub fn partition_rows_gpu_with_profile(
         .arg(&split_bin)
         .arg(&missing_left_u32)
         .arg(&mut flags_dev)
-        .arg(&mut block_counts_dev);
+        .arg(&mut block_counts_dev)
+        .arg(&cat_mask_dev);
     unsafe { launch.launch(count_config) }.context("launch partition_count")?;
 
     // 和训练路径同一个 kernel:单 block、多线程分块 scan。

@@ -1441,6 +1441,19 @@ extern "C" __global__ void hist_build_shared_split(
     }
 }
 
+// `split_bin == CAT_SPLIT` marks a categorical split: `cat_mask` is the 256-bit
+// set of categories that go RIGHT (8 x u32, bit `bin % 32` of word `bin / 32`);
+// every other category goes left. Missing rows follow `missing_left` as ever.
+// For a numeric split `cat_mask` is never read (any valid pointer will do).
+enum : uint32_t { CAT_SPLIT = 0xFFFFFFFFu };
+
+__device__ __forceinline__ uint32_t partition_goes_left(
+    uint8_t bin, uint32_t split_bin, uint32_t missing_left, const uint32_t* cat_mask) {
+    if (bin == UINT8_MAX) return missing_left;
+    if (split_bin == CAT_SPLIT) return ((cat_mask[bin >> 5] >> (bin & 31)) & 1u) ^ 1u;
+    return (uint32_t)(bin < split_bin);
+}
+
 extern "C" __global__ void partition_count(
     const uint8_t* col,
     const uint32_t* rows,
@@ -1449,14 +1462,15 @@ extern "C" __global__ void partition_count(
     uint32_t split_bin,
     uint32_t missing_left,
     uint8_t* flags,
-    uint32_t* block_left_counts) {
+    uint32_t* block_left_counts,
+    const uint32_t* cat_mask) {
     extern __shared__ uint32_t counts[];
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t left = 0;
     if (idx < n_selected) {
         const uint32_t row = rows[idx];
         const uint8_t bin = col[(uint64_t)row];
-        left = (bin == UINT8_MAX) ? missing_left : (uint32_t)(bin < split_bin);
+        left = partition_goes_left(bin, split_bin, missing_left, cat_mask);
         flags[idx] = (uint8_t)left;
     }
     counts[threadIdx.x] = left;
@@ -1677,14 +1691,15 @@ extern "C" __global__ void partition_count_rm(
     uint32_t split_bin,
     uint32_t missing_left,
     uint8_t* flags,
-    uint32_t* block_left_counts) {
+    uint32_t* block_left_counts,
+    const uint32_t* cat_mask) {
     extern __shared__ uint32_t counts_rm[];
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t left = 0;
     if (idx < n_selected) {
         const uint32_t row = rows[idx];
         const uint8_t bin = bins_rm[(uint64_t)row * n_feats + feat];
-        left = (bin == UINT8_MAX) ? missing_left : (uint32_t)(bin < split_bin);
+        left = partition_goes_left(bin, split_bin, missing_left, cat_mask);
         flags[idx] = (uint8_t)left;
     }
     counts_rm[threadIdx.x] = left;
