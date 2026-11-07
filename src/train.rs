@@ -980,6 +980,14 @@ fn train_with_backend(
     }
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
+    anyhow::ensure!(
+        gpu_device.is_none()
+            || cfg.params.gpu_math != crate::types::GpuMath::Fast
+            || cfg.objective.supports_gpu_fast(),
+        "{} 不支持 gpu_math=\"fast\":它的梯度要先对全体行归约一个 scale,\
+         单趟 device 梯度 kernel 做不了;请用 gpu_math=\"exact\"(CPU/GPU 逐字节相同)",
+        cfg.objective.name()
+    );
     let num_class = cfg.objective.num_outputs();
     // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
     // (XGBoost 把标量复制成 K 份),否则按类别频率估计。
@@ -1074,6 +1082,16 @@ fn train_with_backend(
         "colsample_bytree 必须在 (0, 1],收到 {}",
         p.colsample_bytree
     );
+    anyhow::ensure!(
+        p.colsample_bylevel > 0.0 && p.colsample_bylevel <= 1.0 && p.colsample_bylevel.is_finite(),
+        "colsample_bylevel 必须在 (0, 1],收到 {}",
+        p.colsample_bylevel
+    );
+    anyhow::ensure!(
+        p.colsample_bynode > 0.0 && p.colsample_bynode <= 1.0 && p.colsample_bynode.is_finite(),
+        "colsample_bynode 必须在 (0, 1],收到 {}",
+        p.colsample_bynode
+    );
     for ev in evals {
         anyhow::ensure!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
         anyhow::ensure!(
@@ -1118,7 +1136,8 @@ fn train_with_backend(
         validate_source_metadata(ev.source, &format!("验证集 {:?}", ev.name))?;
         anyhow::ensure!(
             ev.source.cuts().offsets == source.cuts().offsets
-                && ev.source.cuts().values == source.cuts().values,
+                && ev.source.cuts().values == source.cuts().values
+                && ev.source.cuts().categorical_flags() == source.cuts().categorical_flags(),
             "验证集 {:?} 没有复用训练集的 cuts",
             ev.name
         );
@@ -1139,6 +1158,7 @@ fn train_with_backend(
         schema_mode: None,
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
+        feature_types: source.cuts().categorical_flags().to_vec(),
         best_iteration: None,
         best_score: None,
     };
@@ -1187,7 +1207,11 @@ fn train_with_backend(
                     // 规划之后这个字段保存的是**生效值**(见 TrainParams 文档)。
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
-                    gpu_split_cache: cfg.params.gpu_split_cache,
+                    // Categorical features are enumerated on the host (the device
+                    // split kernels only know ordered bins), so a categorical
+                    // training run keeps the exact host fallback and allocates
+                    // no resident split cache. See `gpu_split_cache_enabled`.
+                    gpu_split_cache: gpu_split_cache_enabled(&cfg.params, source.cuts()),
                     gpu_math: cfg.params.gpu_math,
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
@@ -1317,6 +1341,20 @@ fn train_with_backend(
             pool.install(|| -> anyhow::Result<()> {
                 let _t = prof::Timer::new(&prof::GRAD);
                 ctx.with_prediction_delta(&mut |delta| {
+                    if obj.is_quantile() {
+                        // 梯度依赖全体行的更新后预测(全局 scale):先施加 delta
+                        // 再整体求梯度,不能边施加边算。
+                        predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .for_each(|(p, d)| *p += *d);
+                        let qs = Objective::quantile_scale(&predictions, labels, weights);
+                        out = match grad_weights {
+                            None => compute_gradients(&predictions, labels, obj, qs),
+                            Some(w) => compute_gradients_weighted(&predictions, labels, w, obj, qs),
+                        };
+                        return;
+                    }
                     out = match grad_weights {
                         None => predictions
                             .par_iter_mut()
@@ -1324,7 +1362,7 @@ fn train_with_backend(
                             .zip(labels.par_iter())
                             .map(|((p, d), &y)| {
                                 *p += *d;
-                                gradient_of(*p, y, obj)
+                                gradient_of(*p, y, obj, 0.0)
                             })
                             .collect(),
                         Some(w) => predictions
@@ -1333,7 +1371,7 @@ fn train_with_backend(
                             .zip(labels.par_iter().zip(w.par_iter()))
                             .map(|((p, d), (&y, &w))| {
                                 *p += *d;
-                                weighted(gradient_of(*p, y, obj), w)
+                                weighted(gradient_of(*p, y, obj, 0.0), w)
                             })
                             .collect(),
                     };
@@ -1344,9 +1382,18 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
+                // quantile 的 scale 是对全体行预测的串行 f64 归约(其它
+                // objective 不用,传 0)。
+                let qs = if cfg.objective.is_quantile() {
+                    Objective::quantile_scale(&predictions, labels, weights)
+                } else {
+                    0.0
+                };
                 match grad_weights {
-                    None => compute_gradients(&predictions, labels, cfg.objective),
-                    Some(w) => compute_gradients_weighted(&predictions, labels, w, cfg.objective),
+                    None => compute_gradients(&predictions, labels, cfg.objective, qs),
+                    Some(w) => {
+                        compute_gradients_weighted(&predictions, labels, w, cfg.objective, qs)
+                    }
                 }
             })
         };
@@ -1503,6 +1550,12 @@ fn train_with_backend(
                 comm,
                 gpu.as_ref(),
                 sampled.as_deref(),
+                crate::colsample::NestedSampler::new(
+                    cfg.params.colsample_bylevel,
+                    cfg.params.colsample_bynode,
+                    cfg.params.seed,
+                    round,
+                ),
             )
         })?;
         // GPU 路径的叶子增量留在 device buffer 里没有施加,记一笔债;
@@ -1634,7 +1687,12 @@ pub fn train_gpu_one_tree(
     let base_score = cfg.resolve_base_score(labels, None);
     let margin = base_margin(cfg.objective, base_score);
     let predictions = vec![margin; source.n_rows()];
-    let gpair = compute_gradients(&predictions, labels, cfg.objective);
+    let qs = if cfg.objective.is_quantile() {
+        Objective::quantile_scale(&predictions, labels, None)
+    } else {
+        0.0
+    };
+    let gpair = compute_gradients(&predictions, labels, cfg.objective, qs);
     let quantizer = GradQuantizer::try_new(&gpair, source.n_rows())?;
     let fixed: Vec<GradPairFixed> = gpair.iter().map(|&g| quantizer.to_fixed(g)).collect();
     let root_sum = hist::node_sum(&fixed, None);
@@ -1645,6 +1703,10 @@ pub fn train_gpu_one_tree(
     );
 
     let cuts = source.cuts();
+    anyhow::ensure!(
+        !cuts.has_categorical(),
+        "train_gpu_one_tree does not support categorical features"
+    );
     let mut best: Option<SplitCandidate> = None;
     for b in 0..source.n_blocks() {
         let block_best = source.with_block_ret(b, |block| {
@@ -1679,6 +1741,7 @@ pub fn train_gpu_one_tree(
             schema_mode: None,
             class_base_margins: Vec::new(),
             scale_pos_weight: cfg.params.scale_pos_weight,
+            feature_types: Vec::new(),
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -1726,6 +1789,7 @@ pub fn train_gpu_one_tree(
         schema_mode: None,
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
+        feature_types: Vec::new(),
         trees: vec![tree],
         base_score,
         objective: cfg.objective,
@@ -1820,15 +1884,20 @@ fn train_multiclass_rounds(
             };
             // 行采样:和单输出相同的确定性掩码,键是树序号。
             if cfg.params.subsample < 1.0 && !device_quant && !fast_math {
+                // 逐行独立哈希,按行并行与串行逐位相同(见单输出路径)。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
-                for (i, g) in gpair_f32.iter_mut().enumerate() {
-                    if !crate::subsample::row_selected(i as u64, th, cfg.params.seed, tree_index) {
-                        *g = GradPair {
-                            grad: 0.0,
-                            hess: 0.0,
-                        };
-                    }
-                }
+                let seed = cfg.params.seed;
+                pool.install(|| {
+                    let _t = prof::Timer::new(&prof::SAMPLE);
+                    gpair_f32.par_iter_mut().enumerate().for_each(|(i, g)| {
+                        if !crate::subsample::row_selected(i as u64, th, seed, tree_index) {
+                            *g = GradPair {
+                                grad: 0.0,
+                                hess: 0.0,
+                            };
+                        }
+                    });
+                });
             }
             let (quantizer, fixed, dev_root_sum) = if fast_math {
                 // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
@@ -1895,6 +1964,12 @@ fn train_multiclass_rounds(
                     comm,
                     gpu,
                     sampled.as_deref(),
+                    crate::colsample::NestedSampler::new(
+                        cfg.params.colsample_bylevel,
+                        cfg.params.colsample_bynode,
+                        cfg.params.seed,
+                        tree_index as usize,
+                    ),
                 )
             })?;
             // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
@@ -2028,11 +2103,27 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         .nodes
         .iter()
         .map(|n| {
-            if n.is_leaf {
+            if n.is_leaf || n.cats.is_some() {
                 0
             } else {
                 tree::split_bin(cuts, n.feat, n.split_cond)
             }
+        })
+        .collect();
+    // Categorical nodes compare the bin (= category code) against a set.
+    let node_cats: Vec<Option<crate::categorical::CatBits>> = t
+        .nodes
+        .iter()
+        .map(|n| {
+            n.cats.as_ref().map(|words| {
+                let mut bits = crate::categorical::CatBits::empty();
+                for cat in crate::categorical::categories_from_words(words) {
+                    if cat < 256 {
+                        bits.set(cat);
+                    }
+                }
+                bits
+            })
         })
         .collect();
 
@@ -2121,6 +2212,8 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                         let bin = block.column(local)[row as usize];
                         let go_left = if bin == MISSING_BIN {
                             n.default_left
+                        } else if let Some(cats) = &node_cats[*node as usize] {
+                            !cats.contains(bin as u32)
                         } else {
                             (bin as u32) < thresholds[*node as usize]
                         };
@@ -2207,6 +2300,9 @@ fn build_tree(
     gpu: Option<&crate::backend::cuda::GpuTrainCtx>,
     // 本棵树的采样特征集(全局 id,升序)。`None` = 全选。
     sampled: Option<&[FeatId]>,
+    // `colsample_bylevel` / `colsample_bynode`:只缩小 split 枚举的特征集,
+    // 直方图仍按 `sampled` 建。`None` = 两者都是 1。
+    nested: Option<crate::colsample::NestedSampler>,
 ) -> anyhow::Result<Tree> {
     let p = &cfg.params;
 
@@ -2330,7 +2426,7 @@ fn build_tree(
     let drop_zero_rows = kept_rows.is_some();
     // 每个已分裂节点的 (特征, 分区用的 bin 边界, 缺失走左):下降必须和分区
     // 用同一套比较,不经过浮点阈值往返。
-    let mut split_info: Vec<(FeatId, u32, bool)> = Vec::new();
+    let mut split_info: Vec<DropSplit> = Vec::new();
 
     let root_rows = match gpu {
         Some(ctx) => NodeRows::Device(ctx.begin_tree_rows()?),
@@ -2349,11 +2445,41 @@ fn build_tree(
     }];
     // 上一层的直方图,[列块][槽位]。兄弟相减要用,所以整层都得留着。
     let mut parent_hists: Vec<Vec<Histogram>> = Vec::new();
+    // bylevel / bynode 的起点:本树的 bytree 集合(没采样 = 全部特征)。
+    let tree_features: Vec<FeatId> = match (nested, sampled) {
+        (Some(_), Some(s)) => s.to_vec(),
+        (Some(_), None) => (0..source.n_features() as FeatId).collect(),
+        (None, _) => Vec::new(),
+    };
 
     for depth in 0..p.max_depth {
         if level.is_empty() {
             break;
         }
+        // ---- 本层每个节点的 split 枚举特征集 ----
+        //
+        // 层集合每层采一次,节点集合每节点采一次(嵌套:节点 ⊂ 层 ⊂ 树)。
+        // 种子只看 (seed, 树, 深度 / 节点号),CPU 与 GPU 同一个集合。
+        // 嵌套采样激活时 GPU 绕开 device split cache(它只有树级的特征掩码),
+        // 改用下载的直方图 + host 枚举 —— 与 cache 路径逐位等价的既有回退。
+        let level_set: Option<Vec<FeatId>> = nested.map(|n| n.level_set(&tree_features, depth));
+        let node_sets: Option<Vec<Vec<FeatId>>> = match (nested, level_set.as_deref()) {
+            (Some(n), Some(ls)) if n.samples_nodes() => Some(
+                level
+                    .iter()
+                    .map(|ln| n.node_set(ls, ln.node))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        };
+        // 节点 i 枚举用的特征集:节点集 > 层集 > bytree 集。
+        let enum_features = |i: usize| -> Option<&[FeatId]> {
+            match (&node_sets, &level_set) {
+                (Some(ns), _) => Some(ns[i].as_slice()),
+                (None, Some(ls)) => Some(ls.as_slice()),
+                (None, None) => sampled,
+            }
+        };
         // ★ 外层列块、内层节点。反过来写(外层节点、内层列块)每个
         // 节点都要重新过一遍所有列块,传输量从 O(数据) 变成
         // O(节点数 × 数据) —— 整个方案就没意义了。改这里要特别小心。
@@ -2466,7 +2592,7 @@ fn build_tree(
                         // 节点也必须走它。
                         let must_batch = session.requires_batched_hist();
                         #[cfg(feature = "cuda")]
-                        if session.begin_split_level(depth)? {
+                        if nested.is_none() && session.begin_split_level(depth)? {
                             use crate::backend::cuda::GpuSplitGroup;
                             let mut groups = Vec::new();
                             if depth == 0 {
@@ -2632,15 +2758,16 @@ fn build_tree(
                             if gpu_done[i] {
                                 return gpu_candidates[i];
                             }
-                            split::best_split_in_block_constrained(
+                            split::best_split_in_block_typed(
                                 &per_node[i],
                                 &plan.hist_feats,
                                 &plan.hist_offsets,
                                 ln.sum,
                                 q,
                                 p,
-                                sampled,
+                                enum_features(i),
                                 monotone_at(p, ln.bounds),
+                                cuts.has_categorical().then(|| cuts.categorical_flags()),
                             )
                         })
                         .collect();
@@ -2755,6 +2882,22 @@ fn build_tree(
             for (block, nodes) in resident_groups {
                 if let Some(mut session) = ctx.partition_session_resident(block, 0)? {
                     let started = std::time::Instant::now();
+                    // The batched kernel only knows ordered bins. Categorical
+                    // nodes take the single-node route (same stream, same stable
+                    // partition), numeric nodes keep the batch.
+                    let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
+                        .into_iter()
+                        .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
+                    for (i, local) in cat_nodes {
+                        let c = chosen[i].expect("resident group contains chosen nodes");
+                        let cats = c.cats.expect("partitioned by categorical");
+                        part_tokens[i] = Some(session.partition_resident_categorical(
+                            level[i].rows.device(),
+                            local,
+                            &cats,
+                            c.missing_left,
+                        )?);
+                    }
                     for chunk in nodes.chunks(crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY) {
                         let requests: Vec<_> = chunk
                             .iter()
@@ -2820,8 +2963,14 @@ fn build_tree(
                 let mut session = ctx.partition_session(col)?;
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    part_tokens[i] =
-                        Some(session.partition(level[i].rows.device(), c.bin, c.missing_left)?);
+                    part_tokens[i] = Some(match &c.cats {
+                        Some(cats) => session.partition_categorical(
+                            level[i].rows.device(),
+                            cats,
+                            c.missing_left,
+                        )?,
+                        None => session.partition(level[i].rows.device(), c.bin, c.missing_left)?,
+                    });
                 }
                 let timing = session.timing();
                 drop(session);
@@ -2885,7 +3034,11 @@ fn build_tree(
             let (left_node, right_node) = t.split_leaf(
                 ln.node,
                 c.feat,
-                tree::split_threshold(cuts, c.feat, c.bin),
+                if c.cats.is_some() {
+                    0.0
+                } else {
+                    tree::split_threshold(cuts, c.feat, c.bin)
+                },
                 c.missing_left,
                 c.gain,
                 children.left_value,
@@ -2893,12 +3046,20 @@ fn build_tree(
                 children.right_value,
                 hess_of(c.right, q),
             );
+            if let Some(cats) = &c.cats {
+                t.set_categories(ln.node, cats);
+            }
 
             if drop_zero_rows {
                 if split_info.len() <= ln_node {
-                    split_info.resize(ln_node + 1, (0, 0, false));
+                    split_info.resize(ln_node + 1, DropSplit::default());
                 }
-                split_info[ln_node] = (c.feat, c.bin, c.missing_left);
+                split_info[ln_node] = DropSplit {
+                    feat: c.feat,
+                    bin: c.bin,
+                    missing_left: c.missing_left,
+                    cats: c.cats,
+                };
             }
             let (left_rows, right_rows) = partitions[i].take().expect("上面按块分好了");
 
@@ -2998,6 +3159,15 @@ fn build_tree(
     Ok(t)
 }
 
+/// `apply_dropped_rows` 需要的、和分区完全同一套的分裂判定。
+#[derive(Clone, Copy, Default)]
+struct DropSplit {
+    feat: FeatId,
+    bin: u32,
+    missing_left: bool,
+    cats: Option<crate::categorical::CatBits>,
+}
+
 /// 沿已建好的树给**没进行集合**的行(梯度全零的行)施加叶子值。
 ///
 /// 每行一次随机访问下降,最多 `max_depth` 步;分裂用的比较和分区那一遍
@@ -3006,7 +3176,7 @@ fn build_tree(
 /// 按行块并行,每块独占自己那段 `predictions`。
 fn apply_dropped_rows(
     t: &Tree,
-    split_info: &[(FeatId, u32, bool)],
+    split_info: &[DropSplit],
     source: &dyn BlockSource,
     gpair: &[GradPairFixed],
     predictions: &mut [f32],
@@ -3037,12 +3207,16 @@ fn apply_dropped_rows(
                         *p += n.leaf_value;
                         break;
                     }
-                    let (feat, bin_bound, missing_left) = split_info[node];
-                    let bin = cols[feat as usize][row];
+                    let sp = &split_info[node];
+                    let bin = cols[sp.feat as usize][row];
+                    // 与 `partition_rows` 逐条相同:缺失走记下的方向;类别分裂
+                    // 里集合走右、其余(含未见过的编码)走左;数值分裂比 bin。
                     let go_left = if bin == MISSING_BIN {
-                        missing_left
+                        sp.missing_left
+                    } else if let Some(cats) = &sp.cats {
+                        !cats.contains(bin as u32)
                     } else {
-                        (bin as u32) < bin_bound
+                        (bin as u32) < sp.bin
                     };
                     node = if go_left { n.left } else { n.right } as usize;
                 }
@@ -3111,6 +3285,19 @@ fn identity_rows(n: usize) -> Vec<RowId> {
             }
         });
     rows
+}
+
+/// Whether the bounded resident GPU split cache is used for this run.
+///
+/// The device split kernels enumerate ordered bins only. A categorical
+/// feature needs XGBoost's one-hot / sorted-partition enumeration, which runs
+/// on the host over the downloaded histograms (the same exact fallback that
+/// already serves cache overflow and streaming). Keeping that single code path
+/// is what makes `gpu_math = "exact"` byte-identical to the CPU for
+/// categorical data; the price is one histogram download per node, so a
+/// categorical GPU run does not get the split-cache speedup.
+pub fn gpu_split_cache_enabled(params: &TrainParams, cuts: &BinCuts) -> bool {
+    params.gpu_split_cache && !cuts.has_categorical()
 }
 
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。
@@ -3278,6 +3465,9 @@ fn partition_rows(
             let bin = col[r as usize];
             let go_left = if bin == MISSING_BIN {
                 c.missing_left
+            } else if let Some(cats) = &c.cats {
+                // Categorical: the set goes right, every other category left.
+                !cats.contains(bin as u32)
             } else {
                 (bin as u32) < c.bin
             };
@@ -3429,10 +3619,16 @@ pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
     obj.base_margin(base_score)
 }
 
-/// 单行的梯度;定义在 `Objective::gradient`。
+/// 单行的梯度;定义在 `Objective::gradient`。`quantile_scale` 只给
+/// `reg:quantileerror` 用(每轮的全局 scale),其它 objective 忽略。
 #[inline]
-fn gradient_of(pred: f32, label: f32, obj: Objective) -> GradPair {
-    obj.gradient(pred, label)
+fn gradient_of(pred: f32, label: f32, obj: Objective, quantile_scale: f32) -> GradPair {
+    match obj {
+        Objective::Quantile { alpha } => {
+            Objective::quantile_gradient(alpha, quantile_scale, pred, label)
+        }
+        _ => obj.gradient(pred, label),
+    }
 }
 
 /// 训练会不会有一份逐行的梯度权重(样本权重,或折进 `scale_pos_weight`
@@ -3485,10 +3681,11 @@ fn compute_gradients_weighted(
     label: &[f32],
     weight: &[f32],
     obj: Objective,
+    quantile_scale: f32,
 ) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter().zip(weight.par_iter()))
-        .map(|(&p, (&y, &w))| weighted(gradient_of(p, y, obj), w))
+        .map(|(&p, (&y, &w))| weighted(gradient_of(p, y, obj, quantile_scale), w))
         .collect()
 }
 
@@ -3499,10 +3696,15 @@ fn compute_gradients_weighted(
 /// 它们只随行数走、完全不进列块那一维,所以以前无论开多少线程都是单线程跑。
 /// GPU 路径上尤其明显 —— HIGGS 1050 万行时 GRAD + QUANTIZE 合计约
 /// 145 ms/轮,占整轮 0.345 s 的四成以上,而那时 GPU 在干等。
-fn compute_gradients(pred: &[f32], label: &[f32], obj: Objective) -> Vec<GradPair> {
+fn compute_gradients(
+    pred: &[f32],
+    label: &[f32],
+    obj: Objective,
+    quantile_scale: f32,
+) -> Vec<GradPair> {
     pred.par_iter()
         .zip(label.par_iter())
-        .map(|(&p, &y)| gradient_of(p, y, obj))
+        .map(|(&p, &y)| gradient_of(p, y, obj, quantile_scale))
         .collect()
 }
 
@@ -3633,7 +3835,7 @@ mod tests {
 
     use super::*;
     use crate::callback::{EarlyStopping, RecordHistory, RoundMetrics, VerboseEval};
-    use crate::columns::{BinCuts, ColumnBlock};
+    use crate::columns::{BinCuts, BinningStrategy, ColumnBlock};
     use crate::comm::Local;
     use crate::metrics::{LogLoss, Metric, Rmse};
     use crate::source::DenseSource;
@@ -3702,6 +3904,133 @@ mod tests {
                 "行 {row} {raw:?}:量化下降 {got} != 浮点下降 {by_floats}"
             );
         }
+    }
+
+    /// Two numeric columns, then two categorical code columns (5 and 12
+    /// levels). The label depends on category membership, so categorical
+    /// splits are worth taking.
+    fn categorical_data(n: usize) -> (Vec<f32>, Vec<f32>, usize, Vec<bool>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..n {
+            let a = ((i * 7) % 9) as f32;
+            let b = if i % 11 == 0 {
+                MISSING
+            } else {
+                ((i * 5) % 6) as f32
+            };
+            let c1 = ((i * 3 + i / 7) % 5) as f32;
+            let c2 = if i % 13 == 0 {
+                MISSING
+            } else {
+                ((i * 17 + i / 5) % 12) as f32
+            };
+            let up = matches!(c1 as i32, 1 | 3) || matches!(c2 as i32, 2 | 5 | 9);
+            x.extend([a, b, c1, c2]);
+            y.push(if up { 1.0 } else { 0.0 } + 0.05 * a);
+        }
+        (x, y, 4, vec![false, false, true, true])
+    }
+
+    fn train_categorical(
+        x: &[f32],
+        y: &[f32],
+        nf: usize,
+        flags: &[bool],
+        p: TrainParams,
+    ) -> (Model, DenseSource) {
+        let src = DenseSource::new(
+            x,
+            y.len(),
+            nf,
+            BinningStrategy::SketchTyped {
+                max_bins: p.max_bin as usize,
+                categorical: flags,
+            },
+            p.cols_per_block,
+        );
+        let cfg = TrainConfig::new(p, Objective::SquaredError);
+        let model = train(&src, y, &[], &cfg, &mut [], &Local).unwrap();
+        (model, src)
+    }
+
+    #[test]
+    fn categorical_bin_descent_matches_float_descent() {
+        let (x, y, nf, flags) = categorical_data(400);
+        let (model, src) = train_categorical(&x, &y, nf, &flags, params(4, 6));
+        assert_eq!(model.feature_types, flags);
+        assert!(
+            model.has_categorical_splits(),
+            "the data rewards categorical splits"
+        );
+        let by_bins = predict_on(&model, &src).unwrap();
+        for (row, got) in by_bins.iter().enumerate() {
+            let raw = &x[row * nf..(row + 1) * nf];
+            assert_eq!(
+                got.to_bits(),
+                model.predict_margin(raw).to_bits(),
+                "row {row} {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_training_ignores_block_width_and_threads() {
+        let (x, y, nf, flags) = categorical_data(600);
+        let mut reference = None;
+        for (cols, nthread) in [(1usize, 1usize), (2, 2), (4, 3)] {
+            let p = TrainParams {
+                cols_per_block: cols,
+                nthread,
+                ..params(4, 4)
+            };
+            let (m, _) = train_categorical(&x, &y, nf, &flags, p);
+            let json = m.to_xgboost_json().unwrap();
+            match &reference {
+                None => reference = Some(json),
+                Some(r) => assert_eq!(&json, r, "cols {cols} threads {nthread}"),
+            }
+        }
+    }
+
+    #[test]
+    fn categorical_validation_set_with_an_unseen_code_is_scored_left() {
+        let (x, y, nf, flags) = categorical_data(300);
+        let (model, train_src) = train_categorical(&x, &y, nf, &flags, params(3, 4));
+        // Same rows with the last column's codes pushed past the trained range.
+        let mut vx = x.clone();
+        for row in 0..y.len() {
+            vx[row * nf + 3] = 40.0;
+        }
+        let valid = DenseSource::with_cuts(&vx, y.len(), nf, train_src.cuts().clone(), 2);
+        let by_bins = predict_on(&model, &valid).unwrap();
+        for (row, got) in by_bins.iter().enumerate() {
+            let raw = &vx[row * nf..(row + 1) * nf];
+            assert_eq!(
+                got.to_bits(),
+                model.predict_margin(raw).to_bits(),
+                "row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_categorical_codes_are_rejected_when_binning_the_training_data() {
+        let (mut x, y, nf, flags) = categorical_data(50);
+        x[2] = 2.5;
+        let r = std::panic::catch_unwind(|| {
+            DenseSource::new(
+                &x,
+                y.len(),
+                nf,
+                BinningStrategy::SketchTyped {
+                    max_bins: 16,
+                    categorical: &flags,
+                },
+                2,
+            )
+        });
+        assert!(r.is_err());
     }
 
     #[test]
@@ -3802,10 +4131,13 @@ mod tests {
             .collect();
         let src = DenseSource::from_row_major(&x, 40, 1, 255, 1);
         // 走加权均值(FitInterceptGlmLike)的 objective;gamma 要求标签为正,
-        // pseudohuber 走 Newton,另有测试。
-        let glm_like = Objective::ALL
-            .into_iter()
-            .filter(|o| !matches!(o, Objective::Gamma | Objective::PseudoHuber { .. }));
+        // pseudohuber 走 Newton,quantile 取分位数,各有自己的测试。
+        let glm_like = Objective::ALL.into_iter().filter(|o| {
+            !matches!(
+                o,
+                Objective::Gamma | Objective::PseudoHuber { .. } | Objective::Quantile { .. }
+            )
+        });
         for obj in glm_like {
             let cfg = TrainConfig::new(params(2, 1), obj);
             let m = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
@@ -3912,6 +4244,7 @@ mod tests {
                 left: GradPairFixed::default(),
                 right: GradPairFixed::default(),
                 missing_left,
+                cats: None,
             };
             let run = |nthread| {
                 crate::threading::build_pool(nthread)
@@ -4486,35 +4819,37 @@ mod tests {
         m.to_xgboost_json().unwrap()
     }
 
+    /// Hides the resident-column accessors, forcing the pre-skip row flow.
+    struct Opaque(DenseSource);
+    impl BlockSource for Opaque {
+        fn n_blocks(&self) -> usize {
+            self.0.n_blocks()
+        }
+        fn n_rows(&self) -> usize {
+            self.0.n_rows()
+        }
+        fn n_features(&self) -> usize {
+            self.0.n_features()
+        }
+        fn cuts(&self) -> &BinCuts {
+            self.0.cuts()
+        }
+        fn block_features(&self, i: usize) -> anyhow::Result<Vec<FeatId>> {
+            self.0.block_features(i)
+        }
+        fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
+            self.0.with_block(i, f)
+        }
+        fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+            self.0.feature_column(f)
+        }
+    }
+
     /// 梯度全零的行不进行集合、建完树再沿树下降:模型必须和「所有行随每层
     /// 分区一起走」逐字节相同(后者靠一个不暴露驻留列的包装 source 触发)。
     /// 覆盖行采样、权重为零的行、缺失值,以及 monotone 约束。
     #[test]
     fn dropping_zero_gradient_rows_keeps_models_byte_identical() {
-        struct Opaque(DenseSource);
-        impl BlockSource for Opaque {
-            fn n_blocks(&self) -> usize {
-                self.0.n_blocks()
-            }
-            fn n_rows(&self) -> usize {
-                self.0.n_rows()
-            }
-            fn n_features(&self) -> usize {
-                self.0.n_features()
-            }
-            fn cuts(&self) -> &BinCuts {
-                self.0.cuts()
-            }
-            fn block_features(&self, i: usize) -> anyhow::Result<Vec<FeatId>> {
-                self.0.block_features(i)
-            }
-            fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
-                self.0.with_block(i, f)
-            }
-            fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
-                self.0.feature_column(f)
-            }
-        }
         let (n_rows, nf) = (4000usize, 6usize);
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
@@ -4580,6 +4915,72 @@ mod tests {
                     json(&a),
                     json(&b),
                     "subsample={subsample} weights={use_weights} monotone={monotone} threads={threads}"
+                );
+            }
+        }
+    }
+
+    /// The zero-gradient row skip must also hold for categorical splits
+    /// (set membership goes right, unseen / invalid codes left, NaN follows
+    /// the learned direction) and for `reg:quantileerror` (global scale from
+    /// all rows' predictions, per-round deltas for dropped rows).
+    #[test]
+    fn dropping_zero_gradient_rows_is_categorical_and_quantile_safe() {
+        let (x, y, nf, flags) = categorical_data(3000);
+        let n_rows = y.len();
+        let w: Vec<f32> = (0..n_rows)
+            .map(|i| if i % 7 < 2 { 0.0 } else { 1.0 })
+            .collect();
+        for (objective, subsample, use_weights) in [
+            (Objective::SquaredError, 0.5f32, false),
+            (Objective::SquaredError, 0.7, true),
+            (Objective::Logistic, 0.6, true),
+            (Objective::Quantile { alpha: 0.7 }, 0.5, false),
+            (Objective::Quantile { alpha: 0.3 }, 0.8, true),
+        ] {
+            let mut p = params(5, 5);
+            p.subsample = subsample;
+            p.seed = 5;
+            p.colsample_bytree = 0.75;
+            p.colsample_bylevel = 0.8;
+            p.colsample_bynode = 0.8;
+            let make = || {
+                DenseSource::new(
+                    &x,
+                    n_rows,
+                    nf,
+                    BinningStrategy::SketchTyped {
+                        max_bins: p.max_bin as usize,
+                        categorical: &flags,
+                    },
+                    p.cols_per_block,
+                )
+            };
+            let dense = make();
+            let opaque = Opaque(make());
+            assert!(dense.has_resident_columns() && !opaque.has_resident_columns());
+            let labels: Vec<f32> = if matches!(objective, Objective::Logistic) {
+                y.iter().map(|&v| if v > 0.5 { 1.0 } else { 0.0 }).collect()
+            } else {
+                y.clone()
+            };
+            let weights = use_weights.then_some(w.as_slice());
+            for threads in [1usize, 4] {
+                let mut q = p.clone();
+                q.nthread = threads;
+                let cfg = TrainConfig::new(q, objective);
+                let a =
+                    train_weighted(&dense, &labels, weights, &[], &cfg, &mut [], &Local).unwrap();
+                let b =
+                    train_weighted(&opaque, &labels, weights, &[], &cfg, &mut [], &Local).unwrap();
+                assert!(
+                    objective.is_quantile() || a.has_categorical_splits(),
+                    "{objective:?}: the data rewards categorical splits"
+                );
+                assert_eq!(
+                    json(&a),
+                    json(&b),
+                    "{objective:?} subsample={subsample} weights={use_weights} threads={threads}"
                 );
             }
         }
@@ -4764,6 +5165,73 @@ mod tests {
             LogLoss.eval_weighted(&pred, &label, Some(&w)),
             (ll / wsum) as f32
         );
+    }
+
+    // ------------------------------------------------- quantile / 嵌套列采样
+
+    #[test]
+    fn quantile_objective_trains_reproducibly_and_tracks_the_quantile() {
+        let (x, y, nf) = wiggly_data(2000, 4);
+        for alpha in [0.1f32, 0.5, 0.9] {
+            let obj = Objective::Quantile { alpha };
+            let mut p = params(4, 30);
+            p.nthread = 1;
+            let (a, src) = train_on(&x, &y, nf, p.clone(), obj);
+            p.nthread = 3;
+            let (b, _) = train_on(&x, &y, nf, p, obj);
+            assert_eq!(json(&a), json(&b), "alpha={alpha}: 线程数不能改变模型");
+            let pred = predict_on(&a, &src).unwrap();
+            let below = y.iter().zip(&pred).filter(|(y, p)| *y <= *p).count();
+            let frac = below as f32 / y.len() as f32;
+            assert!((frac - alpha).abs() < 0.12, "alpha={alpha} frac={frac}");
+        }
+    }
+
+    #[test]
+    fn nested_column_sampling_is_thread_and_blocking_invariant() {
+        let (x, y, nf) = wiggly_data(1500, 6);
+        let mut base = params(5, 6);
+        base.seed = 9;
+        let full = {
+            let (m, _) = train_on(&x, &y, nf, base.clone(), Objective::SquaredError);
+            json(&m)
+        };
+        for (bylevel, bynode) in [(0.6f32, 1.0f32), (1.0, 0.6), (0.8, 0.5)] {
+            let mut p = base.clone();
+            p.colsample_bylevel = bylevel;
+            p.colsample_bynode = bynode;
+            p.nthread = 1;
+            let reference = {
+                let (m, _) = train_on(&x, &y, nf, p.clone(), Objective::SquaredError);
+                json(&m)
+            };
+            assert_ne!(reference, full, "({bylevel}, {bynode}) 应该改变模型");
+            for (threads, cols) in [(4usize, 2usize), (2, 1), (3, 5)] {
+                let mut q = p.clone();
+                q.nthread = threads;
+                q.cols_per_block = cols;
+                let (m, _) = train_on(&x, &y, nf, q, Objective::SquaredError);
+                assert_eq!(
+                    json(&m),
+                    reference,
+                    "({bylevel}, {bynode}) threads={threads} cols_per_block={cols}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_nested_rates_are_rejected() {
+        let (x, y, nf) = wiggly_data(100, 1);
+        for (bylevel, bynode) in [(0.0f32, 1.0f32), (1.0, 0.0), (1.5, 1.0), (1.0, f32::NAN)] {
+            let mut p = params(2, 1);
+            p.colsample_bylevel = bylevel;
+            p.colsample_bynode = bynode;
+            let src = DenseSource::from_row_major(&x, y.len(), nf, p.max_bin, p.cols_per_block);
+            let cfg = TrainConfig::new(p, Objective::SquaredError);
+            let err = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap_err();
+            assert!(err.to_string().contains("colsample_by"), "{err}");
+        }
     }
 
     // ------------------------------------------------------------ 单调约束

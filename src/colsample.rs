@@ -95,6 +95,88 @@ pub fn sample_features(n_features: usize, rate: f32, seed: u64, round: usize) ->
     ids
 }
 
+/// 从一个已有的(升序)特征集里再采 `max(1, floor(rate * len))` 个,升序返回。
+/// `rate >= 1` 原样返回。`key` 决定随机序列;同一个 `(base, rate, key)`
+/// 永远给出同一个子集。
+fn sample_subset(base: &[FeatId], rate: f32, key: u64) -> Vec<FeatId> {
+    let take = sampled_count(base.len(), rate);
+    if take >= base.len() {
+        return base.to_vec();
+    }
+    let mut ids = base.to_vec();
+    let mut rng = SplitMix64(key);
+    for i in (1..ids.len()).rev() {
+        let j = rng.below((i + 1) as u64) as usize;
+        ids.swap(i, j);
+    }
+    ids.truncate(take);
+    ids.sort_unstable();
+    ids
+}
+
+/// `(seed, tree, tag, idx)` → 64 位种子。逐字段过 SplitMix64,相邻的 idx
+/// (节点号、深度)不会给出相关的序列。
+fn subset_key(seed: u64, tree: u64, tag: u64, idx: u64) -> u64 {
+    let mix = |x: u64| SplitMix64(x).next_u64();
+    mix(mix(mix(seed ^ tag.wrapping_mul(0xD6E8_FEB8_6659_FD93)) ^ tree) ^ idx)
+}
+
+/// `colsample_bylevel` / `colsample_bynode` 的嵌套采样(XGBoost `ColumnSampler`
+/// 的语义:bytree → bylevel → bynode,每一级都是上一级的子集,每级个数
+/// `max(1, floor(rate * 上一级个数))`)。
+///
+/// **契约和 `colsample_bytree` 一样:语义对齐 XGBoost,随机序列是 FerrisBoost
+/// 自己的确定性实现**(XGBoost 的 CPU/GPU 采样序列本来就不同,且
+/// `std::shuffle` 实现定义)。种子只取决于 `(seed, 树序号, 深度 / 节点号)`,
+/// 与线程数、backend、列块划分都无关;节点号是树里的节点下标,CPU 和 GPU
+/// 的建树顺序相同,所以两边选出同一个集合。
+///
+/// 层集合每层只算一次(同层节点共用),节点集合每个节点算一次。它们只限制
+/// **split 枚举**:直方图仍然按 bytree 集合建(和 XGBoost 一致),
+/// 所以 bylevel/bynode 不减少 IO。
+#[derive(Clone, Copy, Debug)]
+pub struct NestedSampler {
+    bylevel: f32,
+    bynode: f32,
+    seed: u64,
+    tree: u64,
+}
+
+impl NestedSampler {
+    /// bylevel 和 bynode 都是 1 时返回 `None`(没有额外采样)。
+    pub fn new(bylevel: f32, bynode: f32, seed: u64, tree: usize) -> Option<Self> {
+        (bylevel < 1.0 || bynode < 1.0).then_some(Self {
+            bylevel,
+            bynode,
+            seed,
+            tree: tree as u64,
+        })
+    }
+
+    /// 深度 `depth` 这一层的特征集(`tree_set` 的子集,升序)。
+    pub fn level_set(&self, tree_set: &[FeatId], depth: u32) -> Vec<FeatId> {
+        sample_subset(
+            tree_set,
+            self.bylevel,
+            subset_key(self.seed, self.tree, 1, u64::from(depth)),
+        )
+    }
+
+    /// 是否要对每个节点再采一次。
+    pub fn samples_nodes(&self) -> bool {
+        self.bynode < 1.0
+    }
+
+    /// 节点 `node`(树里的节点下标)的特征集(`level_set` 的子集,升序)。
+    pub fn node_set(&self, level_set: &[FeatId], node: usize) -> Vec<FeatId> {
+        sample_subset(
+            level_set,
+            self.bynode,
+            subset_key(self.seed, self.tree, 2, node as u64),
+        )
+    }
+}
+
 /// 采样特征 → **物理上必须读的列块**。
 ///
 /// 这是 colsample 能省下真实字节的关键一步:没有任何选中特征的块**根本不读**,
@@ -166,6 +248,47 @@ mod tests {
         let a = sample_features(300, 0.3, 11, 5);
         assert_ne!(a, sample_features(300, 0.3, 12, 5), "换 seed 应该换集合");
         assert_ne!(a, sample_features(300, 0.3, 11, 6), "换轮次应该换集合");
+    }
+
+    #[test]
+    fn nested_sets_are_nested_sized_sorted_and_deterministic() {
+        let tree = sample_features(100, 0.8, 7, 3);
+        assert_eq!(tree.len(), 80);
+        let ns = NestedSampler::new(0.5, 0.5, 7, 3).unwrap();
+        for depth in 0..4 {
+            let level = ns.level_set(&tree, depth);
+            assert_eq!(level.len(), 40);
+            assert!(level.windows(2).all(|w| w[0] < w[1]));
+            assert!(level.iter().all(|f| tree.binary_search(f).is_ok()));
+            assert_eq!(level, ns.level_set(&tree, depth), "同层同种子必须复现");
+            for node in 0..6 {
+                let set = ns.node_set(&level, node);
+                assert_eq!(set.len(), 20);
+                assert!(set.windows(2).all(|w| w[0] < w[1]));
+                assert!(set.iter().all(|f| level.binary_search(f).is_ok()));
+                assert_eq!(set, ns.node_set(&level, node));
+            }
+        }
+        // 不同深度 / 节点 / 树 / seed 给出不同集合。
+        assert_ne!(ns.level_set(&tree, 0), ns.level_set(&tree, 1));
+        let level = ns.level_set(&tree, 0);
+        assert_ne!(ns.node_set(&level, 0), ns.node_set(&level, 1));
+        let other = NestedSampler::new(0.5, 0.5, 7, 4).unwrap();
+        assert_ne!(ns.level_set(&tree, 0), other.level_set(&tree, 0));
+        let other = NestedSampler::new(0.5, 0.5, 8, 3).unwrap();
+        assert_ne!(ns.level_set(&tree, 0), other.level_set(&tree, 0));
+    }
+
+    #[test]
+    fn nested_rate_one_is_identity_and_no_sampler_when_both_one() {
+        assert!(NestedSampler::new(1.0, 1.0, 0, 0).is_none());
+        let tree: Vec<FeatId> = (0..10).collect();
+        let only_node = NestedSampler::new(1.0, 0.5, 0, 0).unwrap();
+        assert_eq!(only_node.level_set(&tree, 3), tree);
+        assert!(only_node.samples_nodes());
+        let only_level = NestedSampler::new(0.5, 1.0, 0, 0).unwrap();
+        assert!(!only_level.samples_nodes());
+        assert_eq!(only_level.node_set(&tree, 9), tree);
     }
 
     #[test]

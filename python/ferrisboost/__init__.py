@@ -31,6 +31,17 @@ from ._core import Model
 __all__ = ["train", "Model", "__version__"]
 __version__ = _core.__version__
 
+_SKLEARN_NAMES = ("FerrisBoostClassifier", "FerrisBoostRegressor")
+
+
+def __getattr__(name: str) -> Any:
+    """scikit-learn 估计器按需导入:scikit-learn 是可选依赖,`import ferrisboost` 不需要它。"""
+    if name in _SKLEARN_NAMES:
+        from . import sklearn as _sk
+
+        return getattr(_sk, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 # 规范名 -> 默认值。**未知参数报错**,不像 XGBoost 那样静默忽略 ——
 # 参数名打错了不给任何提示,是最难查的一类问题。
 _DEFAULTS: dict[str, Any] = {
@@ -46,12 +57,18 @@ _DEFAULTS: dict[str, Any] = {
     "max_delta_step": None,
     "tweedie_variance_power": 1.5,
     "huber_slope": 1.0,
+    # reg:quantileerror 必须给:单个 [0, 1] 内的分位数(长度 1 的列表也收)。
+    # 向量(多分位数 = 多输出)不支持。
+    "quantile_alpha": None,
     # multi:softprob / multi:softmax 必须给;其它 objective 忽略。
     "num_class": None,
     "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
     "colsample_bytree": 1.0,
+    # XGBoost 的嵌套采样(bytree → bylevel → bynode)。只限制 split 枚举。
+    "colsample_bylevel": 1.0,
+    "colsample_bynode": 1.0,
     # None = 自动:等拿到 schema 再按 nthread / max_bin 选块宽。
     # 显式给一个正整数就完全按用户的来,启发式不参与。
     "cols_per_block": None,
@@ -93,6 +110,19 @@ _DEFAULTS: dict[str, Any] = {
     # XGBoost 同名参数:元组/列表(按特征位置)、"(1,0,-1)" 字符串,或
     # {特征名: 方向} 字典(需要列名)。1 递增、-1 递减、0 不约束;只看符号。
     "monotone_constraints": None,
+    # Categorical features (XGBoost semantics). `enable_categorical` lets pandas
+    # `category` columns and PyArrow dictionary columns be detected as
+    # categorical; `feature_types` ("c" / "q" per feature) declares them
+    # explicitly for numpy and file inputs. Categories are integer codes in
+    # 0..=254. `max_cat_to_onehot`: features with fewer categories than this are
+    # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
+    # bounds the partition scan.
+    "enable_categorical": False,
+    "max_cat_to_onehot": 4,
+    "max_cat_threshold": 64,
+    # Private wire field set by `train` from `feature_types` / the frame dtypes:
+    # one bool per feature, or None.
+    "_feature_types": None,
 }
 
 # XGBoost 的别名,两种写法都收
@@ -106,7 +136,8 @@ _ALIASES = {
 }
 
 _OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
-               "reg:tweedie", "reg:pseudohubererror", "multi:softprob", "multi:softmax")
+               "reg:tweedie", "reg:pseudohubererror", "reg:quantileerror", "multi:softprob",
+               "multi:softmax")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
@@ -218,9 +249,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
             raise ValueError("num_class 不能是负数")
     if out["max_delta_step"] is not None:
         out["max_delta_step"] = float(out["max_delta_step"])
+    out["quantile_alpha"] = _normalize_quantile_alpha(out["quantile_alpha"], out["objective"])
     for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "tweedie_variance_power",
                 "huber_slope", "scale_pos_weight", "subsample",
-                "colsample_bytree"):
+                "colsample_bytree", "colsample_bylevel", "colsample_bynode"):
         out[key] = float(out[key])
     if out["base_score"] is not None:
         out["base_score"] = float(out["base_score"])
@@ -242,7 +274,36 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
         out["eval_metric"] = names
     out["monotone_constraints"] = _normalize_monotone(out["monotone_constraints"])
+    out["enable_categorical"] = bool(out["enable_categorical"])
+    for key in ("max_cat_to_onehot", "max_cat_threshold"):
+        if isinstance(out[key], bool) or int(out[key]) != out[key]:
+            raise ValueError(f"{key} 要是整数,给的是 {out[key]!r}")
+        out[key] = int(out[key])
+        if out[key] < 1:
+            raise ValueError(f"{key} 要 >= 1,给的是 {out[key]}")
     return out
+
+
+def _normalize_quantile_alpha(value: Any, objective: str) -> float | None:
+    """`quantile_alpha` -> float | None。长度 1 的序列等价于标量;多个值是多输出,不支持。"""
+    if value is None:
+        if objective == "reg:quantileerror":
+            raise ValueError(
+                "reg:quantileerror 需要 quantile_alpha(单个 [0, 1] 内的分位数,例如 0.9)"
+            )
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        flat = np.asarray(value, dtype=np.float64).ravel()
+        if flat.size != 1:
+            raise ValueError(
+                f"quantile_alpha 给了 {flat.size} 个值;多分位数(多输出)不支持,"
+                "请每个分位数训一个模型"
+            )
+        value = flat[0]
+    alpha = float(value)
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError(f"quantile_alpha 要在 [0, 1] 内,给的是 {alpha}")
+    return alpha
 
 
 def _monotone_sign(value: Any, where: str) -> int:
@@ -356,17 +417,116 @@ def _arrow_table(obj: Any) -> Any:
     if not mod.startswith("pyarrow"):
         return None
     if hasattr(obj, "column_names"):
+        if type(obj).__name__ == "RecordBatch":
+            import pyarrow as pa
+
+            return pa.Table.from_batches([obj])
         return obj
     if hasattr(obj, "read_all"):
         return obj.read_all()
     return None
 
 
-def _arrow_matrix(table: Any, order: list[str] | None = None, what: str = "data") -> np.ndarray:
-    """pyarrow 表 -> f32 矩阵。给了 `order` 就**按列名**取列并排成这个顺序。
+def _feature_flags(feature_types: Any, n_features: int | None) -> list[bool] | None:
+    """`feature_types` ("c" / "q" per feature, XGBoost style) -> list of bools.
 
-    验证集按列名绑定到训练集:按位置取的话,列顺序不同的表会被静默错配。
+    `None` = nothing declared. Anything other than "c" is numeric ("q", "float",
+    "int", "i"). The length is checked against `n_features` when it is known.
     """
+    if feature_types is None:
+        return None
+    if isinstance(feature_types, str) or not isinstance(feature_types, (list, tuple, np.ndarray)):
+        raise ValueError(
+            f'feature_types 要是 "c" / "q" 的列表(每个特征一项),给的是 {feature_types!r}'
+        )
+    flags = []
+    for t in feature_types:
+        if not isinstance(t, str):
+            raise ValueError(f'feature_types 的元素要是字符串("c" / "q"),给的是 {t!r}')
+        flags.append(t == "c")
+    if n_features is not None and len(flags) != n_features:
+        raise ValueError(f"feature_types 有 {len(flags)} 项,数据有 {n_features} 个特征")
+    return flags
+
+
+def _is_pandas_frame(obj: Any) -> bool:
+    return (type(obj).__module__ or "").startswith("pandas") and hasattr(obj, "dtypes") \
+        and hasattr(obj, "columns")
+
+
+def _codes_to_f32(codes: np.ndarray, missing: np.ndarray) -> np.ndarray:
+    out = codes.astype(np.float32)
+    out[missing] = np.nan
+    return out
+
+
+def _frame_matrix(
+    df: Any, enable_categorical: bool, ref_levels: dict | None = None, what: str = "data"
+) -> tuple[np.ndarray, list[str], list[bool], dict]:
+    """pandas DataFrame -> (f32 matrix, column names, categorical flags, levels).
+
+    A `category` column becomes its integer codes (NaN for a missing value) and
+    is flagged categorical. `ref_levels` (the training frame's levels by column
+    position) re-codes a validation frame's categories onto the training codes;
+    a category unseen in training gets a code past the trained range, which is
+    in no category set and so goes left, as in XGBoost.
+    """
+    import pandas as pd
+
+    names = [str(c) for c in df.columns]
+    if len(set(names)) != len(names):
+        dups = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(f"{what} 里有重复的列名 {dups};列名必须唯一")
+    cols, flags, levels = [], [], {}
+    for i, name in enumerate(names):
+        s = df.iloc[:, i]
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            if not enable_categorical:
+                raise ValueError(
+                    f"{what} 的列 {name!r} 是 category 类型;要把它当类别特征训练,"
+                    "请设置 params['enable_categorical'] = True"
+                )
+            if ref_levels is not None and i in ref_levels:
+                ref = ref_levels[i]
+                codes = pd.Categorical(s.astype(object), categories=ref).codes.astype(np.int64)
+                unseen = (codes < 0) & s.notna().to_numpy()
+                codes[unseen] = len(ref)
+                levels[i] = ref
+            else:
+                codes = s.cat.codes.to_numpy().astype(np.int64)
+                levels[i] = s.cat.categories
+            cols.append(_codes_to_f32(codes, ~s.notna().to_numpy()))
+            flags.append(True)
+        else:
+            try:
+                cols.append(s.to_numpy(dtype=np.float32, na_value=np.nan))
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"{what} 的列 {name!r} 的类型是 {s.dtype},不能当数值特征;"
+                    "请先转成数值,或转成 category 并设置 enable_categorical=True"
+                ) from e
+            flags.append(False)
+    x = np.ascontiguousarray(np.stack(cols, axis=1)) if cols else np.empty((len(df), 0), np.float32)
+    return x, names, flags, levels
+
+
+def _table_matrix(
+    table: Any,
+    order: list[str] | None,
+    enable_categorical: bool,
+    ref_levels: dict | None = None,
+    what: str = "data",
+) -> tuple[np.ndarray, list[str], list[bool], dict]:
+    """pyarrow Table -> (f32 matrix, names, categorical flags, levels).
+
+    A dictionary column is categorical: its codes are the dictionary indices
+    (dictionaries are unified across chunks first). `order` binds columns by
+    name to a training table; `ref_levels` re-codes dictionary columns onto the
+    training dictionary the way `_frame_matrix` does.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
     names = list(table.column_names)
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
@@ -379,9 +539,67 @@ def _arrow_matrix(table: Any, order: list[str] | None = None, what: str = "data"
                 f"{what} 的列和训练集对不上(按列名绑定):缺少 {missing},多出 {extra}"
             )
         names = order
-    cols = [np.asarray(table.column(c).to_numpy(zero_copy_only=False), dtype=np.float32)
-            for c in names]
-    return np.ascontiguousarray(np.stack(cols, axis=1))
+    if any(pa.types.is_dictionary(table.schema.field(n).type) for n in names):
+        table = table.unify_dictionaries()
+    cols, flags, levels = [], [], {}
+    for i, name in enumerate(names):
+        col = table.column(name)
+        if pa.types.is_dictionary(col.type):
+            if not enable_categorical:
+                raise ValueError(
+                    f"{what} 的列 {name!r} 是 dictionary 类型;要把它当类别特征训练,"
+                    "请设置 params['enable_categorical'] = True"
+                )
+            chunks = col.chunks
+            dictionary = chunks[0].dictionary if chunks else pa.array([])
+            if ref_levels is not None and i in ref_levels:
+                ref = ref_levels[i]
+                decoded = pa.chunked_array([c.dictionary_decode() for c in chunks], col.type.value_type)
+                idx = pc.index_in(decoded, value_set=ref)
+                arr = idx.cast(pa.float32()).to_numpy(zero_copy_only=False).astype(np.float32)
+                null = np.asarray(decoded.is_null().to_numpy(zero_copy_only=False))
+                arr = np.where(np.isnan(arr) & ~null, np.float32(len(ref)), arr)
+                arr[null] = np.nan
+                levels[i] = ref
+            else:
+                indices = pa.chunked_array([c.indices for c in chunks], pa.int32()) \
+                    if chunks else pa.chunked_array([], pa.int32())
+                arr = indices.cast(pa.float32()).to_numpy(zero_copy_only=False).astype(np.float32)
+                levels[i] = dictionary
+            cols.append(np.asarray(arr, dtype=np.float32))
+            flags.append(True)
+        else:
+            cols.append(np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float32))
+            flags.append(False)
+    x = np.ascontiguousarray(np.stack(cols, axis=1)) if cols else np.empty((table.num_rows, 0), np.float32)
+    return x, names, flags, levels
+
+
+def _merge_flags(auto: list[bool] | None, explicit: list[bool] | None, n: int) -> list[bool] | None:
+    """Explicit `feature_types` win over dtype detection; None if nothing is categorical."""
+    flags = explicit if explicit is not None else auto
+    if flags is None or not any(flags):
+        return None
+    if len(flags) != n:
+        raise ValueError(f"feature_types 有 {len(flags)} 项,数据有 {n} 个特征")
+    return list(flags)
+
+
+def _as_predict_matrix(data: Any) -> np.ndarray:
+    """Convert a pandas DataFrame / PyArrow Table to the f32 matrix `Model.predict` scores.
+
+    Categorical columns use their codes, so the frame must carry the same
+    categories (in the same order) as the training data.
+    """
+    if _is_pandas_frame(data):
+        return _frame_matrix(data, True, what="predict data")[0]
+    table = _arrow_table(data)
+    if table is not None:
+        return _table_matrix(table, None, True, what="predict data")[0]
+    raise ValueError(
+        "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、"
+        "pandas DataFrame 或 pyarrow Table"
+    )
 
 
 def train(
@@ -397,6 +615,7 @@ def train(
     header: bool = True,
     quiet: bool = False,
     weight: Any = None,
+    feature_types: Sequence[str] | None = None,
 ) -> Model:
     """训一个模型。
 
@@ -417,10 +636,16 @@ def train(
 
     权重同时作用于梯度、指标和分箱边界(quantile sketch 按权重加权),
     语义和 XGBoost 一致。
+
+    类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
+    pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
+    为 True 时自动识别。类别值是 0..=254 的整数码(缺失用 NaN / null),超出范围、
+    负数或非整数会报错;每个特征最多 255 个类别。
     """
     p = _normalize_params(params, num_boost_round)
     # Private wire field: quiet is a public call option, not a tree parameter.
     p["_quiet"] = bool(quiet)
+    explicit_types = _feature_flags(feature_types, None)
     cb_list = list(callbacks) if callbacks else None
     verbose = None
     if verbose_eval is True:
@@ -449,6 +674,10 @@ def train(
                     "标签列和权重列沿用训练集的列名"
                 )
             eval_specs.append((os.fspath(item[0]), item[1]))
+        # Declared categorical features are positional over the file's feature
+        # columns (label / weight excluded); the length is checked in Rust, where
+        # the schema is known. Dictionary columns are detected there.
+        p["_feature_types"] = explicit_types or None
         # 格式由 Rust 从解析出的文件判定 —— Python 不再按后缀猜,也不做
         # 文件系统判断(目录/glob 展开、排序、schema 一致性全在 Rust)。
         model = _core.train_file(specs, label, p, header, eval_specs,
@@ -456,7 +685,16 @@ def train(
                                  weight=weight)
     else:
         table = _arrow_table(data)
-        names = None if table is None else list(table.column_names)
+        frame = data if _is_pandas_frame(data) else None
+        enable_cat = p["enable_categorical"]
+        auto_flags, levels, names = None, {}, None
+        if table is not None:
+            x, names, auto_flags, levels = _table_matrix(table, None, enable_cat)
+        elif frame is not None:
+            x, names, auto_flags, levels = _frame_matrix(frame, enable_cat)
+        else:
+            x = _as_matrix(data)
+        p["_feature_types"] = _merge_flags(auto_flags, explicit_types, x.shape[1])
         if isinstance(p["monotone_constraints"], dict):
             if names is None:
                 raise ValueError(
@@ -464,7 +702,7 @@ def train(
                     "请改用按位置的元组,或用 pyarrow Table / 带表头的文件"
                 )
             p["monotone_constraints"] = _resolve_named_monotone(p["monotone_constraints"], names)
-        x = _as_matrix(_arrow_matrix(table) if table is not None else data)
+        x = _as_matrix(x)
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):
             raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
@@ -483,7 +721,14 @@ def train(
             et = _arrow_table(ed)
             if et is not None:
                 # 训练集也有列名时按列名绑定;否则(numpy 训练集)只能按位置。
-                ed = _arrow_matrix(et, names, f"evals[{name}]")
+                ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]")[0]
+            elif _is_pandas_frame(ed):
+                if names is not None:
+                    missing = [n for n in names if n not in [str(c) for c in ed.columns]]
+                    if missing:
+                        raise ValueError(f"evals[{name}] 缺少训练集的列 {missing}")
+                    ed = ed[[c for n in names for c in ed.columns if str(c) == n]]
+                ed = _frame_matrix(ed, enable_cat, levels, f"evals[{name}]")[0]
             ex = _as_matrix(ed, f"evals[{name}]")
             if ew is not None:
                 ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")

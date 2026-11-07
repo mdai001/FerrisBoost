@@ -6,9 +6,11 @@
 
 pub mod backend;
 pub mod callback;
+pub mod categorical;
 pub mod colsample;
 pub mod columns;
 pub mod comm;
+pub mod explain;
 pub mod gpu_mem_plan;
 pub mod hist;
 mod inference;

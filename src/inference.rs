@@ -19,9 +19,14 @@ struct CpuInferenceTree {
     default_left: Box<[u8]>,
     left_children: Box<[u32]>,
     right_children: Box<[u32]>,
+    /// bit 0 = leaf, bit 1 = default left, bit 2 = categorical split.
     flags: Box<[u8]>,
     leaf_values: Box<[f32]>,
     max_depth: usize,
+    /// Categorical trees only (they always use the dynamic layout): per node
+    /// an index into `cat_sets`, the right-going category bitsets.
+    cat_index: Box<[u32]>,
+    cat_sets: Box<[Box<[u32]>]>,
 }
 
 impl CpuInferenceTree {
@@ -68,7 +73,10 @@ impl CpuInferenceTree {
         // level, left/right are arithmetic (2*i / 2*i+1), so prediction has no
         // leaf test and no child-pointer loads. An early leaf is extended with
         // NaN comparisons that deterministically walk right to the same value.
-        if max_depth <= 6 {
+        // A tree with categorical splits needs a set lookup per node and uses
+        // the dynamic layout below instead.
+        let has_categorical = tree.has_categorical();
+        if max_depth <= 6 && !has_categorical {
             let internal_count = (1usize << max_depth) - 1;
             let mut features = vec![0u32; internal_count];
             let mut split_conditions = vec![f32::NAN; internal_count];
@@ -102,6 +110,8 @@ impl CpuInferenceTree {
                 flags: Box::new([]),
                 leaf_values: leaf_values.into_boxed_slice(),
                 max_depth,
+                cat_index: Box::new([]),
+                cat_sets: Box::new([]),
             });
         }
 
@@ -114,13 +124,29 @@ impl CpuInferenceTree {
         let mut right_children = Vec::with_capacity(tree.nodes.len());
         let mut flags = Vec::with_capacity(tree.nodes.len());
         let mut leaf_values = Vec::with_capacity(tree.nodes.len());
+        let mut cat_index = Vec::new();
+        let mut cat_sets: Vec<Box<[u32]>> = Vec::new();
         for node in &tree.nodes {
             features.push(node.feat);
             split_conditions.push(node.split_cond);
             left_children.push(if node.is_leaf { 0 } else { node.left as u32 });
             right_children.push(if node.is_leaf { 0 } else { node.right as u32 });
-            flags.push(u8::from(node.is_leaf) | (u8::from(node.default_left) << 1));
+            let categorical = !node.is_leaf && node.cats.is_some();
+            flags.push(
+                u8::from(node.is_leaf)
+                    | (u8::from(node.default_left) << 1)
+                    | (u8::from(categorical) << 2),
+            );
             leaf_values.push(node.leaf_value);
+            if has_categorical {
+                match (&node.cats, node.is_leaf) {
+                    (Some(words), false) => {
+                        cat_index.push(cat_sets.len() as u32);
+                        cat_sets.push(words.clone());
+                    }
+                    _ => cat_index.push(u32::MAX),
+                }
+            }
         }
         Ok(Self {
             features: features.into_boxed_slice(),
@@ -131,6 +157,8 @@ impl CpuInferenceTree {
             flags: flags.into_boxed_slice(),
             leaf_values: leaf_values.into_boxed_slice(),
             max_depth,
+            cat_index: cat_index.into_boxed_slice(),
+            cat_sets: cat_sets.into_boxed_slice(),
         })
     }
 
@@ -179,6 +207,11 @@ impl CpuInferenceTree {
                 let value = row_major[row * n_features + self.features[node] as usize];
                 let go_left = if ANY_MISSING && value.is_nan() {
                     flags & 2 != 0
+                } else if flags & 4 != 0 {
+                    crate::categorical::goes_left(
+                        &self.cat_sets[self.cat_index[node] as usize],
+                        value,
+                    )
                 } else {
                     value < self.split_conditions[node]
                 };
@@ -202,6 +235,11 @@ impl CpuInferenceTree {
         margins: &mut [f32],
     ) {
         debug_assert!(margins.len() <= CPU_PREDICTION_BLOCK_ROWS);
+        // Only the heap layout leaves `flags` empty; categorical trees (and deep
+        // ones) use the dynamic layout whatever their depth.
+        if !self.flags.is_empty() {
+            return self.add_dynamic_block::<ANY_MISSING>(row_major, n_features, margins);
+        }
         match self.max_depth {
             0 => self.add_array_block::<ANY_MISSING, 0>(row_major, n_features, margins),
             1 => self.add_array_block::<ANY_MISSING, 1>(row_major, n_features, margins),
@@ -298,6 +336,12 @@ pub(crate) struct CompactInferenceModel {
 }
 
 impl CompactInferenceModel {
+    /// Whether any split is categorical (the device predictor cannot score it).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn has_categorical_splits(&self) -> bool {
+        self.model.has_categorical_splits()
+    }
+
     pub(crate) fn new(canonical: &Model) -> Result<Self> {
         // 单输出预测器:多分类模型要先拆成 `Model::class_view`。
         if canonical.num_outputs() > 1 {
@@ -419,6 +463,7 @@ mod tests {
             schema_mode: Some(crate::tree::SchemaMode::Named),
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
+            feature_types: Vec::new(),
         };
         let before = canonical.to_xgboost_json().unwrap();
         let compact = CompactInferenceModel::new(&canonical).unwrap();
@@ -480,6 +525,7 @@ mod tests {
             schema_mode: Some(crate::tree::SchemaMode::Named),
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
+            feature_types: Vec::new(),
         };
         let predictor = CpuInferenceModel::new(&model).unwrap();
         let patterns = [

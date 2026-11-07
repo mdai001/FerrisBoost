@@ -479,6 +479,7 @@ impl GpuBlockSession<'_> {
                         hess: i64_at(40),
                     },
                     missing_left: flags & 2 != 0,
+                    cats: None,
                 });
                 let hist = if keep_next && !batch.cached[local] {
                     let _fallback_phase =

@@ -231,6 +231,37 @@ All of these objectives work with sample weights, monotone constraints,
 CPU and with `gpu_math="exact"`, models match XGBoost exactly when every
 feature has fewer distinct values than `max_bin`.
 
+### Quantile regression
+
+`reg:quantileerror` fits one conditional quantile and requires a scalar
+`quantile_alpha` in `[0, 1]` (XGBoost has no default either):
+
+```python
+upper = fb.train(
+    {"objective": "reg:quantileerror", "quantile_alpha": 0.9, "max_depth": 4},
+    Xr, label=noisy, num_boost_round=100,
+    evals=[(Xr, noisy, "train")],              # default metric: quantile
+)
+q90 = upper.predict(Xr)                        # identity link
+```
+
+This is the XGBoost 3.4.1 objective, which is a smoothed pinball loss rather
+than the textbook subgradient. Every round it computes one global scale from
+all rows' current predictions, so its gradients are not a function of a single
+row. The starting prediction (`base_score`, when unset) is the `quantile_alpha`
+quantile of the labels (linear interpolation without weights, a step function
+with weights). The `quantile` metric is the pinball loss at the same alpha, and
+it is the default metric for this objective. On the CPU and with
+`gpu_math="exact"`, models match XGBoost exactly when every feature has fewer
+distinct values than `max_bin` and `nthread=1` (the global scale is summed
+serially here, so results do not depend on the thread count).
+
+Limits: several `quantile_alpha` values (multi-output) are rejected, one model
+per quantile is the supported pattern. `gpu_math="fast"` is rejected with an
+error for this objective because the scale needs a reduction over all rows
+before the per-row gradients; use `gpu_math="exact"`, which is byte-identical
+to the CPU.
+
 ## Regularization and class imbalance
 
 Three parameters have the semantics of their XGBoost namesakes:
@@ -378,6 +409,7 @@ model = fb.train(
 | `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
 | `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
 | `tweedie-nloglik@rho` | `reg:tweedie` | Negative Tweedie log-likelihood at variance power `rho` in `[1, 2)`, for example `tweedie-nloglik@1.5`. The `@rho` part is required |
+| `quantile` | `reg:quantileerror` | Pinball loss at `quantile_alpha`; the objective's default metric |
 | `mlogloss` | `multi:softprob`, `multi:softmax` | Multiclass negative log-likelihood |
 | `merror` | `multi:softprob`, `multi:softmax` | Multiclass error rate |
 
@@ -393,7 +425,7 @@ Without `eval_metric`, the objective selects the default: `logloss` for
 `binary:logistic`, `rmse` for `reg:squarederror`, `poisson-nloglik` for
 `count:poisson`, `gamma-deviance` for `reg:gamma`, `tweedie-nloglik@rho` (with
 the objective's `tweedie_variance_power`) for `reg:tweedie`, `mphe` for
-`reg:pseudohubererror`, and `mlogloss` for both multiclass objectives. With
+`reg:pseudohubererror`, `quantile` for `reg:quantileerror`, and `mlogloss` for both multiclass objectives. With
 weighted validation data every metric is weighted the same way XGBoost does it.
 
 Like `xgboost.Booster.predict`, `Model.predict()` uses all trees by default,
@@ -460,6 +492,34 @@ For continuous features, FerrisBoost and XGBoost use different quantile-sketch
 implementations, with or without weights, so individual bin boundaries can sit
 slightly apart; both are accurate weighted quantiles.
 
+## Feature sampling
+
+Three nested parameters follow XGBoost's `ColumnSampler`: `colsample_bytree`
+draws a feature set once per tree, `colsample_bylevel` draws a subset of it for
+each tree level (shared by all nodes of the level), and `colsample_bynode`
+draws a subset of that for every node. Each stage keeps
+`max(1, floor(rate * previous_count))` features, and the rates multiply:
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "colsample_bytree": 0.8,
+     "colsample_bylevel": 0.7, "colsample_bynode": 0.5, "seed": 3},
+    X, label=y, num_boost_round=100,
+)
+```
+
+The draws are deterministic and depend only on `seed`, the tree number, the
+depth, and the node number: thread count, column blocking, and CPU versus GPU
+(`gpu_math="exact"`) do not change the model. The random sequence is
+FerrisBoost's own, so for the same `seed` the chosen features are **not**
+the same as XGBoost's (XGBoost's CPU and GPU sequences already differ from each
+other); the semantics, counts, and nesting are the same. The same is true of
+`colsample_bytree`.
+
+`colsample_bylevel` and `colsample_bynode` only narrow the split search, as in
+XGBoost. Histograms are still built for every feature of the per-tree set, so
+unlike `colsample_bytree` they do not reduce input reads.
+
 ## Monotone constraints
 
 `params["monotone_constraints"]` forces the model's prediction to move in one
@@ -500,6 +560,84 @@ fewer distinct values than `max_bin`, on CPU and GPU, with or without
 weights. CPU and `gpu_math="exact"` GPU models stay byte-identical. The
 constraints are not stored in the saved model, as in XGBoost; prediction does
 not need them.
+
+## Categorical features
+
+FerrisBoost splits categorical features the way XGBoost's `hist` method does.
+A categorical feature holds **integer category codes**, one bin per code, and a
+split sends a chosen set of categories to the right child and every other
+category to the left.
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "max_cat_to_onehot": 4, "max_cat_threshold": 64},
+    X,                                  # NumPy array of floats
+    label=y,
+    feature_types=["q", "c", "c", "q"],  # "c" = categorical, "q" = numeric
+    num_boost_round=100,
+)
+```
+
+How a feature is declared:
+
+- **`feature_types`** (`fb.train` argument): one `"c"` or `"q"` per feature, as in
+  XGBoost's `DMatrix`. It works for NumPy arrays, PyArrow tables, and Parquet
+  or CSV files. For files the list is positional over the feature columns (the
+  label and weight columns are not features).
+- **pandas `category` columns and PyArrow dictionary columns** are detected
+  automatically when `params["enable_categorical"]` is `True`; without it they
+  are rejected so a categorical column is never trained as one by accident.
+  A category becomes its integer code (its position in the dictionary);
+  missing values stay missing. An explicit `feature_types` overrides detection.
+- **Parquet dictionary columns** are categorical automatically if their values
+  are integers. Dictionaries of strings are rejected in files, because the
+  codes of a string dictionary differ between row groups; encode the categories
+  as integers upstream, or train from an in-memory pandas or PyArrow table.
+
+Category codes must be integers in `0..=254`, with `NaN` / null for a missing
+value; negative, fractional, or larger values raise `ValueError`. The limit
+exists because the largest bin is reserved for missing values, so one feature
+can have at most 255 categories in this version (XGBoost has no such limit).
+Codes need not be contiguous, but each code up to the feature's largest costs one
+histogram bin, so prefer compact codes.
+
+Validation sets use the training codes. A category that never appeared in
+training is "not in any set" and goes to the left child, as it does in XGBoost;
+for pandas and PyArrow validation data the categories are first re-coded onto
+the training categories.
+
+Split search follows XGBoost:
+
+- a feature with fewer than `max_cat_to_onehot` categories (default 4) is split
+  one-versus-rest;
+- otherwise the categories are sorted by their leaf weight and prefixes of that
+  order are scanned, at most `max_cat_threshold` (default 64) per direction;
+- both missing-value directions are tried, and ties resolve to the earlier
+  candidate, so training is deterministic and does not depend on thread count.
+
+`lambda`, `alpha`, `max_delta_step`, `min_child_weight`, `gamma`, sample weights,
+`monotone_constraints` on the numeric features, `subsample` and `colsample_bytree`
+all apply. With lossless binning (numeric columns with fewer distinct values than
+`max_bin`, categorical codes) the trees and predictions match XGBoost
+`tree_method="hist"` exactly, for regression, binary, and multiclass objectives.
+
+Prediction handles category sets on every path (arrays, pandas / PyArrow, files,
+`predict_to_parquet`, multiclass). A pandas DataFrame or PyArrow table passed to
+`predict` is scored through its category codes, so it must carry the same
+categories in the same order as the training data. Prediction from a
+categorical model runs on the CPU even with `use_gpu=True`.
+
+Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
+`feature_types` list) and load in XGBoost in both directions. A loaded XGBoost
+model may use category ids above 254; prediction follows its sets, with
+unknown or invalid values going left.
+
+On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
+CPU) and `"fast"`. The device split kernels only know ordered bins, so a
+categorical run enumerates splits on the host from downloaded histograms (the
+same exact fallback used for streaming) and does not use the resident GPU split
+cache; histogram building, row partitioning, and gradients stay on the device.
+Expect categorical GPU training to be slower than numeric GPU training.
 
 ## Multiclass classification
 
@@ -589,6 +727,62 @@ before the next batch is read.
 Multiclass models are saved with `num_class`, per-tree class ids, and a vector
 `base_score`, and are exchanged with XGBoost in both directions: XGBoost loads
 a FerrisBoost multiclass model, and FerrisBoost loads one trained by XGBoost.
+
+## scikit-learn estimators
+
+`FerrisBoostClassifier` and `FerrisBoostRegressor` follow the `XGBClassifier` /
+`XGBRegressor` interface without taking the XGBoost names (so both libraries can
+be imported together):
+
+| XGBoost | FerrisBoost |
+|---|---|
+| `xgboost.XGBClassifier` | `ferrisboost.FerrisBoostClassifier` |
+| `xgboost.XGBRegressor` | `ferrisboost.FerrisBoostRegressor` |
+
+scikit-learn is optional: `import ferrisboost` never imports it, and the two
+names are loaded on first access.
+
+```python
+from ferrisboost.sklearn import FerrisBoostClassifier
+
+clf = FerrisBoostClassifier(
+    n_estimators=500, learning_rate=0.1, max_depth=6,
+    early_stopping_rounds=20, eval_metric="logloss",
+)
+clf.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
+proba = clf.predict_proba(X_valid)        # (n, 2); (n, K) for multiclass
+labels = clf.predict(X_valid)
+print(clf.best_iteration, clf.evals_result()["validation_0"]["logloss"][-1])
+clf.save_model("clf.json")                # XGBoost-compatible JSON
+```
+
+- `fit(X, y, sample_weight=, eval_set=, sample_weight_eval_set=, verbose=)`,
+  `predict`, `predict_proba`, `score`, `get_params` / `set_params`, `clone`,
+  pickling, `GridSearchCV`, `cross_val_score`, and `Pipeline` work. Constructor
+  parameters use XGBoost's names (`n_estimators`, `learning_rate`, `max_depth`,
+  `subsample`, `colsample_by*`, `reg_alpha`, `reg_lambda`, `n_jobs`,
+  `random_state`, `eval_metric`, `early_stopping_rounds`, ...) plus FerrisBoost's
+  `device`, `gpu_math`, `quantile_alpha`, `tweedie_variance_power`, and
+  `huber_slope`. `None` means "use FerrisBoost's default".
+- Binary classification uses `binary:logistic`; more than two classes switch to
+  `multi:softprob` (or `multi:softmax` if you ask for it) and set `num_class`.
+  Labels can be any sortable class values; they are encoded internally and
+  `classes_` keeps the originals (XGBoost requires `0..K-1`; for such labels
+  the behavior is the same).
+- After early stopping, `predict` / `predict_proba` use trees up to
+  `best_iteration` automatically, as XGBoost's sklearn layer does (the raw
+  `Model.predict` still uses all trees). `early_stopping_rounds` requires an
+  `eval_set`.
+- `evals_result()` is keyed `validation_0`, `validation_1`, ...
+  `feature_importances_` is `Model.get_score(importance_type)` normalized to sum
+  to 1 over all input features (`importance_type` defaults to `gain`, as in
+  XGBoost). `verbose` defaults to `False` (set it to see the validation metrics
+  per round).
+- `load_model(path)` / `from_file(path)` read XGBoost-compatible JSON.
+- Not supported: XGBoost's `missing=` sentinel (only `NaN` is missing),
+  `booster=`, `tree_method=`, `enable_categorical`, and base margins.
+  `sample_weight` follows FerrisBoost's weighted-sketch semantics, so a weight of
+  `k` is not the same as repeating a row `k` times.
 
 ## Custom callbacks
 
@@ -818,7 +1012,11 @@ memory budget, without manual chunk or batch tuning:
   `reg:pseudohubererror`. It is deterministic from run to run but not
   byte-identical to CPU. Support for the newer regression objectives is a
   first version; it is correct, and its speed will be optimized in 0.0.6.
+- **`gpu_math="fast"` and `reg:quantileerror`**: not supported (clear error); its gradients need a global reduction first. Use `gpu_math="exact"`.
+- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
 - **`gpu_math="fast"` with multiclass**: `gpu_math="fast"` with multiclass objectives is supported (device softmax gradients); optimization continues in 0.0.6.
+- **Categorical features**: supported with both `gpu_math` modes. Split search
+  for them runs on the host (see [Categorical features](#categorical-features)).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
@@ -893,7 +1091,17 @@ X_test = np.asarray(X_test, dtype=np.float32)
 prediction = model.predict(X_test)
 raw_margin = model.predict(X_test, output_margin=True)
 first_20_trees = model.predict(X_test, n_trees=20)
+rounds_10_to_19 = model.predict(X_test, iteration_range=(10, 20))
 ```
+
+`iteration_range=(begin, end)` follows XGBoost: it uses the half-open range of
+boosting **rounds** `[begin, end)`, so a multiclass model uses `num_class`
+trees per round, whereas `n_trees` counts trees. `end=0` means "to the last
+round"; a range beyond the model or with `begin > end` raises `ValueError`, and
+`begin == end` is an empty range (only `base_score`). The base prediction is
+always included. It works for arrays, files, and `predict_to_parquet`, and
+cannot be combined with `n_trees`. With `begin > 0` the call scores a copy of
+the selected trees, so repeated calls with a nonzero `begin` are best batched.
 
 C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays, pandas `DataFrame`s, or PyArrow `Table`s must be converted explicitly with `np.asarray(..., dtype=np.float32)`.
 
@@ -908,6 +1116,36 @@ print(model.best_iteration)
 print(model.best_score)
 print(model.evals_result())
 ```
+
+## Feature importance, SHAP values, and leaf indices
+
+These follow XGBoost 3.4.1 (`Booster.get_score` and the `pred_contribs`, `approx_contribs`, `pred_interactions`, and `pred_leaf` options of `Booster.predict`) and work on models trained by FerrisBoost or loaded from XGBoost JSON.
+
+```python
+model.get_score()                           # {"f0": 12.0, "f3": 7.0, ...}
+model.get_score(importance_type="gain")
+
+contribs = model.predict(X_test, pred_contribs=True)          # (n, n_features + 1)
+saabas = model.predict(X_test, pred_contribs=True, approx_contribs=True)
+inter = model.predict(X_test, pred_interactions=True)         # (n, n_features + 1, n_features + 1)
+leaves = model.predict(X_test, pred_leaf=True)                # (n, n_trees)
+```
+
+`get_score(importance_type=...)` returns `{feature_name: score}` for every feature used in at least one split, in feature order; features that are never used are omitted. `importance_type` is one of:
+
+- `"weight"` (default): the number of splits that use the feature across all trees.
+- `"gain"` / `"total_gain"`: the average / summed split gain of those splits.
+- `"cover"` / `"total_cover"`: the average / summed Hessian sum (`sum_hessian`) of the split nodes.
+
+Names are the model's feature names (from a named file or table schema), or `f0`, `f1`, ... when the model was trained from a NumPy array. The scores come from the gain and Hessian sum that every tree node stores, so they also work on models loaded from XGBoost JSON.
+
+`predict(..., pred_contribs=True)` returns exact TreeSHAP values in margin space. Every row sums to the raw margin (`output_margin=True`), and the last column is the bias term: the model's `base_score` (as a margin) plus the cover-weighted mean of the trees. With `approx_contribs=True` it returns the faster Saabas attribution instead. Multiclass models return `(n, num_class, n_features + 1)`, one attribution matrix per class.
+
+`pred_interactions=True` returns SHAP interaction values `(n, n_features + 1, n_features + 1)` (multiclass: `(n, num_class, n_features + 1, n_features + 1)`). The matrices are symmetric, each row sums to the matching `pred_contribs` row, and the whole matrix sums to the margin. Memory grows with `n * (n_features + 1)^2`, so score wide data in batches. Combining `pred_interactions=True` with `approx_contribs=True` raises an error: XGBoost 3.4.1 returns a diagonal-only matrix there.
+
+`pred_leaf=True` returns, for every row, the node index of the leaf it reaches in each tree, as `float32` like XGBoost; indices are node ids within the tree. The result has shape `(n, n_trees)` (a multiclass model has `num_class` trees per round).
+
+These options accept the same inputs as normal prediction: a two-dimensional `float32` array, or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU, and `base_margin` per-row offsets are not supported because FerrisBoost prediction has no such input.
 
 ## Save, load, and exchange models with XGBoost
 
@@ -974,7 +1212,8 @@ empty `evals_result()`.
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `multi:softprob`, `multi:softmax` |
+| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax` |
+| `quantile_alpha` | `None` | Required for `reg:quantileerror`: one quantile in `[0, 1]` (a length-1 list is accepted). Several quantiles (multi-output) are not supported and raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
@@ -989,6 +1228,8 @@ empty `evals_result()`.
 | `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. Used by `binary:logistic`, `reg:squarederror`, and `reg:gamma`, ignored by the other objectives. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
 | `subsample` | `1.0` | Deterministic per-tree row sampling in `(0, 1]`; all rows still receive the learned tree |
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
+| `colsample_bylevel` | `1.0` | Per-level feature sampling in `(0, 1]` from the per-tree set; see [Feature sampling](#feature-sampling) |
+| `colsample_bynode` | `1.0` | Per-node feature sampling in `(0, 1]` from the per-level set; see [Feature sampling](#feature-sampling) |
 | `cols_per_block` | automatic | Positive integer; normally leave unset |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
@@ -1005,6 +1246,9 @@ empty `evals_result()`.
 | `cache_path` | `None` | Persistent Parquet cache directory |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
+| `enable_categorical` | `False` | Detect pandas `category` and PyArrow dictionary columns as categorical features; see [Categorical features](#categorical-features) |
+| `max_cat_to_onehot` | `4` | Categorical features with fewer categories than this use one-vs-rest splits, the others sorted-partition splits (`>= 1`) |
+| `max_cat_threshold` | `64` | Most categories a partition split scans per direction (`>= 1`) |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
 
@@ -1018,6 +1262,7 @@ Call options accepted by `fb.train()`, `fb.Model.save_model()`, and `fb.Model.lo
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
 - `weight` (`fb.train()` only): per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
+- `feature_types` (`fb.train()` only): `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
 
 ## Common errors
 

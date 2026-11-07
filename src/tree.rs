@@ -16,6 +16,10 @@ use crate::types::{FeatId, Objective};
 /// 叶子的左右孩子下标。和 XGBoost 的编码一致。
 const NO_CHILD: i32 = -1;
 
+/// What XGBoost writes in `split_conditions` for a categorical node (the
+/// smallest positive f32; the category set lives in `categories`).
+const CATEGORICAL_SPLIT_COND: f32 = f32::from_bits(1);
+
 /// XGBoost 用它表示根节点没有父亲(uint32 的 -1 落到 int32 上)。
 const NO_PARENT: i32 = 2147483647;
 
@@ -64,9 +68,30 @@ pub struct Node {
     /// 节点的二阶梯度和。同样只为导出服务:对应 `sum_hessian`,
     /// 也就是 importance 里的 "cover"。预测完全不看这两项。
     pub sum_hess: f32,
+    /// Categorical split: the categories that go RIGHT, as little-endian 32-bit
+    /// words (XGBoost's `CatBitField` layout; bit `c % 32` of word `c / 32`).
+    /// Every other category goes left; NaN follows `default_left`. `None` for
+    /// numeric splits and leaves, which compare `v < split_cond`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cats: Option<Box<[u32]>>,
 }
 
 impl Node {
+    /// The branch decision of an internal node for a raw feature value:
+    /// missing (NaN) follows `default_left`, a categorical node tests its
+    /// right-going set, a numeric node compares `v < split_cond`.
+    #[inline]
+    pub fn goes_left(&self, v: f32) -> bool {
+        if v.is_nan() {
+            self.default_left
+        } else if let Some(words) = &self.cats {
+            crate::categorical::goes_left(words, v)
+        } else {
+            // XGBoost 的判据就是 v < split_cond 走左,不是 <=。
+            v < self.split_cond
+        }
+    }
+
     pub fn leaf(value: f32, sum_hess: f32) -> Self {
         Self {
             feat: 0,
@@ -78,6 +103,7 @@ impl Node {
             is_leaf: true,
             gain: 0.0,
             sum_hess,
+            cats: None,
         }
     }
 }
@@ -139,6 +165,21 @@ impl Tree {
         (left, right)
     }
 
+    /// Turn the split at `node` into a categorical split whose right-going
+    /// category set is `cats` (see [`Node::cats`]). The numeric threshold is
+    /// replaced by the placeholder XGBoost stores for categorical nodes.
+    pub fn set_categories(&mut self, node: usize, cats: &crate::categorical::CatBits) {
+        let n = &mut self.nodes[node];
+        debug_assert!(!n.is_leaf, "只能给内部节点设置类别集合");
+        n.cats = Some(cats.to_words().into_boxed_slice());
+        n.split_cond = CATEGORICAL_SPLIT_COND;
+    }
+
+    /// Whether any split in this tree is categorical.
+    pub fn has_categorical(&self) -> bool {
+        self.nodes.iter().any(|n| n.cats.is_some())
+    }
+
     /// 沿树下降,返回叶子值(已含 learning_rate)。
     ///
     /// 缺失用 NaN 表示,走 default 方向。**不能**直接写 `v < cond`
@@ -155,13 +196,7 @@ impl Tree {
                 return n.leaf_value;
             }
             let v = features[n.feat as usize];
-            let go_left = if v.is_nan() {
-                n.default_left
-            } else {
-                // XGBoost 的判据就是 v < split_cond 走左,不是 <=。
-                v < n.split_cond
-            };
-            i = if go_left {
+            i = if n.goes_left(v) {
                 n.left as usize
             } else {
                 n.right as usize
@@ -216,6 +251,17 @@ pub struct Model {
     /// 会写出来;老模型没有这个字段,默认 1。
     #[serde(default = "default_scale_pos_weight")]
     pub scale_pos_weight: f32,
+    /// Per-feature categorical flag, serialized as XGBoost `feature_types`
+    /// (`"c"` / `"q"`). Empty when every feature is numeric.
+    #[serde(default)]
+    pub feature_types: Vec<bool>,
+}
+
+impl Model {
+    /// Whether any tree has a categorical split.
+    pub fn has_categorical_splits(&self) -> bool {
+        self.trees.iter().any(Tree::has_categorical)
+    }
 }
 
 fn default_scale_pos_weight() -> f32 {
@@ -278,6 +324,27 @@ impl Model {
             schema_mode: self.schema_mode,
             class_base_margins: Vec::new(),
             scale_pos_weight: self.scale_pos_weight,
+            feature_types: self.feature_types.clone(),
+        }
+    }
+
+    /// 只含第 `[begin, end)` **轮**的模型(每轮 `num_outputs()` 棵树),
+    /// base_score / objective / 特征信息原样保留。`iteration_range` 的实现。
+    pub fn slice_rounds(&self, begin: usize, end: usize) -> Model {
+        let k = self.num_outputs();
+        assert!(begin <= end && end * k <= self.trees.len(), "轮次区间越界");
+        Model {
+            trees: self.trees[begin * k..end * k].to_vec(),
+            base_score: self.base_score,
+            objective: self.objective,
+            n_features: self.n_features,
+            best_iteration: None,
+            best_score: None,
+            feature_names: self.feature_names.clone(),
+            schema_mode: self.schema_mode,
+            class_base_margins: self.class_base_margins.clone(),
+            scale_pos_weight: self.scale_pos_weight,
+            feature_types: self.feature_types.clone(),
         }
     }
 
@@ -417,8 +484,21 @@ impl Model {
                     a
                 },
                 feature_names: self.feature_names.clone(),
-                // 类型目前统一是数值;留空表示"未声明",和 XGBoost 一致。
-                feature_types: Vec::new(),
+                // 全数值时留空表示"未声明",和以前的字节一致;有类别特征时
+                // 逐特征写 "c" / "q",和 XGBoost 一致。
+                feature_types: if self.feature_types.iter().any(|&c| c) {
+                    (0..self.n_features)
+                        .map(|f| {
+                            if self.feature_types.get(f).copied().unwrap_or(false) {
+                                "c".to_string()
+                            } else {
+                                "q".to_string()
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 gradient_booster: xgb::GradientBooster {
                     name: "gbtree".into(),
                     model: xgb::GbTreeModel {
@@ -619,6 +699,18 @@ impl Model {
                 .and_then(|v| v.trim().parse::<f32>().ok()),
             class_base_margins,
             scale_pos_weight: Objective::scale_pos_weight_from_json(&learner.objective.rest),
+            feature_types: if learner.feature_types.iter().any(|t| t == "c") {
+                anyhow_like_check(
+                    learner.feature_types.len() == n_features,
+                    format_args!(
+                        "feature_types 有 {} 项,模型有 {n_features} 个特征",
+                        learner.feature_types.len()
+                    ),
+                )?;
+                learner.feature_types.iter().map(|t| t == "c").collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -854,7 +946,7 @@ mod xgb {
                 right_children: Vec::with_capacity(n),
                 split_conditions: Vec::with_capacity(n),
                 split_indices: Vec::with_capacity(n),
-                // 0 = 数值分裂。类别分裂(1)第一版不产出。
+                // 0 = 数值分裂,1 = 类别分裂。
                 split_type: vec![0; n],
                 sum_hessian: Vec::with_capacity(n),
                 tree_param: TreeParam {
@@ -884,6 +976,14 @@ mod xgb {
                     out.base_weights.push(0.0);
                     out.parents[node.left as usize] = i as i32;
                     out.parents[node.right as usize] = i as i32;
+                    if let Some(words) = &node.cats {
+                        let cats = crate::categorical::categories_from_words(words);
+                        out.split_type[i] = 1;
+                        out.categories_nodes.push(i as i32);
+                        out.categories_segments.push(out.categories.len() as i32);
+                        out.categories_sizes.push(cats.len() as i32);
+                        out.categories.extend(cats.into_iter().map(|c| c as i32));
+                    }
                 }
             }
             out
@@ -909,11 +1009,91 @@ mod xgb {
                     )));
                 }
             }
-            if !self.categories_sizes.is_empty() || self.split_type.iter().any(|&t| t != 0) {
+            if !self.split_type.is_empty() && self.split_type.len() != n {
                 return Err(unsupported(format_args!(
-                    "树 {} 有类别型分裂,第一版只支持数值分裂",
+                    "树 {} 的 split_type 长度 {} 和节点数 {n} 对不上",
+                    self.id,
+                    self.split_type.len()
+                )));
+            }
+            if let Some(t) = self.split_type.iter().find(|&&t| t > 1) {
+                return Err(unsupported(format_args!(
+                    "树 {} 的 split_type = {t} 不认识(0 = 数值,1 = 类别)",
                     self.id
                 )));
+            }
+            // categories_{nodes,segments,sizes} are parallel arrays over the
+            // categorical nodes in ascending node order.
+            let n_cat_nodes = self.categories_nodes.len();
+            if self.categories_segments.len() != n_cat_nodes
+                || self.categories_sizes.len() != n_cat_nodes
+            {
+                return Err(unsupported(format_args!(
+                    "树 {} 的 categories_nodes / segments / sizes 长度不一致",
+                    self.id
+                )));
+            }
+            let mut cat_of_node: BTreeMap<usize, Box<[u32]>> = BTreeMap::new();
+            for k in 0..n_cat_nodes {
+                let node = self.categories_nodes[k];
+                let (begin, size) = (self.categories_segments[k], self.categories_sizes[k]);
+                let end = begin.checked_add(size);
+                let range = match end {
+                    Some(end) if begin >= 0 && size >= 0 && end as usize <= self.categories.len() => {
+                        begin as usize..end as usize
+                    }
+                    _ => {
+                        return Err(unsupported(format_args!(
+                            "树 {} 的类别段 [{begin}, +{size}) 越界,categories 有 {} 项",
+                            self.id,
+                            self.categories.len()
+                        )))
+                    }
+                };
+                if node < 0
+                    || node as usize >= n
+                    || self.split_type.get(node as usize).copied().unwrap_or(0) != 1
+                {
+                    return Err(unsupported(format_args!(
+                        "树 {} 的 categories_nodes 含 {node},它不是类别分裂节点",
+                        self.id
+                    )));
+                }
+                if self.categories[range.clone()].iter().any(|&c| c < 0) {
+                    return Err(unsupported(format_args!(
+                        "树 {} 的节点 {node} 含负的类别值",
+                        self.id
+                    )));
+                }
+                let cats: Vec<u32> = self.categories[range].iter().map(|&c| c as u32).collect();
+                // XGBoost's bitset indexes words by category / 32; refuse a
+                // category so large that the bitset alone would be absurd.
+                if cats.iter().any(|&c| c >= (1 << 24)) {
+                    return Err(unsupported(format_args!(
+                        "树 {} 的节点 {node} 含超出 2^24 的类别值",
+                        self.id
+                    )));
+                }
+                if cat_of_node
+                    .insert(
+                        node as usize,
+                        crate::categorical::words_from_categories(&cats).into_boxed_slice(),
+                    )
+                    .is_some()
+                {
+                    return Err(unsupported(format_args!(
+                        "树 {} 的节点 {node} 在 categories_nodes 里出现了多次",
+                        self.id
+                    )));
+                }
+            }
+            for (i, &t) in self.split_type.iter().enumerate() {
+                if t == 1 && !cat_of_node.contains_key(&i) {
+                    return Err(unsupported(format_args!(
+                        "树 {} 的节点 {i} 是类别分裂但没有类别段",
+                        self.id
+                    )));
+                }
             }
 
             let mut nodes = Vec::with_capacity(n);
@@ -970,6 +1150,7 @@ mod xgb {
                     is_leaf: false,
                     gain: self.loss_changes.get(i).copied().unwrap_or(0.0),
                     sum_hess: self.sum_hessian.get(i).copied().unwrap_or(0.0),
+                    cats: cat_of_node.remove(&i),
                 });
             }
             if parents[0] != 0 {
@@ -1059,6 +1240,7 @@ mod tests {
             schema_mode: None,
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
+            feature_types: Vec::new(),
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1170,6 +1352,7 @@ mod tests {
             let m = Model {
                 objective: obj,
                 scale_pos_weight: spw,
+                feature_types: Vec::new(),
                 ..fixture_model()
             };
             let json = m.to_xgboost_json().unwrap();
@@ -1202,6 +1385,7 @@ mod tests {
         // class_view 带着它走
         let view = Model {
             scale_pos_weight: 4.0,
+            feature_types: Vec::new(),
             ..fixture_model()
         }
         .class_view(0);
@@ -1543,5 +1727,84 @@ mod tests {
         // 判据是 v < thr 走左,而 f32::MAX 不小于 f32::MAX,所以这一行
         // 走右 —— 和训练时的左边不一致。
         assert!(f32::MAX >= split_threshold(&cuts, 0, 3));
+    }
+
+    /// Root: categorical on feature 0 with right-going set {1, 4, 33}, default
+    /// left; the left child splits numerically on feature 1.
+    fn categorical_model() -> Model {
+        let mut t = Tree::default();
+        let root = t.push_leaf(0.0, 10.0);
+        let (l, _r) = t.split_leaf(root, 0, 0.0, true, 4.0, 0.0, 6.0, 3.0, 4.0);
+        let mut set = crate::categorical::CatBits::empty();
+        for c in [1, 4, 33] {
+            set.set(c);
+        }
+        t.set_categories(root, &set);
+        t.split_leaf(l, 1, 0.5, false, 2.0, 1.0, 3.0, 2.0, 3.0);
+        let mut m = fixture_model();
+        m.trees = vec![t];
+        m.feature_types = vec![true, false];
+        m
+    }
+
+    #[test]
+    fn categorical_split_goes_right_for_members_and_left_otherwise() {
+        let m = categorical_model();
+        let at = |c: f32, n: f32| m.predict_margin(&[c, n]) - m.base_score;
+        // Members go right (leaf 3.0), whatever the other feature says.
+        for c in [1.0, 4.0, 33.0, 4.9] {
+            assert_eq!(at(c, 0.0), 3.0, "category {c}");
+        }
+        // Others go left, then split on feature 1: < 0.5 -> 1.0, else 2.0.
+        assert_eq!(at(0.0, 0.0), 1.0);
+        assert_eq!(at(2.0, 9.0), 2.0);
+        // Invalid or beyond the bitset: left.
+        for c in [-1.0, 500.0, f32::INFINITY, 16_777_216.0] {
+            assert_eq!(at(c, 0.0), 1.0, "category {c}");
+        }
+        // Missing follows default_left (true).
+        assert_eq!(at(f32::NAN, 0.0), 1.0);
+    }
+
+    #[test]
+    fn categorical_model_round_trips_through_xgboost_json() {
+        let m = categorical_model();
+        let json = m.to_xgboost_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let tree = &v["learner"]["gradient_booster"]["model"]["trees"][0];
+        assert_eq!(tree["split_type"], serde_json::json!([1, 0, 0, 0, 0]));
+        assert_eq!(tree["categories"], serde_json::json!([1, 4, 33]));
+        assert_eq!(tree["categories_nodes"], serde_json::json!([0]));
+        assert_eq!(tree["categories_segments"], serde_json::json!([0]));
+        assert_eq!(tree["categories_sizes"], serde_json::json!([3]));
+        assert_eq!(v["learner"]["feature_types"], serde_json::json!(["c", "q"]));
+        let back = Model::from_xgboost_json(&json).unwrap();
+        assert_eq!(back.feature_types, vec![true, false]);
+        assert_eq!(back.to_xgboost_json().unwrap(), json);
+        for c in [-1.0, 0.0, 1.0, 2.0, 4.0, 33.0, 34.0, 99.0, f32::NAN] {
+            for n in [0.0, 1.0] {
+                assert_eq!(back.predict_margin(&[c, n]), m.predict_margin(&[c, n]));
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_models_write_no_feature_types() {
+        let json = fixture_model().to_xgboost_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["learner"]["feature_types"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn malformed_category_metadata_is_rejected() {
+        let json = categorical_model().to_xgboost_json().unwrap();
+        let broken = |key: &str, value: serde_json::Value| {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v["learner"]["gradient_booster"]["model"]["trees"][0][key] = value;
+            Model::from_xgboost_json(&v.to_string())
+        };
+        assert!(broken("categories_sizes", serde_json::json!([9])).is_err());
+        assert!(broken("categories_nodes", serde_json::json!([1])).is_err());
+        assert!(broken("categories", serde_json::json!([1, -4, 33])).is_err());
     }
 }

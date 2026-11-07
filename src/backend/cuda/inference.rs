@@ -79,6 +79,10 @@ impl GpuInferenceModel {
         compact: &CompactInferenceModel,
         device_ordinal: usize,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            !compact.has_categorical_splits(),
+            "GPU prediction does not support categorical splits; score such models on the CPU"
+        );
         let model = compact.model();
         let input_features = compact.canonical_features().to_vec();
         let state = device_state(device_ordinal)?;

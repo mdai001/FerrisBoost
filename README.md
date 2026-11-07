@@ -242,6 +242,16 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.6 (unreleased)
+
+- Added objective `reg:quantileerror` with a scalar `quantile_alpha` (XGBoost 3.4.1's smoothed pinball loss) and the `quantile` metric, on CPU and GPU (`gpu_math="exact"` is byte-identical to CPU; `gpu_math="fast"` is rejected with an error for this objective). Several quantiles (multi-output) are not supported.
+- Added `colsample_bylevel` and `colsample_bynode` with XGBoost's nested sampling semantics (bytree, then bylevel, then bynode) and deterministic seeding that does not depend on threads, blocking, or backend. The random sequence is FerrisBoost's own, so the chosen features differ from XGBoost's for the same seed, as already with `colsample_bytree`. On GPU they use the host split search and are byte-identical to CPU under `gpu_math="exact"`.
+- Added `predict(..., iteration_range=(begin, end))` with XGBoost semantics (boosting rounds, so multiclass uses `num_class` trees per round), next to `n_trees`.
+- Added scikit-learn estimators `FerrisBoostClassifier` and `FerrisBoostRegressor` (`fit`, `predict`, `predict_proba`, `eval_set`, early stopping, `evals_result()`, `save_model` / `load_model`). scikit-learn stays an optional dependency.
+- Added `Model.objective` and `Model.num_class` properties.
+- Added `Model.get_score(importance_type)` (`weight`, `gain`, `cover`, `total_gain`, `total_cover`) and `predict(..., pred_contribs=True)` (exact TreeSHAP, bias last), `approx_contribs=True` (Saabas), `pred_interactions=True`, and `pred_leaf=True`, with XGBoost 3.4.1 semantics and output shapes, for numpy and file inputs, binary, regression, and multiclass models, and models loaded from XGBoost JSON. They run on the CPU, row-parallel and deterministic across thread counts, and honor `n_trees`.
+- Added categorical features with XGBoost semantics: `feature_types=["c", "q", ...]`, `params["enable_categorical"]` for pandas `category` and PyArrow dictionary columns, and `max_cat_to_onehot` / `max_cat_threshold`. Categories are integer codes `0..=254` (at most 255 per feature in this version). One-hot and sorted-partition splits match XGBoost `hist` exactly where binning is lossless; models interchange with XGBoost in both directions; prediction (arrays, files, `predict_to_parquet`, multiclass) follows the category sets. On GPU, `gpu_math="exact"` stays byte-identical to CPU; split search for categorical features runs on the host, so categorical GPU training does not use the resident split cache.
+
 ### 0.0.5
 
 - Changed: when `base_score` is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for `reg:pseudohubererror` and when `scale_pos_weight` is not `1`; per-class log-frequency margins for multiclass). Default models of `binary:logistic` and `reg:squarederror` therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit `base_score` behaves as before, and `binary:logistic` accepts `base_score` in `[0, 1]`, so all-0 or all-1 labels train.

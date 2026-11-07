@@ -68,7 +68,26 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
     col: usize,
     mut visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    let array = batch.column(col);
+    // A dictionary column carries category codes: visit its decoded values.
+    // Only numeric dictionaries are stable codes; string dictionaries have a
+    // per-batch ordering that cannot be turned into consistent codes here.
+    let decoded;
+    let array = match batch.column(col).data_type() {
+        DataType::Dictionary(_, value) => {
+            if !(value.is_numeric()) {
+                let name = batch.schema().field(col).name().clone();
+                anyhow::bail!(
+                    "column {name:?} is a dictionary of {value:?} values: categorical \
+                     file columns must hold integer category codes (the codes of a string \
+                     dictionary differ between row groups). Encode the categories as integers \
+                     upstream, or train from a pandas / PyArrow in-memory table"
+                );
+            }
+            decoded = arrow::compute::cast(batch.column(col), &DataType::Float64)?;
+            &decoded
+        }
+        _ => batch.column(col),
+    };
     let n = array.len();
 
     macro_rules! visit_values {
@@ -115,7 +134,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int64 => visit_values!(Int64Array),
         other => anyhow::bail!(
             "第 {col} 列是 {other:?},只支持数值列。\\
-             类别特征要先在上游编码成数值 —— 第一版不做 categorical 分裂"
+             类别特征要先在上游编码成整数类别码(0..=254),再用 feature_types=\"c\" 声明"
         ),
     }
     Ok(())
@@ -164,6 +183,22 @@ pub(crate) fn build_cuts_and_count_weighted(
     nthread: usize,
     weighted: bool,
 ) -> anyhow::Result<(BinCuts, usize)> {
+    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[])
+}
+
+/// `build_cuts_and_count_weighted` with categorical features.
+///
+/// `categorical[f]` marks feature `f` (in batch column order, weights
+/// excluded) as categorical; an empty slice means "none declared". Dictionary
+/// typed columns are categorical regardless of the list. A categorical
+/// feature's cuts are one bin per integer code `0..=max_code`.
+pub(crate) fn build_cuts_and_count_typed(
+    batches: impl Iterator<Item = anyhow::Result<RecordBatch>>,
+    max_bins: usize,
+    nthread: usize,
+    weighted: bool,
+    categorical: &[bool],
+) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
@@ -176,6 +211,7 @@ pub(crate) fn build_cuts_and_count_weighted(
         .map_err(|e| anyhow::anyhow!("Parquet cuts 线程池创建失败:{e}"))?;
     let profile_columns = pool.current_num_threads() == 1;
     let mut sketches: Option<SketchSet> = None;
+    let mut feature_names: Vec<String> = Vec::new();
     let mut n_rows = 0usize;
     // 手动迭代:`next()` 里才是 Parquet 解压,要和 sketch 分开计时。
     let mut batches = batches;
@@ -215,7 +251,28 @@ pub(crate) fn build_cuts_and_count_weighted(
                 })
             }
         };
-        let sk = sketches.get_or_insert_with(|| SketchSet::new(n_feats, max_bins));
+        if sketches.is_none() {
+            anyhow::ensure!(
+                categorical.is_empty() || categorical.len() == n_feats,
+                "feature_types has {} entries but the data has {n_feats} feature columns",
+                categorical.len()
+            );
+            let schema = batch.schema();
+            feature_names = schema
+                .fields()
+                .iter()
+                .take(n_feats)
+                .map(|f| f.name().clone())
+                .collect();
+            let flags: Vec<bool> = (0..n_feats)
+                .map(|f| {
+                    categorical.get(f).copied().unwrap_or(false)
+                        || matches!(schema.field(f).data_type(), DataType::Dictionary(_, _))
+                })
+                .collect();
+            sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));
+        }
+        let sk = sketches.as_mut().expect("created above");
         anyhow::ensure!(
             n_feats == sk.n_feats(),
             "batch 之间的列数不一致:先前 {},这个 batch {n_feats}",
@@ -243,7 +300,7 @@ pub(crate) fn build_cuts_and_count_weighted(
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
     let cuts = sketches
         .ok_or_else(|| anyhow::anyhow!("一个 batch 都没有,建不了分箱边界"))?
-        .finalize();
+        .finalize_checked(&feature_names)?;
     Ok((cuts, n_rows))
 }
 
@@ -469,7 +526,7 @@ impl ArrowSource {
     }
 
     pub(crate) fn new_with_phase_threads<I, F>(
-        mut batches: F,
+        batches: F,
         max_bins: u32,
         cols_per_block: usize,
         cuts_threads: usize,
@@ -479,8 +536,36 @@ impl ArrowSource {
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
         F: FnMut(bool) -> anyhow::Result<I>,
     {
-        let (cuts, n_rows) =
-            build_cuts_and_count_with_nthread(batches(false)?, max_bins as usize, cuts_threads)?;
+        Self::new_typed_with_phase_threads(
+            batches,
+            max_bins,
+            cols_per_block,
+            cuts_threads,
+            quantize_threads,
+            &[],
+        )
+    }
+
+    /// `new_with_phase_threads` with declared categorical features.
+    pub(crate) fn new_typed_with_phase_threads<I, F>(
+        mut batches: F,
+        max_bins: u32,
+        cols_per_block: usize,
+        cuts_threads: usize,
+        quantize_threads: usize,
+        categorical: &[bool],
+    ) -> anyhow::Result<Self>
+    where
+        I: Iterator<Item = anyhow::Result<RecordBatch>>,
+        F: FnMut(bool) -> anyhow::Result<I>,
+    {
+        let (cuts, n_rows) = build_cuts_and_count_typed(
+            batches(false)?,
+            max_bins as usize,
+            cuts_threads,
+            false,
+            categorical,
+        )?;
         let blocks = quantize_with_nthread_known_rows(
             batches(true)?,
             &cuts,
