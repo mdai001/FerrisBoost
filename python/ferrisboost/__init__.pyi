@@ -21,7 +21,7 @@ def train(
     weight: Any = ...,
     feature_types: Sequence[str] | None = ...,
 ) -> Model:
-    """Train a model from arrays, file paths, or a PyArrow table.
+    """Train a model from arrays, file paths, a pandas DataFrame, or a PyArrow table.
 
     weight gives per-row sample weights (XGBoost's DMatrix weight): a 1-D array
     for array input, or a column name (column index for headerless CSV) for
@@ -36,8 +36,8 @@ def train(
     round builds num_class trees. Objective-specific parameters:
     tweedie_variance_power (default 1.5, in [1, 2)), huber_slope (default 1,
     non-zero) and quantile_alpha (required for reg:quantileerror: one quantile
-    in [0, 1]; several quantiles are rejected; gpu_math="fast" is rejected for
-    this objective). Other regularization parameters follow XGBoost: alpha (alias
+    in [0, 1]; several quantiles are rejected; gpu_math="fast" is supported).
+    Other regularization parameters follow XGBoost: alpha (alias
     reg_alpha), max_delta_step (count:poisson defaults to 0.7 when unset) and
     scale_pos_weight (binary:logistic, reg:squarederror, reg:gamma only).
     When params["base_score"] is unset it is estimated from the training

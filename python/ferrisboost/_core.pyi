@@ -26,7 +26,7 @@ class Model:
         ...
     def predict(
         self,
-        x: NDArray[np.float32] | str | PathLike[str] | Sequence[str | PathLike[str]],
+        data: NDArray[np.float32] | str | PathLike[str] | Sequence[str | PathLike[str]] | Any,
         output_margin: bool = False,
         n_trees: int | None = None,
         header: bool = True,
@@ -51,11 +51,11 @@ class Model:
         header=False for headerless CSV. All trees are used unless n_trees is
         set; n_trees counts trees, so a multiclass model uses num_class trees
         per boosting round. output_margin=True returns raw scores (before the
-        objective's transform. iteration_range=(begin, end) uses the half-open
+        objective's transform). iteration_range=(begin, end) uses the half-open
         range of boosting rounds [begin, end) as XGBoost does (a multiclass round
         is num_class trees); end=0 means up to the last round, an out-of-range
         value raises ValueError, begin == end gives base_score only, and it cannot
-        be combined with n_trees). predict_threads=0 selects auto CPU workers.
+        be combined with n_trees. predict_threads=0 selects auto CPU workers.
         use_gpu=True permits GPU 0 scoring in CUDA builds, with CPU selection
         for batches where GPU overhead is not worthwhile.
 
@@ -78,7 +78,8 @@ class Model:
 
         Explanations (XGBoost 3.4.1 semantics; at most one per call, not
         combinable with output_margin; always computed on the CPU, use_gpu is
-        ignored; n_trees and predict_threads apply; array and file inputs):
+        ignored; n_trees and predict_threads apply; float32 array and file inputs
+        only, not DataFrames or tables):
 
         * pred_contribs=True: exact TreeSHAP in margin space, shape
           (n, n_features + 1) with the bias last, or (n, num_class,

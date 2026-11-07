@@ -99,40 +99,39 @@ prediction = model.predict("test.parquet")</code></pre>
       <h2>Changelog</h2>
       <h3>0.0.6 (unreleased)</h3>
       <ul>
-        <li>Added objective <code>reg:quantileerror</code> with a scalar <code>quantile_alpha</code> (XGBoost 3.4.1's smoothed pinball loss) and the <code>quantile</code> metric, on CPU and GPU (<code>gpu_math="exact"</code> is byte-identical to CPU; <code>gpu_math="fast"</code> computes the per-round global scale with a fixed-shape device reduction, so it is deterministic from run to run but not byte-identical to CPU). Several quantiles (multi-output) are not supported.</li>
-        <li>Added <code>colsample_bylevel</code> and <code>colsample_bynode</code> with XGBoost's nested sampling semantics (bytree, then bylevel, then bynode) and deterministic seeding that does not depend on threads, blocking, or backend. The random sequence is FerrisBoost's own, so the chosen features differ from XGBoost's for the same seed, as already with <code>colsample_bytree</code>. On GPU they use the host split search and are byte-identical to CPU under <code>gpu_math="exact"</code>.</li>
-        <li>Added <code>predict(..., iteration_range=(begin, end))</code> with XGBoost semantics (boosting rounds, so multiclass uses <code>num_class</code> trees per round), next to <code>n_trees</code>.</li>
-        <li>Added scikit-learn estimators <code>FerrisBoostClassifier</code> and <code>FerrisBoostRegressor</code> (<code>fit</code>, <code>predict</code>, <code>predict_proba</code>, <code>eval_set</code>, early stopping, <code>evals_result()</code>, <code>save_model</code> / <code>load_model</code>). scikit-learn stays an optional dependency.</li>
-        <li>Added <code>Model.objective</code> and <code>Model.num_class</code> properties.</li>
-        <li>Added <code>Model.get_score(importance_type)</code> (<code>weight</code>, <code>gain</code>, <code>cover</code>, <code>total_gain</code>, <code>total_cover</code>) and <code>predict(..., pred_contribs=True)</code> (exact TreeSHAP, bias last), <code>approx_contribs=True</code> (Saabas), <code>pred_interactions=True</code>, and <code>pred_leaf=True</code>, with XGBoost 3.4.1 semantics and output shapes, for numpy and file inputs, binary, regression, and multiclass models, and models loaded from XGBoost JSON. They run on the CPU, row-parallel and deterministic across thread counts, and honor <code>n_trees</code>.</li>
-        <li>Improved: <code>gpu_math="fast"</code> does less work per tree for every objective and for multiclass: the gradient kernels also reduce the gradient bounds, the quantization scale is finished on the device (one host round trip per tree instead of two), and multiclass folds each tree's prediction update into the next gradient kernel. Fast models are byte-identical to the previous fast results.</li>
-        <li>Added categorical features with XGBoost semantics: <code>feature_types=["c", "q", ...]</code>, <code>params["enable_categorical"]</code> for pandas <code>category</code> and PyArrow dictionary columns, and <code>max_cat_to_onehot</code> / <code>max_cat_threshold</code>. Categories are integer codes <code>0..=254</code> (at most 255 per feature in this version). One-hot and sorted-partition splits match XGBoost <code>hist</code> exactly where binning is lossless; models interchange with XGBoost in both directions; prediction (arrays, files, <code>predict_to_parquet</code>, multiclass) follows the category sets. On GPU, <code>gpu_math="exact"</code> stays byte-identical to CPU; split search for categorical features runs on the host, so categorical GPU training does not use the resident split cache.</li>
-        <li>Added <code>missing=</code> as a core parameter with XGBoost's <code>DMatrix</code> semantics (default <code>NaN</code>): <code>fb.train({"missing": -999.0, ...})</code> treats feature values equal to it exactly like <code>NaN</code> in the training data and every validation set, and <code>Model.predict(..., missing=...)</code> / <code>predict_to_parquet(..., missing=...)</code> apply it at prediction, for NumPy, pandas, PyArrow, and Parquet / CSV files (the file readers apply it while streaming). Sentinel values never become sketch cuts or categories; results are bit-identical to the same data with <code>NaN</code> and, on lossless-binned data, to XGBoost. <code>missing</code> must be <code>NaN</code> or a finite float32 (<code>inf</code> and the reserved float32 maximum are rejected), also applies to categorical codes as in XGBoost, is not stored in the model, and is bound to a persistent Parquet cache.</li>
-        <li>scikit-learn estimators gained <code>missing</code>, <code>enable_categorical</code>, <code>feature_types</code>, <code>max_cat_to_onehot</code>, and <code>max_cat_threshold</code> constructor parameters (pandas <code>category</code> columns work in <code>fit</code>, <code>predict</code>, <code>predict_proba</code>, and <code>apply</code>, re-coded to the training categories) and <code>apply(X, iteration_range=None)</code> returning per-tree leaf indices like <code>XGBModel.apply</code>.</li>
+        <li>Added categorical features (<code>feature_types</code>, pandas <code>category</code> columns, Arrow dictionaries).</li>
+        <li>Added feature importance and SHAP values (<code>Model.get_score</code>, <code>pred_contribs</code>, <code>pred_interactions</code>, <code>pred_leaf</code>).</li>
+        <li>Added scikit-learn estimators <code>FerrisBoostClassifier</code> and <code>FerrisBoostRegressor</code>.</li>
+        <li>Added <code>reg:quantileerror</code>.</li>
+        <li>Added the <code>missing</code> parameter.</li>
+        <li>Added <code>colsample_bylevel</code> and <code>colsample_bynode</code>.</li>
+        <li>Added <code>iteration_range</code> to <code>predict</code>.</li>
+        <li>Added <code>Model.objective</code> and <code>Model.num_class</code>.</li>
+        <li>Faster CPU training.</li>
+        <li>GPU speed optimizations.</li>
       </ul>
+      <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
       <h3>0.0.5</h3>
       <ul>
-        <li>Changed: when <code>base_score</code> is not set, it is now estimated from the training labels, as XGBoost 2.0+ does (the weighted label mean; one Newton step for <code>reg:pseudohubererror</code> and when <code>scale_pos_weight</code> is not <code>1</code>; per-class log-frequency margins for multiclass). Default models of <code>binary:logistic</code> and <code>reg:squarederror</code> therefore differ from 0.0.4 and now match XGBoost's defaults. An explicit <code>base_score</code> behaves as before, and <code>binary:logistic</code> accepts <code>base_score</code> in <code>[0, 1]</code>, so all-0 or all-1 labels train.</li>
-        <li>Added <code>alpha</code> (alias <code>reg_alpha</code>), <code>max_delta_step</code>, and <code>scale_pos_weight</code>, with XGBoost semantics, on CPU and GPU. For <code>count:poisson</code>, an unset <code>max_delta_step</code> becomes <code>0.7</code>, as in XGBoost.</li>
-        <li>Added objectives <code>count:poisson</code>, <code>reg:gamma</code>, <code>reg:tweedie</code> (<code>tweedie_variance_power</code>), and <code>reg:pseudohubererror</code> (<code>huber_slope</code>), on CPU and GPU.</li>
-        <li>Added multiclass objectives <code>multi:softprob</code> and <code>multi:softmax</code> (<code>num_class</code>): <code>predict</code> returns <code>(n, num_class)</code> probabilities or margins, or class indices for <code>multi:softmax</code>. Multiclass models interchange with XGBoost in both directions. In this version, <code>predict_to_parquet</code> for multiclass models builds its output in memory before writing.</li>
-        <li>Added metrics <code>mae</code>, <code>mape</code>, <code>mphe</code>, <code>poisson-nloglik</code>, <code>gamma-nloglik</code>, <code>gamma-deviance</code>, <code>tweedie-nloglik@rho</code>, <code>error@t</code>, <code>aucpr</code>, <code>mlogloss</code>, and <code>merror</code>. <code>rmse</code> and the other pointwise metrics are computed on transformed predictions.</li>
-        <li>GPU: <code>gpu_math="exact"</code> stays byte-identical to CPU for all new objectives and parameters. <code>gpu_math="fast"</code> supports the new regression objectives and multiclass (device softmax gradients); it is deterministic but not byte-identical to CPU, and its speed will be optimized in 0.0.6.</li>
-        <li>Improved: CPU training applies leaf values to the training predictions in parallel; models are unchanged.</li>
-        <li>Changed: feature values exactly equal to the largest <code>float32</code> (<code>numpy.finfo(numpy.float32).max</code>) are rejected in training, validation and prediction, because that value is reserved for split boundaries and was previously routed differently at prediction. Rescale such a feature; other values, including the next smaller one, are unaffected.</li>
-        <li>Fixed: training now stops with a clear error when extreme inputs (for example <code>reg:gamma</code> with a tiny <code>base_score</code>) produce non-finite gradients, instead of failing inside fixed-point conversion.</li>
-        <li>Fixed: the GPU memory plan now counts the per-slot row-major staging buffers, so narrow column blocks with many resident blocks stay within the memory budget, and counts the device weight buffer that <code>gpu_math="fast"</code> allocates when <code>scale_pos_weight</code> is not <code>1</code>.</li>
+        <li>Changed: <code>base_score</code> is now estimated from the training labels when not set, as in XGBoost, so default models differ from 0.0.4.</li>
+        <li>Changed: feature values equal to the largest <code>float32</code> value are now rejected.</li>
+        <li>Added <code>alpha</code>, <code>max_delta_step</code> and <code>scale_pos_weight</code>.</li>
+        <li>Added Poisson, Gamma, Tweedie and Pseudo-Huber objectives.</li>
+        <li>Added multiclass (<code>multi:softprob</code>, <code>multi:softmax</code>).</li>
+        <li>Added new evaluation metrics, including <code>aucpr</code>.</li>
+        <li>GPU fast mode supports all new objectives.</li>
+        <li>Faster CPU training.</li>
+        <li>Bug fixes.</li>
       </ul>
       <h3>0.0.4</h3>
       <ul>
-        <li>Added per-row sample weights (<code>weight=</code>), including weighted validation sets. Weights apply to gradients, metrics, and bin boundaries, as in XGBoost.</li>
-        <li>Added <code>params["eval_metric"]</code> with <code>rmse</code>, <code>logloss</code>, <code>error</code>, and <code>auc</code>.</li>
-        <li>Added <code>params["monotone_constraints"]</code> (XGBoost semantics; tuple, string, or by feature name), on CPU and GPU.</li>
-        <li>Fixed: validation files and pyarrow validation tables are now matched to the training features by column name. Previously they were matched by position, so a validation file with reordered columns produced wrong metrics and early stopping.</li>
-        <li>Fixed: an exception raised in a callback is no longer lost when more callbacks follow it.</li>
-        <li>Fixed: feature values of ±inf now raise a clear error instead of crashing, and very large finite values (near the f32 limit) train correctly.</li>
-        <li>Fixed: an empty validation set, duplicate column names, and sample weights whose sum overflows f32 now raise a clear error.</li>
-        <li>Fixed: loading a multi-target XGBoost model now raises an error instead of silently giving wrong predictions.</li>
+        <li>Added sample weights (<code>weight=</code>).</li>
+        <li>Added <code>eval_metric</code>.</li>
+        <li>Added <code>monotone_constraints</code>.</li>
+        <li>Fixed: validation files and tables are now matched to the training features by column name, not by position.</li>
+        <li>Fixed: exceptions raised in callbacks are no longer lost.</li>
+        <li>Fixed: loading a multi-target XGBoost model now raises an error.</li>
+        <li>Clearer errors for infinite feature values, empty validation sets and other invalid inputs.</li>
       </ul>
       <h3>0.0.3</h3>
       <ul>
