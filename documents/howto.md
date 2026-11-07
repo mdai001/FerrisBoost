@@ -1229,7 +1229,7 @@ always included. It works for arrays, files, and `predict_to_parquet`, and
 cannot be combined with `n_trees`. With `begin > 0` the call scores a copy of
 the selected trees, so repeated calls with a nonzero `begin` are best batched.
 
-C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become their category codes; see the Categorical section). The explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) take only `float32` arrays or file paths; convert a frame with `df.to_numpy(dtype=np.float32)` first.
+C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become their category codes; see the Categorical section). For a model trained on named columns (a DataFrame, a PyArrow table, Parquet, or a CSV with a header), their columns are matched to the model's features by name: order does not matter, extra columns are ignored, and a missing one is an error. This also applies to the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`).
 
 For GPU prediction, the first eligible call includes CUDA context initialization and one model upload; subsequent calls reuse the cached model. Staging memory remains per-call and bounded to available VRAM. GPU 0 is the only inference target in this version; multi-GPU prediction is intentionally not enabled.
 
@@ -1263,7 +1263,7 @@ leaves = model.predict(X_test, pred_leaf=True)                # (n, n_trees)
 - `"gain"` / `"total_gain"`: the average / summed split gain of those splits.
 - `"cover"` / `"total_cover"`: the average / summed Hessian sum (`sum_hessian`) of the split nodes.
 
-Names are the model's feature names (from a Parquet or headered CSV schema), or `f0`, `f1`, ... when the model was trained from a NumPy array, a pandas frame, or a PyArrow table. The scores come from the gain and Hessian sum that every tree node stores, so they also work on models loaded from XGBoost JSON.
+Names are the model's feature names (the column names of a pandas DataFrame, PyArrow table, Parquet file, or headered CSV), or `f0`, `f1`, ... when the model was trained from a NumPy array. The scores come from the gain and Hessian sum that every tree node stores, so they also work on models loaded from XGBoost JSON.
 
 `predict(..., pred_contribs=True)` returns exact TreeSHAP values in margin space. Every row sums to the raw margin (`output_margin=True`), and the last column is the bias term: the model's `base_score` (as a margin) plus the cover-weighted mean of the trees. With `approx_contribs=True` it returns the faster Saabas attribution instead. Multiclass models return `(n, num_class, n_features + 1)`, one attribution matrix per class.
 
@@ -1490,7 +1490,7 @@ example `0.9`, and train one model per quantile.
 `pred_contribs`, `pred_interactions`, and `pred_leaf` allow only one per call and
 cannot be combined with `output_margin`. `pred_interactions=True` together with
 `approx_contribs=True` is rejected because XGBoost 3.4.1 returns only a diagonal
-matrix there. They take `float32` arrays or file paths, not DataFrames or tables.
+matrix there.
 
 ### `iteration_range` is rejected
 
