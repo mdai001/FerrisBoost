@@ -22,6 +22,7 @@ use cudarc::driver::{
     sys, CudaEvent, CudaFunction, CudaSlice, CudaStream, HostSlice, LaunchConfig, PinnedHostSlice,
     PushKernelArg, SyncOnDrop,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::categorical::CatBits;
@@ -33,6 +34,8 @@ use super::{device_state, DeviceState, SharedHistogramConfig};
 /// grid-stride,所以 block 数只要够填满卡,不随行数线性增长。
 const GPAIR_THREADS: usize = 256;
 const GPAIR_BLOCKS: usize = 1024;
+/// fast 的 device scale 结果:`[grad_scale, hess_scale, max_grad, max_hess]`。
+const GPAIR_SCALE_WORDS: usize = 4;
 
 /// 诊断/实验开关的统一判定。
 ///
@@ -366,6 +369,9 @@ struct GpuBuffers {
     gpair_sum: Option<CudaSlice<i64>>,
     gpair_max_host: Vec<f64>,
     gpair_sum_host: Vec<i64>,
+    /// fast:`[grad_scale, hess_scale, max_grad, max_hess]`(device 算出,和 root sum 一起取回)。
+    gpair_scale: Option<CudaSlice<f64>>,
+    gpair_scale_host: [f64; 4],
     /// selected-row packing:`原始行号 → 压实下标`,每棵树上传一次。
     /// 未启用时为 None。
     /// `gpu_math = "fast"`:raw-margin prediction 常驻 device,不再每轮 D2H。
@@ -557,6 +563,9 @@ pub struct GpuTrainCtx {
     gpu_math: crate::types::GpuMath,
     gpair_max_fn: Option<CudaFunction>,
     gpair_quantize_fn: Option<CudaFunction>,
+    /// `gpu_math = "fast"`:device 上完成 max 终归约 + pow2 scale + 量化(一次 host 往返)。
+    gpair_scale_fn: Option<CudaFunction>,
+    gpair_quantize_dscale_fn: Option<CudaFunction>,
     count_fn: CudaFunction,
     scan_fn: CudaFunction,
     scatter_layer_fn: CudaFunction,
@@ -582,6 +591,9 @@ pub struct GpuTrainCtx {
     /// 是否记录分段耗时。打开会在 H2D/D2H 前后显式同步,产生额外 sync ——
     /// 所以默认关闭,只在 `FB_PROFILE=1` 时打开。
     timing: bool,
+    /// fast 量化尾巴里「device scale 与 host 校验不一致、退回 host scale 重量化」的次数。
+    /// 正常恒为 0;测试用它钉住 device scale 公式没有悄悄漂移。
+    scale_fallbacks: AtomicU64,
     /// Opt-in diagnostic only. It records a CUDA event pair around **every**
     /// histogram launch, which serializes them — so it must never be on in a
     /// normal training run, and never on the same event pair as `timing`.
@@ -826,6 +838,27 @@ impl GpuTrainCtx {
                         .module
                         .load_function("gpair_quantize")
                         .context("PTX 中找不到 gpair_quantize")?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
+        // fast 的量化尾巴:max 终归约 + scale 在 device 上。kernel 加载与 buffer 分配
+        // 用同一个条件(fast 且 device quantization 已启用)。
+        let fast_tail = fast_math && gpair_quantize_fn.is_some();
+        let (gpair_scale_fn, gpair_quantize_dscale_fn) = if fast_tail {
+            (
+                Some(
+                    state
+                        .module
+                        .load_function("gpair_scale_finalize")
+                        .context("PTX 中找不到 gpair_scale_finalize")?,
+                ),
+                Some(
+                    state
+                        .module
+                        .load_function("gpair_quantize_dscale")
+                        .context("PTX 中找不到 gpair_quantize_dscale")?,
                 ),
             )
         } else {
@@ -1089,6 +1122,16 @@ impl GpuTrainCtx {
             )
         } else {
             (None, None, None)
+        };
+        // fast 的 device scale 结果(4 个 f64),计入 `gpair_f32_bytes` 预算项。
+        let gpair_scale = if fast_math_wanted && device_quantize {
+            Some(
+                stream
+                    .alloc_zeros::<f64>(GPAIR_SCALE_WORDS)
+                    .context("gpair scale buffer 分配")?,
+            )
+        } else {
+            None
         };
         // 同一 binary 的严格 A/B 开关。HIGGS 实测 pinned 的 DMA 只快 2%，
         // 却多付 110 ms/轮的 pageable→pinned staging，并锁住 441 MB host
@@ -1375,6 +1418,11 @@ impl GpuTrainCtx {
                     n_gpair_blocks * 2 * (8 + 8)
                 } else {
                     0
+                }
+                + if fast_math && device_quantize {
+                    GPAIR_SCALE_WORDS * 8
+                } else {
+                    0
                 },
             partition_scratch_bytes: n_rows
                 + (n_part_blocks + n_part_offsets * 2 + n_part_descriptors) * 4
@@ -1458,6 +1506,8 @@ impl GpuTrainCtx {
             hist_batched_fn,
             gpair_max_fn,
             gpair_quantize_fn,
+            gpair_scale_fn,
+            gpair_quantize_dscale_fn,
             count_fn,
             scan_fn,
             scatter_layer_fn,
@@ -1475,6 +1525,7 @@ impl GpuTrainCtx {
             n_rows,
             partition_threads,
             timing,
+            scale_fallbacks: AtomicU64::new(0),
             bucket_profile,
             use_pinned,
             budget,
@@ -1506,6 +1557,8 @@ impl GpuTrainCtx {
                 gpair_sum,
                 gpair_max_host: vec![0.0; n_gpair_blocks * 2],
                 gpair_sum_host: vec![0; n_gpair_blocks * 2],
+                gpair_scale,
+                gpair_scale_host: [0.0; 4],
                 gpair_host,
             }),
             hist_slots,
@@ -2254,6 +2307,11 @@ impl GpuTrainCtx {
         Ok(())
     }
 
+    /// fast 量化尾巴退回 host scale 的次数(见 `quantize_fused_device_scale`)。
+    pub fn device_scale_fallbacks(&self) -> u64 {
+        self.scale_fallbacks.load(Ordering::Relaxed)
+    }
+
     pub fn fast_math_enabled(&self) -> bool {
         self.apply_grad_fn.is_some()
     }
@@ -2397,6 +2455,9 @@ impl GpuTrainCtx {
         let threads = GPAIR_THREADS as u32;
         let blocks =
             u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
+        if max_fused && self.gpair_scale_fn.is_some() {
+            return self.quantize_fused_device_scale(buf, started, n_rows_u32, blocks);
+        }
         if !max_fused {
             let GpuBuffers {
                 gpair_f32,
@@ -2489,6 +2550,155 @@ impl GpuTrainCtx {
             };
         }
 
+        self.sync_if_timing()?;
+        let elapsed = if self.timing {
+            started.elapsed().as_secs_f32() * 1e3
+        } else {
+            0.0
+        };
+        Ok((quantizer, root_sum, elapsed))
+    }
+
+    /// fast 的量化尾巴:每 block 的 max 已经由梯度 kernel 写好 → device 上终归约并算
+    /// pow2 scale → 用 device 上的 scale 量化 → **一次** D2H(scale/max + 每 block 的
+    /// root sum)和一次同步。比 exact 共用的尾巴少一次 host 往返。
+    ///
+    /// host 拿到结果后照旧用 `GradQuantizer::try_from_bounds` 校验 max(非有限梯度在这里
+    /// 报错,这棵树不会被用)并**逐位比对** device 的 scale;不一致(只可能是 raw 恰在
+    /// 2 的幂正下方 1 ULP 内,host 的 `log2` 与 device 的 `ilogb` 差一档)就用 host 的
+    /// scale 用旧 kernel 重新量化 —— 永远不会静默使用不同的 scale。
+    fn quantize_fused_device_scale(
+        &self,
+        buf: &mut GpuBuffers,
+        started: std::time::Instant,
+        n_rows_u32: u32,
+        blocks: u32,
+    ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        let scale_fn = self
+            .gpair_scale_fn
+            .as_ref()
+            .context("device scale kernel 未加载")?;
+        let quant_fn = self
+            .gpair_quantize_dscale_fn
+            .as_ref()
+            .context("device scale 量化 kernel 未加载")?;
+        let threads = GPAIR_THREADS as u32;
+        {
+            let GpuBuffers {
+                gpair_max,
+                gpair_scale,
+                ..
+            } = &mut *buf;
+            let maxima = gpair_max.as_ref().context("gpair max buffer 未分配")?;
+            let scales = gpair_scale.as_mut().context("gpair scale buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(scale_fn);
+            launch.arg(maxima).arg(&blocks).arg(&n_rows_u32).arg(scales);
+            unsafe { launch.launch(cfg) }.context("launch gpair_scale_finalize")?;
+        }
+        {
+            let GpuBuffers {
+                gpair_f32,
+                gpair: gpair_dev,
+                gpair_sum,
+                gpair_scale,
+                ..
+            } = &mut *buf;
+            let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
+            let sums = gpair_sum.as_mut().context("gpair sum buffer 未分配")?;
+            let scales = gpair_scale.as_ref().context("gpair scale buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: threads * 2 * std::mem::size_of::<i64>() as u32,
+            };
+            let mut launch = self.stream.launch_builder(quant_fn);
+            launch
+                .arg(src)
+                .arg(&n_rows_u32)
+                .arg(scales)
+                .arg(gpair_dev)
+                .arg(sums);
+            unsafe { launch.launch(cfg) }.context("launch gpair_quantize_dscale")?;
+        }
+        {
+            let GpuBuffers {
+                gpair_scale,
+                gpair_scale_host,
+                gpair_sum,
+                gpair_sum_host,
+                ..
+            } = &mut *buf;
+            let scales = gpair_scale.as_ref().context("gpair scale buffer 未分配")?;
+            self.stream
+                .memcpy_dtoh(scales, gpair_scale_host.as_mut_slice())
+                .context("gpair scale D2H")?;
+            let sums = gpair_sum.as_ref().context("gpair sum buffer 未分配")?;
+            self.stream
+                .memcpy_dtoh(sums, gpair_sum_host.as_mut_slice())
+                .context("gpair sum D2H")?;
+        }
+        self.stream
+            .synchronize()
+            .context("等待 gpair scale/sum D2H")?;
+
+        let [dev_grad_scale, dev_hess_scale, max_grad, max_hess] = buf.gpair_scale_host;
+        let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, self.n_rows)?;
+        if quantizer.grad_scale().to_bits() != dev_grad_scale.to_bits()
+            || quantizer.hess_scale().to_bits() != dev_hess_scale.to_bits()
+        {
+            // 极罕见的 log2/ilogb 分歧:用 host 的 scale 走旧 kernel 重新量化。
+            self.scale_fallbacks.fetch_add(1, Ordering::Relaxed);
+            let quant_fn = self
+                .gpair_quantize_fn
+                .as_ref()
+                .context("device quantization 未启用")?;
+            let grad_scale = quantizer.grad_scale();
+            let hess_scale = quantizer.hess_scale();
+            let GpuBuffers {
+                gpair_f32,
+                gpair: gpair_dev,
+                gpair_sum,
+                gpair_sum_host,
+                ..
+            } = &mut *buf;
+            let src = gpair_f32.as_ref().context("f32 gpair buffer 未分配")?;
+            let sums = gpair_sum.as_mut().context("gpair sum buffer 未分配")?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: threads * 2 * std::mem::size_of::<i64>() as u32,
+            };
+            {
+                let mut launch = self.stream.launch_builder(quant_fn);
+                launch
+                    .arg(src)
+                    .arg(&n_rows_u32)
+                    .arg(&grad_scale)
+                    .arg(&hess_scale)
+                    .arg(gpair_dev)
+                    .arg(&mut *sums);
+                unsafe { launch.launch(cfg) }.context("launch gpair_quantize (host scale)")?;
+            }
+            self.stream
+                .memcpy_dtoh(&*sums, gpair_sum_host.as_mut_slice())
+                .context("gpair sum D2H (host scale)")?;
+            self.stream
+                .synchronize()
+                .context("等待 gpair sum D2H (host scale)")?;
+        }
+        // 用 `+=`(AddAssign)而不是 wrapping_add:debug 下仍然检查溢出。
+        let mut root_sum = GradPairFixed::default();
+        for pair in buf.gpair_sum_host.as_chunks::<2>().0 {
+            root_sum += GradPairFixed {
+                grad: pair[0],
+                hess: pair[1],
+            };
+        }
         self.sync_if_timing()?;
         let elapsed = if self.timing {
             started.elapsed().as_secs_f32() * 1e3

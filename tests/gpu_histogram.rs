@@ -2797,6 +2797,76 @@ fn gpu_multiclass_fast_gradient_matches_host_softmax() {
         .is_err());
 }
 
+/// fast 量化尾巴的 device scale(ilogb + pow2)在各种量级的梯度上必须和 host
+/// `GradQuantizer` 逐位相同,且不触发「退回 host scale 重量化」。样本权重按
+/// 2 的幂与非 2 的幂缩放,把 max|g| / max|h| 扫过很多个数量级。
+#[test]
+fn gpu_fast_device_scale_matches_host_quantizer_across_magnitudes() {
+    use ferrisboost::types::{GradPair, GradQuantizer, Objective};
+    let k = 3usize;
+    let n_rows = 2500usize;
+    let (_, labels, base_weights) = multiclass_fixture(n_rows, 4, k);
+    let obj = Objective::Softprob {
+        num_class: k as u32,
+    };
+    let margins: Vec<f32> = (0..k).map(|c| 0.2 * c as f32 - 0.3).collect();
+    for factor in [1.0e-30f32, 3.7e-7, 0.5, 1.0, 1.37, 123.4, 6.0e8, 1.0e20] {
+        let weights: Vec<f32> = base_weights.iter().map(|&w| w * factor).collect();
+        let config = SharedHistogramConfig {
+            runtime_log: false,
+            gpu_math: ferrisboost::types::GpuMath::Fast,
+            fast_weights: true,
+            n_outputs: k,
+            ..Default::default()
+        };
+        let ctx = GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
+        ctx.init_fast_math(&labels, Some(&weights), &margins)
+            .unwrap();
+        let class_preds: Vec<Vec<f32>> = margins.iter().map(|&m| vec![m; n_rows]).collect();
+        let mut host: Vec<Vec<GradPair>> = vec![Vec::new(); k];
+        obj.softmax_gradients(&class_preds, &labels, Some(&weights), &mut host);
+        ctx.fast_multiclass_begin_round().unwrap();
+        for class in 0..k {
+            let hq = GradQuantizer::new(&host[class], n_rows);
+            let (dq, _, _) = ctx
+                .fast_multiclass_gradient_and_quantize(class, u64::MAX, 0, 0)
+                .unwrap();
+            assert_eq!(dq.grad_scale(), hq.grad_scale(), "factor {factor} class {class}");
+            assert_eq!(dq.hess_scale(), hq.hess_scale(), "factor {factor} class {class}");
+        }
+        assert_eq!(
+            ctx.device_scale_fallbacks(),
+            0,
+            "factor {factor}: device scale must agree with the host quantizer without fallback"
+        );
+    }
+}
+
+/// 非有限梯度在 fast 的 device scale 路径上仍然报错(host 校验 max),不会量化后继续训练。
+#[test]
+fn gpu_fast_non_finite_gradient_is_rejected_after_device_scale() {
+    use ferrisboost::types::Objective;
+    let n_rows = 1500usize;
+    let labels: Vec<f32> = (0..n_rows).map(|i| (i % 5) as f32).collect();
+    let config = SharedHistogramConfig {
+        runtime_log: false,
+        gpu_math: ferrisboost::types::GpuMath::Fast,
+        ..Default::default()
+    };
+    let ctx = GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
+    // expf(200) overflows f32, so every poisson gradient is +inf.
+    ctx.init_fast_math(&labels, None, &[200.0]).unwrap();
+    let Err(err) =
+        ctx.fast_gradient_and_quantize(Objective::Poisson { max_delta_step: 0.7 }, u64::MAX, 0, 0)
+    else {
+        panic!("non-finite gradients must be rejected");
+    };
+    assert!(
+        format!("{err:#}").contains("non-finite"),
+        "unexpected error: {err:#}"
+    );
+}
+
 /// 多分类 fast 训练:逐次确定,和 exact(= CPU 字节)接近,覆盖 K=2/3/7、权重、
 /// 行/列采样、单调约束、streaming/resident 两种布局。
 #[test]

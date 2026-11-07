@@ -899,6 +899,105 @@ extern "C" __global__ void gpair_quantize(
     }
 }
 
+// ---------------------------------------------------------------- fast 量化尾巴
+//
+// `gpu_math = "fast"` 专用:把「归约 max → host 求 pow2 scale → 量化」之间那次
+// host 往返去掉。max 的块间归约、pow2 scale、量化都留在 device,host 只在最后
+// 和 root sum 一起做**一次**小 D2H + 一次同步,再用自己的 `GradQuantizer` 校验。
+//
+// scale 的公式逐步对应 `types::pow2_scale`(预算 2^62/n,向下取 2 的幂);
+// device 上用 ilogb 取 floor(log2),只有 raw 恰在 2 的幂正下方 1 ULP 内时才可能和
+// host 的 `log2().floor()` 差一档 —— host 拿到结果后会逐位比对 scale,不一致就用
+// host 的 scale 重新量化(行为退回到旧路径),所以这里永远不会静默用错 scale。
+// 非有限 / 非法 max 时 scale = 1.0;host 随后据 max 报错,不会往下用这棵树。
+__device__ __forceinline__ double fb_pow2_scale(double max_abs, uint32_t n_rows) {
+    if (!(max_abs > 0.0) || !isfinite(max_abs)) {
+        return 1.0;
+    }
+    const double budget = __ddiv_rn(4611686018427387904.0, (double)(n_rows > 0u ? n_rows : 1u));
+    const double raw = __ddiv_rn(budget, max_abs);
+    if (!isfinite(raw) || raw <= 0.0) {
+        return 1.0;
+    }
+    int k = ilogb(raw);
+    k = k < -1000 ? -1000 : (k > 1000 ? 1000 : k);
+    return ldexp(1.0, k);
+}
+
+// 单 block。out = [grad_scale, hess_scale, max_grad, max_hess]。
+extern "C" __global__ void gpair_scale_finalize(
+    const double* block_max,
+    uint32_t n_blocks,
+    uint32_t n_rows,
+    double* out) {
+    __shared__ double rg[256];
+    __shared__ double rh[256];
+    double mg = 0.0;
+    double mh = 0.0;
+    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        mg = fmax(mg, block_max[(uint64_t)b * 2]);
+        mh = fmax(mh, block_max[(uint64_t)b * 2 + 1]);
+    }
+    rg[threadIdx.x] = mg;
+    rh[threadIdx.x] = mh;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            rg[threadIdx.x] = fmax(rg[threadIdx.x], rg[threadIdx.x + s]);
+            rh[threadIdx.x] = fmax(rh[threadIdx.x], rh[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[0] = fb_pow2_scale(rg[0], n_rows);
+        out[1] = fb_pow2_scale(rh[0], n_rows);
+        out[2] = rg[0];
+        out[3] = rh[0];
+    }
+}
+
+// 与 `gpair_quantize` 逐字相同,只是 scale 从 device 读(`gpair_scale_finalize` 的输出)。
+extern "C" __global__ void gpair_quantize_dscale(
+    const float* gpair,
+    uint32_t n_rows,
+    const double* scales,
+    long long* out_fixed,
+    long long* out_sum) {
+    extern __shared__ long long sred[];
+    long long* sg = sred;
+    long long* sh = sred + blockDim.x;
+    const double grad_scale = scales[0];
+    const double hess_scale = scales[1];
+
+    long long acc_g = 0;
+    long long acc_h = 0;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        const long long gi =
+            (long long)round((double)gpair[(uint64_t)i * 2] * grad_scale);
+        const long long hi =
+            (long long)round((double)gpair[(uint64_t)i * 2 + 1] * hess_scale);
+        out_fixed[(uint64_t)i * 2] = gi;
+        out_fixed[(uint64_t)i * 2 + 1] = hi;
+        acc_g += gi;
+        acc_h += hi;
+    }
+    sg[threadIdx.x] = acc_g;
+    sh[threadIdx.x] = acc_h;
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sg[threadIdx.x] += sg[threadIdx.x + s];
+            sh[threadIdx.x] += sh[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_sum[(uint64_t)blockIdx.x * 2] = sg[0];
+        out_sum[(uint64_t)blockIdx.x * 2 + 1] = sh[0];
+    }
+}
+
 // 行重分区的三个阶段:分类并计数、确定性块级 exclusive scan、稳定 scatter。
 // 这里使用 device-side scan 以保持 checked-in PTX + cudarc 的构建架构;CUB 的
 // DeviceScan 是 host API,不能从纯 PTX kernel 内调用。scan 的结果和 CUB
