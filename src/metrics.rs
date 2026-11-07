@@ -464,11 +464,10 @@ pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
 // 再 `residue *= w`(f32),最后在 f64 里求和、`GetFinal(esum, wsum)`。
 // 逐行公式逐位照搬;求和按行号串行(XGBoost 的线程分段只影响 f64 尾数)。
 
-extern "C" {
-    // XGBoost `common::LogGamma(float)` → `std::lgamma(float)` = C `lgammaf`
-    //(glibc 和 MSVC CRT 都有)。
-    fn lgammaf(x: f32) -> f32;
-}
+// XGBoost `common::LogGamma(float)` 用平台的 `lgammaf`。我们不链接平台 libm 的
+// `lgammaf`:新 glibc(2.43)给它加了新的符号版本,链接后 wheel 就只能在
+// glibc ≥ 2.43 上加载,manylinux 标签也打不上。改用纯 Rust 的 `libm`(musl
+// 移植),Linux / Windows 结果一致;和 XGBoost 的差别在 f32 最后一位以内。
 
 /// 逐行指标的种类。带参数的(error@t、tweedie-nloglik@rho、mphe 的 slope)
 /// 存解析后的值。
@@ -573,8 +572,7 @@ impl Ew {
             }
             Ew::PoissonNll => {
                 let py = p.max(1e-16);
-                // SAFETY: lgammaf 是纯数学函数,只读参数。
-                let lg = unsafe { lgammaf(y + 1.0) };
+                let lg = libm::lgammaf(y + 1.0);
                 lg + py - py.ln() * y
             }
             Ew::GammaDeviance => {

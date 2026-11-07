@@ -539,6 +539,7 @@ dependencies = [
  "bytes",
  "cudarc",
  "flate2",
+ "libm",
  "numpy",
  "parquet",
  "pyo3",

@@ -104,5 +104,23 @@ print(f"    {ok} hashes verified, {bad} mismatched")
 print("\n── WHEEL tags ──")
 print("   ", next(v for k, v in blob.items() if k.endswith("dist-info/WHEEL")).decode().replace("\n", " | "))
 
-print(f"\nRESULT: {'CLEAN' if findings == 0 and bad == 0 else f'{findings} fingerprint categories, {bad} hash mismatches'}")
-sys.exit(1 if (findings or bad) else 0)
+# A Linux native module must not need a glibc newer than the manylinux floor
+# we publish (manylinux_2_34). A newer versioned libm/libc symbol (for example
+# glibc 2.43's lgammaf) would make the wheel unloadable on older systems, and
+# maturin only warns about it. Fail closed instead.
+print("\n── glibc floor ──")
+GLIBC_FLOOR = (2, 34)
+glibc_bad = 0
+for fn, data in blob.items():
+    if not fn.endswith(".so") or not data.startswith(b"\x7fELF"):
+        continue
+    versions = {tuple(map(int, m.groups())) for m in re.finditer(rb"GLIBC_(\d+)\.(\d+)", data)}
+    newest = max(versions, default=None)
+    if newest and newest > GLIBC_FLOOR:
+        glibc_bad += 1
+        print(f"  FAIL  {fn} needs GLIBC_{newest[0]}.{newest[1]} > {GLIBC_FLOOR[0]}.{GLIBC_FLOOR[1]}")
+    else:
+        print(f"  ok    {fn} newest GLIBC_{newest[0]}.{newest[1]}" if newest else f"  ok    {fn} no glibc symbols")
+
+print(f"\nRESULT: {'CLEAN' if findings == 0 and bad == 0 and glibc_bad == 0 else f'{findings} fingerprint categories, {bad} hash mismatches, {glibc_bad} glibc-floor violations'}")
+sys.exit(1 if (findings or bad or glibc_bad) else 0)
