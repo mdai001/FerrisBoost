@@ -301,6 +301,16 @@ impl BlockSource for DenseSource {
         anyhow::bail!("特征 {feat} 不在任何列块里,共 {} 个特征", self.n_features)
     }
 
+    /// 驻留的块直接借出列,零拷贝(见 trait 文档)。
+    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+        self.blocks.iter().find_map(|b| {
+            b.feat_ids
+                .iter()
+                .position(|&x| x == feat)
+                .map(|local| b.column(local))
+        })
+    }
+
     /// 全量持有,直接借出去,**零拷贝**。
     fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
         let block = self
@@ -343,6 +353,20 @@ mod tests {
         assert_eq!(seen, vec![0, 1, 2]);
         assert_eq!(src.n_rows(), 4);
         assert_eq!(src.n_features(), 3);
+    }
+
+    /// 借出的列必须和拷贝出来的列逐字节相同,而且指向块自己的内存。
+    #[test]
+    fn resident_feature_column_borrows_the_same_bytes() {
+        let (data, n_rows, n_feats) = toy();
+        let src = DenseSource::from_row_major(&data, n_rows, n_feats, 16, 2);
+        for f in 0..n_feats as FeatId {
+            let borrowed = src.resident_feature_column(f).expect("dense is resident");
+            assert_eq!(borrowed, src.feature_column(f).unwrap().as_slice());
+        }
+        assert!(src.resident_feature_column(n_feats as FeatId).is_none());
+        let first = src.blocks()[0].column(0).as_ptr();
+        assert_eq!(src.resident_feature_column(0).unwrap().as_ptr(), first);
     }
 
     #[test]

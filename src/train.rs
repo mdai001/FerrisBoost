@@ -790,6 +790,19 @@ pub trait BlockSource: Send + Sync {
     /// 现在编译器会逼每个新 source 想清楚这件事。
     fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>>;
 
+    /// 直接借出**驻留在内存里的**单个特征整列;拿不到(落盘 cache 等)返回
+    /// `None`,调用方退回 `feature_column`。
+    ///
+    /// 行重分区每层对每个选中的特征取一次列,而且只读。`feature_column`
+    /// 交出所有权,所以全量驻留的 source 也要为一次只读的 gather 复制
+    /// n_rows 字节(HIGGS:每棵树约 30 次 × 10.5 MB,串行 memcpy,外加
+    /// 每次一块新分配的缺页)。驻留的 source 覆盖本方法零拷贝借出;
+    /// 默认 `None`,所以只能交出拷贝的 source(落盘 cache、测试里的
+    /// 包装器)行为和以前完全一样。
+    fn resident_feature_column(&self, _feat: FeatId) -> Option<&[Bin]> {
+        None
+    }
+
     /// 第 i 块持有哪些特征。**只是元数据,不该碰数据。**
     ///
     /// 同样没有默认实现:默认实现只能是「加载整块再读 `feat_ids`」,
@@ -2722,9 +2735,18 @@ fn build_tree(
             if node_idxs.is_empty() {
                 continue;
             }
-            let t = prof::Timer::new(&prof::PART_FETCH);
-            let col = source.feature_column(feat)?;
-            drop(t);
+            // 只读借用这一列:驻留 source 零拷贝;落盘 cache 等只能交出拷贝的
+            // source 照旧付那份拷贝(PART_FETCH 只计这部分)。
+            let fetch_timer = prof::Timer::new(&prof::PART_FETCH);
+            let owned_col;
+            let col: &[Bin] = match source.resident_feature_column(feat) {
+                Some(col) => col,
+                None => {
+                    owned_col = source.feature_column(feat)?;
+                    &owned_col
+                }
+            };
+            drop(fetch_timer);
             if prof::enabled() {
                 use std::sync::atomic::Ordering;
                 prof::PART_COLS.fetch_add(1, Ordering::Relaxed);
@@ -2740,7 +2762,7 @@ fn build_tree(
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
-                let mut session = ctx.partition_session(&col)?;
+                let mut session = ctx.partition_session(col)?;
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
                     part_tokens[i] =
@@ -2760,7 +2782,7 @@ fn build_tree(
             } else {
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    let (left, right) = partition_rows(level[i].rows.host(), &col, &c, comm);
+                    let (left, right) = partition_rows(level[i].rows.host(), col, &c, comm);
                     partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
                 }
             }

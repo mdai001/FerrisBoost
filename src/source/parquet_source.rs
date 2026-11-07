@@ -1688,6 +1688,22 @@ impl BlockSource for ParquetBlockSource {
         })?;
         Ok(result)
     }
+
+    /// 内存 cache 直接借出列,零拷贝;落盘 cache 返回 `None`,调用方走
+    /// `feature_column` 的部分读(那条路本来就要读进一份新内存)。
+    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+        let QuantizedCache::Memory(blocks) = &self.cache else {
+            return None;
+        };
+        let (block_id, local) = self
+            .groups
+            .iter()
+            .enumerate()
+            .find_map(|(b, group)| group.iter().position(|&x| x == feat).map(|l| (b, l)))?;
+        // 和 `with_block` 一样记一次缓存读取,遥测口径不因借用而变。
+        self.cache_reads.fetch_add(1, Ordering::Relaxed);
+        Some(blocks.get(block_id)?.column(local))
+    }
 }
 
 impl ParquetBlockSource {
@@ -2464,6 +2480,10 @@ mod tests {
                             block.column(local),
                             "{rows} 行 {cols} 列 cpb={cpb},特征 {f}:单列读和整块读不一致"
                         );
+                        // 内存 cache 借出的列同样必须逐字节一致(落盘 cache 返回 None)。
+                        if let Some(borrowed) = src.resident_feature_column(f) {
+                            assert_eq!(borrowed, block.column(local), "特征 {f}:借出的列不一致");
+                        }
                         checked += 1;
                     }
                 })
