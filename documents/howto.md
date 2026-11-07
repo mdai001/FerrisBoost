@@ -1189,7 +1189,7 @@ always included. It works for arrays, files, and `predict_to_parquet`, and
 cannot be combined with `n_trees`. With `begin > 0` the call scores a copy of
 the selected trees, so repeated calls with a nonzero `begin` are best batched.
 
-C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays, pandas `DataFrame`s, or PyArrow `Table`s must be converted explicitly with `np.asarray(..., dtype=np.float32)`.
+C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become their category codes; see the Categorical section).
 
 For GPU prediction, the first eligible call includes CUDA context initialization and one model upload; subsequent calls reuse the cached model. Staging memory remains per-call and bounded to available VRAM. GPU 0 is the only inference target in this version; multi-GPU prediction is intentionally not enabled.
 
