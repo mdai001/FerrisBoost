@@ -2249,6 +2249,7 @@ fn train_multiclass_rounds(
     let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
     let device_quant = gpu.is_some_and(|c| c.device_quantize_enabled());
     let multi_quantile = cfg.objective.is_multi_quantile();
+    let mut fixed_buf: Vec<GradPairFixed> = Vec::new();
 
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
@@ -2284,24 +2285,9 @@ fn train_multiclass_rounds(
             } else {
                 std::mem::take(&mut grads[class])
             };
-            // 行采样:和单输出相同的确定性掩码,键是树序号。
-            if cfg.params.subsample < 1.0 && !device_quant && !fast_math {
-                // 逐行独立哈希,按行并行与串行逐位相同(见单输出路径)。
-                let th = crate::subsample::threshold_for(cfg.params.subsample);
-                let seed = cfg.params.seed;
-                pool.install(|| {
-                    let _t = prof::Timer::new(&prof::SAMPLE);
-                    gpair_f32.par_iter_mut().enumerate().for_each(|(i, g)| {
-                        if !crate::subsample::row_selected(i as u64, th, seed, tree_index) {
-                            *g = GradPair {
-                                grad: 0.0,
-                                hess: 0.0,
-                            };
-                        }
-                    });
-                });
-            }
-            let (quantizer, fixed, dev_root_sum) = if fast_math {
+            // 行采样:和单输出相同的确定性掩码,键是树序号。host 量化路径上
+            // 掩码与求 scale 的 max 合成一趟(见 `mask_and_bounds`)。
+            let (quantizer, fixed, dev_root_sum, host_nonzero) = if fast_math {
                 // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
                 // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
                 // kernel、无条件执行 —— 采样掩码不是预测掩码。
@@ -2326,7 +2312,7 @@ fn train_multiclass_rounds(
                         tree_index,
                     )?
                 };
-                (q, Vec::new(), Some(root))
+                (q, Vec::new(), Some(root), None)
             } else if device_quant {
                 let ctx = gpu.expect("device_quant 蕴含 gpu 存在");
                 let _t = prof::Timer::new(&prof::QUANTIZE);
@@ -2336,16 +2322,26 @@ fn train_multiclass_rounds(
                     cfg.params.seed,
                     tree_index,
                 )?;
-                (q, Vec::new(), Some(root))
+                (q, Vec::new(), Some(root), None)
             } else {
                 pool.install(|| {
+                    let mask = (cfg.params.subsample < 1.0).then(|| {
+                        (
+                            crate::subsample::threshold_for(cfg.params.subsample),
+                            cfg.params.seed,
+                            tree_index,
+                        )
+                    });
+                    let (max_grad, max_hess, _) = {
+                        let _t = prof::Timer::new(&prof::SAMPLE);
+                        mask_and_bounds(&mut gpair_f32, mask)
+                    };
                     let _t = prof::Timer::new(&prof::QUANTIZE);
-                    let quantizer = GradQuantizer::try_new(&gpair_f32, n)?;
-                    let fixed: Vec<GradPairFixed> = gpair_f32
-                        .par_iter()
-                        .map(|&g| quantizer.to_fixed(g))
-                        .collect();
-                    Ok::<_, anyhow::Error>((quantizer, fixed, None))
+                    let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, n)?;
+                    // 定点缓冲在各类、各轮之间复用(见 `quantize_host`)。
+                    let mut fixed = std::mem::take(&mut fixed_buf);
+                    let (root, nonzero) = quantize_host(&gpair_f32, &quantizer, &mut fixed);
+                    Ok::<_, anyhow::Error>((quantizer, fixed, Some(root), Some(nonzero)))
                 })?
             };
             drop(gpair_f32);
@@ -2369,7 +2365,7 @@ fn train_multiclass_rounds(
                     source,
                     &fixed,
                     dev_root_sum,
-                    None,
+                    host_nonzero,
                     &quantizer,
                     if fast_math {
                         &mut no_host_pred
@@ -2388,6 +2384,7 @@ fn train_multiclass_rounds(
                     ),
                 )
             })?;
+            fixed_buf = fixed;
             // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
             if fast_math && multi_quantile {
                 // 下一棵树(下一个目标)会覆盖 delta buffer:立刻并进这个目标的列。
