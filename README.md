@@ -139,7 +139,7 @@ model = fb.train(
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
 - **`nthread`**: `0` selects available physical CPU parallelism.
 - **Prediction CPU threads**: `model.predict(..., predict_threads=0)` uses process-aware automatic CPU parallelism independently of training `nthread`; a positive value overrides it.
-- **GPU prediction**: `model.predict(..., use_gpu=True)` opts into single-GPU inference. The compact tree model is uploaded lazily and cached for reuse; small or transfer-heavy batches automatically remain on CPU.
+- **GPU prediction**: `model.predict(..., use_gpu=True)` opts into single-GPU inference, including categorical models and `base_margin`. The compact tree model is uploaded lazily and cached for reuse; small or transfer-heavy batches automatically remain on CPU.
 
 Multi-file and partitioned datasets (list of files, directory, or glob pattern):
 
@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned. Prediction from a categorical model runs on the CPU.
+* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned.
 * **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -254,6 +254,7 @@ logging, and the complete parameter reference.
 - Added unbiased learning to rank.
 - Added ranking `auc` and `aucpr`.
 - Added multiple quantiles in one model (`quantile_alpha` list).
+- GPU prediction for categorical models and with `base_margin`.
 - Multiclass `predict_to_parquet` now streams.
 - GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 

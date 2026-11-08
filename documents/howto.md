@@ -586,8 +586,11 @@ pred = model.predict(X_new, base_margin=np.log(exposure_new))
   device prediction buffer is initialized directly from it (the buffer exists
   anyway, so the memory plan is unchanged). CPU and `gpu_math="exact"` GPU
   training stay byte-identical with margins; fast mode stays deterministic.
-- `use_gpu=True` prediction does not support `base_margin` yet and raises
-  `ValueError` (the device predictor has no per-row start): predict on the CPU.
+- `use_gpu=True` prediction takes `base_margin` too (arrays and files, one value per
+  row and output, so multiclass and multi-quantile models work): the device starts
+  each row from its margin instead of the intercept and adds leaf values in tree
+  order, so the result equals the CPU result bit for bit. The per-row margins
+  are staged in the same bounded device buffers as the features.
 
 With lossless bins the margins, trees and SHAP values are bit-identical to XGBoost
 trained with `DMatrix(x, base_margin=...)`.
@@ -830,8 +833,9 @@ Prediction handles category sets on every path (arrays, pandas / PyArrow, files,
 `predict_to_parquet`, multiclass). A pandas DataFrame or PyArrow table passed to
 `Model.predict` is scored through its category codes, so it must carry the same
 categories in the same order as the training data (the scikit-learn estimators
-remember the training categories and re-code by value instead). Prediction from a
-categorical model runs on the CPU even with `use_gpu=True`.
+remember the training categories and re-code by value instead). With
+`use_gpu=True` categorical models are scored on the GPU as well, with the same
+category decisions and bit-identical results (see [Prediction](#prediction)).
 
 Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
 `feature_types` list) and load in XGBoost in both directions. A loaded XGBoost
@@ -1437,7 +1441,7 @@ memory budget, without manual chunk or batch tuning:
 | Histograms, row partition, gradients | GPU, for every supported objective and both `gpu_math` modes |
 | Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
 | Feature binning and file ingest | Host |
-| Prediction (`use_gpu=True`) | GPU 0 when worthwhile; CPU for small batches, models with categorical splits, `predict_to_parquet`, and the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) |
+| Prediction (`use_gpu=True`) | GPU 0 when worthwhile, including categorical models and `base_margin`; CPU for small batches, `predict_to_parquet`, and the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) |
 
 What raises an error instead of falling back: `device="cuda"` on a build without
 CUDA, `max_depth` above 14 (on CPU too), `gpu_math="fast"` together with
@@ -1456,6 +1460,8 @@ gpu_allowed = model.predict(data, use_gpu=True)      # CUDA build; GPU 0 when wo
 `predict_threads=0` uses available physical CPU parallelism and keeps small workloads serial; a positive value is an explicit override. Workers own disjoint row slices and each row traverses trees in model order, so output is bit-identical across serial, explicit multi-thread, and auto CPU execution. NumPy scoring releases the Python GIL.
 
 `use_gpu=False` is the default and never initializes CUDA. With `use_gpu=True`, a CUDA-enabled build lazily creates a compact prediction-only SoA model on GPU 0 and reuses it on later calls. It transfers only tree-used features, while the selector also accounts for host projection and launch costs and can keep a batch on CPU. The inference backend is independent of whether the model was trained by FerrisBoost CPU, FerrisBoost GPU, or XGBoost, and independent of training `gpu_math`.
+
+GPU prediction covers numeric and categorical splits and an optional per-row `base_margin`. Each row is scored by one thread that starts from the intercept (or the row's `base_margin`) and adds leaf values in tree order, with the same decisions as the CPU: missing values follow the node's default direction, numeric splits send `value < threshold` left, and a categorical split sends a category in the node's set right (negative values, values at or above 2^24, and categories beyond the stored set go left; fractional values are truncated toward zero). Category sets may be any width, including the wide sets of XGBoost-trained models. The result equals CPU prediction bit for bit. A `base_margin` adds one `float32` per row to the staging buffers, which stay bounded to available VRAM.
 
 ### File prediction
 

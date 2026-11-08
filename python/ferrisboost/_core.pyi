@@ -59,8 +59,8 @@ class Model:
         num_class names for multiclass) of a column that sits next to the
         features, which requires a model with feature names. It also becomes
         the bias term of pred_contribs / pred_interactions. pred_leaf ignores
-        it. use_gpu=True with base_margin raises ValueError (the device
-        predictor has no per-row start); predict on the CPU.
+        it. use_gpu=True accepts base_margin too (the device starts each row
+        from its margin; results equal the CPU).
 
         The result is 1-D with shape (n,), except for multiclass models:
         multi:softprob returns (n, num_class) probabilities, multi:softmax

@@ -105,6 +105,7 @@ prediction = model.predict("test.parquet")</code></pre>
         <li>Added unbiased learning to rank.</li>
         <li>Added ranking <code>auc</code> and <code>aucpr</code>.</li>
         <li>Added multiple quantiles in one model (<code>quantile_alpha</code> list).</li>
+        <li>GPU prediction for categorical models and with <code>base_margin</code>.</li>
         <li>Multiclass <code>predict_to_parquet</code> now streams.</li>
         <li>GPU speed optimizations for categorical features and for <code>colsample_bylevel</code> / <code>colsample_bynode</code>.</li>
       </ul>
