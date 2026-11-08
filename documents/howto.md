@@ -814,8 +814,12 @@ How a feature is declared:
 - **Parquet dictionary columns** are categorical automatically, unless an
   explicit `feature_types` says otherwise. A dictionary of **strings** is a
   named categorical feature (below). A dictionary of **integers** keeps its
-  values as the category codes, as before. Other dictionary value types raise
-  `ValueError` when the feature is categorical.
+  values as the category codes, as before (unlike an in-memory Arrow table, see
+  *Integer dictionaries: Arrow tables and Parquet files* below). Other
+  dictionary value types raise `ValueError` when the feature is categorical.
+- **CSV columns** are categorical only when `feature_types` declares them
+  `"c"`. A declared column of integers holds category codes; a declared column
+  of text is a named categorical feature (see *CSV text columns* below).
 
 Category codes must be integers in `0..=65533`, with `NaN` / null for a missing
 value; negative, fractional, or larger values raise `ValueError`. One feature
@@ -831,14 +835,16 @@ histogram bin, so prefer compact codes.
 Validation sets use the training codes. For integer codes, a code that never
 appeared in training is "not in any set" and goes to the left child, as it does
 in XGBoost. Named validation data (pandas, PyArrow, Parquet string
-dictionaries) is first re-coded by value onto the training categories.
+dictionaries, CSV text columns) is first re-coded by value onto the training
+categories, and a category the training data did not have raises `ValueError`
+(see *Named categories*).
 
 ### Named categories
 
 When the input names its categories (pandas `category` columns, PyArrow
-dictionary columns, Parquet string dictionaries), the model stores one category
-list per feature, in XGBoost 3.x's `cats` layout, and every later read re-codes
-by **value**:
+dictionary columns, Parquet string dictionaries, CSV text columns declared
+`"c"`), the model stores one category list per feature, in XGBoost 3.x's `cats`
+layout, and every later read re-codes by **value**:
 
 - **Files stay streaming.** For Parquet the Rust reader collects the
   dictionaries while it streams the data (nothing is materialized in Python):
@@ -848,16 +854,24 @@ by **value**:
   not depend on row groups, batching or thread count. Every file is coded onto
   that one list, so files with differently ordered dictionaries train on
   consistent codes. A plain string column declared `"c"` in
-  `feature_types` works the same way. At most 65,534 categories per feature.
+  `feature_types` works the same way, and so do CSV text columns (below). At
+  most 65,534 categories per feature; more than 254 store the feature with two
+  bytes per value, on CPU and GPU.
 - **Validation sets and prediction** (`predict`, `pred_contribs`, `pred_leaf`,
-  `predict_to_parquet`, CPU or GPU) re-code DataFrames, Arrow tables and
-  Parquet files with the stored lists, so their categories may be listed in any
-  order or be a subset. A row holding a category the model does not know raises
-  `ValueError` (XGBoost rejects it too); dictionary entries no row uses are
-  ignored. String and integer categories do not mix: the category data type
-  must match the training data. NumPy input is taken as integer codes. A model
-  without stored lists (trained on integer codes) scores the codes of a
-  DataFrame or table as they are, as before.
+  `predict_to_parquet`, CPU or GPU) re-code DataFrames, Arrow tables, Parquet
+  and CSV files with the stored lists, so their categories may be listed in any
+  order or be a subset. String and integer categories do not mix: the category
+  data type must match the training data. NumPy input is taken as integer
+  codes. A model without stored lists (trained on integer codes) scores the
+  codes of a DataFrame or table as they are, as before.
+- **Unseen categories raise `ValueError`**, as in XGBoost: a validation or
+  prediction row holding a category the model does not know is an error, not a
+  silent left turn. The message names the column and the value, for example
+  `feature column "city" holds the category "Oslo", which is not in the
+  model's categories for this feature` (files) or `predict data column 'city'
+  holds the category 'Oslo', which is not in the training categories`
+  (DataFrames and Arrow tables). Dictionary entries no row uses are ignored, and
+  a missing value (null, `NaN`, an empty CSV field) is never unseen.
 - **Model JSON**: XGBoost 3.4.1 loads a FerrisBoost model with categories and
   re-codes DataFrames the same way; FerrisBoost loads an XGBoost model trained
   on pandas categories with its lists. `Model.get_categories()` returns them.
@@ -868,6 +882,70 @@ by **value**:
   FerrisBoost re-codes by value, so old and new trees agree.)
 - **Quantized cache**: a Parquet cache records the category lists; reusing it
   with other lists (for example a different `init_model`) is rejected.
+
+#### CSV text columns
+
+CSV has no types, so FerrisBoost infers each column's type from the first
+10,000 records of every file. A column declared `"c"` in `feature_types` is
+read as **text** (category names) when any training file's inferred type for it
+is not a number, and then in every file, so one feature never mixes codes and
+names; a declared column whose fields are all integers keeps them as category
+codes, without names, as before. Text columns that are not declared `"c"` raise
+`ValueError`.
+
+```python
+# city,x1,label
+# Oslo,3,0.5
+# Lima,,1.0
+# ,7,0.2        <- empty field: missing
+model = fb.train(params, "train.csv", label="label", feature_types=["c", "q"])
+model.get_categories()  # [['Oslo', 'Lima', ...], None]
+```
+
+- The list holds the values in order of first appearance in the rows (files in
+  order, then rows), the same rule as Parquet string columns, independent of
+  batching and thread count. The same rows as CSV or as Parquet train the same
+  model, on CPU and GPU (`gpu_math="exact"` is byte-identical to the CPU under
+  every residency plan, and the GPU plan CSV makes after its first pass is the
+  Parquet plan).
+- Fields are taken verbatim (no trimming; numbers, `true` or dates in a text
+  column are the strings as written). Only an empty field is missing: `NA` or
+  `null` are categories (`pandas.read_csv` reads them as missing by default).
+- Validation and prediction files read every feature with string categories in
+  the model as text, whatever their own fields look like: a file holding only
+  `1` and `2` of the categories `["1", "2", "x"]` is coded by value, not as the
+  codes 1 and 2. A model with **integer** categories (trained on pandas integer
+  categories) re-codes CSV integers, and plain Parquet integer columns, by value
+  too.
+- A column whose sampled records are numbers but whose later records hold text
+  fails to parse: put a text value in the first 10,000 records of the file.
+
+#### Integer dictionaries: Arrow tables and Parquet files
+
+An integer dictionary column means different things in memory and in a file:
+
+| Input | Category list stored in the model | Codes trained on |
+|---|---|---|
+| PyArrow table / record batch, integer dictionary | the dictionary values in dictionary order (chunks are unified first: the first chunk's dictionary, then values new in later chunks), with the dictionary's integer type, like a pandas integer category | dictionary indices |
+| Parquet file, integer dictionary | none (no `cats`) | the dictionary **values**, which must be codes in `0..=65533` |
+
+- An Arrow table's integer dictionary is a named categorical feature: later
+  input is re-coded by value, so `[40, 3, 17]` and `[3, 17, 40]` dictionaries
+  score alike, and the model's `cats` hold `[40, 3, 17]` as XGBoost writes them
+  for the same pandas column.
+- A Parquet file's integer dictionary trains exactly like a plain integer
+  column declared `"c"`: the value `40` is category code 40. To get named
+  integer categories from a file, train from the table in memory
+  (`pq.read_table(path)`), or from pandas.
+- String dictionaries follow the same split in ordering only: an Arrow table's
+  list is its (unified) dictionary order, a Parquet file's list is the order of
+  first appearance in the rows. Either way the codes are consistent and later
+  input is re-coded by value.
+- Prediction re-codes integer dictionaries (and plain integer columns of
+  files) by value only when the model has integer categories. A model without
+  lists takes a Parquet dictionary's values as codes, but an Arrow table's
+  dictionary **indices** as codes, so score a model trained from a Parquet
+  integer dictionary with Parquet files or with plain integer codes.
 
 Split search follows XGBoost:
 
@@ -1920,9 +1998,15 @@ or a sorted list such as `[0.1, 0.5, 0.9]`.
   `feature_types`) so a categorical column is never trained as one by accident.
 - `feature_types` must have one `"c"` or `"q"` per feature; for files it counts
   feature columns only (not the label or weight column).
-- Parquet or Arrow dictionary columns of strings are rejected in files, because
-  the codes of a string dictionary differ between row groups. Encode them as
-  integers upstream, or train from an in-memory pandas or PyArrow table.
+- `... was inferred as Utf8; only numeric columns are supported ...` (CSV):
+  declare the text column `"c"` in `feature_types` to train it as named
+  categories, or fix stray characters in a numeric column.
+- `... holds the category ..., which is not in the model's categories` /
+  `... not in the training categories`: a validation or prediction row holds a
+  category the training data did not have. XGBoost rejects it too; map such
+  values to a known category or to missing before scoring.
+- `... the category data type must match the training data`: the model's
+  categories are strings and the input's are integers, or the reverse.
 
 ### An explanation option is rejected
 

@@ -125,12 +125,14 @@ where
             projected_features,
             csv_has_header,
             ingest_threads,
+            categories,
         )?
     } else {
         let paths = Arc::new(resolved.paths.clone());
         let names = Arc::new(canonical_feature_names.to_vec());
         let projected = Arc::new(projected_features.to_vec());
         let format = resolved.format;
+        let table = categories.cloned().map(Arc::new);
         Box::new(super::parallel_reader::ordered_parallel_batches(
             paths.len(),
             ingest_threads,
@@ -143,6 +145,7 @@ where
                     &projected,
                     csv_has_header,
                     1,
+                    table.as_deref(),
                 )
             },
         ))
@@ -162,6 +165,7 @@ where
 }
 
 /// 为一个文件解出投影,并返回按规范顺序排好的 batch 流。
+#[allow(clippy::too_many_arguments)]
 fn open_projected(
     path: &Path,
     format: InputFormat,
@@ -170,6 +174,7 @@ fn open_projected(
     projected_features: &[usize],
     csv_has_header: bool,
     ingest_threads: usize,
+    categories: Option<&crate::category_names::CategoryTable>,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + 'static>> {
     match format {
         InputFormat::Parquet => {
@@ -188,6 +193,8 @@ fn open_projected(
         InputFormat::Csv => {
             let (schema, names) = super::csv_source::schema_and_names(path, csv_has_header)?;
             let canonical = bind(&names, canonical_feature_names, canonical_n_features, path)?;
+            // Features with string categories are read as text and re-coded by value.
+            let schema = super::csv_source::prediction_schema(schema, &canonical, categories);
             let proj = projected_features
                 .iter()
                 .map(|&feature| canonical[feature])

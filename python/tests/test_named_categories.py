@@ -300,6 +300,43 @@ def test_integer_dictionaries_in_files_keep_their_values_as_codes(tmp_path):
                                   ref.predict(codes.astype(np.float32)[:, None]))
 
 
+def test_arrow_tables_and_parquet_files_code_integer_dictionaries_differently(tmp_path):
+    """The documented split: an in-memory Arrow table's integer dictionary is a
+    named categorical feature (like a pandas integer category: the categories
+    are the dictionary values in dictionary order, stored with their dtype), a
+    Parquet file's integer dictionary is not (its values are the codes)."""
+    rng = np.random.default_rng(18)
+    n = 1500
+    levels = np.array([40, 3, 17, 9], dtype=np.int16)
+    k = rng.choice(levels, n)
+    y = (k % 5 + rng.normal(0, 0.1, n)).astype(np.float32)
+    keys = pa.array([int(np.flatnonzero(levels == x)[0]) for x in k], pa.int8())
+    column = pa.DictionaryArray.from_arrays(keys, pa.array(levels))
+    table = pa.table({"k": column})
+    from_table = fb.train({**FB, "enable_categorical": True}, table, label=y,
+                          num_boost_round=3, quiet=True)
+    assert from_table.get_categories() == [levels.tolist()]
+    df = pd.DataFrame({"k": pd.Categorical(k, categories=levels)})
+    bst = xgb_model(df, y, 3)
+    want = xgb_margin(bst, df)
+    np.testing.assert_array_equal(from_table.predict(table, output_margin=True), want)
+    assert cats_of(model_json(from_table, tmp_path, "t")) == cats_of(json.loads(bst.save_raw("json")))
+    # Re-coded by value from any other dictionary order, and from a Parquet file.
+    resorted = pa.table({"k": pa.array(k).dictionary_encode()})
+    np.testing.assert_array_equal(from_table.predict(resorted, output_margin=True), want)
+    path = str(tmp_path / "k.parquet")
+    pq.write_table(pa.table({"k": column, "label": y}), path)
+    np.testing.assert_array_equal(from_table.predict(path, output_margin=True), want)
+    # The same column in a Parquet file trains on its values as codes: no list,
+    # one bin per code 0..40, the same model as the plain integer codes.
+    from_file = fb.train(FB, path, label="label", num_boost_round=3, quiet=True)
+    assert from_file.get_categories() is None
+    ref = fb.train(FB, k.astype(np.float32)[:, None], label=y, feature_types=["c"],
+                   num_boost_round=3, quiet=True)
+    trees = lambda m, name: model_json(m, tmp_path, name)["learner"]["gradient_booster"]["model"]["trees"]  # noqa: E731
+    assert trees(from_file, "f") == trees(ref, "r")
+
+
 def test_plain_string_column_declared_categorical(tmp_path):
     v, x1, y, cats = make(n=1500, seed=12)
     path = str(tmp_path / "s.parquet")

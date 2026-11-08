@@ -397,6 +397,37 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
                 assert _bytes(model, tmp_path, "gpu") == ref, (src, resident, spill)
 
 
+@cuda
+@pytest.mark.parametrize("cat_k", [(12, 40), (300, 20000)], ids=["8bit", "16bit"])
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_csv_text_categories_stream_like_parquet_string_dictionaries(tmp_path, capfd, layout,
+                                                                     cat_k):
+    """CSV text columns declared "c" learn the categories in row order, like the
+    Parquet string dictionaries of the same rows: same model on the CPU and under
+    every GPU plan (16-bit blocks above 254 categories), and the CSV GPU plan made
+    after the first pass matches the Parquet one."""
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", layout, sampling=SAMPLE_ALL, n_cat=2,
+                            cat_k=cat_k, string_cats=True)
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    csv = str(tmp_path / "data.csv")
+    pq.read_table(path).to_pandas().to_csv(csv, index=False, na_rep="")
+    assert _bytes(fb.train(p, csv, quiet=True, **kw), tmp_path, "cpu_csv") == ref
+    _, probe = _gpu(capfd, p, path, kw, resident_blocks=0)
+    total = probe["total"]
+    for resident in _plans(total):
+        model, info = _gpu(capfd, p, csv, kw, gpu_math="exact", resident_blocks=resident)
+        _check_plan(info, probe["layout"], resident, total)
+        if cat_k[1] > 254:
+            assert "bins_16bit=col_major" in info["log"], info["log"][-1500:]
+        assert _bytes(model, tmp_path, "gpu") == ref, (info["residency"], resident, total)
+    # Auto block width: the CSV plan (from the first pass) equals the Parquet plan.
+    auto = {k: v for k, v in p.items() if k != "cols_per_block"}
+    model_pq, info_pq = _gpu(capfd, auto, path, kw)
+    model_csv, info_csv = _gpu(capfd, auto, csv, kw)
+    assert _planned(info_csv) == _planned(info_pq)
+    assert _bytes(model_csv, tmp_path, "a") == _bytes(model_pq, tmp_path, "b")
+
+
 # ------------------------------------------------- 16-bit column blocks (0.0.8 wide bins)
 
 # Features with more than 255 bins (max_bin > 255) or more than 254 categories are
