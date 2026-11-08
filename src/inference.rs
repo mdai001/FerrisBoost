@@ -23,8 +23,9 @@ struct CpuInferenceTree {
     flags: Box<[u8]>,
     leaf_values: Box<[f32]>,
     max_depth: usize,
-    /// Categorical trees only (they always use the dynamic layout): per node
-    /// an index into `cat_sets`, the right-going category bitsets.
+    /// Categorical trees only: per node (heap index in the heap layout, node
+    /// id in the dynamic layout) an index into `cat_sets`, the right-going
+    /// category bitsets, or `u32::MAX` for a numeric node. Empty otherwise.
     cat_index: Box<[u32]>,
     cat_sets: Box<[Box<[u32]>]>,
 }
@@ -72,16 +73,22 @@ impl CpuInferenceTree {
         // The common depth <= 6 case gets a complete heap layout. At a given
         // level, left/right are arithmetic (2*i / 2*i+1), so prediction has no
         // leaf test and no child-pointer loads. An early leaf is extended with
-        // NaN comparisons that deterministically walk right to the same value.
-        // A tree with categorical splits needs a set lookup per node and uses
-        // the dynamic layout below instead.
+        // NaN comparisons that deterministically walk right to the same value
+        // (padding nodes are numeric, default right). A categorical node keeps
+        // its set lookup through `cat_index`.
         let has_categorical = tree.has_categorical();
-        if max_depth <= 6 && !has_categorical {
+        if max_depth <= 6 {
             let internal_count = (1usize << max_depth) - 1;
             let mut features = vec![0u32; internal_count];
             let mut split_conditions = vec![f32::NAN; internal_count];
             let mut default_left = vec![0u8; internal_count];
             let mut leaf_values = vec![0.0f32; 1usize << max_depth];
+            let mut cat_index = if has_categorical {
+                vec![u32::MAX; internal_count]
+            } else {
+                Vec::new()
+            };
+            let mut cat_sets: Vec<Box<[u32]>> = Vec::new();
             let mut stack = vec![(0usize, 0usize, 0usize)];
             while let Some((node_id, depth, level_index)) = stack.pop() {
                 let node = &tree.nodes[node_id];
@@ -97,6 +104,11 @@ impl CpuInferenceTree {
                     features[heap_index] = node.feat;
                     split_conditions[heap_index] = node.split_cond;
                     default_left[heap_index] = u8::from(node.default_left);
+                    if let Some(words) = &node.cats {
+                        cat_index[heap_index] = u32::try_from(cat_sets.len())
+                            .context("categorical split count exceeds u32")?;
+                        cat_sets.push(words.clone());
+                    }
                     stack.push((node.left as usize, depth + 1, 2 * level_index));
                     stack.push((node.right as usize, depth + 1, 2 * level_index + 1));
                 }
@@ -110,8 +122,8 @@ impl CpuInferenceTree {
                 flags: Box::new([]),
                 leaf_values: leaf_values.into_boxed_slice(),
                 max_depth,
-                cat_index: Box::new([]),
-                cat_sets: Box::new([]),
+                cat_index: cat_index.into_boxed_slice(),
+                cat_sets: cat_sets.into_boxed_slice(),
             });
         }
 
@@ -163,7 +175,7 @@ impl CpuInferenceTree {
     }
 
     #[inline]
-    fn add_array_block<const ANY_MISSING: bool, const DEPTH: usize>(
+    fn add_array_block<const ANY_MISSING: bool, const DEPTH: usize, const CATEGORICAL: bool>(
         &self,
         row_major: &[f32],
         n_features: usize,
@@ -175,8 +187,15 @@ impl CpuInferenceTree {
             for (row, node_id) in node_ids[..margins.len()].iter_mut().enumerate() {
                 let node = first_node + *node_id as usize;
                 let value = row_major[row * n_features + self.features[node] as usize];
+                // Same decision order as the dynamic layout: missing first,
+                // then the category set, then the numeric threshold.
                 let go_left = if ANY_MISSING && value.is_nan() {
                     self.default_left[node] != 0
+                } else if CATEGORICAL && self.cat_index[node] != u32::MAX {
+                    crate::categorical::goes_left(
+                        &self.cat_sets[self.cat_index[node] as usize],
+                        value,
+                    )
                 } else {
                     value < self.split_conditions[node]
                 };
@@ -235,20 +254,45 @@ impl CpuInferenceTree {
         margins: &mut [f32],
     ) {
         debug_assert!(margins.len() <= CPU_PREDICTION_BLOCK_ROWS);
-        // Only the heap layout leaves `flags` empty; categorical trees (and deep
-        // ones) use the dynamic layout whatever their depth.
+        // Only the heap layout leaves `flags` empty; deep trees use the
+        // dynamic layout.
         if !self.flags.is_empty() {
             return self.add_dynamic_block::<ANY_MISSING>(row_major, n_features, margins);
         }
+        // Categorical heap trees take a separate, out-of-line path so the
+        // numeric dispatch below stays as small as before (with both variants
+        // inline here, numeric models measured 16% slower).
+        if !self.cat_index.is_empty() {
+            return self.add_categorical_heap_block::<ANY_MISSING>(row_major, n_features, margins);
+        }
         match self.max_depth {
-            0 => self.add_array_block::<ANY_MISSING, 0>(row_major, n_features, margins),
-            1 => self.add_array_block::<ANY_MISSING, 1>(row_major, n_features, margins),
-            2 => self.add_array_block::<ANY_MISSING, 2>(row_major, n_features, margins),
-            3 => self.add_array_block::<ANY_MISSING, 3>(row_major, n_features, margins),
-            4 => self.add_array_block::<ANY_MISSING, 4>(row_major, n_features, margins),
-            5 => self.add_array_block::<ANY_MISSING, 5>(row_major, n_features, margins),
-            6 => self.add_array_block::<ANY_MISSING, 6>(row_major, n_features, margins),
+            0 => self.add_array_block::<ANY_MISSING, 0, false>(row_major, n_features, margins),
+            1 => self.add_array_block::<ANY_MISSING, 1, false>(row_major, n_features, margins),
+            2 => self.add_array_block::<ANY_MISSING, 2, false>(row_major, n_features, margins),
+            3 => self.add_array_block::<ANY_MISSING, 3, false>(row_major, n_features, margins),
+            4 => self.add_array_block::<ANY_MISSING, 4, false>(row_major, n_features, margins),
+            5 => self.add_array_block::<ANY_MISSING, 5, false>(row_major, n_features, margins),
+            6 => self.add_array_block::<ANY_MISSING, 6, false>(row_major, n_features, margins),
             _ => self.add_dynamic_block::<ANY_MISSING>(row_major, n_features, margins),
+        }
+    }
+
+    #[inline(never)]
+    fn add_categorical_heap_block<const ANY_MISSING: bool>(
+        &self,
+        row_major: &[f32],
+        n_features: usize,
+        margins: &mut [f32],
+    ) {
+        match self.max_depth {
+            0 => self.add_array_block::<ANY_MISSING, 0, true>(row_major, n_features, margins),
+            1 => self.add_array_block::<ANY_MISSING, 1, true>(row_major, n_features, margins),
+            2 => self.add_array_block::<ANY_MISSING, 2, true>(row_major, n_features, margins),
+            3 => self.add_array_block::<ANY_MISSING, 3, true>(row_major, n_features, margins),
+            4 => self.add_array_block::<ANY_MISSING, 4, true>(row_major, n_features, margins),
+            5 => self.add_array_block::<ANY_MISSING, 5, true>(row_major, n_features, margins),
+            6 => self.add_array_block::<ANY_MISSING, 6, true>(row_major, n_features, margins),
+            _ => unreachable!("heap layout is built only for depth <= 6"),
         }
     }
 }
@@ -648,8 +692,25 @@ mod tests {
             next = right;
         }
 
+        // Categorical splits in the heap layout (depth 2, with an early leaf)
+        // and in the dynamic layout (depth 7).
+        let mut cats = crate::categorical::CatBits::empty();
+        for code in [1u32, 3, 40] {
+            cats.set(code);
+        }
+        let mut categorical = Tree::default();
+        let categorical_root = categorical.push_leaf(0.0, 1.0);
+        let (cat_left, _) =
+            categorical.split_leaf(categorical_root, 2, 0.0, true, 0.0, 0.25, 1.0, -0.375, 1.0);
+        categorical.set_categories(categorical_root, &cats);
+        categorical.split_leaf(cat_left, 1, 0.5, false, 0.0, 0.0625, 1.0, -0.125, 1.0);
+        let mut deep_categorical = deep.clone();
+        let deep_root = 0;
+        deep_categorical.nodes[deep_root].feat = 2;
+        deep_categorical.set_categories(deep_root, &cats);
+
         let model = Model {
-            trees: vec![shallow, uneven, deep],
+            trees: vec![shallow, uneven, deep, categorical, deep_categorical],
             base_score: 0.3,
             objective: Objective::Logistic,
             n_features: 5,
@@ -665,10 +726,13 @@ mod tests {
         let predictor = CpuInferenceModel::new(&model).unwrap();
         let patterns = [
             [0.0, -1.0, 0.0, 1.0, 3.0],
-            [0.0, 1.0, 0.0, 2.0, 1.0],
-            [0.0, 1.0, 0.0, f32::NAN, f32::NAN],
-            [0.0, f32::NAN, 0.0, 1.5, 4.0],
-            [-20.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 3.0, 2.0, 1.0],
+            [0.0, 1.0, 40.0, f32::NAN, f32::NAN],
+            [0.0, f32::NAN, f32::NAN, 1.5, 4.0],
+            [-20.0, 0.0, 2.5, 0.0, 0.0],
+            [0.0, 0.25, 1.75, 0.0, 0.0],
+            [0.0, 0.75, -1.0, 0.0, 0.0],
+            [0.0, 0.75, 5000.0, 0.0, 0.0],
         ];
         let rows: Vec<[f32; 5]> = (0..130).map(|row| patterns[row % patterns.len()]).collect();
         let flat: Vec<f32> = rows.iter().flatten().copied().collect();
