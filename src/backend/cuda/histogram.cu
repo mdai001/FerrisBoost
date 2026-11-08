@@ -3428,11 +3428,15 @@ __device__ __forceinline__ void shx_descend(const ShxModel& m, const float* feat
 // One tree for one row. MODE 0 accumulates per-tree contributions into the
 // scratch slots starting at word `tc_base`; MODE 1 adds the diagonal and the
 // path-partner deltas straight into `mat` (`nc` x `nc` floats of this row/group).
+// MODE 2 performs MODE 1's computation but appends every value MODE 1 would
+// add (including the zero partner deltas MODE 1 skips) to the log at `mat`,
+// one value every `log_stride` floats, in the same order.
 template <int MODE>
 __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float* rn,
                              const float* rw, uint32_t root, uint32_t* su, float* sf,
                              uint64_t stride, uint64_t sid, uint32_t tc_base, float* mat,
-                             uint32_t nc) {
+                             uint32_t nc, uint64_t log_stride = 0) {
+    uint64_t log_at = 0;
     uint32_t d = 0;
     SHX_FU(0, SHX_NODE) = root;
     SHX_FF(0, SHX_W) = 1.0f;
@@ -3470,8 +3474,13 @@ __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float*
                 const uint32_t w = tc_base + m.slot[pn];
                 SHX_SF(w) = SHX_FADD(SHX_SF(w), delta);
             } else {
-                float* diag = mat + (uint64_t)feat * nc + feat;
-                *diag = SHX_FADD(*diag, delta);
+                if (MODE == 2) {
+                    mat[log_at] = delta;
+                    log_at += log_stride;
+                } else {
+                    float* diag = mat + (uint64_t)feat * nc + feat;
+                    *diag = SHX_FADD(*diag, delta);
+                }
                 // Partners: the newest occurrence of every other feature on the
                 // live path, newest to oldest; older duplicates are shadowed.
                 bool skipped_current = false;
@@ -3491,7 +3500,10 @@ __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float*
                     }
                     const float dp = shx_interaction_delta(rn, h, p_enter, p_exit,
                                                            SHX_FF(j, SHX_PE));
-                    if (dp != 0.0f) {
+                    if (MODE == 2) {
+                        mat[log_at] = dp;
+                        log_at += log_stride;
+                    } else if (dp != 0.0f) {
                         float* cell = mat + (uint64_t)feat * nc + split;
                         *cell = SHX_FADD(*cell, dp);
                     }
@@ -3760,4 +3772,158 @@ extern "C" __global__ void predict_margin_soa_cat(
         margin += leaf_values[node];
     }
     output[row] = margin;
+}
+
+// ================================================= SHAP: tree-parallel exact contributions
+//
+// `shx_contribs` gives each (row, output) one thread that walks that output's
+// trees in sequence, so a small batch launches too few threads to fill the
+// device and its latency is one thread's walk over the whole ensemble. A
+// tree's contributions start from zero in that tree's own slots, so they can
+// be computed for every (row, tree) pair independently
+// (`shx_contribs_per_tree`) and then added to the output in tree order by
+// `shx_contribs_reduce`: the same additions, in the same order, as
+// `shx_contribs`, so both produce identical bits.
+//
+// Scratch layout: stride = n_rows * n_trees threads, sid = tree * n_rows + row;
+// words [0, levels * SHX_FRAME_WORDS) hold the traversal frames, the tree's
+// feature slots follow.
+extern "C" __global__ void shx_contribs_per_tree(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, uint32_t levels, float* __restrict__ scratch) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (row >= n_rows || t >= n_trees) return;
+    const uint32_t root = m.tree_node_begin[t];
+    if ((m.flags[root] & 1u) != 0u) return;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint64_t sid = (uint64_t)t * n_rows + row;
+    const uint32_t tc_base = levels * SHX_FRAME_WORDS;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    const uint32_t un = m.uniq_begin[t + 1u] - m.uniq_begin[t];
+    for (uint32_t u = 0; u < un; ++u) SHX_SF(tc_base + u) = 0.0f;
+    shx_run_tree<0>(m, feats, rn, rw, root, su, sf, stride, sid, tc_base, nullptr,
+                    n_features + 1u);
+}
+
+extern "C" __global__ void shx_contribs_reduce(
+    SHX_MODEL_PARAMS,
+    uint32_t n_rows, uint32_t n_features, uint32_t n_trees, uint32_t k, uint32_t levels,
+    const float* __restrict__ group_root_mean, const float* __restrict__ group_bias,
+    const float* __restrict__ margin, const float* __restrict__ scratch,
+    float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t g = blockIdx.y;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint32_t nc = n_features + 1u;
+    const uint32_t tc_base = levels * SHX_FRAME_WORDS;
+    float* p = out + ((uint64_t)row * k + g) * nc;
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        const uint64_t sid = (uint64_t)t * n_rows + row;
+        for (uint32_t u = 0; u < un; ++u) {
+            const uint32_t f = m.uniq_feats[ub + u];
+            p[f] = SHX_FADD(p[f], scratch[(uint64_t)(tc_base + u) * stride + sid]);
+        }
+    }
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], group_root_mean[g]);
+    const float bias = margin != nullptr ? margin[(uint64_t)row * k + g] : group_bias[g];
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], bias);
+}
+
+// ================================================= SHAP: tree-parallel interactions
+//
+// `shx_interactions` walks each (row, output)'s trees in sequence and adds
+// every delta straight into the row's matrix, so a small batch is limited by
+// one thread's walk over the ensemble. Which cell each delta lands in, and in
+// which order, depends only on the tree structure (the host precomputes it per
+// tree). `shx_interactions_log` therefore walks every (row, tree) pair
+// independently and only records the values (`shx_run_tree<2>`), and
+// `shx_interactions_apply` adds them to the matrices: one thread per (row,
+// output, matrix row r) visits the output's trees in order and, inside a tree,
+// that row's log entries in log order. Every cell thus receives the same
+// additions in the same order as in `shx_interactions` (the zero partner
+// deltas it skips are exact no-ops: a cell starts at +0 and is never -0), so
+// the matrices are identical bit for bit.
+//
+// Log layout: value j of tree t for row `row` is at
+// log[(ix_tree_begin[t] + j) * n_rows + row]. Entries of tree t's feature slot
+// q (global slot index ub + s, feature uniq_feats[ub + s]) are
+// [ix_slot_ptr[q], ix_slot_ptr[q + 1]) of ix_entry_index (j) / ix_entry_col.
+extern "C" __global__ void shx_interactions_log(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, const uint32_t* __restrict__ ix_tree_begin,
+    float* __restrict__ scratch, float* __restrict__ log) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (row >= n_rows || t >= n_trees) return;
+    const uint32_t root = m.tree_node_begin[t];
+    if ((m.flags[root] & 1u) != 0u) return;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint64_t sid = (uint64_t)t * n_rows + row;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    float* row_log = log + (uint64_t)ix_tree_begin[t] * n_rows + row;
+    shx_run_tree<2>(m, feats, rn, rw, root, su, sf, stride, sid, 0u, row_log, n_features + 1u,
+                    (uint64_t)n_rows);
+}
+
+extern "C" __global__ void shx_interactions_apply(
+    SHX_MODEL_PARAMS,
+    uint32_t n_rows, uint32_t n_features, uint32_t n_trees, uint32_t k,
+    const uint32_t* __restrict__ ix_tree_begin, const uint32_t* __restrict__ ix_slot_ptr,
+    const uint32_t* __restrict__ ix_entry_index, const uint32_t* __restrict__ ix_entry_col,
+    const float* __restrict__ log, float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t nc = n_features + 1u;
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n_rows * nc) return;
+    const uint32_t row = (uint32_t)(idx / nc);
+    const uint32_t r = (uint32_t)(idx % nc);
+    const uint32_t g = blockIdx.y;
+    float* mat_row = out + ((uint64_t)row * k + g) * nc * nc + (uint64_t)r * nc;
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        uint32_t q = 0xffffffffu;
+        for (uint32_t s = 0; s < un; ++s) {
+            if (m.uniq_feats[ub + s] == r) {
+                q = ub + s;
+                break;
+            }
+        }
+        if (q == 0xffffffffu) continue;
+        const uint64_t base = (uint64_t)ix_tree_begin[t];
+        for (uint32_t e = ix_slot_ptr[q]; e < ix_slot_ptr[q + 1u]; ++e) {
+            const uint32_t c = ix_entry_col[e];
+            mat_row[c] = SHX_FADD(mat_row[c],
+                                  log[(base + ix_entry_index[e]) * n_rows + row]);
+        }
+    }
 }
