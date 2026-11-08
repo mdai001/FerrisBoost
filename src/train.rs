@@ -2704,21 +2704,22 @@ struct LevelNode {
 }
 
 enum NodeRows {
-    Host(Vec<RowId>),
+    /// 本层宿主行缓冲里的一段(见 [`HostSpan`])。
+    Host(HostSpan),
     Device(crate::backend::cuda::GpuRowSpan),
 }
 
 impl NodeRows {
     fn len(&self) -> usize {
         match self {
-            Self::Host(rows) => rows.len(),
+            Self::Host(span) => span.len,
             Self::Device(span) => span.len,
         }
     }
 
-    fn host(&self) -> &[RowId] {
+    fn host<'a>(&self, buf: &'a [RowId]) -> &'a [RowId] {
         match self {
-            Self::Host(rows) => rows,
+            Self::Host(span) => span.of(buf),
             Self::Device(_) => panic!("device rows 被送进 CPU 路径"),
         }
     }
@@ -2884,12 +2885,22 @@ fn build_tree(
     // 用同一套比较,不经过浮点阈值往返。
     let mut split_info: Vec<DropSplit> = Vec::new();
 
+    // CPU:本层所有节点的行下标住在 `rows_cur` 里,分区写进 `rows_next`
+    // 同一段位置,每层交换(见 `partition_level_host`)。GPU 两个都空着。
+    let mut rows_cur: Vec<RowId> = Vec::new();
+    let mut rows_next: Vec<RowId> = Vec::new();
     let root_rows = match gpu {
         Some(ctx) => NodeRows::Device(ctx.begin_tree_rows()?),
-        None => NodeRows::Host(match kept_rows {
-            Some(kept) => kept,
-            None => identity_rows(source.n_rows()),
-        }),
+        None => {
+            rows_cur = match kept_rows {
+                Some(kept) => kept,
+                None => identity_rows(source.n_rows()),
+            };
+            NodeRows::Host(HostSpan {
+                start: 0,
+                len: rows_cur.len(),
+            })
+        }
     };
     drop(setup_timer);
     let mut level = vec![LevelNode {
@@ -3173,7 +3184,7 @@ fn build_tree(
                                 .iter()
                                 .zip(per_node.iter_mut())
                                 .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
-                                .map(|(ln, h)| (ln.rows.host(), h.bins.as_mut_slice()))
+                                .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
                                 .collect();
                             hist::build_nodes(
                                 &block.data,
@@ -3390,6 +3401,38 @@ fn build_tree(
                 }
             }
         }
+        if gpu.is_none() {
+            // CPU:整层一起分(见 `partition_level_host`)。节点按层内顺序,
+            // 也就是按行缓冲里的位置升序。
+            let nodes: Vec<(HostSpan, SplitCandidate)> = level
+                .iter()
+                .zip(&chosen)
+                .filter_map(|(ln, c)| match (&ln.rows, c) {
+                    (NodeRows::Host(span), Some(c)) => Some((*span, *c)),
+                    _ => None,
+                })
+                .collect();
+            if !nodes.is_empty() {
+                if rows_next.len() != rows_cur.len() {
+                    rows_next = vec![0 as RowId; rows_cur.len()];
+                }
+                let spans = partition_level_host(
+                    &rows_cur,
+                    &mut rows_next,
+                    &nodes,
+                    PartCols::for_nodes(source, &nodes),
+                    comm,
+                )?;
+                let mut spans = spans.into_iter();
+                for (i, c) in chosen.iter().enumerate() {
+                    if c.is_some() {
+                        let (left, right) = spans.next().expect("每个分裂节点一对孩子");
+                        partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
+                    }
+                }
+            }
+            by_feat.clear();
+        }
         for (feat, node_idxs) in by_feat {
             let node_idxs: Vec<_> = node_idxs
                 .into_iter()
@@ -3421,7 +3464,8 @@ fn build_tree(
                     Ordering::Relaxed,
                 );
             }
-            if let Some(ctx) = gpu {
+            {
+                let ctx = gpu.expect("CPU 分区已在上面整层完成");
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
@@ -3448,12 +3492,6 @@ fn build_tree(
                     &prof::GPU_PART_D2H,
                     &prof::GPU_PART_HOST,
                 );
-            } else {
-                for i in node_idxs {
-                    let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    let (left, right) = partition_rows(level[i].rows.host(), col, &c, comm);
-                    partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
-                }
             }
         }
 
@@ -3487,7 +3525,7 @@ fn build_tree(
                     ctx.assign_leaf_value(ln.rows.device(), value)?;
                 } else {
                     let _t_pred = prof::Timer::new(&prof::UPDATE_PRED);
-                    for &row in ln.rows.host() {
+                    for &row in ln.rows.host(&rows_cur) {
                         predictions[row as usize] += value;
                     }
                 }
@@ -3564,6 +3602,11 @@ fn build_tree(
         if let Some(ctx) = gpu {
             ctx.finish_partition_level()?;
         }
+        // 孩子的行已经在 `rows_next` 里;本层不分裂的叶子刚才已从 `rows_cur`
+        // 施加完,旧缓冲从此只当下一层的输出用。
+        if gpu.is_none() {
+            std::mem::swap(&mut rows_cur, &mut rows_next);
+        }
         level = next;
     }
 
@@ -3581,7 +3624,7 @@ fn build_tree(
                 .iter()
                 .map(|ln| {
                     debug_assert!(t.nodes[ln.node].is_leaf);
-                    (ln.rows.host(), t.nodes[ln.node].leaf_value)
+                    (ln.rows.host(&rows_cur), t.nodes[ln.node].leaf_value)
                 })
                 .collect();
             apply_host_leaf_updates(predictions, &leaves);
@@ -3893,25 +3936,38 @@ fn partition_orders() -> &'static [PartitionOrder; 256] {
     })
 }
 
-/// 按选中的分裂把行分到左右两边。
+/// 一个节点在宿主行缓冲里占的连续一段。
 ///
-/// 分区用的是 **bin**(训练侧手里就是量化数据),和 `leaf_values` 里
-/// 把阈值换回 bin 再比是同一套语义,`tree::split_bin` /
-/// `split_threshold` 的往返测试钉着这一点。
-fn partition_rows(
-    rows: &[RowId],
-    col: &[Bin],
-    c: &SplitCandidate,
-    comm: &dyn Comm,
-) -> (Vec<RowId>, Vec<RowId>) {
-    // 每行 1 bit。多卡时只有持有该特征的一方知道每行去哪边,这个
-    // 结果必须广播出去 —— 这是主要通信开销,阶段 4 要单独 benchmark。
-    // 单机 Local 是空操作,但走一遍这条路,换后端时训练逻辑不用动。
-    let _t = prof::Timer::new(&prof::PART_BITS);
-    let mut bits = vec![0u8; rows.len().div_ceil(8)];
-    // 按**字节**攒够 8 个 bit 再写一次,而不是每行都对 bits[k/8] 做一次
-    // 读-改-写。同样的结果,内存流量少 8 倍。
-    let fill_byte = |byte: &mut u8, chunk: &[RowId]| {
+/// CPU 路径上一层所有节点的行下标住在**同一个**缓冲里,按节点顺序首尾相接;
+/// 分区把左右孩子写进另一个缓冲的同一段位置(左在前、右在后),两缓冲每层
+/// 交换一次。不再为每个节点分配两条新 `Vec`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostSpan {
+    start: usize,
+    len: usize,
+}
+
+impl HostSpan {
+    fn of<'a>(&self, buf: &'a [RowId]) -> &'a [RowId] {
+        &buf[self.start..self.start + self.len]
+    }
+}
+
+/// 整层分区的一个任务:某节点的一段连续行。必须是 8 的倍数,任务的方向
+/// bit 才按 byte 对齐,各任务写互不重叠的 byte。
+const PART_TASK_ROWS: usize = 8 * 1024;
+
+struct PartTask {
+    /// 在 `nodes` 里的下标
+    node: usize,
+    /// 行缓冲里的绝对位置
+    rows: std::ops::Range<usize>,
+}
+
+/// 一段行的方向 bit:第 `j` 行走左则 `out[j / 8]` 的第 `j % 8` 位为 1。
+fn fill_partition_bits(rows: &[RowId], col: &[Bin], c: &SplitCandidate, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), rows.len().div_ceil(8));
+    for (byte, chunk) in out.iter_mut().zip(rows.chunks(8)) {
         let mut acc = 0u8;
         for (j, &r) in chunk.iter().enumerate() {
             let bin = col[r as usize];
@@ -3926,90 +3982,204 @@ fn partition_rows(
             acc |= (go_left as u8) << j;
         }
         *byte = acc;
-    };
-    if rows.len() >= PARTITION_MIN_ROWS_PER_SEGMENT {
-        bits.par_iter_mut().enumerate().for_each(|(i, byte)| {
-            let start = i * 8;
-            fill_byte(byte, &rows[start..(start + 8).min(rows.len())]);
-        });
-    } else {
-        for (byte, chunk) in bits.iter_mut().zip(rows.chunks(8)) {
-            fill_byte(byte, chunk);
-        }
     }
-    comm.broadcast_partition(owner_rank(c.feat), &mut bits);
-    drop(_t);
-
-    let _t = prof::Timer::new(&prof::PART_SPLIT);
-    let (left, right) = split_rows_by_prefix(rows, &bits);
-    drop(_t);
-    (left, right)
 }
 
-/// 小节点直接串行更便宜;大节点最多切成当前 pool 的线程数份。
-const PARTITION_MIN_ROWS_PER_SEGMENT: usize = 16 * 1024;
-
-/// 按已经广播好的方向 bit 做稳定分区。
+/// 按选中的分裂把**一整层**节点的行分到左右两边。
 ///
-/// 每段覆盖连续、按 byte 对齐的输入。先并行计数,再串行前缀和得到每段
-/// 的左右写入区间,最后并行写不相交的输出切片。段内和段间都保持原顺序,
-/// 所以结果和串行 stable partition 逐字节相同。
-fn split_rows_by_prefix(rows: &[RowId], bits: &[u8]) -> (Vec<RowId>, Vec<RowId>) {
-    debug_assert_eq!(bits.len(), rows.len().div_ceil(8));
-    if rows.is_empty() {
-        return (Vec::new(), Vec::new());
+/// 分区用的是 **bin**(训练侧手里就是量化数据),和 `leaf_values` 里
+/// 把阈值换回 bin 再比是同一套语义,`tree::split_bin` /
+/// `split_threshold` 的往返测试钉着这一点。
+///
+/// `nodes` 按 `start` 升序、互不重叠(本层的节点顺序)。节点 `k` 的左孩子
+/// 写进 `next[start..start + n_left]`,右孩子紧随其后;两边都保持原顺序
+/// (稳定分区),所以孩子的行集合和逐节点分区逐字节相同。
+///
+/// 任务是 (节点, 一段行) 的扁平列表,整层只有两次 fork-join:
+/// 第一趟并行算方向 bit,第二趟并行把行写到各自的输出段。以前是每个节点
+/// 三次(bit、计数、写),深层几十个小节点时线程大多在等 join。
+///
+/// 分区要读的列从哪来。
+enum PartCols<'a> {
+    /// 驻留 source:每个节点分裂特征的列(与 `nodes` 一一对应),零拷贝。
+    Resident(Vec<&'a [Bin]>),
+    /// 只能交出拷贝的 source:按特征分批取,任何时刻只持有一列
+    /// (峰值内存同逐列分区)。
+    Fetch(&'a dyn BlockSource),
+}
+
+impl<'a> PartCols<'a> {
+    fn for_nodes(source: &'a dyn BlockSource, nodes: &[(HostSpan, SplitCandidate)]) -> Self {
+        match nodes
+            .iter()
+            .map(|(_, c)| source.resident_feature_column(c.feat))
+            .collect()
+        {
+            Some(cols) => Self::Resident(cols),
+            None => Self::Fetch(source),
+        }
     }
+}
 
-    let max_segments = rayon::current_num_threads().min(bits.len());
-    let n_segments = rows
-        .len()
-        .div_ceil(PARTITION_MIN_ROWS_PER_SEGMENT)
-        .clamp(1, max_segments);
-    let bytes_per_segment = bits.len().div_ceil(n_segments);
-    let segments: Vec<(usize, usize)> = (0..bits.len())
-        .step_by(bytes_per_segment)
-        .map(|start| (start, (start + bytes_per_segment).min(bits.len())))
-        .collect();
+fn partition_level_host(
+    rows: &[RowId],
+    next: &mut [RowId],
+    nodes: &[(HostSpan, SplitCandidate)],
+    cols: PartCols<'_>,
+    comm: &dyn Comm,
+) -> anyhow::Result<Vec<(HostSpan, HostSpan)>> {
+    debug_assert_eq!(rows.len(), next.len());
+    debug_assert!(nodes
+        .windows(2)
+        .all(|w| w[0].0.start + w[0].0.len <= w[1].0.start));
+    let bits_timer = prof::Timer::new(&prof::PART_BITS);
+    // 节点 k 的方向 bit 占 `node_bits[k]` 这段 byte(按节点首尾相接)。
+    let mut tasks: Vec<PartTask> = Vec::new();
+    let mut node_bits: Vec<std::ops::Range<usize>> = Vec::with_capacity(nodes.len());
+    let mut n_bytes = 0usize;
+    for (k, (span, _)) in nodes.iter().enumerate() {
+        let mut off = 0usize;
+        while off < span.len {
+            let end = (off + PART_TASK_ROWS).min(span.len);
+            tasks.push(PartTask {
+                node: k,
+                rows: span.start + off..span.start + end,
+            });
+            off = end;
+        }
+        node_bits.push(n_bytes..n_bytes + span.len.div_ceil(8));
+        n_bytes += span.len.div_ceil(8);
+    }
+    let mut bits = vec![0u8; n_bytes];
+    {
+        // 每个任务独占自己那段 byte:任务按 byte 位置升序,顺次切开即可。
+        let mut work: Vec<(&PartTask, &mut [u8])> = Vec::with_capacity(tasks.len());
+        let mut rest = bits.as_mut_slice();
+        for t in &tasks {
+            let (head, tail) = rest.split_at_mut(t.rows.len().div_ceil(8));
+            work.push((t, head));
+            rest = tail;
+        }
+        debug_assert!(rest.is_empty());
+        match cols {
+            PartCols::Resident(cols) => work.into_par_iter().for_each(|(t, out)| {
+                let c = &nodes[t.node].1;
+                fill_partition_bits(&rows[t.rows.clone()], cols[t.node], c, out);
+            }),
+            PartCols::Fetch(source) => {
+                let mut feats: Vec<FeatId> = nodes.iter().map(|(_, c)| c.feat).collect();
+                feats.sort_unstable();
+                feats.dedup();
+                for feat in feats {
+                    let fetch_timer = prof::Timer::new(&prof::PART_FETCH);
+                    let col = source.feature_column(feat)?;
+                    drop(fetch_timer);
+                    let (this, rest): (Vec<_>, Vec<_>) = work
+                        .into_iter()
+                        .partition(|(t, _)| nodes[t.node].1.feat == feat);
+                    work = rest;
+                    this.into_par_iter().for_each(|(t, out)| {
+                        let c = &nodes[t.node].1;
+                        fill_partition_bits(&rows[t.rows.clone()], &col, c, out);
+                    });
+                }
+                debug_assert!(work.is_empty());
+            }
+        }
+    }
+    if prof::enabled() {
+        use std::sync::atomic::Ordering;
+        let mut feats: Vec<FeatId> = nodes.iter().map(|(_, c)| c.feat).collect();
+        feats.sort_unstable();
+        feats.dedup();
+        prof::PART_COLS.fetch_add(feats.len() as u64, Ordering::Relaxed);
+        prof::PART_ROWS.fetch_add(
+            nodes.iter().map(|(s, _)| s.len as u64).sum::<u64>(),
+            Ordering::Relaxed,
+        );
+    }
+    // 每行 1 bit。多卡时只有持有该特征的一方知道每行去哪边,这个
+    // 结果必须广播出去 —— 这是主要通信开销,阶段 4 要单独 benchmark。
+    // 单机 Local 是空操作,但走一遍这条路,换后端时训练逻辑不用动。
+    for ((_, c), range) in nodes.iter().zip(&node_bits) {
+        comm.broadcast_partition(owner_rank(c.feat), &mut bits[range.clone()]);
+    }
+    drop(bits_timer);
 
-    let left_counts: Vec<usize> = segments
-        .par_iter()
-        .map(|&(start, end)| {
-            bits[start..end]
-                .iter()
-                .map(|b| b.count_ones() as usize)
-                .sum()
+    let _t = prof::Timer::new(&prof::PART_SPLIT);
+    // 计数在广播**之后**按 bit 数:非持有方的方向全来自广播。
+    // 整层 bit 只有行数 / 8 个 byte,串行数一遍可以忽略。
+    let mut byte = 0usize;
+    let left_counts: Vec<usize> = tasks
+        .iter()
+        .map(|t| {
+            let n = t.rows.len();
+            let bytes = &bits[byte..byte + n.div_ceil(8)];
+            byte += n.div_ceil(8);
+            let full: usize = bytes[..n / 8].iter().map(|b| b.count_ones() as usize).sum();
+            let tail = if n % 8 != 0 {
+                (bytes[n / 8] & ((1u8 << (n % 8)) - 1)).count_ones() as usize
+            } else {
+                0
+            };
+            full + tail
         })
         .collect();
 
-    let mut left_offsets = Vec::with_capacity(segments.len() + 1);
-    let mut right_offsets = Vec::with_capacity(segments.len() + 1);
-    left_offsets.push(0usize);
-    right_offsets.push(0usize);
-    for (&(start_byte, end_byte), &n_left) in segments.iter().zip(&left_counts) {
-        let start_row = start_byte * 8;
-        let end_row = (end_byte * 8).min(rows.len());
-        left_offsets.push(left_offsets.last().unwrap() + n_left);
-        right_offsets.push(right_offsets.last().unwrap() + (end_row - start_row - n_left));
+    // 输出切片:节点 k 的那段是 [各任务的左段..., 各任务的右段...],
+    // 节点之间的空隙(本层不分裂的叶子)跳过。全部互不重叠,无需加锁。
+    let mut outs: Vec<(&mut [RowId], &mut [RowId])> = Vec::with_capacity(tasks.len());
+    let mut spans = Vec::with_capacity(nodes.len());
+    let mut rest = next;
+    let mut pos = 0usize;
+    let mut ti = 0usize;
+    for (k, (span, _)) in nodes.iter().enumerate() {
+        let (_, tail) = rest.split_at_mut(span.start - pos);
+        rest = tail;
+        let first = ti;
+        while ti < tasks.len() && tasks[ti].node == k {
+            ti += 1;
+        }
+        let n_left: usize = left_counts[first..ti].iter().sum();
+        let (mut left, tail) = rest.split_at_mut(n_left);
+        let (mut right, tail) = tail.split_at_mut(span.len - n_left);
+        rest = tail;
+        pos = span.start + span.len;
+        for (t, &nl) in tasks[first..ti].iter().zip(&left_counts[first..ti]) {
+            let (l, lt) = left.split_at_mut(nl);
+            let (r, rt) = right.split_at_mut(t.rows.len() - nl);
+            left = lt;
+            right = rt;
+            outs.push((l, r));
+        }
+        spans.push((
+            HostSpan {
+                start: span.start,
+                len: n_left,
+            },
+            HostSpan {
+                start: span.start + n_left,
+                len: span.len - n_left,
+            },
+        ));
     }
 
-    let mut left = vec![0 as RowId; *left_offsets.last().unwrap()];
-    let mut right = vec![0 as RowId; *right_offsets.last().unwrap()];
-    let left_parts = split_output_by_offsets(&mut left, &left_offsets);
-    let right_parts = split_output_by_offsets(&mut right, &right_offsets);
+    let mut byte_starts = Vec::with_capacity(tasks.len());
+    let mut byte = 0usize;
+    for t in &tasks {
+        byte_starts.push(byte);
+        byte += t.rows.len().div_ceil(8);
+    }
     let orders = partition_orders();
-
-    segments
-        .into_par_iter()
-        .zip(left_parts)
-        .zip(right_parts)
-        .for_each(|(((start_byte, end_byte), left_out), right_out)| {
+    let bits = &bits;
+    tasks
+        .par_iter()
+        .zip(byte_starts.par_iter())
+        .zip(outs.into_par_iter())
+        .for_each(|((t, &b0), (left_out, right_out))| {
+            let rows = &rows[t.rows.clone()];
             let (mut li, mut ri) = (0usize, 0usize);
-            #[allow(clippy::needless_range_loop)]
-            // Physical byte offsets index both masks and stable row spans.
-            for byte in start_byte..end_byte {
-                let start = byte * 8;
-                let chunk = &rows[start..(start + 8).min(rows.len())];
-                let mask = bits[byte];
+            for (chunk, &mask) in rows.chunks(8).zip(&bits[b0..]) {
                 if chunk.len() == 8 {
                     let order = &orders[mask as usize];
                     for &j in &order.left[..order.n_left as usize] {
@@ -4021,7 +4191,7 @@ fn split_rows_by_prefix(rows: &[RowId], bits: &[u8]) -> (Vec<RowId>, Vec<RowId>)
                         ri += 1;
                     }
                 } else {
-                    // 只有全局最后一个 byte 可能不足 8 行。高位不是输入,
+                    // 只有节点最后一个 byte 可能不足 8 行。高位不是输入,
                     // 不能直接按完整查表写。
                     for (j, &row) in chunk.iter().enumerate() {
                         if mask & (1 << j) != 0 {
@@ -4037,23 +4207,7 @@ fn split_rows_by_prefix(rows: &[RowId], bits: &[u8]) -> (Vec<RowId>, Vec<RowId>)
             debug_assert_eq!(li, left_out.len());
             debug_assert_eq!(ri, right_out.len());
         });
-
-    (left, right)
-}
-
-/// 根据前缀 offset 把一个输出切成互不重叠的可变段。这样并行写阶段
-/// 不需要锁,也不需要裸指针。
-fn split_output_by_offsets<'a>(output: &'a mut [RowId], offsets: &[usize]) -> Vec<&'a mut [RowId]> {
-    let mut parts = Vec::with_capacity(offsets.len().saturating_sub(1));
-    let mut rest = output;
-    for range in offsets.windows(2) {
-        let len = range[1] - range[0];
-        let (part, tail) = rest.split_at_mut(len);
-        parts.push(part);
-        rest = tail;
-    }
-    debug_assert!(rest.is_empty());
-    parts
+    Ok(spans)
 }
 
 /// 哪个 rank 持有这个特征。单机永远是 0;阶段 4 换成列 → rank 的映射。
@@ -4677,8 +4831,9 @@ mod tests {
     }
 
     #[test]
-    fn prefix_partition_is_thread_count_independent_and_stable() {
-        let n = 100_003usize; // 多线程阈值以上,并带不足 8 行的尾巴
+    fn level_partition_is_thread_count_independent_and_stable() {
+        // 多个任务大小以上,并带不足 8 行的尾巴;节点之间留空隙(不分裂的叶子)。
+        let n = 100_003usize;
         let rows: Vec<RowId> = (0..n as RowId).rev().collect();
         let col: Vec<Bin> = (0..n)
             .map(|r| {
@@ -4689,48 +4844,89 @@ mod tests {
                 }
             })
             .collect();
+        let spans = [
+            HostSpan {
+                start: 0,
+                len: 40_001,
+            },
+            HostSpan {
+                start: 40_001,
+                len: 3,
+            },
+            HostSpan {
+                start: 50_000,
+                len: n - 50_000,
+            },
+        ];
 
         for missing_left in [false, true] {
-            let cand = SplitCandidate {
+            let cand = |bin| SplitCandidate {
                 feat: 0,
-                bin: 3,
+                bin,
                 gain: 1.0,
                 left: GradPairFixed::default(),
                 right: GradPairFixed::default(),
                 missing_left,
                 cats: None,
             };
+            let nodes: Vec<(HostSpan, SplitCandidate)> = spans
+                .iter()
+                .zip([3, 1, 4])
+                .map(|(s, b)| (*s, cand(b)))
+                .collect();
             let run = |nthread| {
-                crate::threading::build_pool(nthread)
+                let mut next = vec![RowId::MAX; n];
+                let out = crate::threading::build_pool(nthread)
                     .unwrap()
-                    .install(|| partition_rows(&rows, &col, &cand, &Local))
+                    .install(|| {
+                        partition_level_host(
+                            &rows,
+                            &mut next,
+                            &nodes,
+                            PartCols::Resident(vec![&col; nodes.len()]),
+                            &Local,
+                        )
+                    })
+                    .unwrap();
+                (out, next)
             };
             let one = run(1);
             let eight = run(8);
             assert_eq!(one, eight, "1/8 线程的行索引必须逐字节相同");
 
-            let goes_left = |&row: &RowId| {
-                let bin = col[row as usize];
-                if bin == MISSING_BIN {
-                    missing_left
-                } else {
-                    (bin as u32) < cand.bin
-                }
-            };
-            assert_eq!(
-                one.0,
-                rows.iter()
-                    .filter(|r| goes_left(r))
-                    .copied()
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                one.1,
-                rows.iter()
-                    .filter(|r| !goes_left(r))
-                    .copied()
-                    .collect::<Vec<_>>()
-            );
+            let (out, next) = one;
+            for ((span, c), (left, right)) in nodes.iter().zip(&out) {
+                let goes_left = |&row: &RowId| {
+                    let bin = col[row as usize];
+                    if bin == MISSING_BIN {
+                        missing_left
+                    } else {
+                        (bin as u32) < c.bin
+                    }
+                };
+                let input = span.of(&rows);
+                assert_eq!(left.start, span.start);
+                assert_eq!(right.start, left.start + left.len);
+                assert_eq!(left.len + right.len, span.len);
+                assert_eq!(
+                    left.of(&next),
+                    input
+                        .iter()
+                        .filter(|r| goes_left(r))
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    right.of(&next),
+                    input
+                        .iter()
+                        .filter(|r| !goes_left(r))
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+            }
+            // 空隙(不分裂的节点)不被写。
+            assert!(next[40_004..50_000].iter().all(|&r| r == RowId::MAX));
         }
     }
 
