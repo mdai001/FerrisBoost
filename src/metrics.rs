@@ -31,6 +31,24 @@ pub trait Metric: Send + Sync {
         }
     }
 
+    /// Weighted evaluation with query groups (`group_ptr` = `n_groups + 1` row
+    /// offsets). Only ranking metrics use the groups, and for them `weight` is
+    /// per group. Every other metric ignores `group_ptr`.
+    fn eval_grouped(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        _group_ptr: Option<&[u32]>,
+    ) -> f32 {
+        self.eval_weighted(pred, label, weight)
+    }
+
+    /// Reject labels the metric cannot score (e.g. non-binary labels for `map`).
+    fn check_labels(&self, _labels: &[f32], _what: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// 值越小越好?early stopping 靠这个判断方向。
     fn lower_is_better(&self) -> bool {
         true
@@ -389,6 +407,9 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
         Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
             Box::new(MultiClass::new(MultiKind::LogLoss, num_class as usize))
         }
+        Objective::Rank { kind, params } => {
+            Box::new(crate::rank::RankMetric::default_for(kind, &params))
+        }
     }
 }
 
@@ -398,6 +419,24 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
 /// `binary:logistic`;`rmse` 两个 objective 都接(二分类时和 XGBoost
 /// 一样在概率上算)。不认识或组合不支持时返回说明原因的错误。
 pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, String> {
+    // Ranking metrics (`ndcg`, `map`, `pre`, with `@k` / `-`) need query groups,
+    // so they pair with the ranking objectives and nothing else.
+    if let Objective::Rank { params, .. } = obj {
+        return crate::rank::RankMetric::parse(name, params.ndcg_exp_gain)
+            .map(|m| Box::new(m) as Box<dyn Metric>)
+            .map_err(|e| {
+                format!(
+                    "{e}; {} supports the ranking metrics ndcg / ndcg@k / ndcg@k- / map / map@k / pre@k",
+                    obj.name()
+                )
+            });
+    }
+    if crate::rank::is_rank_metric_name(name) {
+        return Err(format!(
+            "eval_metric {name:?} 不支持:它是排序指标,需要排序 objective \
+             (rank:ndcg / rank:pairwise / rank:map)和 query groups"
+        ));
+    }
     // 多分类只接 mlogloss / merror(XGBoost 对其它指标会因为预测长度不符报错)。
     if obj.is_multiclass() {
         let k = obj.num_outputs();

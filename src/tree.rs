@@ -1582,7 +1582,7 @@ mod tests {
     fn rejects_what_it_cannot_represent() {
         let cases = [
             ("\"num_class\": \"0\"", "\"num_class\": \"3\"", "多分类"),
-            ("\"binary:logistic\"", "\"rank:pairwise\"", "objective"),
+            ("\"binary:logistic\"", "\"survival:cox\"", "objective"),
             (
                 "\"num_parallel_tree\": \"1\"",
                 "\"num_parallel_tree\": \"4\"",

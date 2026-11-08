@@ -21,7 +21,7 @@ pub use inference::GpuInferenceModel;
 pub(crate) use train_ctx::GpuSplitGroup;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
-    GpuSegmentTiming, GpuTrainCtx,
+    GpuSegmentTiming, GpuTrainCtx, RankDeviceInputs,
 };
 
 const HISTOGRAM_PTX: &str = include_str!("histogram.ptx");
@@ -156,6 +156,10 @@ pub struct SharedHistogramConfig {
     /// `K > 1` 才有内存代价:常驻 prediction 变成 `K × n`,外加每行 softmax 统计量。
     /// 规划器必须用同一个 K(`gpu_mem_plan::fast_multiclass_extra_bytes`)。
     pub n_outputs: usize,
+    /// `gpu_math = Fast` with a ranking objective: the shape of the device LambdaMART
+    /// buffers (allocated once, charged by the planner with the same
+    /// `gpu_mem_plan::fast_rank_bytes`). `None` for every other training.
+    pub fast_rank: Option<crate::gpu_mem_plan::FastRankShape>,
 }
 
 impl Default for SharedHistogramConfig {
@@ -176,6 +180,7 @@ impl Default for SharedHistogramConfig {
             gpu_math: crate::types::GpuMath::Exact,
             fast_weights: false,
             n_outputs: 1,
+            fast_rank: None,
         }
     }
 }
