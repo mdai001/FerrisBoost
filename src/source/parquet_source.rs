@@ -1549,7 +1549,9 @@ impl ParquetBlockSource {
         );
         crate::ensure_input!(
             manifest.cols_per_block == cols_per_block,
-            "cache column block width differs"
+            "cache cols_per_block differs (cached {}, this run {}); pass the cached value or rebuild the cache",
+            manifest.cols_per_block,
+            cols_per_block
         );
         if max_bins != 0 {
             crate::ensure_input!(manifest.max_bins == max_bins, "cache max_bin differs");

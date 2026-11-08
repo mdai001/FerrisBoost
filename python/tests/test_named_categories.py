@@ -403,3 +403,89 @@ def test_gpu_training_and_prediction_match_the_cpu(tmp_path, k):
                                   cpu.predict(df, output_margin=True))
     np.testing.assert_array_equal(cpu.predict(files, use_gpu=True, output_margin=True),
                                   cpu.predict(files, output_margin=True))
+
+
+# ------------------------------------------------- named categories on 16-bit blocks
+def model_bytes(model, tmp_path, name):
+    path = tmp_path / f"{name}.json"
+    model.save_model(str(path), quiet=True)
+    return path, path.read_bytes()
+
+
+def max_split_code(doc):
+    trees = doc["learner"]["gradient_booster"]["model"]["trees"]
+    return max((max(t["categories"]) for t in trees if t["categories"]), default=-1)
+
+
+@pytest.mark.parametrize("k", [254, 255, 3000])
+def test_wide_named_categories_match_xgboost_gpu_and_round_trip(tmp_path, k):
+    # 254 names (codes 0..=253) are the largest 8-bit feature, 255 and more go
+    # to a 16-bit block; the names, the re-coding and the trees must not care.
+    v, x1, y, cats = make(n=8000, k=k, seed=21)
+    order = list(np.random.default_rng(3).permutation(cats))
+    df, reordered = frame(v, x1, order), frame(v, x1, sorted(cats))
+    p = {**FB, "enable_categorical": True, "max_cat_threshold": 128}
+    ours = fb.train(p, df, label=y, num_boost_round=4, quiet=True)
+    assert ours.get_categories() == [None, order]
+    bst = xgb_model(df, y, 4, {"max_cat_threshold": 128})
+    margin = ours.predict(reordered, output_margin=True)
+    np.testing.assert_array_equal(margin, xgb_margin(bst, df))
+    path, cpu_bytes = model_bytes(ours, tmp_path, "cpu")
+    doc = json.loads(cpu_bytes)
+    ref = json.loads(bst.save_raw("json"))
+    assert cats_of(doc) == cats_of(ref)
+    if k > 254:
+        assert max_split_code(doc) > 253
+    # FerrisBoost -> XGBoost: same categories, same margins on a reordered frame.
+    loaded = xgb.Booster(model_file=str(path))
+    np.testing.assert_array_equal(xgb_margin(loaded, reordered), margin)
+    assert cats_of(json.loads(loaded.save_raw("json"))) == cats_of(doc)
+    # XGBoost -> FerrisBoost.
+    xpath = tmp_path / "x.json"
+    bst.save_model(str(xpath))
+    back = fb.Model.load_model(str(xpath), quiet=True)
+    assert back.get_categories() == ours.get_categories()
+    np.testing.assert_array_equal(back.predict(reordered, output_margin=True), margin)
+    # GPU exact trains the same bytes (planner's choice, then pure streaming).
+    if _has_cuda():
+        for resident in (None, 0):
+            g = {**p, "device": "cuda", "gpu_math": "exact"}
+            if resident is not None:
+                g["resident_blocks"] = resident
+            gpu = fb.train(g, df, label=y, num_boost_round=4, quiet=True)
+            assert model_bytes(gpu, tmp_path, "gpu")[1] == cpu_bytes, resident
+        np.testing.assert_array_equal(ours.predict(reordered, use_gpu=True, output_margin=True),
+                                      margin)
+
+
+def test_wide_named_parquet_dictionaries_with_the_16_bit_cache(tmp_path):
+    # A string dictionary with more than 254 names (the quantized cache is
+    # single-file): the cache is version 3 (16-bit block) and carries the names;
+    # building and reusing it on CPU and GPU exact gives the same bytes.
+    v, x1, y, cats = make(n=12000, k=900, seed=22)
+    files = write_parts(tmp_path, v, x1, y, n_parts=1, row_group_size=1500, name="w")[0]
+    p = {**FB, "max_cat_threshold": 128}
+    ref = fb.train(p, files, label="label", num_boost_round=4, quiet=True)
+    _, ref_bytes = model_bytes(ref, tmp_path, "ref")
+    stored = ref.get_categories()[1]
+    assert sorted(stored) == sorted(set(v) - {None})
+    df = frame(v, x1, stored)
+    bst = xgb_model(df, y, 4, {"max_cat_threshold": 128})
+    np.testing.assert_array_equal(ref.predict(files, output_margin=True), xgb_margin(bst, df))
+    assert max_split_code(json.loads(ref_bytes)) > 253
+    runs = [("cpu-build", {}, "cpu"), ("cpu-reuse", {}, "cpu")]
+    if _has_cuda():
+        runs += [("gpu-reuse", {"device": "cuda", "gpu_math": "exact"}, "cpu"),
+                 ("gpu-build", {"device": "cuda", "gpu_math": "exact"}, "gpu"),
+                 ("gpu-stream", {"device": "cuda", "gpu_math": "exact", "resident_blocks": 0},
+                  "gpu")]
+    for name, extra, cache in runs:
+        # A cache is tied to its cols_per_block; pin it so the GPU can reuse the
+        # CPU-built cache (the planner would pick its own).
+        c = {**p, **extra, "cache_path": str(tmp_path / f"cache-{cache}"),
+             "cache_budget_bytes": 0, "cols_per_block": 2}
+        m = fb.train(c, files, label="label", num_boost_round=4, quiet=True)
+        assert model_bytes(m, tmp_path, name)[1] == ref_bytes, name
+        manifest = json.loads((tmp_path / f"cache-{cache}" / "manifest.json").read_text())
+        assert manifest["version"] == 3 and 2 in manifest["block_widths"], name
+        assert manifest["categories"] == cats_of(json.loads(ref_bytes)), name
