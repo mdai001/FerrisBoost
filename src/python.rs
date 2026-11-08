@@ -262,6 +262,17 @@ fn resolve_blocking(
                     "GPU planning needs the row count, but this input source cannot provide it before open; construct the source with an explicit cols_per_block, and planning finishes with the real aggregate row count after open",
                 )
             })?;
+            // Fast ranking allocates per query group, so the planner needs the
+            // groups themselves; planning without them would have to guess.
+            let rank_groups: &[u32] = match (fast, cfg.objective.rank(), &cfg.group_ptr) {
+                (true, Some(_), Some(g)) => g,
+                (true, Some(_), None) => {
+                    return Err(PyRuntimeError::new_err(
+                        "GPU planning for fast ranking needs the query groups, but none were resolved before planning",
+                    ))
+                }
+                _ => &[],
+            };
             let p = resolve_gpu_streaming_plan(
                 cfg.requested_cols_per_block,
                 cfg.params.hist_streams,
@@ -305,27 +316,17 @@ fn resolve_blocking(
                     } else {
                         model
                     };
-                    // fast ranking: the device LambdaMART buffers. The group count is
-                    // known up front for arrays; file inputs plan with the row count
-                    // (an upper bound) and allocate for the real groups.
+                    // fast ranking: the device LambdaMART buffers, for the real query
+                    // groups. Array inputs carry them; file inputs read their query-id
+                    // column before planning (see `train_file`).
                     let model = match (fast, cfg.objective.rank()) {
                         (true, Some((kind, params))) => model.with_fast_rank(
                             rows,
-                            &crate::gpu_mem_plan::FastRankShape {
-                                n_groups: cfg
-                                    .group_ptr
-                                    .as_ref()
-                                    .map_or(rows, |g| (g.len() - 1) as u64),
-                                map: kind == crate::rank::RankKind::Map,
-                                mean: params.pair_method == crate::rank::PairMethod::Mean,
-                                // the largest group is not known for file inputs: the
-                                // row count is an upper bound
-                                n_positions: params.device_bias_positions(
-                                    cfg.group_ptr
-                                        .as_deref()
-                                        .map_or(rows as usize, crate::rank::max_group_size),
-                                ),
-                            },
+                            &crate::gpu_mem_plan::FastRankShape::for_groups(
+                                kind,
+                                &params,
+                                rank_groups,
+                            ),
                         ),
                         _ => model,
                     };
@@ -4113,6 +4114,21 @@ fn train_file(
         }
         _ => None,
     };
+    // Ranking: the GPU planner charges the fast ranking buffers per query group,
+    // so Parquet reads its query-id column (that column alone, every file in
+    // dataset order) before planning. Training consumes the same ids, so the
+    // planned groups are the trained groups and the column is read once. CSV
+    // cannot project a column cheaply before open; it reads the ids right after
+    // open, before its deferred plan.
+    let mut train_qid: Option<Vec<u64>> = match (fmt, targets.qid) {
+        ("parquet", Some(q)) => {
+            Some(parquet_source::read_u64_columns(&paths, q).map_err(to_py_err)?)
+        }
+        _ => None,
+    };
+    if let Some(ids) = &train_qid {
+        cfg.group_ptr = Some(crate::rank::group_ptr_from_qid(ids).map_err(to_py_err)?);
+    }
     // ⚠️ **路径入口是大数据 GPU 训练的首选路径**:Rust 读数据、量化/缓存、
     // 定块宽、建 source,Python 只给路径和参数。
     // 走 numpy 那条路等于先在 Python 里把整份数据物化一遍,
@@ -4319,7 +4335,7 @@ fn train_file(
                 }
             }
         };
-        let (weights, train_group_ptr) = group_inputs(read_qid(path)?, weights)?;
+        let (weights, train_group_ptr) = group_inputs(train_qid.take(), weights)?;
         let mut train_cfg = train_cfg;
         train_cfg.group_ptr = train_group_ptr;
         ingest_reporter.complete(src.n_rows());
@@ -4444,6 +4460,26 @@ fn train_file(
 
     let ds = open_paths(&paths, targets, None, csv_preflight.clone()).map_err(to_py_err)?;
     ingest_reporter.complete(ds.source.n_rows());
+    // Ranking: query ids come from the qid column of every file, in dataset order.
+    let read_qid_paths = |ps: &[std::path::PathBuf]| -> PyResult<Option<Vec<u64>>> {
+        let Some(q) = targets.qid else {
+            return Ok(None);
+        };
+        match fmt {
+            "parquet" => parquet_source::read_u64_columns(ps, q),
+            _ => csv_source::read_u64_column(ps, header, q),
+        }
+        .map(Some)
+        .map_err(to_py_err)
+    };
+    // CSV reads its query ids now, so the deferred plan below charges the real
+    // groups too (Parquet read them before planning).
+    if train_qid.is_none() {
+        train_qid = read_qid_paths(&paths)?;
+        if let Some(ids) = &train_qid {
+            cfg.group_ptr = Some(crate::rank::group_ptr_from_qid(ids).map_err(to_py_err)?);
+        }
+    }
     // A deferred source only learns its aggregate row count during open.
     // Complete the GPU plan now, preserving the requested block width while
     // resolving memory budget, stream count and residency from the real shape.
@@ -4463,18 +4499,6 @@ fn train_file(
     margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
     let (mut train_cfg, lower_is_better) = cfg.train_config()?;
     train_cfg.prior_model = prior_model.as_ref().map(|p| p.inner.clone());
-    // Ranking: query ids come from the qid column of every file, in dataset order.
-    let read_qid_paths = |ps: &[std::path::PathBuf]| -> PyResult<Option<Vec<u64>>> {
-        let Some(q) = targets.qid else {
-            return Ok(None);
-        };
-        match fmt {
-            "parquet" => parquet_source::read_u64_columns(ps, q),
-            _ => csv_source::read_u64_column(ps, header, q),
-        }
-        .map(Some)
-        .map_err(to_py_err)
-    };
     let group_inputs = |ids: Option<Vec<u64>>,
                         w: Option<&[f32]>|
      -> PyResult<(Option<Vec<f32>>, Option<Vec<u32>>)> {
@@ -4486,8 +4510,7 @@ fn train_file(
             }
         }
     };
-    let (ds_weights, train_group_ptr) =
-        group_inputs(read_qid_paths(&paths)?, ds.weights.as_deref())?;
+    let (ds_weights, train_group_ptr) = group_inputs(train_qid.take(), ds.weights.as_deref())?;
     train_cfg.group_ptr = train_group_ptr;
     let Callbacks {
         list: mut cbs,
