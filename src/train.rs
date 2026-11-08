@@ -2874,7 +2874,7 @@ fn build_tree(
     // 只在 CPU、source 的每一列都能随机访问、且确实能省下可观的行数时启用。
     let kept_rows: Option<Vec<RowId>> = if gpu.is_none() && source.has_resident_columns() {
         let worth = |kept: usize| kept <= gpair.len() - gpair.len() / 8;
-        match host_nonzero {
+        match &host_nonzero {
             // 位图已经给出个数:不划算时连行下标都不写。
             Some(bits) => worth(bits.count()).then(|| bits.rows()),
             None => {
@@ -3666,7 +3666,14 @@ fn build_tree(
     }
 
     if drop_zero_rows {
-        apply_dropped_rows(&t, &split_info, source, gpair, predictions)?;
+        apply_dropped_rows(
+            &t,
+            &split_info,
+            source,
+            gpair,
+            host_nonzero.as_ref(),
+            predictions,
+        )?;
     }
 
     Ok(t)
@@ -3687,51 +3694,138 @@ struct DropSplit {
 /// 完全相同(`bin < 边界`,缺失走记下的方向),所以每行落到的叶子、
 /// 以及对 `predictions` 的那一次加法都和「随每层分区一起搬」逐位相同。
 /// 按行块并行,每块独占自己那段 `predictions`。
+///
+/// 下降是一条依赖链(节点 → 列 → bin → 方向 → 下一节点),方向又是
+/// 一半一半的随机分支。所以一次推进 `DROP_LANES` 行、每行走固定的
+/// 「树深」步:叶子指回自己,每一步对所有行都无分支,各行的链彼此独立,
+/// 访存延迟可以重叠。
+///
+/// `nonzero` 是转定点时记下的非零位图(有就用,省得每行读 16 B 的定点
+/// 梯度);没有时按 `gpair` 判断。
 fn apply_dropped_rows(
     t: &Tree,
     split_info: &[DropSplit],
     source: &dyn BlockSource,
     gpair: &[GradPairFixed],
+    nonzero: Option<&NonzeroBits>,
     predictions: &mut [f32],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(gpair.len() == predictions.len());
-    let mut cols: Vec<&[Bin]> = vec![&[]; source.n_features()];
-    for n in t.nodes.iter().filter(|n| !n.is_leaf) {
-        cols[n.feat as usize] = source
-            .resident_feature_column(n.feat)
-            .context("零梯度行下降需要驻留的列")?;
+    if t.nodes.is_empty() {
+        return Ok(());
     }
+    // 扁平下降表。叶子:两个孩子都是自己,列借根节点的(读到什么都不影响)。
+    struct Step<'a> {
+        col: &'a [Bin],
+        bound: u32,
+        missing_left: bool,
+        cats: Option<crate::categorical::CatBits>,
+        next: [u32; 2],
+        value: f32,
+    }
+    let root_col: &[Bin] = if t.nodes[0].is_leaf {
+        &[]
+    } else {
+        source
+            .resident_feature_column(t.nodes[0].feat)
+            .context("零梯度行下降需要驻留的列")?
+    };
+    let mut steps: Vec<Step<'_>> = Vec::with_capacity(t.nodes.len());
+    for (i, n) in t.nodes.iter().enumerate() {
+        if n.is_leaf {
+            steps.push(Step {
+                col: root_col,
+                bound: 0,
+                missing_left: true,
+                cats: None,
+                next: [i as u32; 2],
+                value: n.leaf_value,
+            });
+        } else {
+            let sp = &split_info[i];
+            steps.push(Step {
+                col: source
+                    .resident_feature_column(sp.feat)
+                    .context("零梯度行下降需要驻留的列")?,
+                bound: sp.bin,
+                missing_left: sp.missing_left,
+                cats: sp.cats,
+                next: [n.left as u32, n.right as u32],
+                value: 0.0,
+            });
+        }
+    }
+    fn depth(t: &Tree, i: usize) -> usize {
+        let n = &t.nodes[i];
+        if n.is_leaf {
+            0
+        } else {
+            1 + depth(t, n.left as usize).max(depth(t, n.right as usize))
+        }
+    }
+    let depth = depth(t, 0);
+    const DROP_LANES: usize = 8;
+    // 64 的倍数:块与非零位图的字对齐。
     const CHUNK: usize = 1 << 15;
+    let steps = &steps;
     predictions
         .par_chunks_mut(CHUNK)
         .zip(gpair.par_chunks(CHUNK))
         .enumerate()
         .for_each(|(c, (pred, g))| {
             let base = c * CHUNK;
-            for (i, (p, gp)) in pred.iter_mut().zip(g).enumerate() {
-                if *gp != GradPairFixed::default() {
-                    continue;
-                }
-                let row = base + i;
-                let mut node = 0usize;
-                loop {
-                    let n = &t.nodes[node];
-                    if n.is_leaf {
-                        *p += n.leaf_value;
-                        break;
+            // 本块里被丢掉的行(块内偏移,升序)。
+            let mut dropped: Vec<u32> = Vec::with_capacity(pred.len());
+            match nonzero {
+                Some(bits) => {
+                    let words = &bits.words[base / 64..(base + pred.len()).div_ceil(64)];
+                    for (wi, &w) in words.iter().enumerate() {
+                        let valid = (pred.len() - wi * 64).min(64);
+                        let mut z = !w;
+                        if valid < 64 {
+                            z &= (1u64 << valid) - 1;
+                        }
+                        while z != 0 {
+                            dropped.push((wi * 64) as u32 + z.trailing_zeros());
+                            z &= z - 1;
+                        }
                     }
-                    let sp = &split_info[node];
-                    let bin = cols[sp.feat as usize][row];
-                    // 与 `partition_rows` 逐条相同:缺失走记下的方向;类别分裂
-                    // 里集合走右、其余(含未见过的编码)走左;数值分裂比 bin。
-                    let go_left = if bin == MISSING_BIN {
-                        sp.missing_left
-                    } else if let Some(cats) = &sp.cats {
-                        !cats.contains(bin as u32)
-                    } else {
-                        (bin as u32) < sp.bin
-                    };
-                    node = if go_left { n.left } else { n.right } as usize;
+                }
+                None => {
+                    let zero = GradPairFixed::default();
+                    dropped.extend(
+                        g.iter()
+                            .enumerate()
+                            .filter(|(_, gp)| **gp == zero)
+                            .map(|(i, _)| i as u32),
+                    );
+                }
+            }
+            for lanes in dropped.chunks(DROP_LANES) {
+                let mut node = [0u32; DROP_LANES];
+                for _ in 0..depth {
+                    for (k, &i) in lanes.iter().enumerate() {
+                        let st = &steps[node[k] as usize];
+                        let bin = st
+                            .col
+                            .get(base + i as usize)
+                            .copied()
+                            .unwrap_or(MISSING_BIN);
+                        // 与 `fill_partition_bits` 逐条相同:缺失走记下的方向;
+                        // 类别分裂里集合走右、其余(含未见过的编码)走左;
+                        // 数值分裂比 bin。
+                        let go_left = if bin == MISSING_BIN {
+                            st.missing_left
+                        } else if let Some(cats) = &st.cats {
+                            !cats.contains(bin as u32)
+                        } else {
+                            (bin as u32) < st.bound
+                        };
+                        node[k] = st.next[(!go_left) as usize];
+                    }
+                }
+                for (k, &i) in lanes.iter().enumerate() {
+                    pred[i as usize] += steps[node[k] as usize].value;
                 }
             }
         });
