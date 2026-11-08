@@ -352,6 +352,23 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
                 assert _bytes(model, tmp_path, "gpu") == ref, (src, resident, spill)
 
 
+
+@cuda
+def test_gpu_csv_without_cols_per_block_uses_a_default_width(tmp_path, capfd):
+    """CSV has no row count before open: without cols_per_block the GPU path uses
+    a conservative default width (announced in the log) instead of failing, and
+    the model still equals the CPU model."""
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major")
+    p = {k: v for k, v in p.items() if k != "cols_per_block"}
+    csv = str(tmp_path / "data.csv")
+    pq.read_table(path).to_pandas().to_csv(csv, index=False, na_rep="")
+    ref = _bytes(fb.train(p, csv, quiet=True, **kw), tmp_path, "cpu")
+    capfd.readouterr()
+    gpu = fb.train({**p, "device": "cuda"}, csv, **kw)
+    log = capfd.readouterr().err
+    assert "GPU_BLOCKING cols_per_block=8" in log, log[-2000:]
+    assert _bytes(gpu, tmp_path, "gpu") == ref
+
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
 def _used_mb():

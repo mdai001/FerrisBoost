@@ -29,6 +29,13 @@ use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 mod explain;
 mod margin;
 
+/// Block width for GPU file input whose row count is unknown before open
+/// (CSV / CSV.gz) when `cols_per_block` is not given. Conservative: a narrow
+/// width from the planner's candidate set (`gpu_mem_plan::CANDIDATE_WIDTHS`),
+/// so each block slot stays small whatever the row count turns out to be.
+#[cfg(feature = "cuda")]
+const DEFERRED_GPU_COLS_PER_BLOCK: usize = 8;
+
 fn on_off(flag: bool) -> &'static str {
     if flag {
         "on"
@@ -4089,11 +4096,26 @@ fn train_file(
     let (plan, deferred_gpu_plan) = match (n_rows_peek, cfg.device) {
         #[cfg(feature = "cuda")]
         (None, Some(_)) => {
-            let c = cfg.requested_cols_per_block.filter(|c| *c > 0).ok_or_else(|| {
-                PyValueError::new_err(
-                    "GPU input needs an explicit cols_per_block when the row count is unavailable before open; memory, stream and residency planning finish with the real row count after open",
-                )
-            })?;
+            // Without a pre-open row count (CSV / CSV.gz) the block width cannot be
+            // solved by the memory planner, so an explicit width wins and otherwise
+            // a conservative narrow width is used: narrow blocks keep every slot
+            // small, and streams / residency / the effective budget are still
+            // planned after open with the real row count (a plan that does not fit
+            // fails there, never silently).
+            let c = match cfg.requested_cols_per_block.filter(|c| *c > 0) {
+                Some(c) => c,
+                None => {
+                    if !cfg.quiet {
+                        eprintln!(
+                            "GPU_BLOCKING cols_per_block={DEFERRED_GPU_COLS_PER_BLOCK} (default: row count unknown before open; set cols_per_block to override)"
+                        );
+                    }
+                    // Treat it as the requested width from here on, so the
+                    // post-open plan keeps the geometry the source was built with.
+                    cfg.requested_cols_per_block = Some(DEFERRED_GPU_COLS_PER_BLOCK);
+                    DEFERRED_GPU_COLS_PER_BLOCK
+                }
+            };
             (
                 BlockingPlan::explicit(c, n_features, cfg.params.nthread),
                 true,
