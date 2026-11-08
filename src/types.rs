@@ -208,10 +208,21 @@ impl GradQuantizer {
             .par_iter()
             .fold(
                 || (0.0f64, 0.0f64),
-                |(g_acc, h_acc), g| (g_acc.max(finite_abs(g.grad)), h_acc.max(finite_abs(g.hess))),
+                |(g_acc, h_acc), g| {
+                    let (gb, hb) = Self::bound_of(*g);
+                    (g_acc.max(gb), h_acc.max(hb))
+                },
             )
             .reduce(|| (0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
         Self::try_from_bounds(max_grad, max_hess, n_rows)
+    }
+
+    /// 一行对 `try_new` 上界的贡献 `(|grad|, |hess|)`;非有限值记为无穷,
+    /// 让 `try_from_bounds` 报错。按行取 max 再交给 `try_from_bounds`,
+    /// 与 `try_new` 逐位相同(max 精确且与顺序无关)。
+    #[inline]
+    pub fn bound_of(g: GradPair) -> (f64, f64) {
+        (finite_abs(g.grad), finite_abs(g.hess))
     }
 
     /// 从已知的上界直接构造。

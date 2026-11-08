@@ -72,9 +72,32 @@ pub fn build(
     out: &mut [GradPairFixed],
 ) {
     debug_assert_eq!(block_data.len(), n_feats * block_n_rows);
+    let cols = block_columns(block_data, block_n_rows, n_feats);
+    build_cols(&cols, feat_offsets, gpair, row_idx, out);
+}
+
+/// 列主序块按列切开:第 `f` 个切片是块内第 `f` 列的 bin。
+pub fn block_columns(block_data: &[Bin], block_n_rows: usize, n_feats: usize) -> Vec<&[Bin]> {
+    (0..n_feats)
+        .map(|f| &block_data[f * block_n_rows..(f + 1) * block_n_rows])
+        .collect()
+}
+
+/// [`build`] 的列切片形式:`cols[f]` 是直方图第 `f` 个特征的整列 bin
+/// (长度 = 行数)。调用方因此可以只交出块里的一部分列(例如本棵树
+/// colsample 选中的那几列),而不用先物化一个压实块。
+pub fn build_cols(
+    cols: &[&[Bin]],
+    feat_offsets: &[u32],
+    gpair: &[GradPairFixed],
+    row_idx: Option<&[RowId]>,
+    out: &mut [GradPairFixed],
+) {
+    let n_feats = cols.len();
+    let block_n_rows = gpair.len();
+    debug_assert!(cols.iter().all(|c| c.len() == block_n_rows));
     debug_assert_eq!(feat_offsets.len(), n_feats + 1);
     debug_assert_eq!(out.len(), feat_offsets[n_feats] as usize);
-    debug_assert_eq!(gpair.len(), block_n_rows);
     // 契约:调用方交进来时就是清零的。违约会静默多算一份上一轮的直方图,
     // 所以在 debug 里直接断言,不留给"结果看起来怪怪的"去发现。
     debug_assert!(
@@ -111,8 +134,7 @@ pub fn build(
             let mut start = 0usize;
             while start < block_n_rows {
                 let end = (start + tile).min(block_n_rows);
-                for f in 0..n_feats {
-                    let col = &block_data[f * block_n_rows..(f + 1) * block_n_rows];
+                for (f, col) in cols.iter().enumerate() {
                     let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
                     for row in start..end {
                         let b = col[row];
@@ -125,23 +147,13 @@ pub fn build(
                 start = end;
             }
         }
-        Some(rows) => build_rows(
-            block_data,
-            block_n_rows,
-            n_feats,
-            feat_offsets,
-            gpair,
-            rows,
-            out,
-        ),
+        Some(rows) => build_rows(cols, feat_offsets, gpair, rows, out),
     }
 }
 
 /// `build` 的行子集分支:按 tile 分块,块内「外层特征、内层行」。
 fn build_rows(
-    block_data: &[Bin],
-    block_n_rows: usize,
-    n_feats: usize,
+    cols: &[&[Bin]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     rows: &[RowId],
@@ -151,8 +163,7 @@ fn build_rows(
     // 行下标是升序的(来自上一层的分区),所以一个 tile 里的
     // 梯度访问也集中在一段地址里。
     for chunk in rows.chunks(tile) {
-        for f in 0..n_feats {
-            let col = &block_data[f * block_n_rows..(f + 1) * block_n_rows];
+        for (f, col) in cols.iter().enumerate() {
             let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
             for &r in chunk {
                 let b = col[r as usize];
@@ -186,27 +197,31 @@ pub fn build_nodes(
     gpair: &[GradPairFixed],
     nodes: &mut [(&[RowId], &mut [GradPairFixed])],
 ) {
-    build_nodes_with_span(
-        block_data,
-        block_n_rows,
-        n_feats,
-        feat_offsets,
-        gpair,
-        nodes,
-        node_span_rows(n_feats),
-    );
+    debug_assert_eq!(block_data.len(), n_feats * block_n_rows);
+    let cols = block_columns(block_data, block_n_rows, n_feats);
+    build_nodes_cols(&cols, feat_offsets, gpair, nodes);
+}
+
+/// [`build_nodes`] 的列切片形式(见 [`build_cols`])。
+pub fn build_nodes_cols(
+    cols: &[&[Bin]],
+    feat_offsets: &[u32],
+    gpair: &[GradPairFixed],
+    nodes: &mut [(&[RowId], &mut [GradPairFixed])],
+) {
+    build_nodes_with_span(cols, feat_offsets, gpair, nodes, node_span_rows(cols.len()));
 }
 
 fn build_nodes_with_span(
-    block_data: &[Bin],
-    block_n_rows: usize,
-    n_feats: usize,
+    cols: &[&[Bin]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     nodes: &mut [(&[RowId], &mut [GradPairFixed])],
     span: usize,
 ) {
-    debug_assert_eq!(block_data.len(), n_feats * block_n_rows);
+    let n_feats = cols.len();
+    let block_n_rows = gpair.len();
+    debug_assert!(cols.iter().all(|c| c.len() == block_n_rows));
     debug_assert_eq!(feat_offsets.len(), n_feats + 1);
     debug_assert_eq!(gpair.len(), block_n_rows);
     debug_assert!(span > 0);
@@ -226,15 +241,7 @@ fn build_nodes_with_span(
     if nodes.len() <= 1 {
         // 单节点没有跨节点复用可言,保持原来的循环。
         for (rows, out) in nodes.iter_mut() {
-            build_rows(
-                block_data,
-                block_n_rows,
-                n_feats,
-                feat_offsets,
-                gpair,
-                rows,
-                out,
-            );
+            build_rows(cols, feat_offsets, gpair, rows, out);
         }
         return;
     }
@@ -250,15 +257,7 @@ fn build_nodes_with_span(
             let to = from + rows[from..].partition_point(|&r| (r as usize) < end);
             *cursor = to;
             if to > from {
-                build_rows(
-                    block_data,
-                    block_n_rows,
-                    n_feats,
-                    feat_offsets,
-                    gpair,
-                    &rows[from..to],
-                    out,
-                );
+                build_rows(cols, feat_offsets, gpair, &rows[from..to], out);
             }
         }
         start = end;
@@ -606,7 +605,13 @@ mod tests {
                     .zip(outs.iter_mut())
                     .map(|(r, o)| (r.as_slice(), o.as_mut_slice()))
                     .collect();
-                build_nodes_with_span(&block, n_rows, n_feats, &offs, &gpair, &mut nodes, span);
+                build_nodes_with_span(
+                    &block_columns(&block, n_rows, n_feats),
+                    &offs,
+                    &gpair,
+                    &mut nodes,
+                    span,
+                );
             }
             for (rows, out) in buckets.iter().zip(&outs) {
                 let mut single = vec![GradPairFixed::default(); width];
