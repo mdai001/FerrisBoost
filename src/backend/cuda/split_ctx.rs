@@ -242,7 +242,10 @@ impl GpuBlockSession<'_> {
             let spills = keep_next && cache.next_ids.len() + nodes > cache.capacity;
             // An uncached histogram lives in reusable hist_out: collect before
             // another producer can overwrite it. Cached winners need only packets.
-            if spills && !pending.is_empty() {
+            // A full packet window is drained only when another batch needs
+            // its slots, so a level that exactly fills the window stays queued
+            // for `split_cached_finish`.
+            if !pending.is_empty() && (spills || pending.len() == SPLIT_PACKET_WINDOW_BATCHES) {
                 results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
                 pending.clear();
                 packet_nodes = 0;
@@ -259,7 +262,7 @@ impl GpuBlockSession<'_> {
                 packet_nodes,
             )?);
             packet_nodes += nodes;
-            if spills || pending.len() == SPLIT_PACKET_WINDOW_BATCHES {
+            if spills {
                 results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
                 pending.clear();
                 packet_nodes = 0;
