@@ -244,11 +244,11 @@ def test_qid_must_be_sorted_and_groups_must_match():
 def test_label_rules_and_unsupported_options():
     x, y, qid, _, _ = make()
     p = dict(objective="rank:ndcg", **PARAMS)
-    with pytest.raises(RuntimeError, match="integers"):
+    with pytest.raises(ValueError, match="integers"):
         fb.train(p, x, label=y + 0.5, qid=qid, quiet=True)
     # fractional relevance is fine with a linear gain
     fb.train({**p, "ndcg_exp_gain": False}, x, label=y + 0.5, qid=qid, num_boost_round=2, quiet=True)
-    with pytest.raises(RuntimeError, match="binary"):
+    with pytest.raises(ValueError, match="binary"):
         fb.train(dict(p, objective="rank:map"), x, label=y, qid=qid, quiet=True)
     with pytest.raises(ValueError, match="ranking metric|ranking objective"):
         fb.train({**p, "eval_metric": "rmse"}, x, label=y, qid=qid, quiet=True)

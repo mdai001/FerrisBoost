@@ -262,15 +262,15 @@ impl Objective {
     /// 参数合法性(XGBoost 的 `set_range` / `CHECK`)。
     pub fn validate_params(self) -> anyhow::Result<()> {
         match self {
-            Objective::Poisson { max_delta_step } => anyhow::ensure!(
+            Objective::Poisson { max_delta_step } => crate::ensure_input!(
                 max_delta_step.is_finite() && max_delta_step >= 0.0,
                 "count:poisson 的 max_delta_step 必须是非负有限值"
             ),
-            Objective::Tweedie { variance_power } => anyhow::ensure!(
+            Objective::Tweedie { variance_power } => crate::ensure_input!(
                 (1.0..2.0).contains(&variance_power),
                 "tweedie_variance_power 必须在 [1, 2),给的是 {variance_power}"
             ),
-            Objective::PseudoHuber { slope } => anyhow::ensure!(
+            Objective::PseudoHuber { slope } => crate::ensure_input!(
                 slope.is_finite() && slope != 0.0,
                 "huber_slope 必须是非 0 的有限值"
             ),
@@ -278,18 +278,18 @@ impl Objective {
             Objective::Quantile { alphas } => {
                 let a = alphas.as_slice();
                 for &alpha in a {
-                    anyhow::ensure!(
+                    crate::ensure_input!(
                         alpha.is_finite() && (0.0..=1.0).contains(&alpha),
                         "quantile_alpha 必须在 [0, 1] 内,给的是 {alpha}"
                     );
                 }
-                anyhow::ensure!(
+                crate::ensure_input!(
                     a.windows(2).all(|w| w[0] <= w[1]),
                     "quantile_alpha 必须按升序排列(XGBoost 同样要求),给的是 {a:?}"
                 );
             }
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     num_class >= 2,
                     "{} 需要 num_class ≥ 2,给的是 {num_class}",
                     self.name()
@@ -513,20 +513,20 @@ impl Objective {
                 RankKind::Map => crate::rank::check_binary_labels(name, labels, what)?,
                 RankKind::Pairwise => {}
             },
-            Objective::Logistic => anyhow::ensure!(
+            Objective::Logistic => crate::ensure_input!(
                 labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
                 "{what}的 {name} 标签必须在 [0, 1]"
             ),
-            Objective::Poisson { .. } | Objective::Tweedie { .. } => anyhow::ensure!(
+            Objective::Poisson { .. } | Objective::Tweedie { .. } => crate::ensure_input!(
                 labels.iter().all(|&v| v >= 0.0),
                 "{what}的 {name} 标签必须非负"
             ),
-            Objective::Gamma => anyhow::ensure!(
+            Objective::Gamma => crate::ensure_input!(
                 labels.iter().all(|&v| v > 0.0),
                 "{what}的 {name} 标签必须为正"
             ),
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     labels
                         .iter()
                         .all(|&v| v >= 0.0 && v < num_class as f32 && v.fract() == 0.0),
@@ -546,16 +546,16 @@ impl Objective {
             | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => {
-                anyhow::ensure!(base_score.is_finite(), "{name} 的 base_score 必须是有限值")
+                crate::ensure_input!(base_score.is_finite(), "{name} 的 base_score 必须是有限值")
             }
             // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
-            Objective::Logistic => anyhow::ensure!(
+            Objective::Logistic => crate::ensure_input!(
                 base_score.is_finite() && (0.0..=1.0).contains(&base_score),
                 "{name} 的 base_score 必须是 [0, 1] 内的有限概率"
             ),
             // log 链接:0 会变成 −inf margin。
             Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     base_score.is_finite() && base_score > 0.0,
                     "{name} 的 base_score 必须为正(标签全为 0 时请显式给一个正的 base_score)"
                 )

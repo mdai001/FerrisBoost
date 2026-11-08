@@ -42,7 +42,8 @@ use crate::types::{Objective, TrainParams};
 /// anyhow 的错误转 Python 异常。
 ///
 /// 尽量给具体的异常类型:文件找不到就是 FileNotFoundError,参数不对
-/// 就是 ValueError。全都甩成 RuntimeError 的话,调用方没法按类型处理,
+/// (带 `crate::error::InputError` 标记的校验错误)就是 ValueError,
+/// 其余(I/O、CUDA、内部错误)才是 RuntimeError。全都甩成 RuntimeError 的话,调用方没法按类型处理,
 /// 而且 traceback 里只剩一句没头没尾的话。
 fn to_py_err(e: anyhow::Error) -> PyErr {
     let msg = format!("{e:#}");
@@ -51,7 +52,9 @@ fn to_py_err(e: anyhow::Error) -> PyErr {
             return pyo3::exceptions::PyFileNotFoundError::new_err(msg);
         }
     }
-    if msg.contains("打不开") || msg.contains("没有列") {
+    // Rejected input is tagged where it is validated (`crate::error`); the two
+    // message checks cover file-open and missing-column errors that predate it.
+    if crate::error::is_input_error(&e) || msg.contains("打不开") || msg.contains("没有列") {
         return PyValueError::new_err(msg);
     }
     PyRuntimeError::new_err(msg)

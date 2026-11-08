@@ -122,12 +122,12 @@ impl RankParams {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(k) = self.num_pair_per_sample {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 k >= 1,
                 "lambdarank_num_pair_per_sample must be >= 1, got {k}"
             );
         }
-        anyhow::ensure!(
+        crate::ensure_input!(
             self.bias_norm.is_finite() && self.bias_norm >= 0.0,
             "lambdarank_bias_norm must be a non-negative finite number"
         );
@@ -155,14 +155,14 @@ impl RankParams {
 /// Group offsets from a per-row query id. XGBoost's rule: ids must be
 /// non-decreasing along the rows; every run of equal ids is one group.
 pub fn group_ptr_from_qid(qid: &[u64]) -> anyhow::Result<Vec<u32>> {
-    anyhow::ensure!(
+    crate::ensure_input!(
         qid.len() <= u32::MAX as usize,
         "too many rows for query groups"
     );
     let mut ptr = vec![0u32];
     for i in 1..qid.len() {
         if qid[i] < qid[i - 1] {
-            anyhow::bail!(
+            crate::bail_input!(
                 "qid must be sorted in non-decreasing order along the rows (row {i} has qid {} \
                  after qid {}); sort the data by query id first",
                 qid[i],
@@ -185,18 +185,18 @@ pub fn group_ptr_from_sizes(sizes: &[u64], n_rows: usize) -> anyhow::Result<Vec<
     ptr.push(0u32);
     let mut total = 0u64;
     for (i, &s) in sizes.iter().enumerate() {
-        anyhow::ensure!(
+        crate::ensure_input!(
             s > 0,
             "group sizes must be positive (group {i} is empty); drop empty query groups"
         );
         total += s;
-        anyhow::ensure!(
+        crate::ensure_input!(
             total <= n_rows as u64,
             "group sizes sum to more than the {n_rows} data rows"
         );
         ptr.push(total as u32);
     }
-    anyhow::ensure!(
+    crate::ensure_input!(
         total == n_rows as u64,
         "group sizes sum to {total}, but the data has {n_rows} rows"
     );
@@ -205,16 +205,16 @@ pub fn group_ptr_from_sizes(sizes: &[u64], n_rows: usize) -> anyhow::Result<Vec<
 
 /// Validate a `group_ptr` against the row count (used for Rust-API callers).
 pub fn validate_group_ptr(ptr: &[u32], n_rows: usize, what: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
+    crate::ensure_input!(
         ptr.len() >= 2 && ptr[0] == 0,
         "{what}: group offsets must start at 0 and contain at least one group"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         *ptr.last().unwrap() as usize == n_rows,
         "{what}: group sizes sum to {}, but the data has {n_rows} rows",
         ptr.last().unwrap()
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         ptr.windows(2).all(|w| w[0] < w[1]),
         "{what}: every query group must have at least one row"
     );
@@ -404,7 +404,7 @@ impl<'a> RankGradient<'a> {
         validate_group_ptr(group_ptr, labels.len(), "training set")?;
         let n_groups = group_ptr.len() - 1;
         if let Some(w) = group_weights {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 w.len() == n_groups,
                 "ranking weights are per query group: got {} weights for {n_groups} groups",
                 w.len()
@@ -915,14 +915,14 @@ fn ideal_dcg_inverse(
 /// `CheckNDCGLabels`.
 pub fn check_ndcg_labels(exp_gain: bool, labels: &[f32], what: &str) -> anyhow::Result<()> {
     if exp_gain {
-        anyhow::ensure!(
+        crate::ensure_input!(
             labels
                 .iter()
                 .all(|&v| v >= 0.0 && (v.floor() - v).abs() <= 1e-6),
             "{what}: when using relevance degree as target, labels must be 0 or positive \
              integers (set ndcg_exp_gain=false to use the raw label as gain)"
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             labels.iter().all(|&v| (v as u32) <= MAX_REL),
             "{what}: relevance degrees must be at most {MAX_REL} when the exponential NDCG gain \
              is used; set ndcg_exp_gain=false to use a custom DCG gain"
@@ -933,7 +933,7 @@ pub fn check_ndcg_labels(exp_gain: bool, labels: &[f32], what: &str) -> anyhow::
 
 /// `CheckPreLabels` (`map` / `pre` need binary relevance).
 pub fn check_binary_labels(name: &str, labels: &[f32], what: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
+    crate::ensure_input!(
         labels
             .iter()
             .all(|&y| (y - 1.0).abs() < 1e-6 || y.abs() < 1e-6),
@@ -1043,7 +1043,7 @@ impl RankMetric {
                     kind.base()
                 )
             })?;
-            anyhow::ensure!(k >= 1, "invalid ranking metric {name:?}: k must be >= 1");
+            crate::ensure_input!(k >= 1, "invalid ranking metric {name:?}: k must be >= 1");
             k
         };
         Ok(Self {
@@ -1424,7 +1424,7 @@ impl crate::metrics::Metric for GroupAuc {
 
     fn check_labels(&self, labels: &[f32], what: &str) -> anyhow::Result<()> {
         if self.kind == GroupAucKind::Pr {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 labels.iter().all(|&y| (0.0..=1.0).contains(&y)),
                 "{what}: aucpr supports only binary relevance for learning to rank \
                  (labels in [0, 1])"
@@ -1448,9 +1448,9 @@ pub fn group_ptr_from_inputs(
     n_rows: usize,
 ) -> anyhow::Result<Option<Vec<u32>>> {
     match (qid, group) {
-        (Some(_), Some(_)) => anyhow::bail!("Either one of `group` or `qid` should be None."),
+        (Some(_), Some(_)) => crate::bail_input!("Either one of `group` or `qid` should be None."),
         (Some(q), None) => {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 q.len() == n_rows,
                 "qid has {} entries, the data has {n_rows} rows",
                 q.len()
@@ -1487,7 +1487,7 @@ pub fn group_weights_from_rows(
         let rows = &row_weights[w[0] as usize..w[1] as usize];
         let first = rows[0];
         if let Some(k) = rows.iter().position(|&v| v != first) {
-            anyhow::bail!(
+            crate::bail_input!(
                 "weight column {column:?}: ranking weights are per query group, but group {g} \
                  has different weights on its rows (row {} has {first}, row {} has {})",
                 w[0],
