@@ -140,10 +140,10 @@ def test_metrics_match_xgboost_on_the_same_model(tmp_path):
 
 # ---------------------------------------------------------------- 错误
 @pytest.mark.parametrize("bad, match", [
-    (lambda n: -np.ones(n), "负数"),
+    (lambda n: -np.ones(n), "negative"),
     (lambda n: np.full(n, np.nan), "NaN"),
-    (lambda n: np.full(n, np.inf), "NaN 或 inf"),
-    (lambda n: np.ones(n - 1), "数据有"),
+    (lambda n: np.full(n, np.inf), "NaN or inf"),
+    (lambda n: np.ones(n - 1), "the data has"),
 ])
 def test_invalid_array_weights_are_rejected(bad, match):
     x, y, _ = toy()
@@ -153,22 +153,22 @@ def test_invalid_array_weights_are_rejected(bad, match):
 
 def test_column_name_weight_with_array_input_is_rejected():
     x, y, _ = toy()
-    with pytest.raises(ValueError, match="一维数组"):
+    with pytest.raises(ValueError, match="1-D array"):
         fb.train(BASE, x, label=y, weight="w", num_boost_round=1, quiet=True)
 
 
 def test_invalid_eval_weights_are_rejected():
     x, y, _ = toy()
-    with pytest.raises(ValueError, match="evals\\[v\\] 的 weight"):
+    with pytest.raises(ValueError, match="evals\\[v\\] weight"):
         fb.train(BASE, x, label=y, num_boost_round=1, quiet=True,
                  evals=[(x, y, -np.ones(len(y)), "v")])
 
 
 @pytest.mark.parametrize("params, match", [
-    ({"eval_metric": "ndcg"}, "不支持"),
+    ({"eval_metric": "ndcg"}, "not supported"),
     ({"eval_metric": "auc", "objective": "reg:squarederror"}, "binary:logistic"),
-    ({"eval_metric": []}, "字符串"),
-    ({"eval_metric": 3}, "字符串"),
+    ({"eval_metric": []}, "string or a list of strings"),
+    ({"eval_metric": 3}, "string or a list of strings"),
 ])
 def test_invalid_eval_metric_is_rejected(params, match):
     x, y, _ = toy()
@@ -249,15 +249,15 @@ def test_parquet_quantized_cache_records_the_weight_column(tmp_path):
     fb.train({**BASE, "cache_path": str(cache)}, str(path), label="label", weight="w",
              num_boost_round=1, quiet=True)
     # 换一个权重列:特征数相同,但特征集合不同 —— 旧缓存必须拒绝。
-    with pytest.raises(Exception, match="权重列"):
+    with pytest.raises(Exception, match="weight column"):
         fb.train({**BASE, "cache_path": str(cache)}, str(path), label="label",
                  weight="w2", num_boost_round=1, quiet=True)
 
 
 @pytest.mark.parametrize("weight, match", [
-    ("label", "同一列"),
+    ("label", "same column"),
     ("nope", "nope"),
-    (3, "列名字符串"),
+    (3, "column name string"),
 ])
 def test_bad_file_weight_column(tmp_path, weight, match):
     x, y, w = toy()
@@ -272,7 +272,7 @@ def test_negative_weight_in_file_is_rejected(tmp_path):
     w[7] = -1.0
     path = tmp_path / "t.csv"
     write_csv(path, x, y, w)
-    with pytest.raises(Exception, match="非负"):
+    with pytest.raises(Exception, match="non-negative"):
         fb.train(BASE, str(path), label="label", weight="w", num_boost_round=1, quiet=True)
 
 

@@ -148,7 +148,7 @@ impl Tree {
         right_value: f32,
         right_hess: f32,
     ) -> (usize, usize) {
-        debug_assert!(self.nodes[node].is_leaf, "只能分裂叶子");
+        debug_assert!(self.nodes[node].is_leaf, "only a leaf can be split");
         let left = self.push_leaf(left_value, left_hess);
         let right = self.push_leaf(right_value, right_hess);
 
@@ -170,7 +170,10 @@ impl Tree {
     /// replaced by the placeholder XGBoost stores for categorical nodes.
     pub fn set_categories(&mut self, node: usize, cats: &crate::categorical::CatBits) {
         let n = &mut self.nodes[node];
-        debug_assert!(!n.is_leaf, "只能给内部节点设置类别集合");
+        debug_assert!(
+            !n.is_leaf,
+            "a category set can only be set on an internal node"
+        );
         n.cats = Some(cats.to_words().into_boxed_slice());
         n.split_cond = CATEGORICAL_SPLIT_COND;
     }
@@ -368,7 +371,10 @@ impl Model {
     /// `n_trees`(总树数的前缀)对应到这一类的前 `ceil((n_trees − class) / K)` 棵。
     pub fn class_view(&self, class: usize) -> Model {
         let k = self.num_outputs();
-        assert!(class < k, "类别 {class} 超出 num_class = {k}");
+        assert!(
+            class < k,
+            "class {class} is out of range for num_class = {k}"
+        );
         Model {
             trees: self.trees.iter().skip(class).step_by(k).cloned().collect(),
             base_score: self
@@ -393,7 +399,10 @@ impl Model {
     /// base_score / objective / 特征信息原样保留。`iteration_range` 的实现。
     pub fn slice_rounds(&self, begin: usize, end: usize) -> Model {
         let k = self.num_outputs();
-        assert!(begin <= end && end * k <= self.trees.len(), "轮次区间越界");
+        assert!(
+            begin <= end && end * k <= self.trees.len(),
+            "round range is out of bounds"
+        );
         Model {
             trees: self.trees[begin * k..end * k].to_vec(),
             base_score: self.base_score,
@@ -454,7 +463,7 @@ impl Model {
     pub fn predict_margin_upto(&self, features: &[f32], n_trees: usize) -> f32 {
         assert!(
             self.class_base_margins.is_empty(),
-            "多分类模型({} 类)没有标量预测:用 predict_margins_upto / predict_row",
+            "multiclass model ({} classes) has no scalar prediction; use predict_margins_upto / predict_row",
             self.num_outputs()
         );
         let n = n_trees.min(self.trees.len());
@@ -650,7 +659,7 @@ impl Model {
 
         if booster.name != "gbtree" {
             return Err(unsupported(format_args!(
-                "只支持 gbtree,这个模型是 {}",
+                "only gbtree is supported, this model is {}",
                 booster.name
             )));
         }
@@ -660,7 +669,7 @@ impl Model {
             Some(o) => o,
             None => {
                 return Err(unsupported(format_args!(
-                    "objective {} 不支持;支持的有 {}",
+                    "objective {} is not supported; supported: {}",
                     learner.objective.name,
                     Objective::supported_names()
                 )))
@@ -678,8 +687,8 @@ impl Model {
             && !(objective.is_multi_quantile() && num_target == objective.num_outputs())
         {
             return Err(unsupported(format_args!(
-                "多目标模型不支持(num_target = {num_target});只支持多个 quantile_alpha 的 \
-                 reg:quantileerror"
+                "multi-target models are not supported (num_target = {num_target}); only \
+                 reg:quantileerror with multiple quantile_alpha is supported"
             )));
         }
         let num_class = num_class_param.max(num_target);
@@ -694,14 +703,14 @@ impl Model {
             .find(|&(i, &g)| g as usize != i % num_class)
         {
             return Err(unsupported(format_args!(
-                "第 {i} 棵树的 tree_info = {g},不是 {i} % num_class({num_class}):不支持这种输出组排法"
+                "tree {i} has tree_info = {g}, not {i} % num_class ({num_class}); this output group layout is not supported"
             )));
         }
         for t in &booster.model.trees {
             let leaf = t.tree_param.size_leaf_vector.trim();
             if !leaf.is_empty() && parse_param::<i32>("size_leaf_vector", leaf)? > 1 {
                 return Err(unsupported(format_args!(
-                    "第 {} 棵树是向量叶子(size_leaf_vector = {leaf}):只支持标量叶子",
+                    "tree {} has vector leaves (size_leaf_vector = {leaf}); only scalar leaves are supported",
                     t.id
                 )));
             }
@@ -712,7 +721,7 @@ impl Model {
         )? != 1
         {
             return Err(unsupported(format_args!(
-                "num_parallel_tree = {}(random forest 模式)不支持",
+                "num_parallel_tree = {} (random forest mode) is not supported",
                 booster.model.gbtree_model_param.num_parallel_tree
             )));
         }
@@ -720,7 +729,7 @@ impl Model {
         anyhow_like_check(
             num_class == objective.num_outputs(),
             format_args!(
-                "num_class = {num_class} 和 objective {} 不一致",
+                "num_class = {num_class} is inconsistent with objective {}",
                 learner.objective.name
             ),
         )?;
@@ -735,7 +744,10 @@ impl Model {
             };
             anyhow_like_check(
                 v.len() == num_class,
-                format_args!("base_score 有 {} 个值,num_class = {num_class}", v.len()),
+                format_args!(
+                    "base_score has {} values, but num_class = {num_class}",
+                    v.len()
+                ),
             )?;
             (v[0], v)
         } else {
@@ -794,7 +806,7 @@ impl Model {
                 anyhow_like_check(
                     learner.feature_types.len() == n_features,
                     format_args!(
-                        "feature_types 有 {} 项,模型有 {n_features} 个特征",
+                        "feature_types has {} entries, but the model has {n_features} features",
                         learner.feature_types.len()
                     ),
                 )?;
@@ -878,7 +890,7 @@ fn parse_base_score_vector(raw: &str) -> Result<Vec<f32>, serde_json::Error> {
         .map(|p| parse_param::<f32>("base_score", p))
         .collect::<Result<Vec<_>, _>>()?;
     if v.is_empty() {
-        return Err(unsupported(format_args!("base_score 是空的:{raw:?}")));
+        return Err(unsupported(format_args!("base_score is empty: {raw:?}")));
     }
     Ok(v)
 }
@@ -901,10 +913,10 @@ fn parse_base_score(raw: &str) -> Result<f32, serde_json::Error> {
     let mut parts = inner.split(',').map(str::trim).filter(|s| !s.is_empty());
     let first = parts
         .next()
-        .ok_or_else(|| unsupported(format_args!("base_score 是空的:{raw:?}")))?;
+        .ok_or_else(|| unsupported(format_args!("base_score is empty: {raw:?}")))?;
     if parts.next().is_some() {
         return Err(unsupported(format_args!(
-            "base_score 是向量({raw:?}),多目标模型不在第一版范围里"
+            "base_score is a vector ({raw:?}); multi-target models are not supported"
         )));
     }
     parse_param("base_score", first)
@@ -913,9 +925,11 @@ fn parse_base_score(raw: &str) -> Result<f32, serde_json::Error> {
 /// XGBoost 的参数**全部是字符串**,这是它自己的约定不是笔误。
 /// 而且写出来的浮点是 "5E-1" 这种科学计数法,解析要能吃下。
 fn parse_param<T: std::str::FromStr>(name: &str, raw: &str) -> Result<T, serde_json::Error> {
-    raw.trim()
-        .parse::<T>()
-        .map_err(|_| unsupported(format_args!("参数 {name} 的值 {raw:?} 解析不了")))
+    raw.trim().parse::<T>().map_err(|_| {
+        unsupported(format_args!(
+            "cannot parse value {raw:?} of parameter {name}"
+        ))
+    })
 }
 
 /// XGBoost JSON schema 的镜像。
@@ -1090,7 +1104,10 @@ mod xgb {
             let n_features =
                 parse_param::<usize>("tree_param.num_feature", &self.tree_param.num_feature)?;
             if n == 0 {
-                return Err(unsupported(format_args!("树 {} 没有根节点", self.id)));
+                return Err(unsupported(format_args!(
+                    "tree {} has no root node",
+                    self.id
+                )));
             }
             for (name, len) in [
                 ("right_children", self.right_children.len()),
@@ -1100,21 +1117,21 @@ mod xgb {
             ] {
                 if len != n {
                     return Err(unsupported(format_args!(
-                        "树 {} 的 {name} 长度 {len} 和节点数 {n} 对不上",
+                        "tree {}: {name} length {len} does not match node count {n}",
                         self.id
                     )));
                 }
             }
             if !self.split_type.is_empty() && self.split_type.len() != n {
                 return Err(unsupported(format_args!(
-                    "树 {} 的 split_type 长度 {} 和节点数 {n} 对不上",
+                    "tree {}: split_type length {} does not match node count {n}",
                     self.id,
                     self.split_type.len()
                 )));
             }
             if let Some(t) = self.split_type.iter().find(|&&t| t > 1) {
                 return Err(unsupported(format_args!(
-                    "树 {} 的 split_type = {t} 不认识(0 = 数值,1 = 类别)",
+                    "tree {}: unknown split_type = {t} (0 = numerical, 1 = categorical)",
                     self.id
                 )));
             }
@@ -1125,7 +1142,7 @@ mod xgb {
                 || self.categories_sizes.len() != n_cat_nodes
             {
                 return Err(unsupported(format_args!(
-                    "树 {} 的 categories_nodes / segments / sizes 长度不一致",
+                    "tree {}: categories_nodes / segments / sizes have different lengths",
                     self.id
                 )));
             }
@@ -1142,7 +1159,7 @@ mod xgb {
                     }
                     _ => {
                         return Err(unsupported(format_args!(
-                            "树 {} 的类别段 [{begin}, +{size}) 越界,categories 有 {} 项",
+                            "tree {}: category segment [{begin}, +{size}) is out of bounds, categories has {} entries",
                             self.id,
                             self.categories.len()
                         )))
@@ -1153,13 +1170,13 @@ mod xgb {
                     || self.split_type.get(node as usize).copied().unwrap_or(0) != 1
                 {
                     return Err(unsupported(format_args!(
-                        "树 {} 的 categories_nodes 含 {node},它不是类别分裂节点",
+                        "tree {}: categories_nodes contains {node}, which is not a categorical split node",
                         self.id
                     )));
                 }
                 if self.categories[range.clone()].iter().any(|&c| c < 0) {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {node} 含负的类别值",
+                        "tree {}: node {node} contains a negative category value",
                         self.id
                     )));
                 }
@@ -1168,7 +1185,7 @@ mod xgb {
                 // category so large that the bitset alone would be absurd.
                 if cats.iter().any(|&c| c >= (1 << 24)) {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {node} 含超出 2^24 的类别值",
+                        "tree {}: node {node} contains a category value above 2^24",
                         self.id
                     )));
                 }
@@ -1180,7 +1197,7 @@ mod xgb {
                     .is_some()
                 {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {node} 在 categories_nodes 里出现了多次",
+                        "tree {}: node {node} appears more than once in categories_nodes",
                         self.id
                     )));
                 }
@@ -1188,7 +1205,7 @@ mod xgb {
             for (i, &t) in self.split_type.iter().enumerate() {
                 if t == 1 && !cat_of_node.contains_key(&i) {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {i} 是类别分裂但没有类别段",
+                        "tree {}: node {i} is a categorical split but has no category segment",
                         self.id
                     )));
                 }
@@ -1201,7 +1218,7 @@ mod xgb {
                 if left == NO_CHILD {
                     if right != NO_CHILD {
                         return Err(unsupported(format_args!(
-                            "树 {} 的节点 {i} 只有一个孩子:{left} / {right}",
+                            "tree {}: node {i} has only one child: {left} / {right}",
                             self.id
                         )));
                     }
@@ -1219,7 +1236,7 @@ mod xgb {
                     || left == right
                 {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {i} 孩子下标非法:{left} / {right}",
+                        "tree {}: node {i} has invalid child indices: {left} / {right}",
                         self.id
                     )));
                 }
@@ -1227,14 +1244,14 @@ mod xgb {
                     parents[child] = parents[child].saturating_add(1);
                     if parents[child] > 1 {
                         return Err(unsupported(format_args!(
-                            "树 {} 的节点 {child} 有多个父节点",
+                            "tree {}: node {child} has multiple parents",
                             self.id
                         )));
                     }
                 }
                 if self.split_indices[i] as usize >= n_features {
                     return Err(unsupported(format_args!(
-                        "树 {} 的节点 {i} 特征 {} 越界,共 {n_features} 个",
+                        "tree {}: node {i} feature {} is out of range for {n_features} features",
                         self.id, self.split_indices[i]
                     )));
                 }
@@ -1253,7 +1270,7 @@ mod xgb {
             }
             if parents[0] != 0 {
                 return Err(unsupported(format_args!(
-                    "树 {} 的根节点被别的节点引用",
+                    "tree {}: the root node is referenced by another node",
                     self.id
                 )));
             }
@@ -1261,7 +1278,10 @@ mod xgb {
             let mut stack = vec![0usize];
             while let Some(i) = stack.pop() {
                 if std::mem::replace(&mut seen[i], true) {
-                    return Err(unsupported(format_args!("树 {} 含环", self.id)));
+                    return Err(unsupported(format_args!(
+                        "tree {} contains a cycle",
+                        self.id
+                    )));
                 }
                 if !nodes[i].is_leaf {
                     stack.push(nodes[i].left as usize);
@@ -1270,7 +1290,7 @@ mod xgb {
             }
             if let Some(i) = seen.iter().position(|&reachable| !reachable) {
                 return Err(unsupported(format_args!(
-                    "树 {} 的节点 {i} 从根不可达",
+                    "tree {}: node {i} is unreachable from the root",
                     self.id
                 )));
             }
@@ -1325,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "多分类模型")]
+    #[should_panic(expected = "multiclass model")]
     fn multiclass_scalar_prediction_is_rejected() {
         let m = multiclass_fixture();
         let x = vec![0.0f32; m.n_features];
@@ -1408,7 +1428,11 @@ mod tests {
         // 边界上的值:1.5 不小于 1.5,走右
         assert_eq!(t.leaf_value(&[1.5, 0.0]), 3.0);
         assert_eq!(t.leaf_value(&[1.49, 0.0]), 1.0);
-        assert_eq!(t.leaf_value(&[0.0, 0.5]), 2.0, "0.5 不小于 0.5,走右");
+        assert_eq!(
+            t.leaf_value(&[0.0, 0.5]),
+            2.0,
+            "0.5 is not less than 0.5, goes right"
+        );
         assert_eq!(t.leaf_value(&[0.0, 0.49]), 1.0);
     }
 
@@ -1433,8 +1457,14 @@ mod tests {
         let t = fixture_tree();
         for (i, n) in t.nodes.iter().enumerate() {
             if !n.is_leaf {
-                assert!(n.left as usize > i, "节点 {i} 的左孩子在前面");
-                assert!(n.right as usize > i, "节点 {i} 的右孩子在前面");
+                assert!(
+                    n.left as usize > i,
+                    "left child of node {i} comes before it"
+                );
+                assert!(
+                    n.right as usize > i,
+                    "right child of node {i} comes before it"
+                );
             }
         }
     }
@@ -1457,7 +1487,7 @@ mod tests {
             ..fixture_model()
         };
         let margin = m.predict_margin(&[9.0, 0.0]);
-        assert_eq!(margin, 3.0, "base_score 0.5 转 raw margin 应该是 0");
+        assert_eq!(margin, 3.0, "base_score 0.5 should convert to raw margin 0");
         let p = m.predict(&[9.0, 0.0]);
         assert!((p - 1.0 / (1.0 + (-3.0f32).exp())).abs() < 1e-7);
         assert!(p > 0.0 && p < 1.0);
@@ -1473,7 +1503,7 @@ mod tests {
         assert_eq!(back.objective, m.objective);
         assert_eq!(back.trees.len(), 1);
         for row in [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [f32::NAN, 0.5]] {
-            assert_eq!(back.predict(&row), m.predict(&row), "行 {row:?}");
+            assert_eq!(back.predict(&row), m.predict(&row), "row {row:?}");
         }
     }
 
@@ -1579,7 +1609,7 @@ mod tests {
             .to_string();
         assert_eq!(parallel, serial);
         assert!(
-            serial.contains("树 3"),
+            serial.contains("tree 3"),
             "must report the first invalid tree: {serial}"
         );
     }
@@ -1695,18 +1725,21 @@ mod tests {
         let m = Model::from_xgboost_json(XGB_DUMP).unwrap();
         assert_eq!(m.objective, Objective::Logistic);
         assert_eq!(m.n_features, 3);
-        assert_eq!(m.base_score, 0.5, "5E-1 要能解析成 0.5");
+        assert_eq!(m.base_score, 0.5, "5E-1 must parse as 0.5");
         assert_eq!(m.trees.len(), 1);
 
         let t = &m.trees[0];
         assert!(!t.nodes[0].is_leaf);
-        assert_eq!(t.nodes[0].feat, 1, "split_indices 才是特征号");
+        assert_eq!(t.nodes[0].feat, 1, "split_indices holds the feature ids");
         assert_eq!(t.nodes[0].split_cond, 2.5);
         assert!(t.nodes[0].default_left);
         assert_eq!(t.nodes[0].sum_hess, 8.0);
         assert_eq!(t.nodes[0].gain, 12.5);
         assert!(t.nodes[1].is_leaf);
-        assert_eq!(t.nodes[1].leaf_value, -0.3, "叶子值在 split_conditions 里");
+        assert_eq!(
+            t.nodes[1].leaf_value, -0.3,
+            "leaf values live in split_conditions"
+        );
 
         // x1 = 2.0 < 2.5 走左;base_score 0.5 → margin 0
         assert_eq!(m.predict_margin(&[0.0, 2.0, 0.0]), -0.3);
@@ -1718,38 +1751,39 @@ mod tests {
     #[test]
     fn rejects_what_it_cannot_represent() {
         let cases = [
-            ("\"num_class\": \"0\"", "\"num_class\": \"3\"", "多分类"),
+            ("\"num_class\": \"0\"", "\"num_class\": \"3\"", "multiclass"),
             ("\"binary:logistic\"", "\"survival:cox\"", "objective"),
             (
                 "\"num_parallel_tree\": \"1\"",
                 "\"num_parallel_tree\": \"4\"",
-                "森林",
+                "forest",
             ),
             (
                 "\"split_type\": [0, 0, 0]",
                 "\"split_type\": [1, 0, 0]",
-                "类别分裂",
+                "categorical split",
             ),
             (
                 "\"left_children\": [1, -1, -1]",
                 "\"left_children\": [0, -1, -1]",
-                "环",
+                "cycle",
             ),
             (
                 "\"right_children\": [2, -1, -1]",
                 "\"right_children\": [-1, -1, -1]",
-                "单边孩子",
+                "one-sided child",
             ),
             (
                 "\"split_indices\": [1, 0, 0]",
                 "\"split_indices\": [3, 0, 0]",
-                "越界特征",
+                "out-of-range feature",
             ),
         ];
         for (from, to, what) in cases {
             let broken = XGB_DUMP.replace(from, to);
-            assert_ne!(broken, XGB_DUMP, "替换没生效:{from}");
-            let err = Model::from_xgboost_json(&broken).expect_err(&format!("{what} 应该被拒绝"));
+            assert_ne!(broken, XGB_DUMP, "replacement did not apply: {from}");
+            let err =
+                Model::from_xgboost_json(&broken).expect_err(&format!("{what} should be rejected"));
             // 报错要说人话,不能是 "invalid type at line 1"
             assert!(!err.to_string().is_empty());
         }
@@ -1774,7 +1808,7 @@ mod tests {
         ];
         for (from, to, what) in cases {
             let broken = XGB_DUMP.replace(from, to);
-            assert_ne!(broken, XGB_DUMP, "替换没生效:{from}");
+            assert_ne!(broken, XGB_DUMP, "replacement did not apply: {from}");
             let err = Model::from_xgboost_json(&broken).expect_err(what);
             assert!(err.to_string().contains(what), "{what}: {err}");
         }
@@ -1833,7 +1867,7 @@ mod tests {
             for v in probes {
                 let by_bin = (cuts.find_bin(0, v) as u32) < bin;
                 let by_thr = v < thr;
-                assert_eq!(by_bin, by_thr, "bin {bin}, v {v}, 阈值 {thr}");
+                assert_eq!(by_bin, by_thr, "bin {bin}, v {v}, threshold {thr}");
             }
         }
     }
@@ -1845,7 +1879,11 @@ mod tests {
         let cuts = BinCuts::new(vec![-2.5, 0.0, 1.5, 7.25], vec![0, 4]);
         for bin in 0..=cuts.n_bins(0) as u32 {
             let thr = split_threshold(&cuts, 0, bin);
-            assert_eq!(split_bin(&cuts, 0, thr), bin, "bin {bin} 的阈值是 {thr}");
+            assert_eq!(
+                split_bin(&cuts, 0, thr),
+                bin,
+                "bin {bin} has threshold {thr}"
+            );
         }
     }
 

@@ -99,14 +99,14 @@ where
     F: FnMut(&[f32], usize) -> Result<()>,
 {
     if projected_features.is_empty() {
-        bail!("prediction feature projection 不能为空");
+        bail!("prediction feature projection cannot be empty");
     }
     if projected_features.windows(2).any(|pair| pair[0] >= pair[1])
         || projected_features
             .iter()
             .any(|&feature| feature >= canonical_n_features)
     {
-        bail!("prediction feature projection 必须是有序、去重且不越界的 canonical id");
+        bail!("prediction feature projection must be sorted, deduplicated, in-range canonical ids");
     }
     let mut total = 0usize;
     let batches: super::parallel_reader::BatchIter = if resolved.paths.len() == 1 {
@@ -211,8 +211,8 @@ fn bind(
         // 无法判断多的是哪一列,所以直接拒,不猜。
         if file_names.len() != n_features {
             bail!(
-                "{} 有 {} 列,模型是按 {} 个特征(位置模式)训的;\
-                 位置模式下列数必须完全一致",
+                "{} has {} columns but the model was trained on {} features (positional mode); \
+                 in positional mode the column count must match exactly",
                 path.display(),
                 file_names.len(),
                 n_features
@@ -228,7 +228,12 @@ fn bind(
             let at = file_names
                 .iter()
                 .position(|name| name == want)
-                .with_context(|| format!("{} 里缺少模型需要的特征列 {want:?}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "{} is missing feature column {want:?} required by the model",
+                        path.display()
+                    )
+                })?;
             proj.push(at);
         }
         return Ok(proj);
@@ -242,10 +247,12 @@ fn bind(
 
     let mut proj = Vec::with_capacity(feature_names.len());
     for want in feature_names {
-        let at = by_name
-            .get(want.as_str())
-            .copied()
-            .with_context(|| format!("{} 里缺少模型需要的特征列 {want:?}", path.display()))?;
+        let at = by_name.get(want.as_str()).copied().with_context(|| {
+            format!(
+                "{} is missing feature column {want:?} required by the model",
+                path.display()
+            )
+        })?;
         proj.push(at);
     }
     // ⚠️ **多余的列被忽略,这是有意的**:预测文件常常还带着标签列或 id 列。
@@ -305,7 +312,7 @@ mod bind_tests {
         let error = bind(&file, &requested, 3, Path::new("data.csv")).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "data.csv 里缺少模型需要的特征列 \"missing-first\""
+            "data.csv is missing feature column \"missing-first\" required by the model"
         );
     }
 
@@ -315,7 +322,7 @@ mod bind_tests {
         let error = bind(&[], &requested, 2, Path::new("empty.csv")).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "empty.csv 里缺少模型需要的特征列 \"required\""
+            "empty.csv is missing feature column \"required\" required by the model"
         );
     }
 
@@ -341,7 +348,7 @@ mod bind_tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "pos.csv 有 {file_columns} 列,模型是按 {n_features} 个特征(位置模式)训的;位置模式下列数必须完全一致"
+                    "pos.csv has {file_columns} columns but the model was trained on {n_features} features (positional mode); in positional mode the column count must match exactly"
                 )
             );
         }
@@ -372,7 +379,7 @@ pub(crate) fn reject_reserved_max(rows: &[f32], batch: &RecordBatch) -> Result<(
     if let Some(i) = rows.iter().position(|&v| v == f32::MAX) {
         let name = batch.schema().field(i % n_features).name().clone();
         bail!(
-            "预测数据的特征列 {name:?} 含有 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征"
+            "prediction data feature column {name:?} contains f32::MAX: this value is reserved for the missing-value split boundary and is rejected in training and prediction; rescale this feature first"
         );
     }
     Ok(())
@@ -557,7 +564,7 @@ mod packing_tests {
         // fast path (all primitive columns)
         let fast = make(Arc::new(Float32Array::from(vec![0.5, 0.5, f32::INFINITY])));
         let err = batch_to_contiguous_rows(&fast, 2, &mut rows).unwrap_err();
-        assert!(err.to_string().contains(r#"特征列 "a""#), "{err}");
+        assert!(err.to_string().contains(r#"feature column "a""#), "{err}");
         // +inf and the next value below MAX stay accepted
         let ok_schema = Arc::new(Schema::new(vec![Field::new(
             "a",

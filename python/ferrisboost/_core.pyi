@@ -98,8 +98,8 @@ class Model:
         trained on named columns they are matched to the model's features by
         name (any order; extra columns ignored; a missing one is an error).
         Categorical columns are scored through their category codes, so they must carry the
-        training categories in the training order. Models with categorical
-        splits always score on the CPU, even with use_gpu=True.
+        training categories in the training order. use_gpu=True scores
+        models with categorical splits on the GPU too (bit-identical to the CPU).
 
         strict_shape=True (XGBoost's strict_shape) makes the shape independent
         of the model type: the output-group axis is always present. Values and

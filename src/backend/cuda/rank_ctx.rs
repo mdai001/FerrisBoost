@@ -116,7 +116,7 @@ impl RankDevice {
         let load = |name: &str| -> Result<CudaFunction> {
             module
                 .load_function(name)
-                .with_context(|| format!("PTX 中找不到 {name}"))
+                .with_context(|| format!("{name} not found in PTX"))
         };
         let fns = RankFns {
             apply_delta: load("rank_apply_delta")?,
@@ -395,7 +395,7 @@ impl GpuTrainCtx {
         let mut buf = self.lock()?;
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
-        let n_rows = u32::try_from(self.n_rows).context("行数超过 u32")?;
+        let n_rows = u32::try_from(self.n_rows).context("row count exceeds u32")?;
         {
             let GpuBuffers {
                 pred_resident,
@@ -409,11 +409,15 @@ impl GpuTrainCtx {
                 .as_mut()
                 .context("the device ranking buffers were not allocated")?;
             let run = rank.run.context("init_fast_rank was not called")?;
-            let pred = pred_resident.as_mut().context("fast pred buffer 未分配")?;
+            let pred = pred_resident
+                .as_mut()
+                .context("fast pred buffer not allocated")?;
             let label = label_resident
                 .as_ref()
-                .context("fast label buffer 未分配")?;
-            let out = gpair_f32.as_mut().context("f32 gpair buffer 未分配")?;
+                .context("fast label buffer not allocated")?;
+            let out = gpair_f32
+                .as_mut()
+                .context("f32 gpair buffer not allocated")?;
             let grid_rows = n_rows.div_ceil(256).clamp(1, 4096);
 
             // 1. pred += delta
@@ -693,7 +697,7 @@ impl GpuTrainCtx {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let n_rows = u32::try_from(self.n_rows).context("行数超过 u32")?;
+            let n_rows = u32::try_from(self.n_rows).context("row count exceeds u32")?;
             let mut l = self.stream.launch_builder(finalize);
             l.arg(&*group_ptr)
                 .arg(&run.n_groups)

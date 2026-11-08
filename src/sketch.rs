@@ -465,7 +465,7 @@ impl SketchSet {
         assert_eq!(
             row.len(),
             self.per_feat.len(),
-            "row 的特征数和 sketch 不一致"
+            "row feature count does not match the sketch"
         );
         for (sk, &v) in self.per_feat.iter_mut().zip(row) {
             sk.push(v, weight);
@@ -477,7 +477,11 @@ impl SketchSet {
         let sk = &mut self.per_feat[feat as usize];
         match weights {
             Some(w) => {
-                assert_eq!(values.len(), w.len(), "values 和 weights 长度必须一致");
+                assert_eq!(
+                    values.len(),
+                    w.len(),
+                    "values and weights must have the same length"
+                );
                 for (&v, &wt) in values.iter().zip(w) {
                     sk.push(v, wt);
                 }
@@ -494,7 +498,7 @@ impl SketchSet {
         assert_eq!(
             self.per_feat.len(),
             other.per_feat.len(),
-            "合并的 sketch 特征数不一致"
+            "merged sketches have different feature counts"
         );
         for (a, b) in self.per_feat.iter_mut().zip(&other.per_feat) {
             a.merge(b);
@@ -562,13 +566,13 @@ mod tests {
             }
         }
         let cuts = sk.cuts(256);
-        assert_eq!(cuts.len(), 3, "4 个唯一值应该有 3 个切分点");
+        assert_eq!(cuts.len(), 3, "4 unique values should give 3 cut points");
 
         let bins: Vec<usize> = [1.0, 2.0, 3.0, 5.0]
             .iter()
             .map(|&v| find_bin(&cuts, v))
             .collect();
-        assert_eq!(bins, vec![0, 1, 2, 3], "每个唯一值独占一个 bin");
+        assert_eq!(bins, vec![0, 1, 2, 3], "each unique value gets its own bin");
     }
 
     #[test]
@@ -582,7 +586,7 @@ mod tests {
         let cuts = sk.cuts(max_bins);
         assert!(cuts.len() < max_bins);
         let e = max_quantile_err(&cuts, max_bins);
-        assert!(e < 0.02, "有序输入分位误差 {e}");
+        assert!(e < 0.02, "quantile error on sorted input {e}");
     }
 
     #[test]
@@ -597,7 +601,7 @@ mod tests {
         }
         let cuts = sk.cuts(max_bins);
         let e = max_quantile_err(&cuts, max_bins);
-        assert!(e < 0.02, "乱序输入分位误差 {e}");
+        assert!(e < 0.02, "quantile error on shuffled input {e}");
     }
 
     #[test]
@@ -625,7 +629,7 @@ mod tests {
 
         assert_eq!(c_whole.len(), c_merged.len());
         for (x, y) in c_whole.iter().zip(&c_merged) {
-            assert!((x - y).abs() < 0.03, "分批 {y} vs 一次性 {x}");
+            assert!((x - y).abs() < 0.03, "batched {y} vs one-shot {x}");
         }
     }
 
@@ -654,7 +658,7 @@ mod tests {
         let cw = weighted.cuts(8);
         assert!(
             cw[3] > cu[3],
-            "加权后中位数应该更大: {} vs {}",
+            "weighted median should be larger: {} vs {}",
             cw[3],
             cu[3]
         );
@@ -667,7 +671,11 @@ mod tests {
             sk.push(i as f32, 1.0);
             sk.push(f32::NAN, 1.0);
         }
-        assert_eq!(sk.total_weight(), 100.0, "NaN 不计入权重");
+        assert_eq!(
+            sk.total_weight(),
+            100.0,
+            "NaN must not count toward the weight"
+        );
     }
 
     #[test]
@@ -678,7 +686,10 @@ mod tests {
             sk.push((i % 99991) as f32, 1.0);
         }
         let n = sk.n_entries();
-        assert!(n <= max_bins * SKETCH_RATIO + 2, "压缩后条目数 {n}");
+        assert!(
+            n <= max_bins * SKETCH_RATIO + 2,
+            "entries after compression {n}"
+        );
     }
 
     #[test]
@@ -687,7 +698,10 @@ mod tests {
         for _ in 0..1000 {
             sk.push(42.0, 1.0);
         }
-        assert!(sk.cuts(256).is_empty(), "常量特征不应产生切分点");
+        assert!(
+            sk.cuts(256).is_empty(),
+            "a constant feature should produce no cut points"
+        );
     }
 
     #[test]
@@ -699,7 +713,11 @@ mod tests {
         }
         let cuts = sk.cuts(16);
         for w in cuts.windows(2) {
-            assert!(w[0] < w[1], "切分点必须严格递增: {:?}", cuts);
+            assert!(
+                w[0] < w[1],
+                "cut points must be strictly increasing: {:?}",
+                cuts
+            );
         }
     }
 
@@ -743,8 +761,11 @@ mod tests {
         }
         let cuts = set.finalize();
         assert_eq!(cuts.n_feats(), 3);
-        assert!(cuts.n_bins(0) > 4, "连续特征应该有多个 bin");
-        assert_eq!(cuts.n_bins(1), 3, "3 个唯一值 -> 3 个 bin");
-        assert_eq!(cuts.n_bins(2), 1, "常量特征 -> 1 个 bin");
+        assert!(
+            cuts.n_bins(0) > 4,
+            "a continuous feature should have multiple bins"
+        );
+        assert_eq!(cuts.n_bins(1), 3, "3 unique values -> 3 bins");
+        assert_eq!(cuts.n_bins(2), 1, "constant feature -> 1 bin");
     }
 }

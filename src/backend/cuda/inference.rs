@@ -105,7 +105,7 @@ impl GpuInferenceModel {
         let stream = state
             .ctx
             .new_stream()
-            .context("创建 prediction CUDA stream")?;
+            .context("create prediction CUDA stream")?;
         let has_categorical = compact.has_categorical_splits();
         let kernel = if has_categorical {
             "predict_margin_soa_cat"
@@ -115,7 +115,7 @@ impl GpuInferenceModel {
         let predict_fn = state
             .module
             .load_function(kernel)
-            .with_context(|| format!("PTX 中找不到 {kernel}"))?;
+            .with_context(|| format!("{kernel} not found in PTX"))?;
 
         let mut tree_offsets = Vec::with_capacity(model.trees.len() + 1);
         let mut features = Vec::new();
@@ -129,19 +129,23 @@ impl GpuInferenceModel {
         let mut cat_words: Vec<u32> = Vec::new();
 
         for tree in &model.trees {
-            let base = u32::try_from(features.len()).context("GPU prediction 节点数超过 u32")?;
+            let base =
+                u32::try_from(features.len()).context("GPU prediction node count exceeds u32")?;
             tree_offsets.push(base);
             for node in &tree.nodes {
                 if !node.is_leaf {
                     if node.feat as usize >= model.n_features {
-                        bail!("GPU prediction 模型含越界 feature {}", node.feat);
+                        bail!(
+                            "GPU prediction model contains out-of-range feature {}",
+                            node.feat
+                        );
                     }
                     if node.left < 0
                         || node.right < 0
                         || node.left as usize >= tree.nodes.len()
                         || node.right as usize >= tree.nodes.len()
                     {
-                        bail!("GPU prediction 模型含越界 child index");
+                        bail!("GPU prediction model contains out-of-range child index");
                     }
                 }
                 let categorical = !node.is_leaf && node.cats.is_some();
@@ -150,11 +154,11 @@ impl GpuInferenceModel {
                         (Some(words), false) => {
                             cat_slots.push(
                                 u32::try_from(cat_words.len())
-                                    .context("GPU prediction category words 超过 u32")?,
+                                    .context("GPU prediction category words exceed u32")?,
                             );
                             cat_words.push(
                                 u32::try_from(words.len())
-                                    .context("GPU prediction category set 超过 u32")?,
+                                    .context("GPU prediction category set exceeds u32")?,
                             );
                             cat_words.extend_from_slice(words);
                         }
@@ -167,13 +171,13 @@ impl GpuInferenceModel {
                     0
                 } else {
                     base.checked_add(node.left as u32)
-                        .context("GPU prediction child index 溢出")?
+                        .context("GPU prediction child index overflow")?
                 });
                 right_children.push(if node.is_leaf {
                     0
                 } else {
                     base.checked_add(node.right as u32)
-                        .context("GPU prediction child index 溢出")?
+                        .context("GPU prediction child index overflow")?
                 });
                 flags.push(
                     u8::from(node.is_leaf)
@@ -183,7 +187,8 @@ impl GpuInferenceModel {
                 leaf_values.push(node.leaf_value);
             }
         }
-        tree_offsets.push(u32::try_from(features.len()).context("GPU prediction 节点数超过 u32")?);
+        tree_offsets
+            .push(u32::try_from(features.len()).context("GPU prediction node count exceeds u32")?);
 
         // CUDA allocations cannot be zero-sized. Empty ensembles still use
         // zero tree ranges, so one unreachable sentinel node is sufficient.
@@ -235,7 +240,7 @@ impl GpuInferenceModel {
         };
         stream
             .synchronize()
-            .context("等待 prediction model upload")?;
+            .context("wait for prediction model upload")?;
 
         Ok(Self {
             state,
@@ -281,10 +286,10 @@ impl GpuInferenceModel {
     ) -> Result<Vec<f32>> {
         let expected = n_rows
             .checked_mul(self.n_features)
-            .context("GPU prediction input size 溢出")?;
+            .context("GPU prediction input size overflow")?;
         if row_major.len() != expected {
             bail!(
-                "GPU prediction 输入有 {} 个值,预期 {n_rows} × {} = {expected}",
+                "GPU prediction input has {} values, expected {n_rows} × {} = {expected}",
                 row_major.len(),
                 self.n_features
             );
@@ -292,7 +297,7 @@ impl GpuInferenceModel {
         if let Some(init) = init {
             if init.len() != n_rows {
                 bail!(
-                    "GPU prediction base_margin 有 {} 个值,预期 {n_rows}",
+                    "GPU prediction base_margin has {} values, expected {n_rows}",
                     init.len()
                 );
             }
@@ -310,12 +315,12 @@ impl GpuInferenceModel {
             .n_features
             .checked_add(1 + usize::from(init.is_some()))
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .context("GPU prediction row size 溢出")?;
+            .context("GPU prediction row size overflow")?;
         let (free, _) = self
             .state
             .ctx
             .mem_get_info()
-            .context("读取 prediction 可用显存")?;
+            .context("query free device memory for prediction")?;
         let usable = free
             .saturating_add(guard.as_ref().map_or(0, PredictionStaging::bytes))
             .saturating_sub(DEVICE_HEADROOM_BYTES)
@@ -338,7 +343,7 @@ impl GpuInferenceModel {
                 // replacement allocation, including under memory pressure.
                 self.stream
                     .synchronize()
-                    .context("释放 prediction staging")?;
+                    .context("release prediction staging")?;
             }
             self.allocate_staging(batch_rows, init.is_some())?
         };
@@ -351,7 +356,7 @@ impl GpuInferenceModel {
             // large calls retain no staging allocation after returning.
             if let Err(error) = self.stream.synchronize() {
                 if result.is_ok() {
-                    return Err(error).context("释放 prediction staging");
+                    return Err(error).context("release prediction staging");
                 }
             }
         }
@@ -361,24 +366,24 @@ impl GpuInferenceModel {
     fn allocate_staging(&self, batch_rows: usize, with_init: bool) -> Result<PredictionStaging> {
         let input_values = batch_rows
             .checked_mul(self.n_features)
-            .context("GPU prediction staging size 溢出")?;
+            .context("GPU prediction staging size overflow")?;
         input_values
             .checked_add(batch_rows * (1 + usize::from(with_init)))
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .context("GPU prediction staging bytes 溢出")?;
+            .context("GPU prediction staging bytes overflow")?;
         // SAFETY: every active input value is uploaded before the kernel
         // reads it (the start margins likewise); the predict kernels write
         // every active output row (also for zero trees) before D2H. Unused
         // capacity is never read/copied.
         // CompactInferenceModel retains one feature even for leaf-only models.
         let input = unsafe { self.stream.alloc::<f32>(input_values) }
-            .context("分配 GPU prediction input staging")?;
+            .context("allocate GPU prediction input staging")?;
         let output = unsafe { self.stream.alloc::<f32>(batch_rows) }
-            .context("分配 GPU prediction output staging")?;
+            .context("allocate GPU prediction output staging")?;
         let init = if with_init {
             Some(
                 unsafe { self.stream.alloc::<f32>(batch_rows) }
-                    .context("分配 GPU prediction base_margin staging")?,
+                    .context("allocate GPU prediction base_margin staging")?,
             )
         } else {
             None
@@ -408,9 +413,9 @@ impl GpuInferenceModel {
             completed: false,
         };
         let n_features =
-            u32::try_from(self.n_features).context("GPU prediction feature 数超过 u32")?;
-        let n_trees =
-            u32::try_from(n_trees.min(self.n_trees)).context("GPU prediction tree 数超过 u32")?;
+            u32::try_from(self.n_features).context("GPU prediction feature count exceeds u32")?;
+        let n_trees = u32::try_from(n_trees.min(self.n_trees))
+            .context("GPU prediction tree count exceeds u32")?;
 
         for first_row in (0..n_rows).step_by(batch_rows) {
             let rows = (n_rows - first_row).min(batch_rows);
@@ -429,7 +434,7 @@ impl GpuInferenceModel {
                 let device_init = staging
                     .init
                     .as_mut()
-                    .context("GPU prediction base_margin staging 缺失")?;
+                    .context("GPU prediction base_margin staging missing")?;
                 let mut init_view = device_init.slice_mut(..rows);
                 self.stream
                     .memcpy_htod(&init[first_row..first_row + rows], &mut init_view)
@@ -437,7 +442,8 @@ impl GpuInferenceModel {
             }
             let input_view = staging.input.slice(..values);
             let mut output_view = staging.output.slice_mut(..rows);
-            let rows_u32 = u32::try_from(rows).context("GPU prediction batch 行数超过 u32")?;
+            let rows_u32 =
+                u32::try_from(rows).context("GPU prediction batch row count exceeds u32")?;
             let config = LaunchConfig {
                 grid_dim: (rows_u32.div_ceil(PREDICT_THREADS), 1, 1),
                 block_dim: (PREDICT_THREADS, 1, 1),
@@ -479,7 +485,7 @@ impl GpuInferenceModel {
         }
         self.stream
             .synchronize()
-            .context("等待 GPU prediction 完成")?;
+            .context("wait for GPU prediction to finish")?;
         host_copy_guard.completed = true;
         Ok(output)
     }

@@ -180,7 +180,7 @@ fn group_weights_scale_gradients_and_must_match_the_group_count() {
         ferrisboost::train::train_weighted(&src, &d.y, Some(&per_row), &[], &cfg, &mut [], &Local)
             .unwrap_err()
             .to_string();
-    assert!(err.contains("权重"), "{err}");
+    assert!(err.contains("weights"), "{err}");
 }
 
 #[test]

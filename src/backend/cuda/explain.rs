@@ -258,12 +258,12 @@ impl GpuExplainModel {
         let stream = state
             .ctx
             .new_stream()
-            .context("创建 explanation CUDA stream")?;
+            .context("create explanation CUDA stream")?;
         let load = |name: &str| -> Result<CudaFunction> {
             state
                 .module
                 .load_function(name)
-                .with_context(|| format!("PTX 中找不到 {name}"))
+                .with_context(|| format!("{name} not found in PTX"))
         };
         let up = |what: &str| format!("explanation {what} H2D");
         Ok(Self {
@@ -435,7 +435,7 @@ impl GpuExplainModel {
             .state
             .ctx
             .mem_get_info()
-            .context("读取 explanation 可用显存")?;
+            .context("query free device memory for explanation")?;
         let usable = free
             .saturating_sub(DEVICE_HEADROOM_BYTES)
             .min(MAX_BATCH_BYTES);
@@ -446,17 +446,18 @@ impl GpuExplainModel {
         // margin are uploaded, the output is zeroed per batch, and the scratch
         // frames / slots are initialised by the kernels before they are read.
         let mut input =
-            unsafe { stream.alloc::<f32>(batch * nf) }.context("分配 GPU explanation input")?;
+            unsafe { stream.alloc::<f32>(batch * nf) }.context("allocate GPU explanation input")?;
         let mut margin_buf = match margin {
             Some(_) => Some(
-                unsafe { stream.alloc::<f32>(batch * k) }.context("分配 GPU explanation margin")?,
+                unsafe { stream.alloc::<f32>(batch * k) }
+                    .context("allocate GPU explanation margin")?,
             ),
             None => None,
         };
         let mut out_buf = unsafe { stream.alloc::<f32>(batch * out_width) }
-            .context("分配 GPU explanation output")?;
+            .context("allocate GPU explanation output")?;
         let mut scratch = unsafe { stream.alloc::<f32>((batch * k * scratch_words).max(1)) }
-            .context("分配 GPU explanation scratch")?;
+            .context("allocate GPU explanation scratch")?;
         let group_root_mean = stream
             .clone_htod(ex.group_root_mean())
             .context("explanation group means H2D")?;
@@ -597,13 +598,17 @@ impl GpuExplainModel {
                 .context("explanation output D2H")?;
             // Per-batch sync: the host slice must be complete before the next
             // batch reuses the staging buffers.
-            stream.synchronize().context("等待 GPU explanation 完成")?;
+            stream
+                .synchronize()
+                .context("wait for GPU explanation to finish")?;
         }
         guard.done = true;
         drop(guard);
         // Release the staging before returning (stream-ordered frees).
         drop((input, margin_buf, out_buf, scratch));
-        stream.synchronize().context("释放 explanation staging")?;
+        stream
+            .synchronize()
+            .context("release explanation staging")?;
         Ok(out)
     }
 }

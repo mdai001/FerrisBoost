@@ -238,7 +238,7 @@ pub mod cuda {
             _config: SharedHistogramConfig,
             _timing: bool,
         ) -> Result<Self> {
-            anyhow::bail!("CUDA backend 未启用")
+            anyhow::bail!("CUDA backend is not enabled")
         }
         pub fn budget(&self) -> GpuMemoryBudget {
             match self.0 {}
@@ -446,7 +446,7 @@ pub mod cuda {
         _row_idx: Option<&[RowId]>,
         _config: SharedHistogramConfig,
     ) -> Result<(Vec<GradPairFixed>, SharedHistogramProfile)> {
-        anyhow::bail!("CUDA backend 未启用")
+        anyhow::bail!("CUDA backend is not enabled")
     }
     #[allow(clippy::too_many_arguments)]
     pub fn partition_rows_gpu_with_profile(
@@ -459,6 +459,6 @@ pub mod cuda {
         _missing_left: bool,
         _threads: u32,
     ) -> Result<((Vec<RowId>, Vec<RowId>), PartitionProfile)> {
-        anyhow::bail!("CUDA backend 未启用")
+        anyhow::bail!("CUDA backend is not enabled")
     }
 }

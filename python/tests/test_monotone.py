@@ -85,12 +85,12 @@ def test_works_with_weights_and_regression():
 
 # ---------------------------------------------------------------- 错误
 @pytest.mark.parametrize("bad, match", [
-    ((1, 0, 0, 0, 1), "只有 4 个特征"),
-    ((1.5, 0), "整数"),
-    ((True, 0), "整数"),
-    ("1,0,-1", "字符串"),
-    ("(1,x)", "非整数"),
-    (3.0, "元组"),
+    ((1, 0, 0, 0, 1), "only 4 features"),
+    ((1.5, 0), "integer"),
+    ((True, 0), "integer"),
+    ("1,0,-1", "string must look like"),
+    ("(1,x)", "non-integer"),
+    (3.0, "tuple"),
 ])
 def test_invalid_constraints_are_rejected(bad, match):
     x, y = wiggly()
@@ -101,7 +101,7 @@ def test_invalid_constraints_are_rejected(bad, match):
 
 def test_named_constraints_need_feature_names():
     x, y = wiggly()
-    with pytest.raises(ValueError, match="列名"):
+    with pytest.raises(ValueError, match="column names"):
         fb.train({**BASE, "monotone_constraints": {"f0": 1}}, x, label=y,
                  num_boost_round=1, quiet=True)
 
@@ -158,10 +158,10 @@ def test_named_constraints_on_pyarrow_table():
 def test_unknown_named_column_is_rejected(tmp_path):
     x, y = wiggly()
     write_parquet(tmp_path / "t.parquet", x, y)
-    with pytest.raises(ValueError, match="不是特征列"):
+    with pytest.raises(ValueError, match="is not a feature column"):
         fb.train({**BASE, "monotone_constraints": {"nope": 1}}, str(tmp_path / "t.parquet"),
                  label="label", num_boost_round=1, quiet=True)
-    with pytest.raises(ValueError, match="不是特征列"):
+    with pytest.raises(ValueError, match="is not a feature column"):
         # 标签列不是特征
         fb.train({**BASE, "monotone_constraints": {"label": 1}}, str(tmp_path / "t.parquet"),
                  label="label", num_boost_round=1, quiet=True)

@@ -554,8 +554,8 @@ pub fn resolve_gpu_streaming_cols_per_block(
         // 连最窄的合法配置都放不下 —— **训练开始前就明确失败**,
         // 不要开跑之后靠 CUDA OOM 来当内存规划器。
         anyhow::anyhow!(
-            "GPU 显存放不下最小的 streaming 配置:需要约 {:.1} MB,\
-             预算只有 {:.1} MB(空闲 {:.1} MB − 保留 {:.1} MB)",
+            "the smallest streaming configuration does not fit in GPU memory: needs about {:.1} MB, \
+             budget is only {:.1} MB (free {:.1} MB − reserve {:.1} MB)",
             model.peak_for(1) as f64 / (1024.0 * 1024.0),
             budget as f64 / (1024.0 * 1024.0),
             free_vram as f64 / (1024.0 * 1024.0),
@@ -1073,7 +1073,7 @@ mod tests {
             let err = (est - measured).abs() / measured;
             assert!(
                 err < 0.05,
-                "cols={cols}: 估计 {est:.1} MiB vs 实测 {measured} MiB,误差 {:.1}%",
+                "cols={cols}: estimated {est:.1} MiB vs measured {measured} MiB, error {:.1}%",
                 err * 100.0
             );
         }
@@ -1086,7 +1086,7 @@ mod tests {
         let slope = m.per_col_bytes as f64 / (1024.0 * 1024.0);
         assert!(
             (slope - 10.06).abs() < 0.5,
-            "每列斜率 {slope:.2} MiB 与实测 10.06 MiB 不符"
+            "per-column slope {slope:.2} MiB does not match the measured 10.06 MiB"
         );
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         let by_bytes_would_be = 8u64;
         assert!(
             by_blocks > by_bytes_would_be,
-            "块数规则必须比字节规则给出更宽的块:{by_blocks} vs {by_bytes_would_be}"
+            "the block-count rule must give wider blocks than the byte rule: {by_blocks} vs {by_bytes_would_be}"
         );
     }
 
@@ -1197,12 +1197,12 @@ mod resolve_tests {
         .unwrap();
         assert!(
             p.resident_blocks > 0,
-            "5 GB 空闲还全 streaming,等于白白每层重传所有列块:{}",
+            "fully streaming with 5 GB free re-uploads every column block on every level: {}",
             p.report()
         );
         assert!(
             p.estimated_peak <= p.free_vram - p.reserve,
-            "峰值不能越过安全预算"
+            "peak must not exceed the safe budget"
         );
     }
 
@@ -1221,7 +1221,7 @@ mod resolve_tests {
         .unwrap();
         assert_eq!(
             p.resident_blocks, p.physical_blocks,
-            "常驻块不能超过物理块数"
+            "resident blocks must not exceed the physical block count"
         );
         // 全常驻就不要再叫它 streaming。
         assert_eq!(p.residency_label(), "full resident");
@@ -1239,7 +1239,7 @@ mod resolve_tests {
             assert_eq!(
                 p.resident_blocks,
                 0,
-                "预算不够时不能还去常驻:{}",
+                "must not keep blocks resident when the budget is insufficient: {}",
                 p.report()
             );
             assert_eq!(p.residency_label(), "pure streaming");
@@ -1254,7 +1254,7 @@ mod resolve_tests {
         let three_streams_no_resident = m.peak_for_layout(64, 3, 0);
         assert_eq!(
             one_stream_two_resident, three_streams_no_resident,
-            "resident slot 和 stream slot 的单价必须一致,否则预算和实际分配对不上"
+            "resident slot and stream slot unit costs must match, otherwise the budget diverges from actual allocation"
         );
     }
 
@@ -1277,12 +1277,12 @@ mod resolve_tests {
             .unwrap();
         assert!(
             p.resolved_cols_per_block <= 128,
-            "不该超过候选集上限:{}",
+            "must not exceed the candidate-set limit: {}",
             p.resolved_cols_per_block
         );
         assert!(
             p.physical_blocks >= 2,
-            "不该塌成 1 块:{} 块",
+            "must not collapse to 1 block: {} blocks",
             p.physical_blocks
         );
     }
@@ -1304,7 +1304,7 @@ mod resolve_tests {
             cu.contains(&format!(
                 "#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u"
             )),
-            "histogram.cu 的 QUANTILE_REDUCE_BLOCKS 与 gpu_mem_plan 不一致"
+            "QUANTILE_REDUCE_BLOCKS in histogram.cu disagrees with gpu_mem_plan"
         );
     }
 
@@ -1479,7 +1479,10 @@ mod resolve_tests {
         assert_eq!(p.resolved_cols_per_block, 128);
         assert_eq!(p.physical_blocks, 16);
         assert_eq!(p.resolved_hist_streams, 1);
-        assert_eq!(p.resident_blocks, 16, "显式块宽不能关闭 residency planning");
+        assert_eq!(
+            p.resident_blocks, 16,
+            "an explicit block width must not disable residency planning"
+        );
         assert_eq!(p.residency_label(), "full resident");
         assert_eq!(p.how, Resolution::ExplicitOverride);
     }
@@ -1490,7 +1493,7 @@ mod resolve_tests {
         let m = higgs();
         let free = m.fixed_bytes + m.per_col_bytes * 5 + default_safety_reserve(2 * GB);
         let p = resolve_gpu_streaming_cols_per_block(None, 28, free, 6 * GB, m).unwrap();
-        assert!(p.resolved_cols_per_block < 8, "应被夹小");
+        assert!(p.resolved_cols_per_block < 8, "should be clamped down");
         assert_eq!(p.how, Resolution::VramClamped);
     }
 
@@ -1500,7 +1503,10 @@ mod resolve_tests {
         let err = resolve_gpu_streaming_cols_per_block(None, 28, 64 * 1024 * 1024, 6 * GB, higgs())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("放不下"), "错误信息要说清楚:{err}");
+        assert!(
+            err.contains("does not fit"),
+            "error message should be explicit: {err}"
+        );
     }
 
     #[test]

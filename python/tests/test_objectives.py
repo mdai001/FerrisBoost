@@ -141,7 +141,7 @@ def test_invalid_labels_are_rejected(objective, bad):
     x, y = make(objective, n=200)
     y = y.copy()
     y[3] = bad
-    with pytest.raises(Exception, match="标签"):
+    with pytest.raises(Exception, match="labels must be"):
         fb.train({"objective": objective}, x, label=y, num_boost_round=1, quiet=True)
 
 
