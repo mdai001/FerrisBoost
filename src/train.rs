@@ -621,8 +621,8 @@ use crate::metrics::Metric;
 use crate::split::{self, SplitCandidate};
 use crate::tree::{self, Model, Tree};
 use crate::types::{
-    Bin, FeatId, GradPair, GradPairFixed, GradQuantizer, Objective, PredictionAuthority, RowId,
-    TrainParams, MISSING_BIN,
+    FeatId, GradPair, GradPairFixed, GradQuantizer, Objective, PredictionAuthority, RowId,
+    TrainParams,
 };
 
 pub struct TrainConfig {
@@ -832,7 +832,9 @@ pub trait BlockSource: Send + Sync {
     /// 结果是每个全量驻留的 source 都静默继承了一个 6 倍的性能悬崖 ——
     /// HIGGS 上为了取 1 列克隆 294MB,吃掉单轮一半时间,profile 才看出来。
     /// 现在编译器会逼每个新 source 想清楚这件事。
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>>;
+    ///
+    /// The column comes back at its feature's storage width (`crate::bins`).
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<crate::bins::BinData>;
 
     /// 直接借出**驻留在内存里的**单个特征整列;拿不到(落盘 cache 等)返回
     /// `None`,调用方退回 `feature_column`。
@@ -843,7 +845,7 @@ pub trait BlockSource: Send + Sync {
     /// 每次一块新分配的缺页)。驻留的 source 覆盖本方法零拷贝借出;
     /// 默认 `None`,所以只能交出拷贝的 source(落盘 cache、测试里的
     /// 包装器)行为和以前完全一样。
-    fn resident_feature_column(&self, _feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, _feat: FeatId) -> Option<crate::bins::BinSlice<'_>> {
         None
     }
 
@@ -1269,7 +1271,9 @@ fn train_with_backend(
     let p = &cfg.params;
     crate::ensure_input!(
         (1..=crate::types::MAX_BIN_LIMIT).contains(&p.max_bin),
-        "max_bin 要在 1..=255"
+        "max_bin must be in 1..={}, got {}",
+        crate::types::MAX_BIN_LIMIT,
+        p.max_bin
     );
     // ⚠️ **必须在共享路径上校验**,不能只在 GPU 里。以前完全没有校验:
     // CPU 会安静地接受 depth 16,GPU 则在训练深处报
@@ -1495,6 +1499,15 @@ fn train_with_backend(
     let gpu = match gpu_device {
         Some(device) => {
             let cuts = source.cuts();
+            // The CUDA kernels read 8-bit bins only. Refuse 16-bit columns up
+            // front with a clear message instead of failing at the first block
+            // (never a silent CPU fallback).
+            crate::ensure_input!(
+                !cuts.has_wide() && evals.iter().all(|e| !e.source.cuts().has_wide()),
+                "GPU training does not support features with more than 255 bins yet \
+                 (max_bin > 255 stores them as 16-bit columns); train on the CPU or use \
+                 max_bin <= 255"
+            );
             let mut max_block_feats = 0usize;
             let mut max_hist_bins = 0usize;
             for b in 0..source.n_blocks() {
@@ -2095,7 +2108,7 @@ pub fn train_gpu_one_tree(
             let offsets = cuts.block_hist_offsets(&block.feat_ids);
             let hist = build_histogram_shared(
                 device_ordinal,
-                &block.data,
+                block.bins().require_u8("GPU training")?,
                 block.n_rows,
                 block.n_feats(),
                 &offsets,
@@ -2156,7 +2169,7 @@ pub fn train_gpu_one_tree(
     let rows: Vec<RowId> = (0..source.n_rows() as RowId).collect();
     let (left_rows, right_rows) = crate::backend::cuda::partition_rows_gpu(
         device_ordinal,
-        &col,
+        col.as_slice().require_u8("GPU training")?,
         source.n_rows(),
         0,
         &rows,
@@ -2646,6 +2659,10 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                     "预测时列块 {b} 数据长度与行数 × 特征数不一致"
                 );
                 anyhow::ensure!(
+                    block.width() == source.cuts().block_width(&block.feat_ids),
+                    "预测时列块 {b} 的 bin 宽度与 cuts 不一致"
+                );
+                anyhow::ensure!(
                     block.feat_ids == block_feats[b],
                     "预测时列块 {b} 的实际特征与 block_features 元数据不一致"
                 );
@@ -2665,8 +2682,9 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                         if local == usize::MAX {
                             break;
                         }
-                        let bin = block.column(local)[row as usize];
-                        let go_left = if bin == MISSING_BIN {
+                        let col = block.column(local);
+                        let bin = col.get(row as usize);
+                        let go_left = if bin == col.width().missing() {
                             n.default_left
                         } else if let Some(cats) = &node_cats[*node as usize] {
                             !cats.contains(bin as u32)
@@ -2995,6 +3013,10 @@ fn build_tree(
                             block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
                             "列块 {b} 数据长度与行数 × 特征数不一致"
                         );
+                        anyhow::ensure!(
+                            block.width() == source.cuts().block_width(&block.feat_ids),
+                            "列块 {phys} 的 bin 宽度与 cuts 不一致"
+                        );
                     }
                     let width = *plan.hist_offsets.last().unwrap() as usize;
                     // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
@@ -3033,7 +3055,7 @@ fn build_tree(
                                     block.context("GPU cache miss requires source payload")?;
                                 ctx.block_session(
                                     phys,
-                                    &block.data,
+                                    block.bins().require_u8("GPU training")?,
                                     block.n_rows,
                                     block.n_feats(),
                                     &plan.hist_offsets,
@@ -3155,15 +3177,15 @@ fn build_tree(
                         if depth == 0 && !drop_zero_rows {
                             // 根节点走 None 那条路:少一层行下标的间接寻址,
                             // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                            hist::build(
-                                &block.data,
+                            crate::with_bins!(block.bins(), |bins| hist::build(
+                                bins,
                                 block.n_rows,
                                 block.n_feats(),
                                 &plan.hist_offsets,
                                 gpair,
                                 None,
                                 &mut per_node[0].bins,
-                            );
+                            ));
                         } else {
                             // 本层所有要实际累加的节点一起走:行 id 区间在外、
                             // 节点在内,同一段 bin/gpair 被所有节点复用
@@ -3175,14 +3197,14 @@ fn build_tree(
                                 .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
                                 .map(|(ln, h)| (ln.rows.host(), h.bins.as_mut_slice()))
                                 .collect();
-                            hist::build_nodes(
-                                &block.data,
+                            crate::with_bins!(block.bins(), |bins| hist::build_nodes(
+                                bins,
                                 block.n_rows,
                                 block.n_feats(),
                                 &plan.hist_offsets,
                                 gpair,
                                 &mut targets,
-                            );
+                            ));
                         }
                     }
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
@@ -3402,11 +3424,11 @@ fn build_tree(
             // source 照旧付那份拷贝(PART_FETCH 只计这部分)。
             let fetch_timer = prof::Timer::new(&prof::PART_FETCH);
             let owned_col;
-            let col: &[Bin] = match source.resident_feature_column(feat) {
+            let col: crate::bins::BinSlice<'_> = match source.resident_feature_column(feat) {
                 Some(col) => col,
                 None => {
                     owned_col = source.feature_column(feat)?;
-                    &owned_col
+                    owned_col.as_slice()
                 }
             };
             drop(fetch_timer);
@@ -3425,7 +3447,7 @@ fn build_tree(
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
-                let mut session = ctx.partition_session(col)?;
+                let mut session = ctx.partition_session(col.require_u8("GPU training")?)?;
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
                     part_tokens[i] = Some(match &c.cats {
@@ -3451,7 +3473,12 @@ fn build_tree(
             } else {
                 for i in node_idxs {
                     let c = chosen[i].expect("by_feat 里只放了有候选的节点");
-                    let (left, right) = partition_rows(level[i].rows.host(), col, &c, comm);
+                    let (left, right) = crate::with_bins!(col, |col| partition_rows(
+                        level[i].rows.host(),
+                        col,
+                        &c,
+                        comm
+                    ));
                     partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
                 }
             }
@@ -3647,7 +3674,8 @@ fn apply_dropped_rows(
     predictions: &mut [f32],
 ) -> anyhow::Result<()> {
     anyhow::ensure!(gpair.len() == predictions.len());
-    let mut cols: Vec<&[Bin]> = vec![&[]; source.n_features()];
+    let mut cols: Vec<crate::bins::BinSlice<'_>> =
+        vec![crate::bins::BinSlice::U8(&[]); source.n_features()];
     for n in t.nodes.iter().filter(|n| !n.is_leaf) {
         cols[n.feat as usize] = source
             .resident_feature_column(n.feat)
@@ -3673,15 +3701,16 @@ fn apply_dropped_rows(
                         break;
                     }
                     let sp = &split_info[node];
-                    let bin = cols[sp.feat as usize][row];
+                    let col = cols[sp.feat as usize];
+                    let bin = col.get(row);
                     // 与 `partition_rows` 逐条相同:缺失走记下的方向;类别分裂
                     // 里集合走右、其余(含未见过的编码)走左;数值分裂比 bin。
-                    let go_left = if bin == MISSING_BIN {
+                    let go_left = if bin == col.width().missing() {
                         sp.missing_left
                     } else if let Some(cats) = &sp.cats {
-                        !cats.contains(bin as u32)
+                        !cats.contains(bin)
                     } else {
-                        (bin as u32) < sp.bin
+                        bin < sp.bin
                     };
                     node = if go_left { n.left } else { n.right } as usize;
                 }
@@ -3898,9 +3927,9 @@ fn partition_orders() -> &'static [PartitionOrder; 256] {
 /// 分区用的是 **bin**(训练侧手里就是量化数据),和 `leaf_values` 里
 /// 把阈值换回 bin 再比是同一套语义,`tree::split_bin` /
 /// `split_threshold` 的往返测试钉着这一点。
-fn partition_rows(
+fn partition_rows<B: crate::bins::BinCode>(
     rows: &[RowId],
-    col: &[Bin],
+    col: &[B],
     c: &SplitCandidate,
     comm: &dyn Comm,
 ) -> (Vec<RowId>, Vec<RowId>) {
@@ -3915,13 +3944,13 @@ fn partition_rows(
         let mut acc = 0u8;
         for (j, &r) in chunk.iter().enumerate() {
             let bin = col[r as usize];
-            let go_left = if bin == MISSING_BIN {
+            let go_left = if bin == B::MISSING {
                 c.missing_left
             } else if let Some(cats) = &c.cats {
                 // Categorical: the set goes right, every other category left.
-                !cats.contains(bin as u32)
+                !cats.contains(bin.idx() as u32)
             } else {
-                (bin as u32) < c.bin
+                (bin.idx() as u32) < c.bin
             };
             acc |= (go_left as u8) << j;
         }
@@ -4292,6 +4321,7 @@ mod tests {
     use crate::comm::Local;
     use crate::metrics::{LogLoss, Metric, Rmse};
     use crate::source::DenseSource;
+    use crate::types::{Bin, MISSING_BIN};
 
     const MISSING: f32 = f32::NAN;
 
@@ -5062,7 +5092,7 @@ mod tests {
                 self.blocks.fetch_add(1, Ordering::Relaxed);
                 self.inner.with_block(i, f)
             }
-            fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+            fn feature_column(&self, f: FeatId) -> anyhow::Result<crate::bins::BinData> {
                 self.cols.fetch_add(1, Ordering::Relaxed);
                 self.inner.feature_column(f)
             }
@@ -5299,7 +5329,7 @@ mod tests {
         fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
             self.0.with_block(i, f)
         }
-        fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+        fn feature_column(&self, f: FeatId) -> anyhow::Result<crate::bins::BinData> {
             self.0.feature_column(f)
         }
     }

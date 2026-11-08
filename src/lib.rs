@@ -5,6 +5,7 @@
 //! for Python examples and the public modules below for the Rust API.
 
 pub mod backend;
+pub mod bins;
 pub mod callback;
 pub mod categorical;
 pub mod colsample;

@@ -921,10 +921,10 @@ mod tests {
     fn empty_fields_are_missing_not_zero() {
         let path = write("empty_missing", BODY);
         let ds = open(&path, "target", 16, 3).unwrap();
-        assert_eq!(ds.source.bin_at(1, 1), crate::types::MISSING_BIN);
-        assert_eq!(ds.source.bin_at(5, 1), crate::types::MISSING_BIN);
+        assert_eq!(ds.source.bin_at(1, 1), crate::types::MISSING_BIN as u32);
+        assert_eq!(ds.source.bin_at(5, 1), crate::types::MISSING_BIN as u32);
         for row in [0usize, 2, 3, 4] {
-            assert_ne!(ds.source.bin_at(row, 1), crate::types::MISSING_BIN);
+            assert_ne!(ds.source.bin_at(row, 1), crate::types::MISSING_BIN as u32);
         }
         std::fs::remove_file(&path).ok();
     }

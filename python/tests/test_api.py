@@ -54,10 +54,11 @@ def test_bad_objective_lists_the_supported_ones():
     assert "binary:logistic" in str(e.value)
 
 
-def test_max_bin_over_255_rejected():
+def test_max_bin_over_65535_rejected():
     x, y = toy()
-    with pytest.raises(ValueError, match="max_bin"):
-        fb.train({**BASE, "max_bin": 256}, x, label=y, num_boost_round=2)
+    for bad in (0, 65536):
+        with pytest.raises(ValueError, match="max_bin"):
+            fb.train({**BASE, "max_bin": bad}, x, label=y, num_boost_round=2)
 
 
 # ---------------------------------------------------------------- 训练控制

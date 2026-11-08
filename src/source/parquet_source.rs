@@ -24,11 +24,12 @@ use parquet::file::reader::ChunkReader;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::columns::{BinCuts, ColumnBlock};
+use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
+use crate::columns::{quantize_value, BinCuts, ColumnBlock};
 use crate::source::arrow_source::ArrowSource;
 use crate::source::Targets;
 use crate::train::BlockSource;
-use crate::types::{Bin, FeatId, MISSING_BIN};
+use crate::types::FeatId;
 
 pub(crate) const PARQUET_READ_WINDOW_BYTES: usize = crate::source::parquet_io::READ_WINDOW_BYTES;
 
@@ -923,6 +924,25 @@ struct CacheManifest {
     groups: Vec<Vec<FeatId>>,
     /// BLAKE3 of each `block-{i}.bin`, in `groups` order.
     block_hashes: Vec<String>,
+    /// Bytes per bin of each block (version 3 only; version 2 = all 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    block_widths: Vec<u8>,
+}
+
+/// Cache format of all-8-bit caches.
+const CACHE_VERSION: u32 = 2;
+/// Cache format with at least one 16-bit block (`block_widths` present).
+const CACHE_VERSION_WIDE: u32 = 3;
+
+/// Bytes of the whole quantized dataset at each feature's storage width.
+fn quantized_bytes(cuts: &BinCuts, n_rows: usize) -> anyhow::Result<usize> {
+    (0..cuts.n_feats() as FeatId)
+        .try_fold(0usize, |acc, f| {
+            n_rows
+                .checked_mul(cuts.bin_width(f).bytes())
+                .and_then(|b| acc.checked_add(b))
+        })
+        .ok_or_else(|| anyhow::anyhow!("量化缓存大小溢出"))
 }
 
 fn no_missing_bits() -> u32 {
@@ -998,8 +1018,19 @@ impl ParquetBlockSource {
             .map(|&f| self.file_col[f as usize])
             .collect();
 
-        let mut data = vec![0u8; feat_ids.len() * self.n_rows];
-        self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+        let len = feat_ids.len() * self.n_rows;
+        let data = match self.cuts.block_width(&feat_ids) {
+            BinWidth::U8 => {
+                let mut data = vec![0u8; len];
+                self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                BinData::U8(data)
+            }
+            BinWidth::U16 => {
+                let mut data = vec![0u16; len];
+                self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                BinData::U16(data)
+            }
+        };
         Ok(ColumnBlock {
             feat_ids,
             data,
@@ -1298,10 +1329,9 @@ impl ParquetBlockSource {
             "标签列 {label:?} 里有缺失值"
         );
 
-        let groups = crate::columns::partition_features(n_features, cols_per_block);
-        let cache_bytes = n_rows
-            .checked_mul(n_features)
-            .ok_or_else(|| anyhow::anyhow!("量化缓存大小溢出"))?;
+        cuts.check_widths()?;
+        let groups = crate::columns::partition_features_by_width(&cuts.widths(), cols_per_block);
+        let cache_bytes = quantized_bytes(&cuts, n_rows)?;
         let mut source = Self {
             path,
             cuts,
@@ -1369,10 +1399,13 @@ impl ParquetBlockSource {
                     .into_par_iter()
                     .map(|i| -> anyhow::Result<String> {
                         let block = self.quantize_block(i)?;
-                        let hash = block_hash(&block.data);
+                        // Little-endian element bytes: the 8-bit image is the
+                        // block itself, so 8-bit caches are byte-identical.
+                        let bytes = block.data.to_le_bytes();
+                        let hash = block_hash(&bytes);
                         let tmp = dir.join(format!("block-{i}.bin.tmp"));
                         let final_path = dir.join(format!("block-{i}.bin"));
-                        File::create(&tmp)?.write_all(&block.data)?;
+                        File::create(&tmp)?.write_all(&bytes)?;
                         std::fs::rename(tmp, final_path)?;
                         Ok(hash)
                     })
@@ -1404,8 +1437,21 @@ impl ParquetBlockSource {
         block_hashes: Vec<String>,
     ) -> anyhow::Result<CacheManifest> {
         let (source_path, source_len, source_mtime_ns) = source_identity(&self.path)?;
+        let widths: Vec<u8> = self
+            .groups
+            .iter()
+            .map(|g| self.cuts.block_width(g).bytes() as u8)
+            .collect();
+        // Version 2 stays the format of all-8-bit caches (byte-identical to
+        // 0.0.7, so existing caches remain valid); a cache with any 16-bit
+        // block is version 3 and records the width of every block.
+        let wide = widths.iter().any(|&w| w != 1);
         Ok(CacheManifest {
-            version: 2,
+            version: if wide {
+                CACHE_VERSION_WIDE
+            } else {
+                CACHE_VERSION
+            },
             source_path,
             source_len,
             source_mtime_ns,
@@ -1427,6 +1473,7 @@ impl ParquetBlockSource {
             missing_bits: missing_bits(self.missing),
             groups: self.groups.clone(),
             block_hashes,
+            block_widths: if wide { widths } else { Vec::new() },
         })
     }
 
@@ -1443,7 +1490,7 @@ impl ParquetBlockSource {
         let raw = std::fs::read(cache_path.join("manifest.json"))?;
         let manifest: CacheManifest = serde_json::from_slice(&raw)?;
         crate::ensure_input!(
-            manifest.version == 2,
+            manifest.version == CACHE_VERSION || manifest.version == CACHE_VERSION_WIDE,
             "不支持的量化缓存版本 {}（payload checksum 从版本 2 开始；请重建旧缓存）",
             manifest.version
         );
@@ -1483,12 +1530,6 @@ impl ParquetBlockSource {
             crate::ensure_input!(manifest.max_bins == max_bins, "缓存 max_bin 不一致");
         }
         crate::ensure_input!(manifest.n_features == feat_cols.len(), "缓存特征数不一致");
-        let expected_groups =
-            crate::columns::partition_features(manifest.n_features, cols_per_block);
-        anyhow::ensure!(
-            manifest.groups == expected_groups,
-            "缓存列块映射损坏:groups 没有按 cols_per_block 覆盖全部特征"
-        );
         anyhow::ensure!(
             manifest.block_hashes.len() == manifest.groups.len(),
             "缓存 block checksum 数量不一致"
@@ -1537,6 +1578,37 @@ impl ParquetBlockSource {
             cuts_hash(&cuts) == manifest.cuts_hash,
             "缓存 cuts 哈希不一致"
         );
+        cuts.check_widths()?;
+        let expected_groups =
+            crate::columns::partition_features_by_width(&cuts.widths(), cols_per_block);
+        anyhow::ensure!(
+            manifest.groups == expected_groups,
+            "缓存列块映射损坏:groups 没有按 cols_per_block 覆盖全部特征"
+        );
+        // Block widths are derived from the cuts; the manifest must agree
+        // (version 2 = every block 8-bit, version 3 = recorded per block).
+        let expected_widths: Vec<BinWidth> = manifest
+            .groups
+            .iter()
+            .map(|g| cuts.block_width(g))
+            .collect();
+        let recorded_widths: Vec<BinWidth> = if manifest.version == CACHE_VERSION {
+            vec![BinWidth::U8; manifest.groups.len()]
+        } else {
+            manifest
+                .block_widths
+                .iter()
+                .map(|&b| {
+                    BinWidth::from_bytes(b)
+                        .ok_or_else(|| anyhow::anyhow!("缓存块宽度 {b} 字节不受支持"))
+                })
+                .collect::<anyhow::Result<_>>()?
+        };
+        anyhow::ensure!(
+            recorded_widths == expected_widths,
+            "缓存块的 bin 宽度与 cuts 不一致(manifest 版本 {})",
+            manifest.version
+        );
 
         let mut labels = Vec::new();
         for batch in batch_reader(&path, &[label_col], BATCH_SIZE)? {
@@ -1544,10 +1616,14 @@ impl ParquetBlockSource {
         }
         anyhow::ensure!(labels.len() == manifest.n_rows, "缓存行数不一致");
         for (i, group) in manifest.groups.iter().enumerate() {
-            let expected = group.len().saturating_mul(manifest.n_rows) as u64;
+            let expected = group
+                .len()
+                .saturating_mul(manifest.n_rows)
+                .saturating_mul(expected_widths[i].bytes()) as u64;
             let actual = std::fs::metadata(cache_path.join(format!("block-{i}.bin")))?.len();
             anyhow::ensure!(actual == expected, "缓存块 {i} 长度不一致");
         }
+        let cache_bytes = quantized_bytes(&cuts, manifest.n_rows)?;
         Ok((
             Self {
                 path,
@@ -1566,7 +1642,7 @@ impl ParquetBlockSource {
                         .collect(),
                     block_hashes: manifest.block_hashes,
                 },
-                cache_bytes: manifest.n_rows * manifest.n_features,
+                cache_bytes,
                 cache_reads: AtomicUsize::new(0),
                 source_bytes: std::sync::atomic::AtomicU64::new(0),
                 parquet_loads: AtomicUsize::new(0),
@@ -1641,6 +1717,15 @@ fn cuts_hash(cuts: &BinCuts) -> String {
     format!("{hash:016x}")
 }
 
+/// Columns `cols` (block-local, in order) of a column-major block.
+fn gather_columns<B: BinCode>(data: &[B], cols: &[usize], n_rows: usize) -> Vec<B> {
+    let mut out = Vec::with_capacity(cols.len() * n_rows);
+    for &l in cols {
+        out.extend_from_slice(&data[l * n_rows..(l + 1) * n_rows]);
+    }
+    out
+}
+
 fn block_hash(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
@@ -1690,12 +1775,14 @@ impl BlockSource for ParquetBlockSource {
                         whole = Some((b.data.clone(), b.feat_ids.clone()));
                     })?;
                     let (whole_data, whole_feats) = whole.expect("with_block 必须恰好调用一次 f");
-                    let mut data = vec![0u8; cols.len() * self.n_rows];
-                    for (slot, &l) in cols.iter().enumerate() {
+                    let n_rows = self.n_rows;
+                    for &l in cols {
                         anyhow::ensure!(l < whole_feats.len(), "列块 {i} 没有局部特征 {l}");
-                        data[slot * self.n_rows..(slot + 1) * self.n_rows]
-                            .copy_from_slice(&whole_data[l * self.n_rows..(l + 1) * self.n_rows]);
                     }
+                    let data = match &whole_data {
+                        BinData::U8(d) => BinData::U8(gather_columns(d, cols, n_rows)),
+                        BinData::U16(d) => BinData::U16(gather_columns(d, cols, n_rows)),
+                    };
                     let block = ColumnBlock {
                         feat_ids: cols.iter().map(|&l| whole_feats[l]).collect(),
                         data,
@@ -1705,19 +1792,21 @@ impl BlockSource for ParquetBlockSource {
                     return Ok(());
                 }
                 use std::io::{Read, Seek, SeekFrom};
+                let width = self.cuts.block_width(feat_ids);
+                let col_bytes = self.n_rows * width.bytes();
                 let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
-                let mut data = vec![0u8; cols.len() * self.n_rows];
+                let mut bytes = vec![0u8; cols.len() * col_bytes];
                 for (slot, &l) in cols.iter().enumerate() {
                     anyhow::ensure!(l < feat_ids.len(), "列块 {i} 没有局部特征 {l}");
-                    file.seek(SeekFrom::Start((l * self.n_rows) as u64))?;
-                    file.read_exact(&mut data[slot * self.n_rows..(slot + 1) * self.n_rows])?;
+                    file.seek(SeekFrom::Start((l * col_bytes) as u64))?;
+                    file.read_exact(&mut bytes[slot * col_bytes..(slot + 1) * col_bytes])?;
                 }
                 self.cache_reads.fetch_add(1, Ordering::Relaxed);
                 self.source_bytes
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let block = ColumnBlock {
                     feat_ids: cols.iter().map(|&l| feat_ids[l]).collect(),
-                    data,
+                    data: BinData::from_le_bytes(width, bytes)?,
                     n_rows: self.n_rows,
                 };
                 f(&block);
@@ -1763,10 +1852,11 @@ impl BlockSource for ParquetBlockSource {
                     .get(i)
                     .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在"))?
                     .clone();
+                let width = self.cuts.block_width(&feat_ids);
                 let mut data = Vec::new();
                 File::open(dir.join(format!("block-{i}.bin")))?.read_to_end(&mut data)?;
                 anyhow::ensure!(
-                    data.len() == feat_ids.len() * self.n_rows,
+                    data.len() == feat_ids.len() * self.n_rows * width.bytes(),
                     "缓存块 {i} 长度不一致"
                 );
                 // 整块读也如实计数 —— 只有把「读了多少」和「传了多少」
@@ -1789,7 +1879,7 @@ impl BlockSource for ParquetBlockSource {
                 }
                 f(&ColumnBlock {
                     feat_ids,
-                    data,
+                    data: BinData::from_le_bytes(width, data)?,
                     n_rows: self.n_rows,
                 });
             }
@@ -1819,7 +1909,7 @@ impl BlockSource for ParquetBlockSource {
             .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,一共 {} 个", self.groups.len()))
     }
 
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>> {
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<BinData> {
         let (block_id, local) = self
             .groups
             .iter()
@@ -1836,13 +1926,13 @@ impl BlockSource for ParquetBlockSource {
         // 所以直接复用 `with_block_cols` 的部分读路径(连同它的 checksum
         // 首触规则和字节计数)。不支持部分读的 source 会走默认整块回退,
         // 行为和以前一致。
-        let mut result = Vec::new();
+        let mut result = None;
         self.with_block_cols(block_id, &[local], &mut |block| {
             // 部分读时块里只有这一列;整块回退时仍要按 local 取。
             let col = if block.n_feats() == 1 { 0 } else { local };
-            result.extend_from_slice(block.column(col));
+            result = Some(block.column(col).to_owned());
         })?;
-        Ok(result)
+        Ok(result.expect("with_block_cols 必须恰好调用一次 f"))
     }
 
     /// 内存 cache 直接借出列,零拷贝;落盘 cache 返回 `None`,调用方走
@@ -1851,7 +1941,7 @@ impl BlockSource for ParquetBlockSource {
         matches!(self.cache, QuantizedCache::Memory(_))
     }
 
-    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, feat: FeatId) -> Option<BinSlice<'_>> {
         let QuantizedCache::Memory(blocks) = &self.cache else {
             return None;
         };
@@ -1873,12 +1963,12 @@ impl ParquetBlockSource {
     /// 写的话,两条路的 bin 迟早会飘 —— 而那会悄悄破坏位精确基线:
     /// 建直方图用的是块里的 bin,行重分区用的是单列的 bin,两者对不上
     /// 就等于训练和分区看到了不同的数据。
-    fn read_into(
+    fn read_into<B: BinCode>(
         &self,
         file_cols: &[usize],
         feat_ids: &[FeatId],
         n_rows: usize,
-        out: &mut [Bin],
+        out: &mut [B],
     ) -> anyhow::Result<()> {
         debug_assert_eq!(out.len(), feat_ids.len() * n_rows);
         let mut row_base = 0usize;
@@ -1891,11 +1981,7 @@ impl ParquetBlockSource {
                 let dst = &mut out[local * n_rows + row_base..][..n];
                 for (slot, v) in dst.iter_mut().zip(values) {
                     // null 和 NaN 都是缺失
-                    *slot = if v.is_nan() {
-                        MISSING_BIN
-                    } else {
-                        self.cuts.find_bin(f, v)
-                    };
+                    *slot = quantize_value::<B>(&self.cuts, f, v);
                 }
             }
             row_base += n;
@@ -2637,7 +2723,7 @@ mod tests {
                 src.with_block(b, &mut |block| {
                     for (local, &f) in block.feat_ids.iter().enumerate() {
                         assert_eq!(
-                            src.feature_column(f).unwrap(),
+                            src.feature_column(f).unwrap().as_slice(),
                             block.column(local),
                             "{rows} 行 {cols} 列 cpb={cpb},特征 {f}:单列读和整块读不一致"
                         );

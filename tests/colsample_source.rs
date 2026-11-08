@@ -84,7 +84,9 @@ fn partial_column_read_matches_full_block_and_reads_fewer_bytes() {
     assert!(src.n_blocks() >= 2, "需要多个列块才有意义");
 
     // 先整块读一次(顺便让 checksum 通过验证 —— 部分读取要求块已验过)。
-    let full: Vec<u8> = src.with_block_ret(0, |b| b.data.clone()).unwrap();
+    let full: Vec<u8> = src
+        .with_block_ret(0, |b| b.data.as_u8().unwrap().to_vec())
+        .unwrap();
     let feats: Vec<_> = src.block_features(0).unwrap();
     let n_rows = src.n_rows();
 
@@ -99,7 +101,7 @@ fn partial_column_read_matches_full_block_and_reads_fewer_bytes() {
         .and_then(|_| {
             let mut out = (Vec::new(), Vec::new());
             src.with_block_cols(0, &cols, &mut |b| {
-                out = (b.data.clone(), b.feat_ids.clone());
+                out = (b.data.as_u8().unwrap().to_vec(), b.feat_ids.clone());
             })?;
             Ok(out)
         })
@@ -125,9 +127,9 @@ fn partial_column_read_matches_full_block_and_reads_fewer_bytes() {
 fn selecting_every_column_is_equivalent_to_a_full_read() {
     let dir = TmpDir::new("all");
     let src = spilled_source(dir.path());
-    let full: Vec<u8> = src.with_block_ret(0, |b| b.data.clone()).unwrap();
+    let full = src.with_block_ret(0, |b| b.data.clone()).unwrap();
     let all: Vec<usize> = (0..src.block_features(0).unwrap().len()).collect();
-    let mut got = Vec::new();
+    let mut got = Default::default();
     src.with_block_cols(0, &all, &mut |b| got = b.data.clone())
         .unwrap();
     assert_eq!(got, full);

@@ -12,9 +12,10 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
-use crate::columns::{partition_features, BinCuts, ColumnBlock};
+use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
+use crate::columns::{partition_features_by_width, quantize_value, BinCuts, ColumnBlock};
 use crate::sketch::SketchSet;
-use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
+use crate::types::{FeatId, MAX_BIN_LIMIT};
 
 /// A query-id column as u64. Integer columns of any width, and floating point
 /// columns holding integral values; nulls and negative values are errors.
@@ -262,7 +263,7 @@ pub(crate) fn build_cuts_and_count_typed(
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
-        "max_bin 上限是 {MAX_BIN_LIMIT}(255 留给缺失哨兵),给的是 {max_bins}"
+        "max_bin must be at most {MAX_BIN_LIMIT}, got {max_bins}"
     );
 
     // 整次扫描只建一个 pool。每 batch 重建一次在线程数较多、batch 很小
@@ -396,12 +397,18 @@ pub fn quantize_with_nthread(
 ) -> anyhow::Result<(Vec<ColumnBlock>, usize)> {
     assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
     let n_features = cuts.n_feats();
-    let groups = partition_features(n_features, cols_per_block);
+    cuts.check_widths()?;
+    let groups = partition_features_by_width(&cuts.widths(), cols_per_block);
 
     // 每个块先攒成"按特征分段"的 Vec,行数未知所以只能边走边 push。
     // 列主序的好处在这里也成立:同一个特征的 bin 是连续追加的。
-    let mut per_block: Vec<Vec<Vec<Bin>>> =
-        groups.iter().map(|g| vec![Vec::new(); g.len()]).collect();
+    let mut per_block: Vec<GrowBlock> = groups
+        .iter()
+        .map(|g| match cuts.block_width(g) {
+            BinWidth::U8 => GrowBlock::U8(vec![Vec::new(); g.len()]),
+            BinWidth::U16 => GrowBlock::U16(vec![Vec::new(); g.len()]),
+        })
+        .collect();
     let mut n_rows = 0usize;
     let pool = crate::threading::build_pool(nthread)
         .map_err(|e| anyhow::anyhow!("Arrow quantize ingest 线程池创建失败:{e}"))?;
@@ -420,19 +427,10 @@ pub fn quantize_with_nthread(
                 .par_iter_mut()
                 .zip(groups.par_iter())
                 .try_for_each(|(block, feats)| -> anyhow::Result<()> {
-                    for (local, &f) in feats.iter().enumerate() {
-                        let dst = &mut block[local];
-                        dst.reserve(batch.num_rows());
-                        for_each_feature_f32(&batch, f as usize, missing, |value| {
-                            // null, NaN and the `missing` sentinel share MISSING_BIN.
-                            dst.push(if value.is_nan() {
-                                MISSING_BIN
-                            } else {
-                                cuts.find_bin(f, value)
-                            });
-                        })?;
+                    match block {
+                        GrowBlock::U8(cols) => append_batch(cols, feats, &batch, cuts, missing),
+                        GrowBlock::U16(cols) => append_batch(cols, feats, &batch, cuts, missing),
                     }
-                    Ok(())
                 })
         })?;
     }
@@ -441,11 +439,10 @@ pub fn quantize_with_nthread(
         .into_iter()
         .zip(per_block)
         .map(|(feat_ids, cols)| {
-            let mut data = Vec::with_capacity(feat_ids.len() * n_rows);
-            for col in cols {
-                debug_assert_eq!(col.len(), n_rows, "某一列的行数和别的列对不上");
-                data.extend_from_slice(&col);
-            }
+            let data = match cols {
+                GrowBlock::U8(cols) => BinData::U8(concat_columns(cols, n_rows)),
+                GrowBlock::U16(cols) => BinData::U16(concat_columns(cols, n_rows)),
+            };
             ColumnBlock {
                 feat_ids,
                 data,
@@ -455,6 +452,64 @@ pub fn quantize_with_nthread(
         .collect();
 
     Ok((blocks, n_rows))
+}
+
+/// Per-column growth buffers of one block at its width.
+enum GrowBlock {
+    U8(Vec<Vec<u8>>),
+    U16(Vec<Vec<u16>>),
+}
+
+/// Append one batch's bins of `feats` to their growth buffers.
+fn append_batch<B: BinCode>(
+    cols: &mut [Vec<B>],
+    feats: &[FeatId],
+    batch: &RecordBatch,
+    cuts: &BinCuts,
+    missing: f32,
+) -> anyhow::Result<()> {
+    for (local, &f) in feats.iter().enumerate() {
+        let dst = &mut cols[local];
+        dst.reserve(batch.num_rows());
+        // null, NaN and the `missing` sentinel share the missing bin.
+        for_each_feature_f32(batch, f as usize, missing, |value| {
+            dst.push(quantize_value::<B>(cuts, f, value));
+        })?;
+    }
+    Ok(())
+}
+
+fn concat_columns<B: BinCode>(cols: Vec<Vec<B>>, n_rows: usize) -> Vec<B> {
+    let mut data = Vec::with_capacity(cols.len() * n_rows);
+    for col in cols {
+        debug_assert_eq!(col.len(), n_rows, "某一列的行数和别的列对不上");
+        data.extend_from_slice(&col);
+    }
+    data
+}
+
+/// Write one batch's bins of `features` into a known-size column-major block.
+fn fill_batch<B: BinCode>(
+    data: &mut [B],
+    features: &[FeatId],
+    batch: &RecordBatch,
+    cuts: &BinCuts,
+    missing: f32,
+    n_rows: usize,
+    row_offset: usize,
+) -> anyhow::Result<()> {
+    let batch_rows = batch.num_rows();
+    for (local, &feature) in features.iter().enumerate() {
+        let start = local * n_rows + row_offset;
+        let output = &mut data[start..start + batch_rows];
+        let mut index = 0usize;
+        for_each_feature_f32(batch, feature as usize, missing, |value| {
+            output[index] = quantize_value::<B>(cuts, feature, value);
+            index += 1;
+        })?;
+        debug_assert_eq!(index, batch_rows);
+    }
+    Ok(())
 }
 
 /// Quantize into final column-major blocks when the first scan already
@@ -470,7 +525,8 @@ fn quantize_with_nthread_known_rows(
 ) -> anyhow::Result<Vec<ColumnBlock>> {
     let allocation_profile = crate::source::openprof::start("bins allocate");
     assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
-    let groups = partition_features(cuts.n_feats(), cols_per_block);
+    cuts.check_widths()?;
+    let groups = partition_features_by_width(&cuts.widths(), cols_per_block);
     let mut blocks = groups
         .iter()
         .map(|features| {
@@ -480,7 +536,7 @@ fn quantize_with_nthread_known_rows(
                 .ok_or_else(|| anyhow::anyhow!("量化块大小溢出 usize"))?;
             Ok(ColumnBlock {
                 feat_ids: features.clone(),
-                data: vec![MISSING_BIN; len],
+                data: BinData::missing(cuts.block_width(features), len),
                 n_rows,
             })
         })
@@ -518,21 +574,14 @@ fn quantize_with_nthread_known_rows(
         pool.install(|| {
             blocks.par_iter_mut().zip(groups.par_iter()).try_for_each(
                 |(block, features)| -> anyhow::Result<()> {
-                    for (local, &feature) in features.iter().enumerate() {
-                        let start = local * n_rows + row_offset;
-                        let output = &mut block.data[start..start + batch_rows];
-                        let mut index = 0usize;
-                        for_each_feature_f32(&batch, feature as usize, missing, |value| {
-                            output[index] = if value.is_nan() {
-                                MISSING_BIN
-                            } else {
-                                cuts.find_bin(feature, value)
-                            };
-                            index += 1;
-                        })?;
-                        debug_assert_eq!(index, batch_rows);
+                    match &mut block.data {
+                        BinData::U8(d) => {
+                            fill_batch(d, features, &batch, cuts, missing, n_rows, row_offset)
+                        }
+                        BinData::U16(d) => {
+                            fill_batch(d, features, &batch, cuts, missing, n_rows, row_offset)
+                        }
                     }
-                    Ok(())
                 },
             )
         })?;
@@ -751,10 +800,10 @@ impl ArrowSource {
     }
 
     /// 某一行某个特征的 bin。测试和调试用。
-    pub fn bin_at(&self, row: usize, feat: FeatId) -> Bin {
+    pub fn bin_at(&self, row: usize, feat: FeatId) -> u32 {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return b.column(local)[row];
+                return b.column(local).get(row);
             }
         }
         panic!("特征 {feat} 不在任何列块里");
@@ -789,10 +838,10 @@ impl crate::train::BlockSource for ArrowSource {
     /// 再切一列」,对全量驻留的 source 就是「为了 1 列克隆整块」。
     /// HIGGS 上 28 列 × 1050 万行 = 每次克隆 294MB,行重分区因此吃掉
     /// 单轮一半的时间(profile 抓出来的,见 CLAUDE.md「6.9× 花在哪」)。
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>> {
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<BinData> {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return Ok(b.column(local).to_vec());
+                return Ok(b.column(local).to_owned());
             }
         }
         anyhow::bail!("特征 {feat} 不在任何列块里,共 {} 个特征", self.n_features)
@@ -803,7 +852,7 @@ impl crate::train::BlockSource for ArrowSource {
         true
     }
 
-    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, feat: FeatId) -> Option<BinSlice<'_>> {
         self.blocks.iter().find_map(|b| {
             b.feat_ids
                 .iter()
@@ -830,6 +879,7 @@ mod tests {
     use super::*;
     use crate::source::DenseSource;
     use crate::train::BlockSource as _;
+    use crate::types::{Bin, MISSING_BIN};
     use arrow::array::{Float32Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -942,11 +992,15 @@ mod tests {
         let bs = batches();
         let src = ArrowSource::new(|| Ok(feed(&bs)), 16, 3).unwrap();
         // 第 2 列的第 1 行和第 5 行是 null
-        assert_eq!(src.bin_at(1, 1), MISSING_BIN);
-        assert_eq!(src.bin_at(5, 1), MISSING_BIN);
+        assert_eq!(src.bin_at(1, 1), MISSING_BIN as u32);
+        assert_eq!(src.bin_at(5, 1), MISSING_BIN as u32);
         // 其余行不是缺失
         for row in [0usize, 2, 3, 4] {
-            assert_ne!(src.bin_at(row, 1), MISSING_BIN, "行 {row} 不该是缺失");
+            assert_ne!(
+                src.bin_at(row, 1),
+                MISSING_BIN as u32,
+                "行 {row} 不该是缺失"
+            );
         }
     }
 
@@ -1154,7 +1208,7 @@ mod tests {
                 .find(|b| b.feat_ids.contains(&1))
                 .map(|b| {
                     let local = b.feat_ids.iter().position(|&f| f == 1).unwrap();
-                    b.column(local).to_vec()
+                    b.column(local).as_u8().unwrap().to_vec()
                 })
                 .unwrap()
         };

@@ -134,13 +134,17 @@ pub fn goes_left(words: &[u32], value: f32) -> bool {
 /// stop at `MAX_CAT_CODE`).
 /// Only validation sets quantized with the training cuts can reach this:
 /// training data is validated while the cuts are built.
+///
+/// The unseen bin is the one of the feature's storage width
+/// (`BinWidth::unseen_cat`), so it is never a trained code.
 #[inline]
-pub fn code_to_bin(value: f32, n_bins: usize) -> u8 {
-    debug_assert!(n_bins <= MAX_CAT_CODE as usize + 1);
+pub fn code_to_bin(value: f32, n_bins: usize) -> u32 {
+    let width = crate::bins::BinWidth::for_feature(n_bins, true)
+        .expect("categorical feature wider than the widest bin storage");
     if value >= 0.0 && value < n_bins as f32 {
-        return value as u8; // truncation toward zero, like `goes_left`
+        return value as u32; // truncation toward zero, like `goes_left`
     }
-    UNSEEN_CAT_BIN
+    width.unseen_cat()
 }
 
 /// Whether a non-missing training category value is not a valid code.
@@ -208,17 +212,17 @@ mod tests {
         assert_eq!(code_to_bin(-1.0, 6), 254);
         assert_eq!(code_to_bin(2.5, 6), 2);
         assert_eq!(code_to_bin(5.9, 6), 5);
-        assert_eq!(code_to_bin(-0.5, 6), UNSEEN_CAT_BIN);
-        assert_eq!(code_to_bin(6.0, 6), UNSEEN_CAT_BIN);
-        assert_eq!(code_to_bin(300.0, 254), UNSEEN_CAT_BIN);
+        assert_eq!(code_to_bin(-0.5, 6), UNSEEN_CAT_BIN as u32);
+        assert_eq!(code_to_bin(6.0, 6), UNSEEN_CAT_BIN as u32);
+        assert_eq!(code_to_bin(300.0, 254), UNSEEN_CAT_BIN as u32);
         assert_eq!(code_to_bin(253.0, 254), 253);
-        assert_eq!(code_to_bin(254.0, 254), UNSEEN_CAT_BIN);
+        assert_eq!(code_to_bin(254.0, 254), UNSEEN_CAT_BIN as u32);
         assert!(invalid_code(254.0));
         // Validation binning and prediction agree on every value class.
         let words = [0b0100u32]; // category 2 goes right
         for v in [2.0f32, 2.5, 2.99, 1.5, -0.5, 7.0, 300.0] {
             let bin = code_to_bin(v, 6);
-            let bin_left = bin == UNSEEN_CAT_BIN || words[0] >> bin & 1 == 0;
+            let bin_left = bin == UNSEEN_CAT_BIN as u32 || words[0] >> bin & 1 == 0;
             assert_eq!(bin_left, goes_left(&words, v), "value {v}");
         }
         assert!(!invalid_code(253.0));

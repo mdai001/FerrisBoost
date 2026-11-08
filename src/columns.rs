@@ -3,7 +3,8 @@
 //! 关键约束:bin 数据存成扁平的 `Vec<u8>`,不是 `Vec<Vec<_>>`,也不带
 //! 生命周期的 view 类型。取指针就能直接传给 C++,阶段 3 不用重构。
 
-use crate::types::{Bin, FeatId, GradPairFixed};
+use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
+use crate::types::{FeatId, GradPairFixed};
 
 /// 一组特征的量化数据,列主序存放。
 ///
@@ -16,7 +17,10 @@ pub struct ColumnBlock {
     /// 本块包含的全局特征 id,升序。
     pub feat_ids: Vec<FeatId>,
     /// 扁平的 bin 数据,长度 = feat_ids.len() * n_rows。
-    pub data: Vec<Bin>,
+    ///
+    /// The element width is the block's: 8 bits unless its features need more
+    /// bins (see `crate::bins`). A block never mixes widths.
+    pub data: BinData,
     pub n_rows: usize,
 }
 
@@ -26,14 +30,19 @@ impl ColumnBlock {
     }
 
     /// 取某个局部特征的整列。
-    pub fn column(&self, local_feat: usize) -> &[Bin] {
+    pub fn column(&self, local_feat: usize) -> BinSlice<'_> {
         let start = local_feat * self.n_rows;
-        &self.data[start..start + self.n_rows]
+        self.data.as_slice().slice(start..start + self.n_rows)
     }
 
-    /// 传给 FFI 的裸指针。阶段 3 用。
-    pub fn as_ptr(&self) -> *const Bin {
-        self.data.as_ptr()
+    /// Storage width of every column in this block.
+    pub fn width(&self) -> BinWidth {
+        self.data.width()
+    }
+
+    /// The whole payload, borrowed at its width.
+    pub fn bins(&self) -> BinSlice<'_> {
+        self.data.as_slice()
     }
 }
 
@@ -173,6 +182,56 @@ impl BinCuts {
         self.cuts_for(feat).len() + 1
     }
 
+    /// Storage width of this feature's bins: 8 bits unless it has more bins
+    /// than an 8-bit code can hold next to its sentinels.
+    ///
+    /// Panics if no supported width holds the feature; constructors of cuts
+    /// that feed training validate this first ([`Self::check_widths`]).
+    pub fn bin_width(&self, feat: FeatId) -> BinWidth {
+        BinWidth::for_feature(self.n_bins(feat), self.is_categorical(feat))
+            .expect("feature has more bins than the widest bin storage; validate with check_widths")
+    }
+
+    /// Per-feature storage widths.
+    pub fn widths(&self) -> Vec<BinWidth> {
+        (0..self.n_feats() as FeatId)
+            .map(|f| self.bin_width(f))
+            .collect()
+    }
+
+    /// Whether any feature needs bins wider than 8 bits.
+    pub fn has_wide(&self) -> bool {
+        (0..self.n_feats() as FeatId).any(|f| {
+            BinWidth::for_feature(self.n_bins(f), self.is_categorical(f)) != Some(BinWidth::U8)
+        })
+    }
+
+    /// Every feature fits a supported bin width.
+    pub fn check_widths(&self) -> anyhow::Result<()> {
+        for f in 0..self.n_feats() as FeatId {
+            crate::ensure_input!(
+                BinWidth::for_feature(self.n_bins(f), self.is_categorical(f)).is_some(),
+                "feature {f} has {} bins; at most {} are supported",
+                self.n_bins(f),
+                crate::bins::MAX_BIN_LIMIT_WIDE
+            );
+        }
+        Ok(())
+    }
+
+    /// The width of a block holding `feat_ids` (all of one width by
+    /// construction, see [`partition_features_by_width`]).
+    pub fn block_width(&self, feat_ids: &[FeatId]) -> BinWidth {
+        let w = feat_ids
+            .first()
+            .map_or(BinWidth::U8, |&f| self.bin_width(f));
+        debug_assert!(
+            feat_ids.iter().all(|&f| self.bin_width(f) == w),
+            "a column block must hold features of a single bin width"
+        );
+        w
+    }
+
     /// 直方图里该特征的起始偏移。直方图按特征拼接存放。
     pub fn hist_offset(&self, feat: FeatId) -> usize {
         self.hist_offsets[feat as usize] as usize
@@ -244,12 +303,29 @@ impl BinCuts {
     ///
     /// NaN(缺失)不走这里 —— 它在训练时由 default direction 决定
     /// 去向,不占 bin。调用方负责先判断。
-    pub fn find_bin(&self, feat: FeatId, value: f32) -> u8 {
+    ///
+    /// The result fits the feature's [`Self::bin_width`]; quantizers narrow it
+    /// with `BinCode::from_bin`.
+    pub fn find_bin(&self, feat: FeatId, value: f32) -> u32 {
         if self.is_categorical(feat) {
             return crate::categorical::code_to_bin(value, self.n_bins(feat));
         }
         let cuts = self.cuts_for(feat);
-        cuts.partition_point(|&c| c <= value) as u8
+        cuts.partition_point(|&c| c <= value) as u32
+    }
+}
+
+/// The stored bin of one non-missing-or-NaN value at width `B`: NaN (the only
+/// missing representation once `missing=` sentinels are mapped) is the
+/// width's missing sentinel, everything else goes through
+/// [`BinCuts::find_bin`]. Every quantizer goes through this one function so the
+/// widths cannot diverge.
+#[inline(always)]
+pub fn quantize_value<B: BinCode>(cuts: &BinCuts, feat: FeatId, value: f32) -> B {
+    if value.is_nan() {
+        B::MISSING
+    } else {
+        B::from_bin(cuts.find_bin(feat, value))
     }
 }
 
@@ -326,6 +402,33 @@ pub fn partition_features(n_feats: usize, cols_per_block: usize) -> Vec<Vec<Feat
         .collect()
 }
 
+/// Column blocks that never mix bin widths.
+///
+/// Features of each width are chunked by `cols_per_block` in ascending order
+/// (skipping the other width), and the blocks are ordered by their first
+/// feature. With every feature at 8 bits this is exactly
+/// [`partition_features`], so existing groupings, caches and plans are
+/// unchanged; a wide feature only ever widens its own block.
+///
+/// Block order then no longer follows feature order everywhere, which is why
+/// the cross-block split reduction breaks equal gains by feature id
+/// (`split::reduce_best`), not by block position.
+pub fn partition_features_by_width(widths: &[BinWidth], cols_per_block: usize) -> Vec<Vec<FeatId>> {
+    assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
+    let mut classes: Vec<BinWidth> = widths.to_vec();
+    classes.sort_unstable();
+    classes.dedup();
+    let mut blocks: Vec<Vec<FeatId>> = Vec::new();
+    for w in classes {
+        let feats: Vec<FeatId> = (0..widths.len() as FeatId)
+            .filter(|&f| widths[f as usize] == w)
+            .collect();
+        blocks.extend(feats.chunks(cols_per_block).map(|c| c.to_vec()));
+    }
+    blocks.sort_by_key(|b| b[0]);
+    blocks
+}
+
 #[cfg(test)]
 mod auto_block_tests {
     use super::auto_cols_per_block;
@@ -389,5 +492,49 @@ mod categorical_cut_tests {
             Ok(_) => panic!("cuts past MAX_CAT_CODE were accepted"),
             Err(err) => assert!(err.to_string().contains("at most"), "{err}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod width_grouping_tests {
+    use super::{partition_features, partition_features_by_width, BinCuts};
+    use crate::bins::BinWidth::{U16, U8};
+
+    #[test]
+    fn all_narrow_grouping_is_the_contiguous_grouping() {
+        for (n, cpb) in [(1, 1), (7, 3), (28, 4), (300, 38), (5, 64)] {
+            assert_eq!(
+                partition_features_by_width(&vec![U8; n], cpb),
+                partition_features(n, cpb)
+            );
+        }
+    }
+
+    #[test]
+    fn wide_features_get_their_own_blocks_in_first_feature_order() {
+        let widths = [U8, U8, U16, U8, U16, U16, U8, U8];
+        let blocks = partition_features_by_width(&widths, 2);
+        assert_eq!(
+            blocks,
+            vec![vec![0, 1], vec![2, 4], vec![3, 6], vec![5], vec![7]]
+        );
+        for b in &blocks {
+            assert!(b
+                .iter()
+                .all(|&f| widths[f as usize] == widths[b[0] as usize]));
+        }
+    }
+
+    #[test]
+    fn find_bin_does_not_wrap_above_255_bins() {
+        let cuts: Vec<f32> = (1..600).map(|c| c as f32).collect();
+        let n = cuts.len() as u32;
+        let cuts = BinCuts::new(cuts, vec![0, n]);
+        assert_eq!(cuts.n_bins(0), 600);
+        assert_eq!(cuts.bin_width(0), U16);
+        assert!(cuts.has_wide());
+        assert_eq!(cuts.find_bin(0, 0.5), 0);
+        assert_eq!(cuts.find_bin(0, 300.0), 300);
+        assert_eq!(cuts.find_bin(0, 1e9), 599);
     }
 }

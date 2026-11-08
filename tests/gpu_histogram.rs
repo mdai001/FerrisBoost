@@ -69,7 +69,7 @@ impl BlockSource for CountedDenseSource {
     fn feature_column(
         &self,
         feat: ferrisboost::types::FeatId,
-    ) -> anyhow::Result<Vec<ferrisboost::types::Bin>> {
+    ) -> anyhow::Result<ferrisboost::bins::BinData> {
         self.inner.feature_column(feat)
     }
 

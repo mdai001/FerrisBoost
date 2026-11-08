@@ -1689,7 +1689,7 @@ empty `evals_result()`.
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
-| `max_bin` | `255` | Must be between 1 and 255 |
+| `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 16-bit storage (CPU only for now) |
 | `eta` | `0.3` | Alias: `learning_rate` |
 | `lambda` | `1.0` | Alias: `reg_lambda` |
 | `gamma` | `0.0` | Minimum split loss |

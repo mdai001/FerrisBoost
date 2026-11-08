@@ -177,9 +177,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         raise ValueError(
             f"objective {out['objective']!r} 不支持,现在只有:{', '.join(_OBJECTIVES)}"
         )
-    if not 0 < out["max_bin"] <= 255:
-        # 255 是上限,bin 255 留给缺失哨兵
-        raise ValueError(f"max_bin 要在 1..=255,给的是 {out['max_bin']}")
+    if not 0 < out["max_bin"] <= 65535:
+        # Features with more than 255 bins are stored as 16-bit columns; the
+        # largest 16-bit code is the missing sentinel.
+        raise ValueError(f"max_bin must be in 1..=65535, got {out['max_bin']}")
     if num_boost_round < 1:
         raise ValueError(f"num_boost_round 要 >= 1,给的是 {num_boost_round}")
 

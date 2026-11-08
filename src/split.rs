@@ -575,10 +575,22 @@ fn enumerate_categorical<F>(
 /// 多 GPU 时这一步就是 allreduce 的内容 —— 交换的是候选,不是数据。
 /// 所以并列规则要和块内一致(先来的赢),否则块的划分方式一变,
 /// 同一份数据能训出两棵不同的树。
+///
+/// Equal gains go to the lower feature id (XGBoost `SplitEntry::NeedReplace`),
+/// not to the earlier block: blocks are grouped by bin width
+/// (`columns::partition_features_by_width`), so a 16-bit block can hold a
+/// lower feature than an 8-bit block before it. With contiguous ascending
+/// blocks (every all-8-bit grouping) the two rules pick the same candidate.
+/// Candidates of one feature never come from two blocks.
 pub fn reduce_best(candidates: &[Option<SplitCandidate>]) -> Option<SplitCandidate> {
     let mut best: Option<SplitCandidate> = None;
     for &c in candidates.iter().flatten() {
-        update_best(&mut best, c);
+        match best {
+            Some(b) if c.gain == b.gain && c.feat < b.feat && c.gain > MIN_GAIN_EPS => {
+                best = Some(c);
+            }
+            _ => update_best(&mut best, c),
+        }
     }
     best
 }

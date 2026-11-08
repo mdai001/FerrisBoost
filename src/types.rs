@@ -323,23 +323,26 @@ fn pow2_scale(max_abs: f64, n_rows: usize) -> f64 {
     scale
 }
 
-/// 量化后的 bin 编号。0..=254 是真实 bin,255 是缺失哨兵。
+/// 量化后的 8-bit bin 编号。0..=254 是真实 bin,255 是缺失哨兵。
+///
+/// This is the storage of almost every column block. Features with more bins
+/// are stored at 16 bits in their own blocks (`crate::bins`); the 8-bit names
+/// below keep their values.
 pub type Bin = u8;
 
-/// 缺失值的哨兵 bin。
+/// 缺失值的哨兵 bin(8-bit blocks; a 16-bit block uses `u16::MAX`).
 ///
 /// 缺失不占真实 bin:直方图累加时直接跳过,缺失的梯度和用
 /// 「节点总和 - 所有非缺失 bin 之和」反推。这正是 split.rs 双向扫描
 /// 需要的形式,也是 XGBoost 的做法。
 ///
-/// 代价:真实 bin 只剩 255 个,所以 max_bin 上限是 255 而不是 256。
-/// 想要 256 得把 Bin 换成 u16,但那样 ColumnBlock.data 就不是
-/// `Vec<u8>` 了,内存翻倍、FFI 契约也要跟着改 —— 不值得。
-/// 和 XGBoost 对拍时两边都设 max_bin=255 即可。
+/// 代价:8-bit 真实 bin 只剩 255 个。A feature with 256 or more bins is
+/// stored at 16 bits (see `crate::bins`); only its own block widens.
 pub const MISSING_BIN: Bin = u8::MAX;
 
-/// 单个特征的真实 bin 数上限。见 MISSING_BIN。
-pub const MAX_BIN_LIMIT: u32 = 255;
+/// Largest accepted `max_bin` (the 16-bit storage tier: 65535 real bins plus
+/// the missing sentinel).
+pub const MAX_BIN_LIMIT: u32 = crate::bins::MAX_BIN_LIMIT_WIDE;
 
 /// `max_depth` 的上限,**两个后端共用一个数**。合法区间是 `0..=14`,
 /// 其中 **0 表示只有根节点的树**(合法,有专门测试)。
