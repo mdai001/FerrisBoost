@@ -99,9 +99,14 @@ prediction = model.predict("test.parquet")</code></pre>
       <h2>Changelog</h2>
       <h3>0.0.7 (unreleased)</h3>
       <ul>
-        <li>Added learning to rank (<code>rank:ndcg</code>, <code>rank:pairwise</code>, <code>rank:map</code>), the ranking metrics <code>ndcg</code>, <code>map</code> and <code>pre</code>, query groups (<code>qid</code>, <code>group</code>) and <code>FerrisBoostRanker</code>.</li>
+        <li>Added <code>base_margin</code>.</li>
+        <li>Added training continuation (<code>xgb_model</code>).</li>
+        <li>Added learning to rank (<code>rank:ndcg</code>, <code>rank:pairwise</code>, <code>rank:map</code>) and <code>FerrisBoostRanker</code>.</li>
+        <li>Added unbiased learning to rank.</li>
+        <li>Added ranking <code>auc</code> and <code>aucpr</code>.</li>
         <li>Added multiple quantiles in one model (<code>quantile_alpha</code> list).</li>
         <li>Multiclass <code>predict_to_parquet</code> now streams.</li>
+        <li>GPU speed optimizations for categorical features and for <code>colsample_bylevel</code> / <code>colsample_bynode</code>.</li>
       </ul>
       <h3>0.0.6 (unreleased)</h3>
       <ul>

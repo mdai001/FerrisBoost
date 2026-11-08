@@ -451,3 +451,51 @@ def test_streaming_multi_output_parquet_memory_is_bounded(tmp_path):
     rows, growth_mb = map(int, out.stdout.split())
     assert rows == n_rows
     assert growth_mb < 30, f"peak RSS grew by {growth_mb} MB"
+
+
+@pytest.mark.parametrize("objective, k", [("multi:softprob", 3), ("multi:softmax", 3),
+                                          ("reg:squarederror", 1)])
+@pytest.mark.parametrize("margin_out", [False, True])
+def test_streaming_parquet_honours_base_margin_and_missing(tmp_path, objective, k, margin_out):
+    # Several input batches, so the margin slices cross batch boundaries.
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=500, k=3, seed=61, missing=0.0)
+    params = {"objective": objective, "max_depth": 3}
+    if k > 1:
+        params["num_class"] = k
+    else:
+        y = (y + np.random.default_rng(1).normal(0, 0.1, len(y))).astype(np.float32)
+    rng = np.random.default_rng(62)
+    # Trained from a file so the model binds columns by name (needed for margin columns).
+    train_src = str(tmp_path / "train.parquet")
+    pq.write_table(pa.table({**{f"f{i}": x[:, i] for i in range(x.shape[1])}, "y": y}), train_src)
+    m = fb.train(params, train_src, label="y", num_boost_round=3, quiet=True)
+    copies = 300
+    big = np.tile(x, (copies, 1))
+    sentinel = -999.0
+    holed = big.copy()
+    holed[rng.random(holed.shape) < 0.05] = sentinel
+    margin = rng.normal(0, 0.4, size=(len(big), k)).astype(np.float32)
+    names = [f"m{c}" for c in range(k)]
+    src = str(tmp_path / "big.parquet")
+    pq.write_table(
+        pa.table({**{f"f{i}": holed[:, i] for i in range(holed.shape[1])},
+                  **{n: margin[:, c] for c, n in enumerate(names)}}),
+        src, row_group_size=20_000)
+    want_x = holed.copy()
+    want_x[want_x == sentinel] = np.nan
+    bm = margin if k > 1 else margin[:, 0]
+    expected = m.predict(want_x, output_margin=margin_out, base_margin=bm)
+    out = str(tmp_path / "o.parquet")
+    n = m.predict_to_parquet(src, out, output_margin=margin_out, missing=sentinel,
+                             base_margin=names if k > 1 else names[0])
+    assert n == len(big)
+    table = pq.read_table(out)
+    got = np.column_stack([table[c].to_numpy() for c in table.column_names])
+    np.testing.assert_array_equal(got.reshape(expected.shape), expected)
+    # a margin with the wrong number of columns is refused and leaves no output behind
+    if k > 1:
+        with pytest.raises(ValueError):
+            m.predict_to_parquet(src, str(tmp_path / "bad.parquet"), base_margin=names[:-1])
+        assert not (tmp_path / "bad.parquet").exists()

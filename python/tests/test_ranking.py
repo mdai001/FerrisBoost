@@ -5,6 +5,7 @@ bit-identical to ``xgb.train(tree_method="hist")``: predictions are compared bit
 ranking metrics to float precision, and models cross-load in both directions.
 """
 import itertools
+import json
 import os
 
 import numpy as np
@@ -228,8 +229,12 @@ def test_qid_must_be_sorted_and_groups_must_match():
         fb.train(p, x, label=y, qid=qid, group=sizes, quiet=True)
     with pytest.raises(ValueError, match="needs query groups"):
         fb.train(p, x, label=y, quiet=True)
-    with pytest.raises(ValueError, match="only used by the rank"):
-        fb.train(dict(objective="reg:squarederror"), x, label=y, qid=qid, quiet=True)
+    # other objectives accept query groups (as XGBoost does) and ignore them in training
+    a = fb.train(dict(objective="reg:squarederror", **PARAMS), x, label=y, qid=qid,
+                 num_boost_round=3, quiet=True)
+    b = fb.train(dict(objective="reg:squarederror", **PARAMS), x, label=y,
+                 num_boost_round=3, quiet=True)
+    np.testing.assert_array_equal(f32_bits(a.predict(x)), f32_bits(b.predict(x)))
     with pytest.raises(ValueError, match="per query group"):
         fb.train(p, x, label=y, qid=qid, weight=np.ones(len(y), np.float32), quiet=True)
     with pytest.raises(ValueError, match="at least 1|>= 1"):
@@ -245,8 +250,6 @@ def test_label_rules_and_unsupported_options():
     fb.train({**p, "ndcg_exp_gain": False}, x, label=y + 0.5, qid=qid, num_boost_round=2, quiet=True)
     with pytest.raises(RuntimeError, match="binary"):
         fb.train(dict(p, objective="rank:map"), x, label=y, qid=qid, quiet=True)
-    with pytest.raises(ValueError, match="unbiased"):
-        fb.train({**p, "lambdarank_unbiased": True}, x, label=y, qid=qid, quiet=True)
     with pytest.raises(ValueError, match="ranking metric|ranking objective"):
         fb.train({**p, "eval_metric": "rmse"}, x, label=y, qid=qid, quiet=True)
     with pytest.raises(ValueError, match="rank:ndcg"):
@@ -428,3 +431,250 @@ def test_gpu_fast_with_validation_and_subsample():
               "subsample": 0.8, "seed": 2}, x, label=y, qid=qid, num_boost_round=6, quiet=True,
              evals=[(vx, vy, "v")], eval_qid=[vqid], evals_result=res)
     assert len(res["v"]["ndcg@32"]) == 6
+
+
+# ---------------------------------------------------------------- unbiased LTR
+def _xgb_bias(booster):
+    obj = json.loads(booster.save_raw("json"))["learner"]["objective"]
+    return obj["ti+"], obj["tj-"]
+
+
+def _fb_bias(model, tmp_path, name="m.json"):
+    path = os.fspath(tmp_path / name)
+    model.save_model(path, quiet=True)
+    with open(path) as f:
+        obj = json.load(f)["learner"]["objective"]
+    return obj["ti+"], obj["tj-"]
+
+
+UNBIASED = list(itertools.product(
+    ["rank:ndcg", "rank:pairwise", "rank:map"], ["topk", "mean"], [False, True]))
+
+
+@pytest.mark.parametrize("obj,pair_method,weighted", UNBIASED)
+def test_unbiased_bit_exact_vs_xgboost(obj, pair_method, weighted, tmp_path):
+    x, y, qid, _, w = make(weights=weighted, binary=True)
+    extra = {"lambdarank_unbiased": True, "lambdarank_pair_method": pair_method}
+    b, d, xres = xgb_train(obj, x, y, qid, w, 8, extra)
+    m, fres = fb_train(obj, x, y, qid, w, 8, extra)
+    np.testing.assert_array_equal(f32_bits(m.predict(x)), f32_bits(b.predict(d)))
+    (name, xvals), = xres["t"].items()
+    np.testing.assert_allclose(fres["t"][name], xvals, rtol=1e-6, atol=1e-7)
+    # the estimated position biases are part of the model, like XGBoost's `ti+` / `tj-`
+    xti, xtj = _xgb_bias(b)
+    fti, ftj = _fb_bias(m, tmp_path)
+    assert fti == xti and ftj == xtj
+    assert any(v != 1.0 for v in fti[1:]) and fti[0] == 1.0
+    # and the unbiased model differs from the plain one
+    plain, _ = fb_train(obj, x, y, qid, w, 8, {"lambdarank_pair_method": pair_method},
+                        evals=False)
+    assert not np.array_equal(f32_bits(plain.predict(x)), f32_bits(m.predict(x)))
+
+
+@pytest.mark.parametrize("extra", [
+    {"lambdarank_bias_norm": 0.0},
+    {"lambdarank_bias_norm": 0.5},
+    {"lambdarank_bias_norm": 3.0},
+    {"lambdarank_num_pair_per_sample": 3},
+    {"lambdarank_num_pair_per_sample": 80},
+    {"lambdarank_pair_method": "mean", "lambdarank_num_pair_per_sample": 4, "seed": 5},
+    {"lambdarank_normalization": False, "lambdarank_score_normalization": False},
+])
+def test_unbiased_parameters_vs_xgboost(extra, tmp_path):
+    x, y, qid, _, w = make(seed=4, weights=True, binary=True)
+    extra = {"lambdarank_unbiased": True, **extra}
+    b, d, _ = xgb_train("rank:ndcg", x, y, qid, w, 10, extra, evals=False)
+    m, _ = fb_train("rank:ndcg", x, y, qid, w, 10, extra, evals=False)
+    np.testing.assert_array_equal(f32_bits(m.predict(x)), f32_bits(b.predict(d)))
+    assert _fb_bias(m, tmp_path) == _xgb_bias(b)
+
+
+def test_unbiased_graded_labels_and_early_stopping(tmp_path):
+    x, y, qid, _, _ = make(seed=1)
+    vx, vy, vqid, _, _ = make(seed=2, sizes=[6, 12, 30, 4, 18])
+    extra = {"lambdarank_unbiased": True, "eval_metric": "ndcg@5"}
+    d, dv = xgb.DMatrix(x, y, qid=qid), xgb.DMatrix(vx, vy, qid=vqid)
+    p = dict(objective="rank:ndcg", tree_method="hist", nthread=1, max_depth=3, max_bin=16, **extra)
+    xb = xgb.train(p, d, 40, evals=[(dv, "v")], verbose_eval=False, early_stopping_rounds=4)
+    m = fb.train({"objective": "rank:ndcg", **PARAMS, **extra}, x, label=y, qid=qid,
+                 num_boost_round=40, evals=[(vx, vy, "v")], eval_qid=[vqid],
+                 early_stopping_rounds=4, quiet=True)
+    assert m.best_iteration == xb.best_iteration
+    np.testing.assert_array_equal(f32_bits(m.predict(vx)), f32_bits(xb.predict(dv)))
+    assert _fb_bias(m, tmp_path) == _xgb_bias(xb)
+
+
+def test_unbiased_json_round_trip_with_xgboost(tmp_path):
+    x, y, qid, _, w = make(weights=True, binary=True)
+    extra = {"lambdarank_unbiased": True, "lambdarank_bias_norm": 0.7}
+    b, d, _ = xgb_train("rank:pairwise", x, y, qid, w, 5, extra, evals=False)
+    m, _ = fb_train("rank:pairwise", x, y, qid, w, 5, extra, evals=False)
+    # FerrisBoost model in XGBoost
+    path = os.fspath(tmp_path / "fb.json")
+    m.save_model(path, quiet=True)
+    loaded = xgb.Booster()
+    loaded.load_model(path)
+    np.testing.assert_array_equal(f32_bits(loaded.predict(d)), f32_bits(m.predict(x)))
+    cfg = json.loads(loaded.save_config())["learner"]["objective"]
+    assert cfg["lambdarank_param"]["lambdarank_unbiased"] == "1"
+    assert cfg["ti+"] == _xgb_bias(b)[0]
+    # XGBoost model in FerrisBoost, re-saved with the same biases
+    xpath = os.fspath(tmp_path / "xgb.json")
+    b.save_model(xpath)
+    back = fb.Model.load_model(xpath, quiet=True)
+    np.testing.assert_array_equal(f32_bits(back.predict(x)), f32_bits(b.predict(d)))
+    assert _fb_bias(back, tmp_path, "again.json") == _xgb_bias(b)
+
+
+def test_unbiased_models_do_not_depend_on_threads():
+    x, y, qid, _, w = make(weights=True, binary=True)
+    extra = {"lambdarank_unbiased": True}
+    p1, _ = fb_train("rank:ndcg", x, y, qid, w, 6, {**extra, "nthread": 1}, evals=False)
+    p4, _ = fb_train("rank:ndcg", x, y, qid, w, 6, {**extra, "nthread": 4}, evals=False)
+    np.testing.assert_array_equal(f32_bits(p1.predict(x)), f32_bits(p4.predict(x)))
+
+
+def test_unbiased_sklearn_ranker():
+    from ferrisboost.sklearn import FerrisBoostRanker
+
+    x, y, qid, _, _ = make(binary=True)
+    r = FerrisBoostRanker(n_estimators=5, max_depth=3, max_bin=16, n_jobs=1,
+                          lambdarank_unbiased=True, lambdarank_bias_norm=0.5)
+    r.fit(x, y, qid=qid)
+    ref, _ = fb_train("rank:ndcg", x, y, qid, None, 5,
+                      {"lambdarank_unbiased": True, "lambdarank_bias_norm": 0.5}, evals=False)
+    np.testing.assert_array_equal(f32_bits(r.predict(x)), f32_bits(ref.predict(x)))
+
+
+@cuda
+@pytest.mark.parametrize("obj,pair_method", list(itertools.product(
+    ["rank:ndcg", "rank:pairwise", "rank:map"], ["topk", "mean"])))
+def test_unbiased_gpu_exact_is_byte_identical_to_cpu(obj, pair_method, tmp_path):
+    x, y, qid, _, w = make(weights=True, binary=True)
+    extra = {"lambdarank_unbiased": True, "lambdarank_pair_method": pair_method}
+    cpu, _ = fb_train(obj, x, y, qid, w, 6, extra, evals=False)
+    gpu, _ = fb_train(obj, x, y, qid, w, 6, {**extra, "device": "cuda", "gpu_math": "exact"},
+                      evals=False)
+    np.testing.assert_array_equal(f32_bits(cpu.predict(x)), f32_bits(gpu.predict(x)))
+    assert _fb_bias(cpu, tmp_path, "c.json") == _fb_bias(gpu, tmp_path, "g.json")
+
+
+@cuda
+def test_unbiased_gpu_fast_is_an_error():
+    x, y, qid, _, _ = make(binary=True)
+    with pytest.raises(Exception, match="lambdarank_unbiased.*gpu_math"):
+        fb_train("rank:ndcg", x, y, qid, None, 2,
+                 {"lambdarank_unbiased": True, "device": "cuda", "gpu_math": "fast"}, evals=False)
+
+
+# ---------------------------------------------------------------- auc / aucpr per group
+def _xgb_metric_on_scores(metric, scores, labels, qid, w):
+    d = xgb.DMatrix(np.zeros((len(labels), 1), np.float32), labels, qid=qid, weight=w)
+    d.set_base_margin(scores)
+    booster = xgb.train(dict(objective="rank:ndcg", tree_method="hist", nthread=1, base_score=0.0,
+                             eval_metric=metric), d, 0)
+    return float(booster.eval(d, "t").split(":")[-1])
+
+
+@pytest.mark.parametrize("metric", ["auc", "aucpr"])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_group_auc_metrics_vs_xgboost(metric, weighted, seed):
+    x, y, qid, _, w = make(seed=seed, weights=weighted)
+    yb = (y > 1).astype(np.float32)
+    m, _ = fb_train("rank:pairwise", x, yb, qid, w, 4, evals=False)
+    scores = m.predict(x)
+    # also with tied scores (a constant model) and a heavily tied one
+    for s in (scores, np.zeros_like(scores), np.round(scores, 1).astype(np.float32)):
+        want = _xgb_metric_on_scores(metric, s, yb, qid, w)
+        got = fb._core.rank_score(metric, s, yb, qid.astype(np.uint64), w, True)
+        assert got == pytest.approx(want, rel=1e-9, abs=1e-12), (metric, got, want)
+
+
+@pytest.mark.parametrize("metric", ["auc", "aucpr"])
+@pytest.mark.parametrize("obj", ["rank:ndcg", "rank:map"])
+def test_group_auc_in_training_and_early_stopping(metric, obj):
+    x, y, qid, _, _ = make(seed=1, binary=True)
+    vx, vy, vqid, _, vw = make(seed=2, sizes=[6, 12, 30, 4, 18, 3, 9], binary=True, weights=True)
+    d = xgb.DMatrix(x, y, qid=qid)
+    dv = xgb.DMatrix(vx, vy, qid=vqid, weight=vw)
+    p = dict(objective=obj, tree_method="hist", nthread=1, max_depth=3, max_bin=16,
+             eval_metric=metric)
+    xres = {}
+    xb = xgb.train(p, d, 40, evals=[(d, "t"), (dv, "v")], evals_result=xres, verbose_eval=False,
+                   early_stopping_rounds=5)
+    res = {}
+    m = fb.train({"objective": obj, "eval_metric": metric, **PARAMS}, x, label=y, qid=qid,
+                 num_boost_round=40, evals=[(x, y, "t"), (vx, vy, vw, "v")],
+                 eval_qid=[qid, vqid], early_stopping_rounds=5, evals_result=res, quiet=True)
+    assert m.best_iteration == xb.best_iteration
+    for name in ("t", "v"):
+        np.testing.assert_allclose(res[name][metric], xres[name][metric], rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(f32_bits(m.predict(vx)), f32_bits(xb.predict(dv)))
+
+
+def test_group_auc_degenerate_groups():
+    # groups of size < 3 have no ROC AUC; groups without a positive or a negative have no PR-AUC
+    qid = np.array([0, 0, 1, 1, 1, 2, 2, 2, 2])
+    y = np.array([1, 0, 1, 0, 0, 0, 0, 0, 0], np.float32)
+    s = np.array([0.3, 0.1, 0.9, 0.5, 0.2, 0.4, 0.3, 0.2, 0.1], np.float32)
+    for metric in ("auc", "aucpr"):
+        want = _xgb_metric_on_scores(metric, s, y, qid, None)
+        assert fb._core.rank_score(metric, s, y, qid.astype(np.uint64), None, True) == \
+            pytest.approx(want, abs=1e-12)
+    # nothing scorable -> NaN, like XGBoost
+    allneg = np.zeros_like(y)
+    assert np.isnan(fb._core.rank_score("aucpr", s, allneg, qid.astype(np.uint64), None, True))
+    with pytest.raises(ValueError, match="binary relevance"):
+        fb._core.rank_score("aucpr", s, y * 3, qid.astype(np.uint64), None, True)
+
+
+def test_ranking_objective_without_groups_says_how_to_pass_them():
+    x, y, _, _, _ = make()
+    with pytest.raises(ValueError, match="qid.*group|group.*qid"):
+        fb.train(dict(objective="rank:ndcg", **PARAMS), x, label=y, quiet=True)
+
+
+@pytest.mark.parametrize("metric", ["auc", "aucpr"])
+def test_binary_logistic_with_query_groups_scores_auc_per_group(metric):
+    # XGBoost scores auc / aucpr per group whenever the data has qid, whatever the objective
+    x, y, qid, _, _ = make(seed=1, binary=True)
+    vx, vy, vqid, _, _ = make(seed=2, sizes=[6, 12, 30, 4, 18, 3, 9], binary=True)
+    d, dv = xgb.DMatrix(x, y, qid=qid), xgb.DMatrix(vx, vy, qid=vqid)
+    p = dict(objective="binary:logistic", tree_method="hist", nthread=1, max_depth=3, max_bin=16,
+             eval_metric=metric)
+    xres = {}
+    xb = xgb.train(p, d, 30, evals=[(d, "t"), (dv, "v")], evals_result=xres, verbose_eval=False,
+                   early_stopping_rounds=4)
+    res = {}
+    m = fb.train({"objective": "binary:logistic", "eval_metric": metric, **PARAMS}, x, label=y,
+                 qid=qid, num_boost_round=30, evals=[(x, y, "t"), (vx, vy, "v")],
+                 eval_qid=[qid, vqid], early_stopping_rounds=4, evals_result=res, quiet=True)
+    assert m.best_iteration == xb.best_iteration
+    for name in ("t", "v"):
+        np.testing.assert_allclose(res[name][metric], xres[name][metric], rtol=1e-6, atol=1e-7)
+    np.testing.assert_array_equal(f32_bits(m.predict(vx)), f32_bits(xb.predict(dv)))
+    # without groups the same metric is the pooled binary one
+    plain = {}
+    fb.train({"objective": "binary:logistic", "eval_metric": metric, **PARAMS}, x, label=y,
+             num_boost_round=3, evals=[(x, y, "t")], evals_result=plain, quiet=True)
+    assert plain["t"][metric][0] != pytest.approx(res["t"][metric][0], abs=1e-9)
+
+
+def test_binary_logistic_groups_with_row_weights_and_auc_is_an_error():
+    x, y, qid, _, _ = make(binary=True)
+    w = np.ones(len(y), np.float32)
+    with pytest.raises(Exception, match="one weight per group"):
+        fb.train({"objective": "binary:logistic", "eval_metric": "auc", **PARAMS}, x, label=y,
+                 num_boost_round=2, evals=[(x, y, w, "t")], eval_qid=[qid], quiet=True)
+    # other metrics keep the per-row weights
+    fb.train({"objective": "binary:logistic", "eval_metric": "logloss", **PARAMS}, x, label=y,
+             num_boost_round=2, evals=[(x, y, w, "t")], eval_qid=[qid], quiet=True)
+
+
+def test_file_qid_column_is_for_ranking_objectives_only(tmp_path):
+    x, y, qid, _, _ = make(binary=True)
+    path = _write(tmp_path, x, y, qid)
+    with pytest.raises(ValueError, match="only used by the rank"):
+        fb.train(dict(objective="binary:logistic", **PARAMS), path, label="rel",
+                 qid="query_id", quiet=True)

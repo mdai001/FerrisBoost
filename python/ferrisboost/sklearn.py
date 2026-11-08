@@ -48,6 +48,10 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
   转给 `ferrisboost.train`。pandas `category` 列在 `fit` / `predict` /
   `predict_proba` / `apply` 里都可用;估计器记住训练时的类别表,预测时按**取值**
   重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
+* `fit(..., base_margin=, base_margin_eval_set=, xgb_model=)` 和
+  `predict` / `predict_proba(..., base_margin=)` 与 XGBoost 一致:`base_margin` 是每行的
+  起始 raw margin(替换 `base_score` 作为起点),`xgb_model` 接已有的 `Model` / 估计器 /
+  模型 JSON 路径 / `xgboost.Booster`,在它后面续训 `n_estimators` 棵新树。
 * `apply(X, iteration_range=None)` 返回每棵树的叶子节点号,形状 `(n_samples, n_trees)`,
   float32,与 `XGBModel.apply` 相同;有早停时默认用到 best_iteration。
 
@@ -327,11 +331,23 @@ class _FerrisBoostBase(BaseEstimator):
         verbose: Any,
         eval_labels: Any,
         feature_types: Any = None,
+        base_margin: Any = None,
+        base_margin_eval_set: Any = None,
+        xgb_model: Any = None,
         ranking: dict | None = None,
     ) -> None:
         # Ranking: `ranking` carries qid / group, the validation sets' query ids and
         # tells that sample weights are per query group (not per row).
         per_group = ranking is not None
+        if base_margin_eval_set is not None and not eval_set:
+            raise ValueError("base_margin_eval_set was given without eval_set")
+        if base_margin_eval_set is not None and len(base_margin_eval_set) != len(eval_set):
+            raise ValueError(
+                "base_margin_eval_set must have the same length as eval_set: "
+                f"{len(base_margin_eval_set)} != {len(eval_set)}"
+            )
+        if hasattr(xgb_model, "get_booster"):
+            xgb_model = xgb_model.get_booster()
         if sample_weight is not None:
             if per_group:
                 sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
@@ -383,6 +399,9 @@ class _FerrisBoostBase(BaseEstimator):
             quiet=not verbose,
             weight=None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32),
             feature_types=feature_types if self.feature_types is None else self.feature_types,
+            base_margin=base_margin,
+            base_margin_eval_set=base_margin_eval_set,
+            xgb_model=xgb_model,
             **({} if ranking is None else ranking),
         )
         self.evals_result_ = result
@@ -453,6 +472,7 @@ class _FerrisBoostBase(BaseEstimator):
         X: Any,
         output_margin: bool = False,
         iteration_range: tuple[int, int] | None = None,
+        base_margin: Any = None,
     ) -> np.ndarray:
         check_is_fitted(self, "_Booster")
         X, _, _ = self._prepare_X(X, reset=False)
@@ -461,6 +481,7 @@ class _FerrisBoostBase(BaseEstimator):
             output_margin=output_margin,
             iteration_range=self._iteration_range(iteration_range),
             missing=self.missing,
+            base_margin=base_margin,
         )
 
     def apply(
@@ -528,8 +549,11 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         y: Any,
         *,
         sample_weight: Any = None,
+        base_margin: Any = None,
         eval_set: Any = None,
         sample_weight_eval_set: Any = None,
+        base_margin_eval_set: Any = None,
+        xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostRegressor:
         if y is None:
@@ -546,6 +570,9 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
             verbose,
             eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
             feature_types=flags,
+            base_margin=base_margin,
+            base_margin_eval_set=base_margin_eval_set,
+            xgb_model=xgb_model,
         )
         return self
 
@@ -555,8 +582,9 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         *,
         output_margin: bool = False,
         iteration_range: tuple[int, int] | None = None,
+        base_margin: Any = None,
     ) -> np.ndarray:
-        return self._raw_predict(X, output_margin, iteration_range)
+        return self._raw_predict(X, output_margin, iteration_range, base_margin)
 
     @classmethod
     def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostRegressor:
@@ -591,8 +619,11 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         y: Any,
         *,
         sample_weight: Any = None,
+        base_margin: Any = None,
         eval_set: Any = None,
         sample_weight_eval_set: Any = None,
+        base_margin_eval_set: Any = None,
+        xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostClassifier:
         from sklearn.utils.multiclass import check_classification_targets
@@ -610,6 +641,13 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         self.classes_ = classes
         self.n_classes_ = len(classes)
         params = self.get_ferrisboost_params()
+        if hasattr(xgb_model, "get_booster"):
+            xgb_model = xgb_model.get_booster()
+        if xgb_model is not None and self.objective is None:
+            # Continuation keeps the objective of the model being continued.
+            from . import _load_prior
+
+            params["objective"] = _load_prior(xgb_model).objective
         if self.n_classes_ > 2:
             if params["objective"] != "multi:softmax":
                 params["objective"] = "multi:softprob"
@@ -639,6 +677,9 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
             verbose,
             eval_labels=encode_eval,
             feature_types=flags,
+            base_margin=base_margin,
+            base_margin_eval_set=base_margin_eval_set,
+            xgb_model=xgb_model,
         )
         self._objective_resolved = params["objective"]
         return self
@@ -652,9 +693,10 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         *,
         output_margin: bool = False,
         iteration_range: tuple[int, int] | None = None,
+        base_margin: Any = None,
     ) -> np.ndarray:
         check_is_fitted(self, "_Booster")
-        raw = self._raw_predict(X, output_margin, iteration_range)
+        raw = self._raw_predict(X, output_margin, iteration_range, base_margin)
         if output_margin:
             return raw
         if raw.ndim == 2:  # multi:softprob
@@ -668,15 +710,16 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         X: Any,
         *,
         iteration_range: tuple[int, int] | None = None,
+        base_margin: Any = None,
     ) -> np.ndarray:
         """每个类别的概率,形状 `(n_samples, n_classes_)`。"""
         check_is_fitted(self, "_Booster")
         if self._objective_resolved == "multi:softmax":
-            margin = self._raw_predict(X, True, iteration_range)
+            margin = self._raw_predict(X, True, iteration_range, base_margin)
             shifted = margin - margin.max(axis=1, keepdims=True)
             expd = np.exp(shifted)
             return expd / expd.sum(axis=1, keepdims=True)
-        raw = self._raw_predict(X, False, iteration_range)
+        raw = self._raw_predict(X, False, iteration_range, base_margin)
         if raw.ndim == 2:
             return raw
         return np.vstack((1.0 - raw, raw)).T
@@ -720,7 +763,8 @@ class FerrisBoostRanker(_FerrisBoostBase):
 
     `rank:ndcg`, `rank:pairwise` and `rank:map` with XGBoost's `lambdarank_pair_method`,
     `lambdarank_num_pair_per_sample`, `lambdarank_normalization`,
-    `lambdarank_score_normalization` and `ndcg_exp_gain`.
+    `lambdarank_score_normalization`, `ndcg_exp_gain` and the unbiased
+    `lambdarank_unbiased` / `lambdarank_bias_norm` (not with `gpu_math="fast"`).
 
     `fit(X, y, qid=...)` needs the query groups: `qid` (one id per row, rows sorted by it) or
     `group` (the size of every group). A pandas `qid` column in `X` is used like the `qid`
@@ -740,10 +784,13 @@ class FerrisBoostRanker(_FerrisBoostBase):
         qid: Any = None,
         group: Any = None,
         sample_weight: Any = None,
+        base_margin: Any = None,
         eval_set: Any = None,
         eval_qid: Any = None,
         eval_group: Any = None,
         sample_weight_eval_set: Any = None,
+        base_margin_eval_set: Any = None,
+        xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostRanker:
         if y is None:
@@ -796,6 +843,9 @@ class FerrisBoostRanker(_FerrisBoostBase):
             verbose,
             eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
             feature_types=flags,
+            base_margin=base_margin,
+            base_margin_eval_set=base_margin_eval_set,
+            xgb_model=xgb_model,
             ranking={
                 "qid": qid,
                 "group": group,
@@ -811,9 +861,10 @@ class FerrisBoostRanker(_FerrisBoostBase):
         *,
         output_margin: bool = False,
         iteration_range: tuple[int, int] | None = None,
+        base_margin: Any = None,
     ) -> np.ndarray:
         X, _ = _split_qid(X, None)
-        return self._raw_predict(X, output_margin, iteration_range)
+        return self._raw_predict(X, output_margin, iteration_range, base_margin)
 
     def apply(self, X: Any, iteration_range: tuple[int, int] | None = None) -> np.ndarray:
         X, _ = _split_qid(X, None)

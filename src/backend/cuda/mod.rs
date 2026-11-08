@@ -161,6 +161,15 @@ pub struct SharedHistogramConfig {
     /// 所以只有 `K × n` 的 prediction 有常驻代价(规划器见
     /// `gpu_mem_plan::fast_multi_output_extra_bytes`)。
     pub multi_quantile: bool,
+    /// The training data has categorical features. The resident split cache then
+    /// also allocates the category-set outputs (and 96 B packets) and loads the
+    /// categorical split kernels; the planner prices the same buffers
+    /// (`StreamingMemModel::with_resident_split_cache`).
+    pub has_categorical: bool,
+    /// bylevel / bynode column sampling is active: the resident split cache
+    /// then also allocates a per-(node, column) feature mask
+    /// (`gpu_mem_plan::with_node_feature_masks` prices it).
+    pub node_feature_masks: bool,
     /// `gpu_math = Fast` with a ranking objective: the shape of the device LambdaMART
     /// buffers (allocated once, charged by the planner with the same
     /// `gpu_mem_plan::fast_rank_bytes`). `None` for every other training.
@@ -186,6 +195,8 @@ impl Default for SharedHistogramConfig {
             fast_weights: false,
             n_outputs: 1,
             multi_quantile: false,
+            has_categorical: false,
+            node_feature_masks: false,
             fast_rank: None,
         }
     }

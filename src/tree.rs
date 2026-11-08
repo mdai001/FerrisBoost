@@ -255,6 +255,18 @@ pub struct Model {
     /// (`"c"` / `"q"`). Empty when every feature is numeric.
     #[serde(default)]
     pub feature_types: Vec<bool>,
+    /// Position-bias estimates of an unbiased LambdaMART model
+    /// (`lambdarank_unbiased`), stored in the objective JSON as `ti+` / `tj-`.
+    #[serde(default)]
+    pub rank_bias: Option<RankBias>,
+}
+
+/// The position biases `ti+` / `tj-` of an unbiased LambdaMART model. XGBoost keeps
+/// them as `F32Array`s in the objective config; they do not affect predictions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RankBias {
+    pub ti_plus: Vec<f32>,
+    pub tj_minus: Vec<f32>,
 }
 
 impl Model {
@@ -325,6 +337,7 @@ impl Model {
             class_base_margins: Vec::new(),
             scale_pos_weight: self.scale_pos_weight,
             feature_types: self.feature_types.clone(),
+            rank_bias: None,
         }
     }
 
@@ -345,6 +358,7 @@ impl Model {
             class_base_margins: self.class_base_margins.clone(),
             scale_pos_weight: self.scale_pos_weight,
             feature_types: self.feature_types.clone(),
+            rank_bias: self.rank_bias.clone(),
         }
     }
 
@@ -552,9 +566,17 @@ impl Model {
                         "1".into()
                     },
                 },
-                objective: xgb::ObjectiveJson {
-                    name: self.objective.name().into(),
-                    rest: self.objective.json_params(self.scale_pos_weight),
+                objective: {
+                    // Unbiased LambdaMART keeps its position biases in the objective
+                    // config; XGBoost writes empty arrays before the first round.
+                    let unbiased = self.objective.rank().is_some_and(|(_, p)| p.unbiased);
+                    let bias = self.rank_bias.clone().unwrap_or_default();
+                    xgb::ObjectiveJson {
+                        name: self.objective.name().into(),
+                        ti_plus: unbiased.then(|| bias.ti_plus.clone()),
+                        tj_minus: unbiased.then_some(bias.tj_minus),
+                        rest: self.objective.json_params(self.scale_pos_weight),
+                    }
                 },
             },
         };
@@ -709,6 +731,15 @@ impl Model {
                 .get("best_score")
                 .and_then(|v| v.trim().parse::<f32>().ok()),
             class_base_margins,
+            rank_bias: match (&learner.objective.ti_plus, &learner.objective.tj_minus) {
+                (Some(t), Some(j)) if objective.rank().is_some_and(|(_, p)| p.unbiased) => {
+                    Some(RankBias {
+                        ti_plus: t.clone(),
+                        tj_minus: j.clone(),
+                    })
+                }
+                _ => None,
+            },
             scale_pos_weight: Objective::scale_pos_weight_from_json(&learner.objective.rest),
             feature_types: if learner.feature_types.iter().any(|t| t == "c") {
                 anyhow_like_check(
@@ -900,6 +931,11 @@ mod xgb {
     #[derive(Serialize, Deserialize)]
     pub struct ObjectiveJson {
         pub name: String,
+        /// Position biases of unbiased LambdaMART (`F32Array` in XGBoost).
+        #[serde(rename = "ti+", default, skip_serializing_if = "Option::is_none")]
+        pub ti_plus: Option<Vec<f32>>,
+        #[serde(rename = "tj-", default, skip_serializing_if = "Option::is_none")]
+        pub tj_minus: Option<Vec<f32>>,
         /// reg_loss_param 之类的东西原样带着走,不解释也不丢。
         #[serde(flatten)]
         pub rest: BTreeMap<String, serde_json::Value>,
@@ -1252,6 +1288,7 @@ mod tests {
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
+            rank_bias: None,
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1364,6 +1401,7 @@ mod tests {
                 objective: obj,
                 scale_pos_weight: spw,
                 feature_types: Vec::new(),
+                rank_bias: None,
                 ..fixture_model()
             };
             let json = m.to_xgboost_json().unwrap();
@@ -1397,6 +1435,7 @@ mod tests {
         let view = Model {
             scale_pos_weight: 4.0,
             feature_types: Vec::new(),
+            rank_bias: None,
             ..fixture_model()
         }
         .class_view(0);

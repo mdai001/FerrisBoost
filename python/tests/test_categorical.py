@@ -6,6 +6,7 @@ integer codes (one bin per code, as in XGBoost's cuts), so both libraries see
 identical histograms and any difference is a difference in split search.
 """
 import json
+import re
 
 import numpy as np
 import pytest
@@ -587,6 +588,61 @@ def test_gpu_streaming_with_categorical_matches_cpu(tmp_path):
     cpu = fb.train(p, path, label="label", num_boost_round=4, feature_types=ft, quiet=True)
     gpu = fb.train({**p, "device": "cuda", "resident_blocks": 0}, path, label="label",
                    num_boost_round=4, feature_types=ft, quiet=True)
+    assert gpu_bytes(cpu, tmp_path, "cpu") == gpu_bytes(gpu, tmp_path, "gpu")
+
+
+@cuda
+@pytest.mark.parametrize("extra,expect_device", [
+    ({}, True),
+    ({"colsample_bylevel": 0.7, "colsample_bynode": 0.6}, True),
+    ({"hist_nodes_per_batch": 1}, False),
+    ({"resident_blocks": 0}, False),
+])
+def test_gpu_categorical_split_runs_on_the_device_cache(tmp_path, extra, expect_device):
+    """The categorical split search must use the resident device cache (not the
+    host fallback) when it is available, and the host fallback otherwise."""
+    import os
+    import subprocess
+    import sys
+
+    x, y, ft = make_data(n=3000, n_num=2, cat_levels=(3, 12, 40), seed=31, missing=0.05)
+    np.save(tmp_path / "x.npy", x)
+    np.save(tmp_path / "y.npy", y)
+    code = (
+        "import json, sys, numpy as np, ferrisboost as fb\n"
+        "x = np.load(sys.argv[1]); y = np.load(sys.argv[2])\n"
+        "p = json.loads(sys.argv[3]); ft = json.loads(sys.argv[4])\n"
+        "fb.train(p, x, y, num_boost_round=3, feature_types=ft, quiet=True)\n"
+    )
+    params = {"objective": "reg:squarederror", "max_depth": 5, "device": "cuda",
+              "nthread": 2, "cols_per_block": 2, **extra}
+    if "resident_blocks" not in params:
+        params["resident_blocks"] = 4
+    env = dict(os.environ, FB_PROFILE="1")
+    out = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "x.npy"), str(tmp_path / "y.npy"),
+         json.dumps(params), json.dumps(list(ft))],
+        env=env, capture_output=True, text=True, check=True)
+    m = re.search(r"evaluated_nodes=(\d+) categorical_feature_nodes=(\d+)", out.stderr)
+    assert m, out.stderr[-2000:]
+    evaluated, categorical = int(m.group(1)), int(m.group(2))
+    if expect_device:
+        assert evaluated > 0 and categorical > 0, (evaluated, categorical)
+    else:
+        assert categorical == 0, categorical
+
+
+@cuda
+@pytest.mark.parametrize("extra", [
+    {"colsample_bylevel": 0.7},
+    {"colsample_bynode": 0.5},
+    {"colsample_bylevel": 0.8, "colsample_bynode": 0.6, "colsample_bytree": 0.9},
+])
+def test_gpu_exact_categorical_with_nested_colsample_matches_cpu(tmp_path, extra):
+    x, y, ft = make_data(n=3000, n_num=3, cat_levels=(3, 12, 40), seed=33, missing=0.05)
+    p = {"objective": "reg:squarederror", "max_depth": 5, "nthread": 2, "seed": 5, **extra}
+    cpu = fb_train(x, y, ft, p, 5)
+    gpu = fb_train(x, y, ft, {**p, "device": "cuda", "gpu_math": "exact"}, 5)
     assert gpu_bytes(cpu, tmp_path, "cpu") == gpu_bytes(gpu, tmp_path, "gpu")
 
 

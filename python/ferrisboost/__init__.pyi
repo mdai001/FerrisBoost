@@ -21,12 +21,44 @@ def train(
     quiet: bool = ...,
     weight: Any = ...,
     feature_types: Sequence[str] | None = ...,
+    base_margin: Any = ...,
+    base_margin_eval_set: Sequence[Any] | None = ...,
+    xgb_model: Any = ...,
     qid: Any = ...,
     group: Any = ...,
     eval_qid: Sequence[Any] | None = ...,
     eval_group: Sequence[Any] | None = ...,
 ) -> Model:
     """Train a model from arrays, file paths, a pandas DataFrame, or a PyArrow table.
+
+    base_margin (XGBoost's DMatrix base_margin) is a per-row starting raw
+    margin: training starts every row's prediction from it instead of from
+    base_score. Arrays give shape (n,) ((n, num_class) for multiclass); file
+    inputs give the column name (a list of num_class names for multiclass, a
+    column index for headerless CSV), and that column is not a feature. As in
+    XGBoost the intercept is still estimated from the labels (or taken from
+    params["base_score"]) and stored in the model; the margin only replaces it
+    as the starting point, so prediction must be given the same margin
+    (Model.predict(..., base_margin=...)). base_margin_eval_set is a list
+    parallel to evals with one margin (or None) per validation set; file evals
+    read the same column name(s) from their own files.
+
+    xgb_model continues training: a ferrisboost.Model, a path to a FerrisBoost
+    or XGBoost model JSON, or an xgboost.Booster. Training starts from that
+    model's prediction on the new training data and on every validation set,
+    keeps its base_score and objective (params["objective"] defaults to the
+    model's), and appends num_boost_round NEW trees; the returned model holds
+    all of them. The objective, num_class, feature count, feature names (data
+    with names is bound to the model's names) and categorical feature types
+    must agree with the model or ValueError is raised. Bin boundaries are
+    sketched afresh from the new data, which is safe because the existing
+    trees split on stored float thresholds and are scored on the raw values.
+    Combined with base_margin the starting point is base_margin plus the
+    existing trees. evals_result covers only the new rounds, round indices
+    passed to callbacks start at 0, and early stopping's best_iteration is the
+    absolute round in the whole model (as in XGBoost). A stale best_iteration
+    of the continued model is kept if early stopping is not used. File inputs
+    need a model that records its feature schema (saved by FerrisBoost).
 
     weight gives per-row sample weights (XGBoost's DMatrix weight): a 1-D array
     for array input, or a column name (column index for headerless CSV) for
@@ -65,9 +97,10 @@ def train(
     like label). Weights are per query group. Validation sets take eval_qid /
     eval_group, lists parallel to evals. XGBoost's lambdarank_pair_method
     ("topk" or "mean"), lambdarank_num_pair_per_sample, lambdarank_normalization,
-    lambdarank_score_normalization and ndcg_exp_gain are supported;
-    lambdarank_unbiased is not yet. The default metric is ndcg@32 (map@32 for
-    rank:map). gpu_math="fast" is not yet supported for ranking.
+    lambdarank_score_normalization, ndcg_exp_gain and lambdarank_unbiased /
+    lambdarank_bias_norm (unbiased LambdaMART; not with gpu_math="fast") are
+    supported. The default metric is ndcg@32 (map@32 for rank:map); auc and
+    aucpr are scored per query group.
 
     colsample_bytree, colsample_bylevel and colsample_bynode (each in (0, 1])
     nest as in XGBoost (tree set, then per-level subset, then per-node subset);

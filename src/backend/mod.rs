@@ -34,6 +34,8 @@ pub mod cuda {
         pub fast_weights: bool,
         pub n_outputs: usize,
         pub multi_quantile: bool,
+        pub has_categorical: bool,
+        pub node_feature_masks: bool,
         pub fast_rank: Option<crate::gpu_mem_plan::FastRankShape>,
     }
     /// Static inputs of the device ranking path (uninhabited without CUDA).
@@ -60,6 +62,8 @@ pub mod cuda {
                 fast_weights: false,
                 n_outputs: 1,
                 multi_quantile: false,
+                has_categorical: false,
+                node_feature_masks: false,
                 fast_rank: None,
             }
         }
@@ -103,6 +107,7 @@ pub mod cuda {
         pub cache_admitted_nodes: u64,
         pub cache_spilled_nodes: u64,
         pub split_evaluated_nodes: u64,
+        pub split_cat_evaluated: u64,
     }
     impl GpuSegmentTiming {
         pub fn h2d_ms(&self) -> f32 {
@@ -155,6 +160,14 @@ pub mod cuda {
             _labels: &[f32],
             _weights: Option<&[f32]>,
             _margins: &[f32],
+        ) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn init_fast_math_rows(
+            &self,
+            _labels: &[f32],
+            _weights: Option<&[f32]>,
+            _row_margins: &[f32],
         ) -> Result<()> {
             match self.0 {}
         }

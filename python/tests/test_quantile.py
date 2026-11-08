@@ -461,3 +461,188 @@ def test_gpu_fast_multi_quantile_planner_counts_the_prediction_columns(capfd):
     err = capfd.readouterr().err
     # (K - 1) * n * 4 extra prediction bytes, and no softmax statistics
     assert f"multiclass_outputs=3 multiclass_bytes={2 * 3000 * 4}" in err
+
+
+# ------------------------------------------- multi-quantile x base_margin / continuation
+def _margin(n, k, seed):
+    return np.random.default_rng(seed).normal(0, 0.5, size=(n, k)).astype(np.float32)
+
+
+def _xgb_multi(x, y, w, rounds, margin=None, xgb_model=None, alphas=MULTI, evals=()):
+    p = {"objective": "reg:quantileerror", "quantile_alpha": alphas, "max_depth": 4,
+         "eta": 0.3, "tree_method": "hist", "nthread": 1}
+    d = xgb.DMatrix(x, label=y, weight=w, base_margin=margin)
+    res = {}
+    bst = xgb.train(p, d, rounds, xgb_model=xgb_model, evals=evals, evals_result=res,
+                    verbose_eval=False)
+    return bst, res
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_multi_quantile_base_margin_is_bit_exact_vs_xgboost(weighted):
+    x, y = make(seed=51)
+    vx, vy = make(n=900, seed=52)
+    w = np.random.default_rng(51).uniform(0.2, 3, len(y)).astype(np.float32) if weighted else None
+    margin, vmargin = _margin(len(y), 3, 1), _margin(len(vy), 3, 2)
+    p = {"objective": "reg:quantileerror", "quantile_alpha": MULTI, "max_depth": 4}
+    bst, ref = _xgb_multi(x, y, w, 6, margin,
+                          evals=[(xgb.DMatrix(vx, label=vy, base_margin=vmargin), "v")])
+    res = {}
+    ours = fb.train({**p, "nthread": 1}, x, label=y, weight=w, num_boost_round=6,
+                    base_margin=margin, evals=[(vx, vy, "v")], base_margin_eval_set=[vmargin],
+                    evals_result=res, quiet=True)
+    d = xgb.DMatrix(x, base_margin=margin)
+    np.testing.assert_array_equal(ours.predict(x, output_margin=True, base_margin=margin),
+                                  bst.predict(d, output_margin=True))
+    np.testing.assert_array_equal(ours.predict(x, base_margin=margin), bst.predict(d))
+    # without a margin the prediction starts from the (label-quantile) intercepts
+    np.testing.assert_array_equal(ours.predict(x), bst.predict(xgb.DMatrix(x)))
+    np.testing.assert_allclose(res["v"]["quantile"], ref["v"]["quantile"], rtol=2e-6, atol=1e-7)
+    np.testing.assert_array_equal(
+        ours.predict(x, pred_contribs=True, base_margin=margin),
+        bst.predict(d, pred_contribs=True))
+    # a margin needs one value per row and quantile
+    with pytest.raises(ValueError, match="base_margin"):
+        fb.train(p, x, label=y, num_boost_round=1, base_margin=margin[:, :2], quiet=True)
+    with pytest.raises(ValueError, match="base_margin"):
+        fb.train(p, x, label=y, num_boost_round=1, base_margin=margin[:, 0], quiet=True)
+
+
+def test_multi_quantile_continuation_matches_xgboost_and_straight_training(tmp_path):
+    x, y = make(n=1500, seed=53)
+    p = {"objective": "reg:quantileerror", "quantile_alpha": MULTI, "max_depth": 4, "nthread": 1}
+    first, _ = _xgb_multi(x, y, None, 3)
+    cont, _ = _xgb_multi(x, y, None, 3, xgb_model=first)
+    m1 = fb.train(p, x, label=y, num_boost_round=3, quiet=True)
+    m2 = fb.train(p, x, label=y, num_boost_round=3, xgb_model=m1, quiet=True)
+    assert m2.num_trees == 18 and m1.num_trees == 9
+    np.testing.assert_array_equal(m2.predict(x, output_margin=True),
+                                  cont.predict(xgb.DMatrix(x), output_margin=True))
+    # N + M rounds equals N continued by M, byte for byte (with sampling)
+    q = {**p, "subsample": 0.8, "colsample_bytree": 0.8, "seed": 5}
+    full = fb.train(q, x, label=y, num_boost_round=7, quiet=True)
+    joined = fb.train(q, x, label=y, num_boost_round=4, xgb_model=fb.train(
+        q, x, label=y, num_boost_round=3, quiet=True), quiet=True)
+    assert fb_json(full, tmp_path, "full") == fb_json(joined, tmp_path, "joined")
+    # the quantiles come from the model when params omit them; XGBoost models continue too
+    ref_path = tmp_path / "xgb.json"
+    first.save_model(str(ref_path))
+    again = fb.train({"objective": "reg:quantileerror", "max_depth": 4, "nthread": 1}, x, label=y,
+                     num_boost_round=3, xgb_model=str(ref_path), quiet=True)
+    np.testing.assert_array_equal(again.predict(x, output_margin=True),
+                                  cont.predict(xgb.DMatrix(x), output_margin=True))
+    # ... and with a base margin as well
+    margin = _margin(len(y), 3, 7)
+    bm_first, _ = _xgb_multi(x, y, None, 2, margin)
+    bm_cont, _ = _xgb_multi(x, y, None, 2, margin, xgb_model=bm_first)
+    f1 = fb.train(p, x, label=y, num_boost_round=2, base_margin=margin, quiet=True)
+    f2 = fb.train(p, x, label=y, num_boost_round=2, base_margin=margin, xgb_model=f1, quiet=True)
+    np.testing.assert_array_equal(f2.predict(x, output_margin=True, base_margin=margin),
+                                  bm_cont.predict(xgb.DMatrix(x, base_margin=margin),
+                                                  output_margin=True))
+
+
+def test_multi_quantile_continuation_needs_the_same_alphas():
+    x, y = make(n=500, seed=54)
+    base = {"objective": "reg:quantileerror", "max_depth": 3, "nthread": 1}
+    m = fb.train({**base, "quantile_alpha": MULTI}, x, label=y, num_boost_round=2, quiet=True)
+    for alphas in ([0.2, 0.5, 0.8], [0.1, 0.9], 0.5, [0.1, 0.5, 0.9, 0.95]):
+        with pytest.raises(ValueError, match="quantile"):
+            fb.train({**base, "quantile_alpha": alphas}, x, label=y, num_boost_round=1,
+                     xgb_model=m, quiet=True)
+    single = fb.train({**base, "quantile_alpha": 0.5}, x, label=y, num_boost_round=2, quiet=True)
+    with pytest.raises(ValueError, match="quantile"):
+        fb.train({**base, "quantile_alpha": 0.6}, x, label=y, num_boost_round=1,
+                 xgb_model=single, quiet=True)
+    assert m.quantile_alpha == pytest.approx(MULTI) and single.quantile_alpha == [0.5]
+
+
+def test_multi_quantile_file_margin_columns_and_streaming_output(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=700, seed=55)
+    margin = _margin(len(y), 3, 8)
+    cols = {f"f{i}": x[:, i] for i in range(x.shape[1])}
+    names = [f"m{c}" for c in range(3)]
+    path = str(tmp_path / "d.parquet")
+    pq.write_table(pa.table({**cols, "y": y, **{n: margin[:, c] for c, n in enumerate(names)}}),
+                   path, row_group_size=200)
+    p = {"objective": "reg:quantileerror", "quantile_alpha": MULTI, "max_depth": 3, "nthread": 1}
+    from_file = fb.train(p, path, label="y", num_boost_round=4, base_margin=names, quiet=True)
+    from_array = fb.train(p, x, label=y, num_boost_round=4, base_margin=margin, quiet=True)
+    np.testing.assert_array_equal(from_file.predict(x, base_margin=margin),
+                                  from_array.predict(x, base_margin=margin))
+    out = str(tmp_path / "o.parquet")
+    assert from_file.predict_to_parquet(path, out, base_margin=names) == len(y)
+    got = pq.read_table(out)
+    assert got.column_names == ["prediction_0", "prediction_1", "prediction_2"]
+    np.testing.assert_array_equal(np.column_stack([got[c].to_numpy() for c in got.column_names]),
+                                  from_array.predict(x, base_margin=margin))
+    out2 = str(tmp_path / "o2.parquet")
+    from_file.predict_to_parquet(path, out2, output_margin=True, base_margin=names)
+    got = pq.read_table(out2)
+    np.testing.assert_array_equal(np.column_stack([got[c].to_numpy() for c in got.column_names]),
+                                  from_array.predict(x, output_margin=True, base_margin=margin))
+    # file continuation with the margin columns
+    cont = fb.train(p, path, label="y", num_boost_round=2, base_margin=names, xgb_model=from_file,
+                    quiet=True)
+    assert cont.num_trees == 18
+
+
+def test_multi_quantile_streaming_honours_missing_and_a_wrong_margin_is_removed(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=600, seed=56, missing=0.0)
+    p = {"objective": "reg:quantileerror", "quantile_alpha": MULTI, "max_depth": 3}
+    m = fb.train(p, x, label=y, num_boost_round=3, quiet=True)
+    sentinel = -999.0
+    holed = x.copy()
+    holed[np.random.default_rng(1).random(x.shape) < 0.1] = sentinel
+    src = str(tmp_path / "h.parquet")
+    pq.write_table(pa.table({f"f{i}": holed[:, i] for i in range(x.shape[1])}), src)
+    out = str(tmp_path / "o.parquet")
+    m.predict_to_parquet(src, out, missing=sentinel)
+    got = pq.read_table(out)
+    want = holed.copy()
+    want[want == sentinel] = np.nan
+    np.testing.assert_array_equal(np.column_stack([got[c].to_numpy() for c in got.column_names]),
+                                  m.predict(want))
+    # the sentinel really matters
+    out2 = str(tmp_path / "o2.parquet")
+    m.predict_to_parquet(src, out2)
+    other = pq.read_table(out2)
+    assert not np.array_equal(
+        np.column_stack([other[c].to_numpy() for c in other.column_names]),
+        np.column_stack([got[c].to_numpy() for c in got.column_names]))
+
+
+@cuda
+def test_gpu_multi_quantile_base_margin_and_continuation(tmp_path):
+    x, y = make(n=4000, seed=57)
+    margin = _margin(len(y), 3, 9)
+    p = {"objective": "reg:quantileerror", "quantile_alpha": MULTI, "max_depth": 5,
+         "subsample": 0.8, "seed": 3}
+    kw = {"label": y, "base_margin": margin, "quiet": True}
+    cpu = fb.train(p, x, num_boost_round=4, **kw)
+    gpu = fb.train({**p, "device": "cuda", "gpu_math": "exact"}, x, num_boost_round=4, **kw)
+    assert model_bytes(cpu, tmp_path, "c") == model_bytes(gpu, tmp_path, "g")
+    # continuation: GPU exact equals CPU and the uninterrupted run
+    gp = {**p, "device": "cuda", "gpu_math": "exact"}
+    first = fb.train(gp, x, num_boost_round=2, **kw)
+    cont = fb.train(gp, x, num_boost_round=2, xgb_model=first, **kw)
+    full = fb.train(gp, x, num_boost_round=4, **kw)
+    assert model_bytes(cont, tmp_path, "cont") == model_bytes(full, tmp_path, "full")
+    # fast seeds the device K x n prediction from the per-row margin; deterministic, and it
+    # really starts from the margin (a run without it differs), close to exact in coverage
+    fp = {**p, "device": "cuda", "gpu_math": "fast"}
+    runs = [fb.train(fp, x, num_boost_round=12, **kw) for _ in range(2)]
+    assert model_bytes(runs[0], tmp_path, "f1") == model_bytes(runs[1], tmp_path, "f2")
+    plain = fb.train(fp, x, label=y, num_boost_round=12, quiet=True)
+    assert model_bytes(runs[0], tmp_path, "f3") != model_bytes(plain, tmp_path, "f4")
+    exact = fb.train({**gp}, x, num_boost_round=12, **kw)
+    pf = runs[0].predict(x, base_margin=margin)
+    pe = exact.predict(x, base_margin=margin)
+    for j, alpha in enumerate(MULTI):
+        assert abs(float(np.mean(y <= pf[:, j])) - float(np.mean(y <= pe[:, j]))) < 0.04
+    fast_cont = fb.train(fp, x, num_boost_round=3, xgb_model=runs[0], **kw)
+    assert fast_cont.num_trees == 45

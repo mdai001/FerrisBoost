@@ -443,8 +443,8 @@ model = fb.train(
 | `logloss` | `binary:logistic` | Negative log-likelihood |
 | `error` | `binary:logistic` | Error rate at threshold 0.5 (`p > 0.5` counts as positive) |
 | `error@t` | `binary:logistic` | Error rate at threshold `t`, for example `error@0.7` |
-| `auc` | `binary:logistic` | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it |
-| `aucpr` | `binary:logistic` | Area under the precision-recall curve. Larger is better, so early stopping maximizes it |
+| `auc` | `binary:logistic`, ranking objectives | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it. With query groups: mean over the groups, see [Learning to rank](#learning-to-rank) |
+| `aucpr` | `binary:logistic`, ranking objectives | Area under the precision-recall curve. Larger is better, so early stopping maximizes it. With query groups: mean over the groups |
 | `poisson-nloglik` | `count:poisson` | Negative Poisson log-likelihood |
 | `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
 | `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
@@ -534,6 +534,115 @@ Rules:
 For continuous features, FerrisBoost and XGBoost use different quantile-sketch
 implementations, with or without weights, so individual bin boundaries can sit
 slightly apart; both are accurate weighted quantiles.
+
+## Starting margins (`base_margin`)
+
+`base_margin` gives every row its own starting raw margin, like XGBoost's
+`DMatrix(base_margin=...)`. Training starts each row's prediction from it
+instead of from `base_score`; an offset (log exposure for Poisson counts, the
+output of an earlier model, ...) therefore enters the model without being a
+feature.
+
+```python
+model = fb.train(
+    {"objective": "count:poisson"},
+    X_train, label=y_train, base_margin=np.log(exposure_train),
+    evals=[(X_valid, y_valid, "valid")],
+    base_margin_eval_set=[np.log(exposure_valid)],
+    num_boost_round=100,
+)
+pred = model.predict(X_new, base_margin=np.log(exposure_new))
+```
+
+- Shape: `(n,)` (or `(n, 1)`) for one output, `(n, num_class)` for
+  `multi:softprob` / `multi:softmax`. Lists, pandas Series and PyArrow arrays work.
+  Values are raw margins (before the sigmoid, exp or softmax) and must be finite.
+- It **replaces** the intercept; it is not added to it. As in XGBoost the
+  intercept is still estimated from the labels (or taken from `base_score`) and
+  stored in the model; the margin only changes where each row starts. A
+  `predict` without `base_margin` therefore starts from that intercept, so give
+  prediction the same kind of margin you trained with.
+- Validation sets take `base_margin_eval_set`: a list parallel to `evals` with a
+  margin or `None` per set.
+- Prediction: `Model.predict(..., base_margin=)` for arrays, DataFrames and
+  tables; `output_margin=True`, `iteration_range`, and the transformed output
+  all apply on top of it. `pred_contribs` / `pred_interactions` put the margin
+  in the bias column, as XGBoost does (rows still sum to the raw prediction);
+  `pred_leaf` ignores it.
+- Files: `base_margin` names a column (a list of `num_class` names for
+  multiclass; a zero-based index for headerless CSV training). The column is
+  excluded from the features, like `label` and `weight`, and file validation
+  sets read the same column from their own files. `Model.predict` and
+  `predict_to_parquet` read the column next to the features, which needs a model
+  with feature names (trained from a table or file).
+
+  ```python
+  model = fb.train(params, "train.parquet", label="y", base_margin="offset",
+                   evals=[("valid.parquet", "valid")])
+  model.predict("new.parquet", base_margin="offset")
+  ```
+- The margin lives in a plain per-row array next to the labels and weights; it is
+  not part of the column-blocked feature storage. With `gpu_math="fast"` the
+  device prediction buffer is initialized directly from it (the buffer exists
+  anyway, so the memory plan is unchanged). CPU and `gpu_math="exact"` GPU
+  training stay byte-identical with margins; fast mode stays deterministic.
+- `use_gpu=True` prediction does not support `base_margin` yet and raises
+  `ValueError` (the device predictor has no per-row start): predict on the CPU.
+
+With lossless bins the margins, trees and SHAP values are bit-identical to XGBoost
+trained with `DMatrix(x, base_margin=...)`.
+
+## Continue training (`xgb_model`)
+
+`xgb_model` continues an existing model: the new trees are fitted to the
+residual of the old ones.
+
+```python
+first = fb.train(params, X, label=y, num_boost_round=100)
+more = fb.train(params, X_new, label=y_new, num_boost_round=50, xgb_model=first)
+assert more.num_trees == 150          # 100 old trees + 50 new ones
+
+fb.train(params, X, label=y, num_boost_round=50, xgb_model="model.json")
+```
+
+`xgb_model` is a FerrisBoost `Model`, a path to a FerrisBoost **or XGBoost** model
+JSON, or an `xgboost.Booster`. The model passed in is not modified.
+
+- `num_boost_round` counts the **new** rounds (XGBoost 3.4.1 does the same); the
+  result holds the old trees followed by the new ones.
+- Training starts from the old model's prediction on the new training data and on
+  every validation set, and keeps its `base_score` / per-class margins. A given
+  `base_margin` replaces the old intercept (the start is `base_margin` plus the
+  old trees, as in XGBoost). The old trees are scored on the raw feature values
+  through their stored float thresholds, so they do not depend on bin boundaries.
+- The bin boundaries of the new trees are sketched afresh from the new data
+  (XGBoost does the same). Categorical features and multiclass models work.
+- The objective follows the model: leave `params["objective"]` (and `num_class`) out
+  to use the model's. A different objective, `num_class`, feature count, feature
+  names (a DataFrame / table is bound to the model's names, in any column order;
+  numpy data continues by position) or categorical feature types raise
+  `ValueError`. An explicit `base_score` that differs from the model's is an error.
+- `evals_result` and the round numbers passed to callbacks cover the new rounds
+  only. Early stopping reports `best_iteration` as the round in the **whole**
+  model, so `predict(iteration_range=(0, best_iteration + 1))` is the best model,
+  as in XGBoost. A `best_iteration` already stored in the continued model stays if
+  early stopping is not used this time.
+- Files work too (`fb.train(params, "more.parquet", label="y", xgb_model=m)`); the
+  model must record its feature schema, which any FerrisBoost-saved model does.
+- `sklearn`: `fit(X, y, xgb_model=)` accepts a `Model`, another estimator, a path
+  or a `Booster`, and adds `n_estimators` new rounds.
+
+What holds: on lossless bins, continuing is bit-identical to XGBoost's own
+continuation (also from an XGBoost-trained JSON). On the **same** data, N rounds
+followed by M continued rounds is byte-identical to N+M uninterrupted rounds,
+including `subsample` and `colsample_*`, because FerrisBoost keys its sampling on
+the absolute round. On different data the old trees stay as they are and the new
+trees learn from the new data's cuts, so there is no uninterrupted equivalent.
+CPU and `gpu_math="exact"` GPU continuation are byte-identical; `gpu_math="fast"`
+initializes the device predictions from the old model's margins and stays
+deterministic.
+
+A model trained with `lambdarank_unbiased=True` cannot be continued, as in XGBoost; train it again from the start.
 
 ## Feature sampling
 
@@ -730,11 +839,12 @@ model may use category ids above 254; prediction follows its sets, with
 unknown or invalid values going left.
 
 On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
-CPU) and `"fast"`. The device split kernels only know ordered bins, so a
-categorical run enumerates splits on the host from downloaded histograms (the
-same exact fallback used for streaming) and does not use the resident GPU split
-cache; histogram building, row partitioning, and gradients stay on the device.
-Expect categorical GPU training to be slower than numeric GPU training.
+CPU) and `"fast"`. The resident GPU split cache enumerates categorical features
+on the device (one-hot and sorted partition, with the same tie-breaking and
+missing-value direction as the CPU), so histogram building, split search, row
+partitioning, and gradients all stay on the device. Cache overflow and pure
+streaming (`resident_blocks=0`) fall back to the exact host enumeration over
+downloaded histograms.
 
 ## Learning to rank
 
@@ -768,7 +878,10 @@ column** (the column index for a headerless CSV): it is excluded from the
 features like `label`, and the validation files reuse it. The ids must be
 non-decreasing along the rows (an unsorted `qid` is an error, not a silent
 regrouping), and a group cannot be empty. A ranking objective without query
-groups, or query groups with another objective, raises `ValueError`.
+groups raises `ValueError` (XGBoost would treat the data as one group; here
+the message asks for `qid=` / `group=`). Array inputs of other objectives
+accept query groups too, as in XGBoost: they do not change training, but
+`auc` and `aucpr` on data with groups are scored per group (see Metrics).
 
 **Weights are per query group**, as in XGBoost: `weight` has one value per group
 (not per row). For files, the weight column repeats the group's weight on every
@@ -784,7 +897,8 @@ also weight the quantile sketch of the bin boundaries, like row weights do.
 | `lambdarank_normalization` | `True` | Normalize the gradient of each group (by `log2(1 + sum)` for `topk`, by the pair count for `mean`) |
 | `lambdarank_score_normalization` | `True` | Divide the metric change by the score difference |
 | `ndcg_exp_gain` | `True` | NDCG gain `2^label - 1` (labels must be integers in `[0, 31]`); `False` uses the label itself |
-| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART is not supported yet; `lambdarank_unbiased=True` raises `ValueError` |
+| `lambdarank_unbiased` | `False` | Unbiased LambdaMART: estimate the position bias of click data and divide it out of the pair gradients (see below) |
+| `lambdarank_bias_norm` | `1.0` | Exponent control of the position-bias update: the ratios are raised to `1 / (1 + lambdarank_bias_norm)`; at least 0 |
 
 `rank:map` needs binary labels (0 / 1). `rank:pairwise` optimizes the RankNet
 pairwise loss without a metric weighting. Documents that share a label inside a
@@ -797,6 +911,19 @@ generator (one draw of the training `std::mt19937` per round, `seed` selects
 the stream), so models match XGBoost's on losslessly binned data when
 `subsample` and `colsample_*` are 1.
 
+**Unbiased learning to rank.** With `lambdarank_unbiased=True` the rows of a
+query group are taken to be in the order the documents were **displayed**, and
+the labels to be clicks. Every round FerrisBoost estimates how likely a click
+at each display position is (`ti+` for relevant documents, `tj-` for the
+others, following the Unbiased LambdaMART paper and XGBoost) and divides these
+position biases out of the pair gradients. Positions beyond
+`lambdarank_num_pair_per_sample` (`topk`; at most 32 for `mean`) are not
+tracked. The estimates are stored with the objective in the model JSON as
+`ti+` / `tj-` (32-bit arrays, as in XGBoost); they do not change predictions.
+Models match XGBoost's bit for bit on losslessly binned data, on the CPU and
+with `gpu_math="exact"` (byte-identical to the CPU). `gpu_math="fast"` does not
+support it and raises an error; use `"exact"`.
+
 **Metrics.** `ndcg`, `map` and `pre`, with XGBoost's syntax and values: `ndcg@k`
 and `map@k` truncate at `k`, a trailing `-` (`ndcg-`, `ndcg@5-`) scores a group
 without relevant documents as 0 instead of 1. A metric without `@k` is
@@ -806,7 +933,21 @@ default metric is `ndcg@32` for `rank:ndcg` and `rank:pairwise` and `map@32` for
 `rank:map` (`k` follows `lambdarank_num_pair_per_sample`; with the `mean` method
 `ndcg` covers the whole list). Early stopping maximizes them. With group weights
 the group scores are averaged with those weights. Ranking objectives accept
-only these metrics, and the ranking metrics are rejected for other objectives.
+these metrics plus `auc` and `aucpr`, and the other ranking metrics are
+rejected for other objectives.
+
+`auc` and `aucpr` on data with query groups are computed **per group** and
+averaged, as in XGBoost. `auc` counts every pair of a group ordered by label (1
+when the scores keep the label order, 0.5 for tied scores, 0 otherwise; groups
+with fewer than 3 documents are skipped), so it is not the pooled ROC AUC;
+`aucpr` is the binary PR-AUC of each group (labels in `[0, 1]`; groups without a
+positive or without a negative document are skipped). The group weight
+multiplies both sides of the ratio of `auc`, so it only matters as 0. The mean
+is over the groups that can be scored, and the value is `NaN` when none can.
+Both work for early stopping. XGBoost uses the same per-group path for
+`binary:logistic` whenever the validation data has `qid` / `group`, and so does
+FerrisBoost (arrays only; the weights of that set must then be per group, which
+`binary:logistic` cannot use, so such a set takes no weights).
 
 **Starting score.** Without `base_score`, the estimate is one Newton step on the
 objective's gradients at score 0, as in XGBoost; it is close to 0.
@@ -951,7 +1092,7 @@ print(clf.best_iteration, clf.evals_result()["validation_0"]["logloss"][-1])
 clf.save_model("clf.json")                # XGBoost-compatible JSON
 ```
 
-- `fit(X, y, sample_weight=, eval_set=, sample_weight_eval_set=, verbose=)`,
+- `fit(X, y, sample_weight=, base_margin=, eval_set=, sample_weight_eval_set=, base_margin_eval_set=, xgb_model=, verbose=)`,
   `predict`, `predict_proba`, `apply`, `score`, `get_params` / `set_params`, `clone`,
   pickling, `GridSearchCV`, `cross_val_score`, and `Pipeline` work. Constructor
   parameters use XGBoost's names (`n_estimators`, `learning_rate`, `max_depth`,
@@ -996,7 +1137,11 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   XGBoost). `verbose` defaults to `False` (set it to see the validation metrics
   per round).
 - `load_model(path)` / `from_file(path)` read XGBoost-compatible JSON.
-- Not supported: `booster=`, `tree_method=`, and base margins.
+- `fit(..., base_margin=, base_margin_eval_set=, xgb_model=)` and
+  `predict` / `predict_proba(..., base_margin=)` follow XGBoost; see
+  [Starting margins](#starting-margins-base_margin) and
+  [Continue training](#continue-training-xgb_model).
+- Not supported: `booster=` and `tree_method=`.
   `sample_weight` follows FerrisBoost's weighted-sketch semantics, so a weight of
   `k` is not the same as repeating a row `k` times.
 
@@ -1260,6 +1405,8 @@ memory budget, without manual chunk or batch tuning:
   about 28 bytes per row plus 16 for `rank:map`, 12 for the `mean` method and
   20 per query group; the planner counts them. Very large groups can overflow
   the fixed-point accumulators and are rejected with an error.
+  `lambdarank_unbiased=True` is not available in fast mode (error); use
+  `gpu_math="exact"`.
 - **Extra GPU memory in fast mode**: `gpu_math="fast"` keeps the running
   prediction and the labels on the device (4 bytes per row each) and, with
   sample weights, the weights (4 more bytes per row). Multiclass keeps one
@@ -1267,16 +1414,16 @@ memory budget, without manual chunk or batch tuning:
   `quantile_alpha` values keep one prediction column per quantile.
   `reg:quantileerror` adds a small fixed scratch buffer that does not depend
   on the row count (it is reused by every quantile in turn). The memory planner accounts for all of these.
-- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
+- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. The per-level and per-node feature sets are drawn on the host exactly as on the CPU and applied by the device split cache.
 - **Categorical features**: supported with both `gpu_math` modes. Split search
-  for them runs on the host (see [Categorical features](#categorical-features)).
+  for them runs in the device split cache (see
+  [Categorical features](#categorical-features)).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
 - **Bounded split cache**: A bounded resident histogram/split cache is enabled
-  by default and included in the GPU memory plan. Unsupported cases
-  (`colsample_bylevel` / `colsample_bynode`, categorical features) and cache
-  overflow use the exact host fallback. This is managed internally and is not
+  by default and included in the GPU memory plan. Cache overflow and pure
+  streaming use the exact host fallback. This is managed internally and is not
   a public Python parameter.
 - **`hist_streams`**: Defaults to automatic (`None`), resolved by the GPU planner based on execution path, block width, and VRAM budget (selects 2 streams for chunked row-major streaming when memory allows, and 1 stream for resident or column-major paths); can be explicitly set to `1` or `2`.
 - **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU scaling is in progress (WIP).
@@ -1287,7 +1434,7 @@ memory budget, without manual chunk or batch tuning:
 | Step | Where it runs |
 |---|---|
 | Histograms, row partition, gradients | GPU, for every supported objective and both `gpu_math` modes |
-| Split search | GPU (resident cache) by default; on the host from downloaded histograms for `colsample_bylevel` / `colsample_bynode`, categorical features, and cache overflow |
+| Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
 | Feature binning and file ingest | Host |
 | Prediction (`use_gpu=True`) | GPU 0 when worthwhile; CPU for small batches, models with categorical splits, `predict_to_parquet`, and the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) |
 
@@ -1421,7 +1568,7 @@ Names are the model's feature names (the column names of a pandas DataFrame, PyA
 
 `pred_leaf=True` returns, for every row, the node index of the leaf it reaches in each tree, as `float32` like XGBoost; indices are node ids within the tree. The result has shape `(n, n_trees)` (a multiclass model has `num_class` trees per round).
 
-These options accept a two-dimensional `float32` array or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU, and `base_margin` per-row offsets are not supported because FerrisBoost prediction has no such input.
+These options accept a two-dimensional `float32` array or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU. A per-row `base_margin` replaces the intercept in the bias column, as in XGBoost (see [Starting margins](#starting-margins-base_margin)); `pred_leaf` ignores it.
 
 ## Save, load, and exchange models with XGBoost
 
@@ -1489,7 +1636,8 @@ empty `evals_result()`.
 | Parameter | Default | Notes |
 |---|---:|---|
 | `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
-| `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank). `lambdarank_unbiased` and `lambdarank_bias_norm` are accepted but `lambdarank_unbiased=True` is rejected |
+| `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank) |
+| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation (CPU and `gpu_math="exact"`); see [Learning to rank](#learning-to-rank) |
 | `quantile_alpha` | `None` | Required for `reg:quantileerror`: a quantile in `[0, 1]`, or an ascending list of up to 64 quantiles for one multi-output model (one tree per quantile per round; `predict` returns `(n, n_quantiles)`). Unsorted or out-of-range values raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
@@ -1537,16 +1685,18 @@ The following familiar XGBoost parameters are recognized but not implemented:
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 
-Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None)`:
+Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None, base_margin=None, base_margin_eval_set=None, xgb_model=None)`:
 - `num_boost_round`: number of boosting rounds (default `10`; multiclass builds `num_class` trees per round).
 - `evals`, `early_stopping_rounds`, `evals_result`, `verbose_eval`, `callbacks`: validation, early stopping, and monitoring; see [Validation and early stopping](#validation-and-early-stopping) and [Custom callbacks](#custom-callbacks).
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
 - `weight`: per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
 - `feature_types`: `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
+- `base_margin`, `base_margin_eval_set`: per-row starting margins; see [Starting margins](#starting-margins-base_margin).
+- `xgb_model`: a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-xgb_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
-Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, and `missing`. `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
+Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
 ## Common errors
 
@@ -1581,8 +1731,8 @@ need binary 0 / 1 labels.
 
 ### Ranking needs query groups
 
-`rank:ndcg`, `rank:pairwise` and `rank:map` raise `ValueError` when neither
-`qid` nor `group` is given (a `qid` column name for file input), when `qid` is
+`rank:ndcg`, `rank:pairwise` and `rank:map` raise `ValueError` (asking for
+`qid=` / `group=`) when neither `qid` nor `group` is given (a `qid` column name for file input), when `qid` is
 not sorted along the rows, when group sizes do not add up to the row count, or
 when the weights are not one per query group. Validation sets need
 `eval_qid` / `eval_group` too. See [Learning to rank](#learning-to-rank).
@@ -1594,8 +1744,8 @@ when the weights are not one per query group. Validation sets need
 
 ### A metric does not fit the objective
 
-Binary metrics (`logloss`, `error`, `error@t`, `auc`, `aucpr`) require
-`binary:logistic`. `mlogloss` and `merror` require a multiclass objective, and
+Binary metrics (`logloss`, `error`, `error@t`) require `binary:logistic`; `auc`
+and `aucpr` also accept the ranking objectives. `mlogloss` and `merror` require a multiclass objective, and
 multiclass objectives accept only those two. `quantile` requires
 `reg:quantileerror`. `tweedie-nloglik` must be written with its variance power,
 such as `tweedie-nloglik@1.5`.

@@ -254,6 +254,8 @@ pub struct GpuSegmentTiming {
     pub cache_admitted_nodes: u64,
     pub cache_spilled_nodes: u64,
     pub split_evaluated_nodes: u64,
+    /// (node, categorical feature) pairs enumerated by the device split cache.
+    pub split_cat_evaluated: u64,
 }
 
 /// 一个已经 launch、但 totals 还没取回的 partition。
@@ -361,6 +363,7 @@ impl GpuSegmentTiming {
         self.cache_admitted_nodes += other.cache_admitted_nodes;
         self.cache_spilled_nodes += other.cache_spilled_nodes;
         self.split_evaluated_nodes += other.split_evaluated_nodes;
+        self.split_cat_evaluated += other.split_cat_evaluated;
     }
 }
 
@@ -541,9 +544,20 @@ impl<T> HostSlice<T> for PinnedPrefix<'_, T> {
     }
 }
 
+/// Starting prediction for `gpu_math = "fast"`: one raw margin per output, or
+/// one per row and output (class-major).
+enum FastInit<'a> {
+    PerOutput(&'a [f32]),
+    PerRow(&'a [f32]),
+}
+
 pub struct GpuTrainCtx {
     split_features_fn: Option<CudaFunction>,
     split_nodes_fn: Option<CudaFunction>,
+    /// Categorical variants of the two split kernels (present only when the
+    /// resident split cache is on and the data has categorical features).
+    split_features_cat_fn: Option<CudaFunction>,
+    split_nodes_cat_fn: Option<CudaFunction>,
     #[allow(dead_code)]
     state: Arc<DeviceState>,
     stream: Arc<CudaStream>,
@@ -742,6 +756,17 @@ impl GpuTrainCtx {
         };
         let split_nodes_fn = if split_cache_enabled {
             Some(state.module.load_function("split_cached_nodes")?)
+        } else {
+            None
+        };
+        let split_cat_enabled = split_cache_enabled && config.has_categorical;
+        let split_features_cat_fn = if split_cat_enabled {
+            Some(state.module.load_function("split_cached_features_cat")?)
+        } else {
+            None
+        };
+        let split_nodes_cat_fn = if split_cat_enabled {
+            Some(state.module.load_function("split_cached_nodes_cat")?)
         } else {
             None
         };
@@ -1351,6 +1376,8 @@ impl GpuTrainCtx {
                         max_hist_bins,
                         max_block_feats,
                         hist_nodes_per_batch,
+                        split_cat_enabled,
+                        config.node_feature_masks,
                     )?)
                 } else {
                     None
@@ -1507,7 +1534,26 @@ impl GpuTrainCtx {
                         + max_block_feats.max(1) * 12
                         // sums 16 + metadata 16 + bounds 8,再加 packet 窗口
                         + hist_nodes_per_batch
-                            * (40 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES))
+                            * (40 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES)
+                        // categorical: info (4 B per column), per-(node, column)
+                        // category-set output (32 B) and 32 B set per packet slot,
+                        // priced by the same helper the planner uses.
+                        + if config.node_feature_masks {
+                            crate::gpu_mem_plan::node_feature_mask_bytes(
+                                max_block_feats as u64,
+                                hist_nodes_per_batch as u64,
+                            ) as usize
+                        } else {
+                            0
+                        }
+                        + if split_cat_enabled {
+                            crate::gpu_mem_plan::categorical_split_cache_bytes(
+                                max_block_feats as u64,
+                                hist_nodes_per_batch as u64,
+                            ) as usize
+                        } else {
+                            0
+                        })
             } else {
                 0
             },
@@ -1555,6 +1601,8 @@ impl GpuTrainCtx {
         let ctx = Self {
             split_features_fn,
             split_nodes_fn,
+            split_features_cat_fn,
+            split_nodes_cat_fn,
             rm_transpose_fn,
             rm_hist_fn,
             rm_count_fn,
@@ -1749,6 +1797,8 @@ impl GpuTrainCtx {
                 self.rm_chunk_rows,
             )
             + &format!(" max_bins_per_tile={}", self.max_bins_per_tile)
+            + &format!(" categorical_split={}",
+                if self.split_features_cat_fn.is_some() { "device_cache" } else { "none" })
             + &format!(" split={} split_cache_capacity={} split_cache_bytes={}",
                 if self.budget.split_cache_bytes > 0 { "gpu_resident_cache" } else { "cpu" },
                 if self.budget.split_cache_bytes > 0 { self.hist_nodes_per_batch } else { 0 },
@@ -2632,6 +2682,36 @@ impl GpuTrainCtx {
                 self.n_outputs
             );
         }
+        self.init_fast_math_impl(labels, weights, FastInit::PerOutput(margins))
+    }
+
+    /// Like [`Self::init_fast_math`], but every row starts from its own raw
+    /// margin (`base_margin`): `row_margins` is class-major `K x n`, uploaded
+    /// straight into the resident prediction buffer (which is already sized
+    /// `K x n`, so the memory plan has no extra term).
+    pub fn init_fast_math_rows(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        row_margins: &[f32],
+    ) -> Result<()> {
+        if row_margins.len() != self.n_rows * self.n_outputs {
+            bail!(
+                "逐行初始 margin 有 {} 个,应为 {} 行 × {} 个输出",
+                row_margins.len(),
+                self.n_rows,
+                self.n_outputs
+            );
+        }
+        self.init_fast_math_impl(labels, weights, FastInit::PerRow(row_margins))
+    }
+
+    fn init_fast_math_impl(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        init: FastInit<'_>,
+    ) -> Result<()> {
         if labels.len() != self.n_rows {
             bail!(
                 "label 长度 {} 与训练行数 {} 不符",
@@ -2670,6 +2750,27 @@ impl GpuTrainCtx {
         // 后者在 margin 不是 +0.0 时(比如 logit(0.5) = −0.0)会实打实占用
         // 4 B/行的常驻内存。值逐元素相同,结果不变。
         const FILL_CHUNK: usize = 1 << 20;
+        if let FastInit::PerRow(rows) = init {
+            // Per-row margins are already class-major on the host: upload in
+            // chunks straight from the caller's slice (no staging copy).
+            let mut start = 0usize;
+            while start < rows.len() {
+                let end = (start + FILL_CHUNK).min(rows.len());
+                let mut dst = pred.slice_mut(start..end);
+                self.stream
+                    .memcpy_htod(&rows[start..end], &mut dst)
+                    .context("逐行初始 prediction H2D")?;
+                self.stream
+                    .synchronize()
+                    .context("逐行初始 prediction H2D 同步")?;
+                start = end;
+            }
+            self.stream.synchronize().context("等待 fast-math 初始化")?;
+            return Ok(());
+        }
+        let FastInit::PerOutput(margins) = init else {
+            unreachable!("PerRow handled above")
+        };
         for (k, &margin) in margins.iter().enumerate() {
             let chunk = vec![margin; FILL_CHUNK.min(self.n_rows).max(1)];
             let mut start = 0usize;

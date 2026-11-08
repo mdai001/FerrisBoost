@@ -85,7 +85,7 @@ impl PyModel {
 
     /// File inputs need the same schema contract as `predict_files`; this
     /// mirrors its checks (the explain path reads full canonical rows).
-    fn check_explain_file_schema(
+    pub(super) fn check_explain_file_schema(
         &self,
         resolved: &crate::source::input::ResolvedInput,
         header: bool,
@@ -162,6 +162,7 @@ impl PyModel {
         header: bool,
         predict_threads: usize,
         missing: f32,
+        margin: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         guard(|| {
             let kind = request.kind()?;
@@ -198,6 +199,8 @@ impl PyModel {
                 );
                 let mut pool = None;
                 let mut out: Vec<f32> = Vec::new();
+                let k = self.inner.num_outputs();
+                let mut row_offset = 0usize;
                 let rows = py
                     .detach(|| {
                         crate::source::predict_input::for_each_projected_contiguous_batch(
@@ -215,14 +218,38 @@ impl PyModel {
                                     n_rows,
                                     work_per_row,
                                 );
-                                out.extend(
-                                    explainer.compute(kind, batch, n_rows, workers, &mut pool)?,
-                                );
+                                let batch_margin = match margin {
+                                    Some(m) => {
+                                        anyhow::ensure!(
+                                            (row_offset + n_rows) * k <= m.len(),
+                                            "base_margin has fewer rows than the data"
+                                        );
+                                        Some(&m[row_offset * k..(row_offset + n_rows) * k])
+                                    }
+                                    None => None,
+                                };
+                                row_offset += n_rows;
+                                out.extend(explainer.compute_with_margin(
+                                    kind,
+                                    batch,
+                                    n_rows,
+                                    workers,
+                                    &mut pool,
+                                    batch_margin,
+                                )?);
                                 Ok(())
                             },
                         )
                     })
                     .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+                if let Some(m) = margin {
+                    if m.len() != rows * k {
+                        return Err(PyValueError::new_err(format!(
+                            "base_margin has {} values, the files have {rows} rows x {k} outputs",
+                            m.len()
+                        )));
+                    }
+                }
                 return self.explain_array(py, out, kind, rows, upto);
             }
 
@@ -260,7 +287,9 @@ impl PyModel {
             );
             let mut pool = None;
             let out = py
-                .detach(|| explainer.compute(kind, rows, n_rows, workers, &mut pool))
+                .detach(|| {
+                    explainer.compute_with_margin(kind, rows, n_rows, workers, &mut pool, margin)
+                })
                 .map_err(to_py_err)?;
             self.explain_array(py, out, kind, n_rows, upto)
         })

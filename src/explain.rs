@@ -566,7 +566,32 @@ impl<'a> Explainer<'a> {
         workers: usize,
         pool: &mut Option<rayon::ThreadPool>,
     ) -> Result<Vec<f32>> {
+        self.compute_with_margin(kind, rows, n_rows, workers, pool, None)
+    }
+
+    /// [`Self::compute`] with an optional per-row `base_margin` (row-major
+    /// `n_rows x num_outputs`) standing in for the model intercept in the bias
+    /// column, as XGBoost does: the bias is `root means + base_margin[row, g]`
+    /// instead of `root means + base_score`.
+    pub fn compute_with_margin(
+        &self,
+        kind: Kind,
+        rows: &[f32],
+        n_rows: usize,
+        workers: usize,
+        pool: &mut Option<rayon::ThreadPool>,
+        margin: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
         let nf = self.n_features;
+        if let Some(m) = margin {
+            if m.len() != n_rows.checked_mul(self.k).context("margin size overflow")? {
+                bail!(
+                    "base_margin has {} values, expected {n_rows} rows x {} outputs",
+                    m.len(),
+                    self.k
+                );
+            }
+        }
         if rows.len() != n_rows.checked_mul(nf).context("input size overflow")? {
             bail!(
                 "expected {n_rows} rows x {nf} features = {} values, got {}",
@@ -581,7 +606,7 @@ impl<'a> Explainer<'a> {
             return Ok(out);
         }
         if workers <= 1 || n_rows == 1 {
-            self.block(kind, rows, &mut out);
+            self.block(kind, rows, &mut out, margin);
             return Ok(out);
         }
         if pool.is_none() {
@@ -589,24 +614,38 @@ impl<'a> Explainer<'a> {
         }
         let chunk_rows = n_rows.div_ceil(workers.saturating_mul(4)).max(1);
         pool.as_ref().expect("pool just built").install(|| {
+            let k = self.k;
             out.par_chunks_mut(chunk_rows * width)
                 .zip(rows.par_chunks(chunk_rows * nf))
-                .for_each(|(o, r)| self.block(kind, r, o));
+                .enumerate()
+                .for_each(|(i, (o, r))| {
+                    let first = i * chunk_rows;
+                    let m = margin.map(|m| &m[first * k..(first * k + r.len() / nf * k)]);
+                    self.block(kind, r, o, m)
+                });
         });
         Ok(out)
     }
 
     /// Serial computation of one contiguous block of rows.
-    fn block(&self, kind: Kind, rows: &[f32], out: &mut [f32]) {
+    fn block(&self, kind: Kind, rows: &[f32], out: &mut [f32], margin: Option<&[f32]>) {
         let nf = self.n_features;
         let width = out.len() / (rows.len() / nf);
         let mut scratch = self.scratch();
-        for (feats, o) in rows.chunks_exact(nf).zip(out.chunks_exact_mut(width)) {
+        for (i, (feats, o)) in rows
+            .chunks_exact(nf)
+            .zip(out.chunks_exact_mut(width))
+            .enumerate()
+        {
+            // This row's bias per output group: its own start, else the intercept.
+            let bias = margin.map_or(self.group_bias.as_slice(), |m| {
+                &m[i * self.k..(i + 1) * self.k]
+            });
             match kind {
                 Kind::Leaf => self.leaf_row(feats, o),
-                Kind::Contribs { approx: false } => self.shap_row(feats, o, &mut scratch),
-                Kind::Contribs { approx: true } => self.saabas_row(feats, o, &mut scratch),
-                Kind::Interactions => self.interaction_row(feats, o, &mut scratch),
+                Kind::Contribs { approx: false } => self.shap_row(feats, o, &mut scratch, bias),
+                Kind::Contribs { approx: true } => self.saabas_row(feats, o, &mut scratch, bias),
+                Kind::Interactions => self.interaction_row(feats, o, &mut scratch, bias),
             }
         }
     }
@@ -626,7 +665,7 @@ impl<'a> Explainer<'a> {
         }
     }
 
-    fn shap_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch) {
+    fn shap_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch, bias: &[f32]) {
         let nc = self.n_features + 1;
         let rule = rule();
         for g in 0..self.k {
@@ -648,11 +687,11 @@ impl<'a> Explainer<'a> {
                 }
             }
             p[nc - 1] += self.group_root_mean[g];
-            p[nc - 1] += self.group_bias[g];
+            p[nc - 1] += bias[g];
         }
     }
 
-    fn saabas_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch) {
+    fn saabas_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch, bias: &[f32]) {
         let nc = self.n_features + 1;
         for g in 0..self.k {
             let p = &mut out[g * nc..(g + 1) * nc];
@@ -680,11 +719,11 @@ impl<'a> Explainer<'a> {
                     p[ci] += s.tree_contribs[ci];
                 }
             }
-            p[nc - 1] += self.group_bias[g];
+            p[nc - 1] += bias[g];
         }
     }
 
-    fn interaction_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch) {
+    fn interaction_row(&self, feats: &[f32], out: &mut [f32], s: &mut Scratch, bias: &[f32]) {
         let nc = self.n_features + 1;
         let rule = rule();
         for g in 0..self.k {
@@ -707,7 +746,7 @@ impl<'a> Explainer<'a> {
                 runner.run();
             }
             s.diag[nc - 1] += self.group_root_mean[g];
-            s.diag[nc - 1] += self.group_bias[g];
+            s.diag[nc - 1] += bias[g];
             // The path-local updates fill the off-diagonal row-wise; average
             // the two directional estimates so the matrix is symmetric.
             for r in 0..nc {
@@ -809,6 +848,7 @@ mod tests {
             class_base_margins: margins,
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
+            rank_bias: None,
         }
     }
 
@@ -1119,5 +1159,73 @@ mod tests {
             let out = run(&model, Kind::Contribs { approx }, &rows, 1);
             assert_eq!(out, vec![0.0, 0.0, 0.75 + 0.25]);
         }
+    }
+
+    /// A per-row `base_margin` replaces the intercept in the bias column (and only
+    /// there), for every explanation kind, with any worker count; a margin equal to
+    /// the intercept changes nothing.
+    #[test]
+    fn base_margin_replaces_the_bias_per_row() {
+        let mut rng = Rng(5150);
+        let nf = 4;
+        for k in [1usize, 3] {
+            let trees = (0..6 * k).map(|_| random_tree(&mut rng, nf, 4)).collect();
+            let model = model_of(trees, nf, k);
+            let n = 25;
+            let rows = random_rows(&mut rng, n, nf);
+            let margin: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.37).sin()).collect();
+            for kind in [
+                Kind::Contribs { approx: false },
+                Kind::Contribs { approx: true },
+                Kind::Interactions,
+            ] {
+                let ex = Explainer::new(&model, model.trees.len(), kind).unwrap();
+                let width = ex.row_width(kind).unwrap() / k;
+                let plain = ex.compute(kind, &rows, n, 1, &mut None).unwrap();
+                let intercept: Vec<f32> = (0..n).flat_map(|_| ex.group_bias.clone()).collect();
+                let same = ex
+                    .compute_with_margin(kind, &rows, n, 1, &mut None, Some(&intercept))
+                    .unwrap();
+                assert_eq!(plain, same, "k={k} {kind:?}: intercept margin is a no-op");
+                for workers in [1usize, 4] {
+                    let got = ex
+                        .compute_with_margin(kind, &rows, n, workers, &mut None, Some(&margin))
+                        .unwrap();
+                    let nc = nf + 1;
+                    let last = match kind {
+                        Kind::Interactions => nc * nc - 1,
+                        _ => nc - 1,
+                    };
+                    for r in 0..n {
+                        for g in 0..k {
+                            let base = (r * k + g) * width;
+                            for j in 0..width {
+                                let (a, b) = (got[base + j], plain[base + j]);
+                                if j == last {
+                                    let want = b - ex.group_bias[g] + margin[r * k + g];
+                                    assert!((a - want).abs() < 1e-4, "k={k} {kind:?} bias row {r}");
+                                } else {
+                                    assert_eq!(a.to_bits(), b.to_bits(), "k={k} {kind:?} j={j}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A margin of the wrong length is an error.
+        let model = model_of(vec![random_tree(&mut rng, nf, 3)], nf, 1);
+        let ex = Explainer::new(&model, 1, Kind::Contribs { approx: false }).unwrap();
+        let rows = random_rows(&mut rng, 3, nf);
+        assert!(ex
+            .compute_with_margin(
+                Kind::Contribs { approx: false },
+                &rows,
+                3,
+                1,
+                &mut None,
+                Some(&[0.0, 1.0])
+            )
+            .is_err());
     }
 }
