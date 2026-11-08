@@ -123,9 +123,12 @@ impl BinCuts {
         for (f, _) in flags.iter().enumerate().filter(|(_, &c)| c) {
             let cuts = self.cuts_for(f as FeatId);
             anyhow::ensure!(
-                cuts.len() < crate::types::MISSING_BIN as usize
+                cuts.len() <= crate::categorical::MAX_CAT_CODE as usize
                     && cuts.iter().enumerate().all(|(i, &c)| c == (i + 1) as f32),
-                "categorical feature {f} needs consecutive code cuts [1..max_code]"
+                "categorical feature {f} needs consecutive code cuts [1..max_code] with \
+                 max_code <= {} (at most {} categories)",
+                crate::categorical::MAX_CAT_CODE,
+                crate::categorical::MAX_CAT_CODE + 1
             );
         }
         self.categorical = flags.to_vec();
@@ -363,6 +366,26 @@ mod auto_block_tests {
     fn degenerate_inputs_never_return_zero() {
         for (f, t, b) in [(1, 1, 255), (1, 64, 255), (0, 0, 0), (7, 1000, 255)] {
             assert!(auto_cols_per_block(f, t, b) >= 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod categorical_cut_tests {
+    use super::BinCuts;
+
+    #[test]
+    fn categorical_cuts_above_the_code_limit_are_rejected() {
+        let max = crate::categorical::MAX_CAT_CODE as usize;
+        let ok: Vec<f32> = (1..=max).map(|c| c as f32).collect();
+        let ok_len = ok.len() as u32;
+        assert!(BinCuts::new(ok, vec![0, ok_len]).with_categorical(&[true]).is_ok());
+        // One more code would use the bin reserved for unseen categories.
+        let over: Vec<f32> = (1..=max + 1).map(|c| c as f32).collect();
+        let over_len = over.len() as u32;
+        match BinCuts::new(over, vec![0, over_len]).with_categorical(&[true]) {
+            Ok(_) => panic!("cuts past MAX_CAT_CODE were accepted"),
+            Err(err) => assert!(err.to_string().contains("at most"), "{err}"),
         }
     }
 }

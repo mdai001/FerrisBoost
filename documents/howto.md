@@ -657,7 +657,7 @@ Category codes must be integers in `0..=253`, with `NaN` / null for a missing
 value; negative, fractional, or larger values raise `ValueError`. One feature
 can have at most 254 categories in this version, because the two largest bins
 are reserved: one for missing values and one for categories seen only at
-validation or prediction time, which always go left, as in prediction. XGBoost
+validation or prediction time, which always go left, as in prediction. At validation and prediction time a fractional value is read as its integer part (`1.5` is category `1`), as in XGBoost; training data must hold whole codes. XGBoost
 has no such limit; a larger limit is planned for a future release.
 Codes need not be contiguous, but each code up to the feature's largest costs one
 histogram bin, so prefer compact codes.
