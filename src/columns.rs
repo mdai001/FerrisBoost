@@ -263,7 +263,7 @@ pub enum BinningStrategy<'a> {
     /// 自己建草图算(默认)
     Sketch { max_bins: usize },
     /// Like `Sketch`, with `categorical[f]` marking feature `f` as categorical:
-    /// its values are integer codes `0..=254` binned one per code (no sketch).
+    /// its values are integer codes `0..=253` binned one per code (no sketch).
     /// A shorter (or empty) list leaves the remaining features numeric.
     SketchTyped {
         max_bins: usize,

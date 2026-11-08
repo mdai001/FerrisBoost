@@ -515,3 +515,14 @@ def test_gridsearch_with_categorical_dataframe():
         FerrisBoostRegressor(n_estimators=8, n_jobs=1, enable_categorical=True), df,
         np.asarray(y, dtype=float), cv=3)
     assert scores.shape == (3,)
+
+
+def test_negative_n_jobs_means_all_cores():
+    from ferrisboost.sklearn import FerrisBoostRegressor
+    rng = np.random.default_rng(31)
+    x = rng.normal(size=(300, 4)).astype(np.float32)
+    y = x[:, 0].astype(np.float32)
+    est = FerrisBoostRegressor(n_estimators=3, n_jobs=-1)
+    assert est.get_ferrisboost_params()["nthread"] == 0
+    est.fit(x, y)
+    np.testing.assert_array_equal(est.predict(x), FerrisBoostRegressor(n_estimators=3, n_jobs=1).fit(x, y).predict(x))

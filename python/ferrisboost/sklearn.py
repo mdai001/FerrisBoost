@@ -244,7 +244,9 @@ class _FerrisBoostBase(BaseEstimator):
         seed = _seed_of(self.random_state)
         if seed is not None:
             params["seed"] = seed
-        if isinstance(params.get("n_jobs"), int) and params.get("nthread", 0) < 0:
+        # sklearn's n_jobs=-1 (and any negative value) means "all cores", which is
+        # nthread=0 here; Rust takes an unsigned thread count.
+        if isinstance(params.get("nthread"), int) and params["nthread"] < 0:
             params["nthread"] = 0
         return params
 

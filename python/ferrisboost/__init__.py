@@ -114,7 +114,7 @@ _DEFAULTS: dict[str, Any] = {
     # `category` columns and PyArrow dictionary columns be detected as
     # categorical; `feature_types` ("c" / "q" per feature) declares them
     # explicitly for numpy and file inputs. Categories are integer codes in
-    # 0..=254. `max_cat_to_onehot`: features with fewer categories than this are
+    # 0..=253. `max_cat_to_onehot`: features with fewer categories than this are
     # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
     # bounds the partition scan.
     "enable_categorical": False,
@@ -686,8 +686,8 @@ def train(
 
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
-    为 True 时自动识别。类别值是 0..=254 的整数码(缺失用 NaN / null),超出范围、
-    负数或非整数会报错;每个特征最多 255 个类别。
+    为 True 时自动识别。类别值是 0..=253 的整数码(缺失用 NaN / null),超出范围、
+    负数或非整数会报错;每个特征最多 254 个类别。
     """
     p = _normalize_params(params, num_boost_round)
     # Private wire field: quiet is a public call option, not a tree parameter.

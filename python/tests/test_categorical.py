@@ -451,13 +451,13 @@ def test_quantized_cache_keeps_categorical_binning(tmp_path):
 # --------------------------------------------------------------------------- validation of values
 def test_invalid_categories_are_rejected():
     x, y, ft = make_data(cat_levels=(5,), seed=18)
-    for bad in (-1.0, 2.5, 255.0, 1000.0):
+    for bad in (-1.0, 2.5, 254.0, 255.0, 1000.0):
         x2 = x.copy()
         x2[3, 2] = bad
         with pytest.raises(ValueError, match="categor"):
             fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
     x2 = x.copy()
-    x2[3, 2] = 254.0  # the largest supported code is fine
+    x2[3, 2] = 253.0  # the largest supported code is fine
     fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
 
 
@@ -477,10 +477,10 @@ def test_cat_params_are_validated(key, value):
         fb_train(x, y, ft, {"objective": "reg:squarederror", key: value}, 1)
 
 
-def test_full_255_category_feature_trains_and_matches_xgboost():
+def test_full_254_category_feature_trains_and_matches_xgboost():
     rng = np.random.default_rng(21)
     n = 4000
-    x = rng.integers(0, 255, (n, 1)).astype(np.float32)
+    x = rng.integers(0, 254, (n, 1)).astype(np.float32)
     y = (np.sin(x[:, 0] * 0.7) + rng.normal(0, 0.2, n)).astype(np.float32)
     ft = ["c"]
     params = {"objective": "reg:squarederror", "max_depth": 4}
@@ -588,3 +588,28 @@ def test_gpu_streaming_with_categorical_matches_cpu(tmp_path):
     gpu = fb.train({**p, "device": "cuda", "resident_blocks": 0}, path, label="label",
                    num_boost_round=4, feature_types=ft, quiet=True)
     assert gpu_bytes(cpu, tmp_path, "cpu") == gpu_bytes(gpu, tmp_path, "gpu")
+
+
+@pytest.mark.parametrize("missing_right", [False, True])
+def test_unseen_validation_category_scores_like_predict_with_all_codes_used(missing_right):
+    # Every code 0..=253 occurs in training, so no bin above the trained range
+    # is free except the reserved unseen bin. Validation rows with an unseen
+    # category must score exactly like Model.predict (left at every categorical
+    # node), never like a missing value (default direction) -- otherwise the eval
+    # metric and early stopping disagree with prediction.
+    rng = np.random.default_rng(23)
+    n = 6000
+    cat = np.concatenate([np.arange(254), rng.integers(0, 254, n - 254)]).astype(np.float32)
+    if missing_right:
+        cat[rng.random(n) < 0.3] = np.nan  # pushes some default directions right
+    y = (np.cos(np.nan_to_num(cat, nan=300.0) * 0.37) + rng.normal(0, 0.1, n)).astype(np.float32)
+    x = cat[:, None]
+    xv = np.full((500, 1), 400.0, np.float32)  # unseen category for every row
+    yv = rng.normal(0, 1, 500).astype(np.float32)
+    hist = {}
+    m = fb.train({"objective": "reg:squarederror", "max_depth": 4, "eval_metric": "rmse"}, x, label=y,
+                 feature_types=["c"], evals=[(xv, yv, "v")], evals_result=hist,
+                 num_boost_round=6, quiet=True)
+    pred = m.predict(xv)
+    rmse = float(np.sqrt(np.mean((pred.astype(np.float64) - yv) ** 2)))
+    assert hist["v"]["rmse"][-1] == pytest.approx(rmse, rel=1e-6)

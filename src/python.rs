@@ -3166,7 +3166,7 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     }
 }
 
-/// Training categorical columns must hold integer codes `0..=254` (NaN =
+/// Training categorical columns must hold integer codes `0..=253` (NaN =
 /// missing). Report the first offender by feature index before binning.
 fn check_categorical_codes(
     data: &[f32],

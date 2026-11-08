@@ -649,10 +649,12 @@ How a feature is declared:
   codes of a string dictionary differ between row groups; encode the categories
   as integers upstream, or train from an in-memory pandas or PyArrow table.
 
-Category codes must be integers in `0..=254`, with `NaN` / null for a missing
-value; negative, fractional, or larger values raise `ValueError`. The limit
-exists because the largest bin is reserved for missing values, so one feature
-can have at most 255 categories in this version (XGBoost has no such limit).
+Category codes must be integers in `0..=253`, with `NaN` / null for a missing
+value; negative, fractional, or larger values raise `ValueError`. One feature
+can have at most 254 categories in this version, because the two largest bins
+are reserved: one for missing values and one for categories seen only at
+validation or prediction time, which always go left, as in prediction. XGBoost
+has no such limit; a larger limit is planned for a future release.
 Codes need not be contiguous, but each code up to the feature's largest costs one
 histogram bin, so prefer compact codes.
 
@@ -1473,9 +1475,9 @@ example `0.9`, and train one model per quantile.
 ### A categorical column is rejected
 
 - `categorical feature ... contains the value ...`: categorical columns must
-  hold integer codes in `0..=254`, with `NaN` or null for a missing value.
+  hold integer codes in `0..=253`, with `NaN` or null for a missing value.
   Negative, fractional, or larger codes are rejected; re-encode the categories
-  compactly. A feature can have at most 255 categories.
+  compactly. A feature can have at most 254 categories in this version.
 - `... is a category dtype` / `... is a dictionary type`: set
   `params["enable_categorical"] = True` (or declare the column with
   `feature_types`) so a categorical column is never trained as one by accident.

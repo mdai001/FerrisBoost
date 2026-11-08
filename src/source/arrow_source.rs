@@ -147,7 +147,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int64 => visit_values!(Int64Array),
         other => anyhow::bail!(
             "第 {col} 列是 {other:?},只支持数值列。\\
-             类别特征要先在上游编码成整数类别码(0..=254),再用 feature_types=\"c\" 声明"
+             类别特征要先在上游编码成整数类别码(0..=253),再用 feature_types=\"c\" 声明"
         ),
     }
     Ok(())
