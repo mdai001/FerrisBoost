@@ -1560,15 +1560,9 @@ fn train_with_backend(
                     // Device LambdaMART buffers (fast ranking only); the planner
                     // charges the same shape.
                     fast_rank: match (ranking, cfg.group_ptr.as_deref()) {
-                        (Some((kind, params)), Some(g)) if fast_requested => {
-                            Some(crate::gpu_mem_plan::FastRankShape {
-                                n_groups: (g.len() - 1) as u64,
-                                map: kind == crate::rank::RankKind::Map,
-                                mean: params.pair_method == crate::rank::PairMethod::Mean,
-                                n_positions: params
-                                    .device_bias_positions(crate::rank::max_group_size(g)),
-                            })
-                        }
+                        (Some((kind, params)), Some(g)) if fast_requested => Some(
+                            crate::gpu_mem_plan::FastRankShape::for_groups(kind, &params, g),
+                        ),
                         _ => None,
                     },
                     device_quantize: cfg.params.device_quantize,
