@@ -801,7 +801,9 @@ def test_gil_is_released_during_numpy_prediction():
         label=y,
         num_boost_round=30,
     )
-    predict_x = np.tile(x, (20, 1))
+    # Long enough to span many scheduler ticks on every platform (Windows'
+    # default timer resolution is ~15.6 ms, so a ~15 ms prediction is too short).
+    predict_x = np.tile(x, (200, 1))
     ticks = []
     stop = threading.Event()
 
@@ -812,11 +814,16 @@ def test_gil_is_released_during_numpy_prediction():
 
     thread = threading.Thread(target=ticker)
     thread.start()
+    started = time.perf_counter()
     model.predict(predict_x, predict_threads=1)
+    elapsed = time.perf_counter() - started
     stop.set()
     thread.join()
-    assert len(ticks) > 5, (
-        f"prediction 期间别的线程只跑了 {len(ticks)} 次,GIL 大概没放开"
+    # With the GIL held the ticker cannot run at all; with it released it wakes
+    # at least once per ~16 ms timer tick. Require a third of that rate.
+    expected = elapsed / 0.016
+    assert len(ticks) > max(5, expected / 3), (
+        f"prediction 期间别的线程只跑了 {len(ticks)} 次(用时 {elapsed * 1000:.0f} ms),GIL 大概没放开"
     )
 
 
