@@ -717,7 +717,7 @@ fn resident_disk_blocks_are_read_once_and_corruption_fails_before_upload() {
     )
     .expect_err("corrupted first-use disk block must fail checksum validation");
     assert!(
-        format!("{error:#}").contains("payload checksum 不一致"),
+        format!("{error:#}").contains("payload checksum mismatch"),
         "unexpected corruption error: {error:#}"
     );
 }
