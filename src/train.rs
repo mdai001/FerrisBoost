@@ -1043,7 +1043,7 @@ fn train_with_backend(
         match cfg.base_score {
             Some(b) => b,
             None => {
-                let seed = round_seeds.as_mut().map_or(0, |r| r.next());
+                let seed = round_seeds.as_mut().map_or(0, |r| r.draw());
                 crate::rank::estimate_base_score(rg, seed)
             }
         }
@@ -1414,7 +1414,7 @@ fn train_with_backend(
         // 回调和 metric 也只看 eval),所以把施加推迟到这里是安全的;
         // 训练结束时若还欠一次施加,循环外会补上,不留下过期状态。
         let fuse = pending_delta;
-        let round_seed = round_seeds.as_mut().map_or(0, |r| r.next());
+        let round_seed = round_seeds.as_mut().map_or(0, |r| r.draw());
         // fast 模式下 host 侧完全不产生 gpair:prediction apply、objective
         // gradient 和量化在 device 上一次做完。
         let exact_gradient_phase =

@@ -755,7 +755,7 @@ impl RoundSeeds {
             rng: (params.pair_method == PairMethod::Mean).then(|| Mt19937::new(seed as u32)),
         }
     }
-    pub fn next(&mut self) -> u32 {
+    pub fn draw(&mut self) -> u32 {
         self.rng.as_mut().map_or(0, Mt19937::next_u32)
     }
 }
