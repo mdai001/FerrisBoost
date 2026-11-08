@@ -256,6 +256,9 @@ logging, and the complete parameter reference.
 - Added multiple quantiles in one model (`quantile_alpha` list).
 - GPU prediction for categorical models and with `base_margin`.
 - Multiclass `predict_to_parquet` now streams.
+- Continue training from XGBoost models with file input.
+- Faster file prediction for wide data.
+- Changed: input validation errors that surfaced as `RuntimeError` are now `ValueError`.
 - GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6

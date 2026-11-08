@@ -114,7 +114,7 @@ impl BinCuts {
         if !flags.iter().any(|&f| f) {
             return Ok(self);
         }
-        anyhow::ensure!(
+        crate::ensure_input!(
             flags.len() == self.n_feats(),
             "categorical flags cover {} features, cuts have {}",
             flags.len(),
@@ -122,7 +122,7 @@ impl BinCuts {
         );
         for (f, _) in flags.iter().enumerate().filter(|(_, &c)| c) {
             let cuts = self.cuts_for(f as FeatId);
-            anyhow::ensure!(
+            crate::ensure_input!(
                 cuts.len() <= crate::categorical::MAX_CAT_CODE as usize
                     && cuts.iter().enumerate().all(|(i, &c)| c == (i + 1) as f32),
                 "categorical feature {f} needs consecutive code cuts [1..max_code] with \

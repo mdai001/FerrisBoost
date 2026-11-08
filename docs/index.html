@@ -107,6 +107,9 @@ prediction = model.predict("test.parquet")</code></pre>
         <li>Added multiple quantiles in one model (<code>quantile_alpha</code> list).</li>
         <li>GPU prediction for categorical models and with <code>base_margin</code>.</li>
         <li>Multiclass <code>predict_to_parquet</code> now streams.</li>
+        <li>Continue training from XGBoost models with file input.</li>
+        <li>Faster file prediction for wide data.</li>
+        <li>Changed: input validation errors that surfaced as <code>RuntimeError</code> are now <code>ValueError</code>.</li>
         <li>GPU speed optimizations for categorical features and for <code>colsample_bylevel</code> / <code>colsample_bynode</code>.</li>
       </ul>
       <h3>0.0.6</h3>

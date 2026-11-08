@@ -137,7 +137,7 @@ impl PyModel {
             let names = margin_column_names(base_margin, k)?;
             let resolved = crate::source::input::resolve(&specs)
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-            self.check_explain_file_schema(&resolved, header)?;
+            self.check_file_schema(&resolved, header)?;
             // The margin column sits next to the features, so the file must be
             // bound by name; a positional model scores files of exactly its
             // feature width and has nowhere to put a margin column.

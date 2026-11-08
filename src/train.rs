@@ -940,19 +940,19 @@ pub fn train_gpu_weighted(
 
 /// 权重校验:长度一致、有限、非负。XGBoost 同样拒绝负权重。
 fn validate_weights(weights: &[f32], n: usize, name: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
+    crate::ensure_input!(
         weights.len() == n,
         "{name}的权重有 {} 行,数据有 {n} 行",
         weights.len()
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         weights.iter().all(|w| w.is_finite() && *w >= 0.0),
         "{name}的权重必须全部是有限的非负值"
     );
     // 单个权重有限,加起来(以及乘上梯度后)仍可能溢出 f32,
     // 训练会悄悄变成 inf / NaN。总和超出 f32 范围直接拒绝。
     let total: f64 = weights.iter().map(|&w| f64::from(w)).sum();
-    anyhow::ensure!(
+    crate::ensure_input!(
         total <= f64::from(f32::MAX),
         "{name}的权重总和是 {total:e},超出了 f32 范围;请把权重整体缩小"
     );
@@ -998,13 +998,13 @@ fn validate_start_margins(
 ) -> anyhow::Result<()> {
     let k = cfg.objective.num_outputs();
     let check = |margin: &[f32], rows: usize, what: &str| -> anyhow::Result<()> {
-        anyhow::ensure!(
+        crate::ensure_input!(
             margin.len() == rows * k,
             "{what}的 base_margin 有 {} 个值,应为 {rows} 行 × {k} 个输出 = {}",
             margin.len(),
             rows * k
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             margin.iter().all(|v| v.is_finite()),
             "{what}的 base_margin 必须全部是有限值"
         );
@@ -1013,7 +1013,7 @@ fn validate_start_margins(
     if let Some(m) = &cfg.base_margin {
         check(m, source.n_rows(), "训练集")?;
     }
-    anyhow::ensure!(
+    crate::ensure_input!(
         cfg.eval_base_margins.len() <= evals.len(),
         "eval_base_margins 有 {} 项,但只有 {} 个验证集",
         cfg.eval_base_margins.len(),
@@ -1031,11 +1031,11 @@ fn validate_start_margins(
     // lambdarank_obj.cc): the position biases are estimated from round 0 and
     // restarting them would silently change the model.
     let unbiased = |o: &Objective| matches!(o, Objective::Rank { params, .. } if params.unbiased);
-    anyhow::ensure!(
+    crate::ensure_input!(
         !unbiased(&cfg.objective) && prior.rank_bias.is_none(),
         "lambdarank_unbiased 模型不能续训(和 XGBoost 一样);请从头训练"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         prior.objective.name() == cfg.objective.name(),
         "续训的 objective 是 {:?},已有模型的是 {:?}",
         cfg.objective.name(),
@@ -1043,7 +1043,7 @@ fn validate_start_margins(
     );
     // Each output of a quantile model is tied to its alpha: continuing with other
     // quantiles would silently mix two different targets.
-    anyhow::ensure!(
+    crate::ensure_input!(
         prior.objective.quantile_alphas() == cfg.objective.quantile_alphas(),
         "续训的 quantile_alpha 是 {:?},已有模型的是 {:?}:续训必须使用相同的分位数",
         cfg.objective
@@ -1054,18 +1054,18 @@ fn validate_start_margins(
             .quantile_alphas()
             .map(|a| a.as_slice().to_vec())
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         prior.num_outputs() == k,
         "续训的输出数是 {k}(num_class),已有模型的是 {}",
         prior.num_outputs()
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         prior.n_features == source.n_features(),
         "续训的数据有 {} 个特征,已有模型有 {} 个",
         source.n_features(),
         prior.n_features
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         prior.trees.len() % k == 0,
         "已有模型有 {} 棵树,不是 {k} 个输出的整数轮",
         prior.trees.len()
@@ -1079,7 +1079,7 @@ fn validate_start_margins(
         }
     };
     let n_features = source.n_features();
-    anyhow::ensure!(
+    crate::ensure_input!(
         flags(&prior.feature_types, n_features)
             == flags(source.cuts().categorical_flags(), n_features),
         "续训数据的类别特征(feature_types)和已有模型不一致"
@@ -1094,7 +1094,7 @@ fn validate_start_margins(
                 .iter()
                 .find(|&&c| c > crate::categorical::MAX_CAT_CODE)
             {
-                anyhow::bail!(
+                crate::bail_input!(
                     "已有模型的第 {t} 棵树在类别特征 {} 上分裂到类别码 {big},超过当前训练支持的上限 {}(MAX_CAT_CODE);无法续训",
                     node.feat,
                     crate::categorical::MAX_CAT_CODE
@@ -1108,18 +1108,18 @@ fn validate_start_margins(
         } else {
             prior.base_score
         };
-        anyhow::ensure!(
+        crate::ensure_input!(
             k > 1 || b.to_bits() == model_b.to_bits(),
             "续训时 base_score 沿用已有模型的 {model_b},不能改成 {b}"
         );
     }
     if !prior.trees.is_empty() {
-        anyhow::ensure!(
+        crate::ensure_input!(
             cfg.base_margin.is_some(),
             "续训必须带已有模型在训练集上的 raw margin 作为 base_margin"
         );
         for (i, ev) in evals.iter().enumerate() {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 cfg.eval_margin(i).is_some(),
                 "续训必须带已有模型在验证集 {:?} 上的 raw margin 作为 base_margin",
                 ev.name
@@ -1155,24 +1155,24 @@ fn train_with_backend(
     gpu_device: Option<usize>,
 ) -> anyhow::Result<Model> {
     let n = source.n_rows();
-    anyhow::ensure!(n > 0, "训练数据必须至少有一行");
+    crate::ensure_input!(n > 0, "训练数据必须至少有一行");
     // 行号是 u32(`RowId`):超过就会静默截断成错的行。
-    anyhow::ensure!(
+    crate::ensure_input!(
         n <= crate::types::RowId::MAX as usize,
         "训练数据有 {n} 行,超过了支持的上限 {}",
         crate::types::RowId::MAX
     );
-    anyhow::ensure!(source.n_features() > 0, "训练数据必须至少有一个特征");
+    crate::ensure_input!(source.n_features() > 0, "训练数据必须至少有一个特征");
     validate_source_metadata(source, "训练集")?;
-    anyhow::ensure!(
+    crate::ensure_input!(
         labels.len() == n,
         "标签有 {} 行,训练数据有 {n} 行",
         labels.len()
     );
-    anyhow::ensure!(labels.iter().all(|v| v.is_finite()), "标签必须全部是有限值");
+    crate::ensure_input!(labels.iter().all(|v| v.is_finite()), "标签必须全部是有限值");
     let ranking = cfg.objective.rank();
     match (ranking.is_some(), cfg.group_ptr.as_deref()) {
-        (true, None) => anyhow::bail!(
+        (true, None) => crate::bail_input!(
             "{} needs query groups: pass qid= or group= with the training data",
             cfg.objective.name()
         ),
@@ -1200,7 +1200,7 @@ fn train_with_backend(
     cfg.objective.validate_params()?;
     let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
     if let Some((_, rp)) = ranking {
-        anyhow::ensure!(
+        crate::ensure_input!(
             !(rp.unbiased && fast_requested && gpu_device.is_some()),
             "lambdarank_unbiased is not supported with gpu_math=\"fast\" (the position-bias \
              estimation has no deterministic device implementation yet); use gpu_math=\"exact\" \
@@ -1270,12 +1270,12 @@ fn train_with_backend(
     // spw == 1 时不复制(乘 1 是恒等,结果逐位相同)。
     let spw_weights = gradient_weights(cfg.objective, labels, weights, cfg.params.scale_pos_weight);
     let grad_weights: Option<&[f32]> = spw_weights.as_deref().or(weights);
-    anyhow::ensure!(base_score.is_finite(), "base_score 必须是有限值");
+    crate::ensure_input!(base_score.is_finite(), "base_score 必须是有限值");
     cfg.objective.validate_base_score(base_score)?;
     let source_bytes_start = source.source_bytes_read();
     let source_reads_start = source.source_block_reads();
     let p = &cfg.params;
-    anyhow::ensure!(
+    crate::ensure_input!(
         (1..=crate::types::MAX_BIN_LIMIT).contains(&p.max_bin),
         "max_bin 要在 1..=255"
     );
@@ -1285,97 +1285,97 @@ fn train_with_backend(
     // 而且 GPU 那个错误信息离原因很远。
     // ⚠️ 下界是 **0**,不是 1:`max_depth = 0` 是合法的「只有根节点」的树,
     // 有专门的测试钉着它的语义(`root_only_tree_updates_the_next_round_predictions`)。
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.max_depth <= crate::types::MAX_DEPTH_LIMIT,
         "max_depth 要在 0..={}(收到 {});0 表示只有根节点,上限由 GPU 的\
          每层 partition 节点 buffer 决定,见 types::MAX_DEPTH_LIMIT",
         crate::types::MAX_DEPTH_LIMIT,
         p.max_depth
     );
-    anyhow::ensure!(p.cols_per_block > 0, "cols_per_block 必须 > 0");
+    crate::ensure_input!(p.cols_per_block > 0, "cols_per_block 必须 > 0");
     // XGBoost:约束比特征多是错误;比特征少的部分视为 0。
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.monotone_constraints.len() <= source.n_features(),
         "monotone_constraints 有 {} 个,但只有 {} 个特征",
         p.monotone_constraints.len(),
         source.n_features()
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.monotone_constraints.iter().all(|c| (-1..=1).contains(c)),
         "monotone_constraints 只接受 -1 / 0 / 1(按符号归一后)"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.learning_rate.is_finite() && p.learning_rate >= 0.0,
         "learning_rate 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.lambda.is_finite() && p.lambda >= 0.0,
         "lambda 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.gamma.is_finite() && p.gamma >= 0.0,
         "gamma 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.min_child_weight.is_finite() && p.min_child_weight >= 0.0,
         "min_child_weight 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.alpha.is_finite() && p.alpha >= 0.0,
         "alpha 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.max_delta_step.is_finite() && p.max_delta_step >= 0.0,
         "max_delta_step 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.scale_pos_weight.is_finite() && p.scale_pos_weight >= 0.0,
         "scale_pos_weight 必须是非负有限值"
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.subsample > 0.0 && p.subsample <= 1.0 && p.subsample.is_finite(),
         "subsample 必须在 (0, 1],收到 {}",
         p.subsample
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.colsample_bytree > 0.0 && p.colsample_bytree <= 1.0 && p.colsample_bytree.is_finite(),
         "colsample_bytree 必须在 (0, 1],收到 {}",
         p.colsample_bytree
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.colsample_bylevel > 0.0 && p.colsample_bylevel <= 1.0 && p.colsample_bylevel.is_finite(),
         "colsample_bylevel 必须在 (0, 1],收到 {}",
         p.colsample_bylevel
     );
-    anyhow::ensure!(
+    crate::ensure_input!(
         p.colsample_bynode > 0.0 && p.colsample_bynode <= 1.0 && p.colsample_bynode.is_finite(),
         "colsample_bynode 必须在 (0, 1],收到 {}",
         p.colsample_bynode
     );
     for ev in evals {
-        anyhow::ensure!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
-        anyhow::ensure!(
+        crate::ensure_input!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
+        crate::ensure_input!(
             ev.source.n_rows() <= crate::types::RowId::MAX as usize,
             "验证集 {:?} 有 {} 行,超过了支持的上限 {}",
             ev.name,
             ev.source.n_rows(),
             crate::types::RowId::MAX
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             ev.labels.len() == ev.source.n_rows(),
             "验证集 {:?} 的标签有 {} 行,数据有 {} 行",
             ev.name,
             ev.labels.len(),
             ev.source.n_rows()
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             ev.source.n_features() == source.n_features(),
             "验证集 {:?} 有 {} 个特征,训练集有 {} 个",
             ev.name,
             ev.source.n_features(),
             source.n_features()
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             ev.labels.iter().all(|v| v.is_finite()),
             "验证集 {:?} 的标签必须全部是有限值",
             ev.name
@@ -1383,7 +1383,7 @@ fn train_with_backend(
         cfg.objective
             .validate_labels(ev.labels, &format!("验证集 {:?} ", ev.name))?;
         match (ranking.is_some(), ev.group_ptr) {
-            (true, None) => anyhow::bail!(
+            (true, None) => crate::bail_input!(
                 "validation set {:?} needs query groups (eval qid / group) for {}",
                 ev.name,
                 cfg.objective.name()
@@ -1416,7 +1416,7 @@ fn train_with_backend(
                     .iter()
                     .find(|m| matches!(m.name(), "auc" | "aucpr"))
                 {
-                    anyhow::bail!(
+                    crate::bail_input!(
                         "validation set {:?}: {} with query groups is scored per group and needs \
                          one weight per group, but {} uses per-row weights; drop the weights or \
                          the groups of this set",
@@ -1428,7 +1428,7 @@ fn train_with_backend(
             }
             validate_weights(w, n_ev_weights, &format!("验证集 {:?} ", ev.name))?;
             for m in &cfg.eval_metrics {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     m.supports_weights(),
                     "metric {:?} 不支持加权评估,但验证集 {:?} 带了权重",
                     m.name(),
@@ -1437,7 +1437,7 @@ fn train_with_backend(
             }
         }
         validate_source_metadata(ev.source, &format!("验证集 {:?}", ev.name))?;
-        anyhow::ensure!(
+        crate::ensure_input!(
             ev.source.cuts().offsets == source.cuts().offsets
                 && ev.source.cuts().values == source.cuts().values
                 && ev.source.cuts().categorical_flags() == source.cuts().categorical_flags(),

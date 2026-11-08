@@ -307,6 +307,54 @@ impl SchemaMode {
 }
 
 impl Model {
+    /// The column binding used for file inputs, or `None` when it cannot be
+    /// established safely.
+    ///
+    /// A recorded `schema_mode` always wins. A model without a record (trained
+    /// by XGBoost, or saved by an old FerrisBoost) is bound **by name** only
+    /// when it carries a complete list of unique feature names: names say which
+    /// column feeds which feature, so a file with another column order still
+    /// scores correctly. Without names the only possible binding is positional,
+    /// which silently mis-scores a file whose columns are in another order, so
+    /// it is never guessed: such a model scores files only after being trained
+    /// (or re-saved with names) by a version that records its schema.
+    ///
+    /// The stored `schema_mode` field is left untouched, so loading and saving
+    /// a model does not change its bytes.
+    pub fn file_schema_mode(&self) -> Option<SchemaMode> {
+        if let Some(mode) = self.schema_mode {
+            return Some(mode);
+        }
+        let names = &self.feature_names;
+        if names.is_empty() || names.len() != self.n_features {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        names
+            .iter()
+            .all(|n| seen.insert(n.as_str()))
+            .then_some(SchemaMode::Named)
+    }
+
+    /// Ascending, de-duplicated ids of the features that any of the first
+    /// `n_trees` trees splits on. Never empty (feature 0 stands in for a model
+    /// without splits), so a reader always has one column to count rows by.
+    pub fn used_split_features(&self, n_trees: usize) -> Vec<usize> {
+        let mut used: Vec<usize> = self.trees[..n_trees.min(self.trees.len())]
+            .iter()
+            .flat_map(|tree| tree.nodes.iter())
+            .filter(|node| !node.is_leaf)
+            .map(|node| node.feat as usize)
+            .filter(|&feature| feature < self.n_features)
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        if used.is_empty() {
+            used.push(0);
+        }
+        used
+    }
+
     /// 每行几个输出:多分类是 `num_class`,其余 1。
     pub fn num_outputs(&self) -> usize {
         self.class_base_margins.len().max(1)
@@ -1299,6 +1347,42 @@ mod tests {
             best_iteration: None,
             best_score: None,
         }
+    }
+
+    #[test]
+    fn file_schema_mode_binds_by_name_only_with_complete_unique_names() {
+        let names = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let mut m = fixture_model();
+        // No record, no names (an XGBoost model trained on an array): refused.
+        assert_eq!(m.file_schema_mode(), None);
+        // No record, complete names (an XGBoost model with feature names): by name.
+        m.feature_names = names(&["a", "b"]);
+        assert_eq!(m.file_schema_mode(), Some(SchemaMode::Named));
+        // Incomplete or duplicate names are not trusted.
+        m.feature_names = names(&["a"]);
+        assert_eq!(m.file_schema_mode(), None);
+        m.feature_names = names(&["a", "a"]);
+        assert_eq!(m.file_schema_mode(), None);
+        // A recorded mode always wins, whatever the names say.
+        m.schema_mode = Some(SchemaMode::Positional);
+        assert_eq!(m.file_schema_mode(), Some(SchemaMode::Positional));
+        m.feature_names = Vec::new();
+        m.schema_mode = Some(SchemaMode::Named);
+        assert_eq!(m.file_schema_mode(), Some(SchemaMode::Named));
+    }
+
+    #[test]
+    fn used_split_features_is_sorted_unique_and_never_empty() {
+        let mut m = fixture_model();
+        m.n_features = 5;
+        assert_eq!(m.used_split_features(1), vec![0, 1]);
+        assert_eq!(m.used_split_features(99), vec![0, 1]);
+        m.trees.clear();
+        assert_eq!(m.used_split_features(0), vec![0]);
+        // Splits beyond the declared width are ignored rather than indexed.
+        let mut m = fixture_model();
+        m.n_features = 1;
+        assert_eq!(m.used_split_features(1), vec![0]);
     }
 
     fn many_tree_model(n_trees: usize) -> Model {
