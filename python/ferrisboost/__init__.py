@@ -889,7 +889,7 @@ def train(
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
     为 True 时自动识别。类别值是 0..=65533 的整数码(缺失用 NaN / null),超出范围、
-    负数或非整数会报错;每个特征最多 65534 个类别(GPU 训练目前最多 254 个)。
+    负数或非整数会报错;每个特征最多 65534 个类别(CPU 和 GPU 相同)。`max_bin` 取 1..=65535。
 
     `base_margin`(XGBoost 的 DMatrix `base_margin`):每行的起始 raw margin,训练从它起步
     而不是从 `base_score` 起步(截距仍然按标签估计并存进模型,和 XGBoost 一致)。数组入口给

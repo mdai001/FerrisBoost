@@ -537,12 +537,17 @@ impl TrainParams {
         self.monotone_constraints.iter().any(|&c| c != 0)
     }
 
-    /// split 评估要不要走 XGBoost 的「给定权重」形式
-    /// (`CalcWeight` → 夹界 → `CalcGainGivenWeight`)。单调约束、L1、
-    /// `max_delta_step` 都要它;三者都关时走原来的 `G²/(H+λ)` 路径,
-    /// 和 0.0.4 逐位相同。
+    /// Whether split evaluation uses XGBoost's given-weight form
+    /// (`CalcWeight` -> bounds -> `CalcGainGivenWeight`, each side rounded to
+    /// f32, summed in f32, minus the f32 parent gain). Always: XGBoost 3.4.1's
+    /// scalar `CalcSplitGain` uses it with or without monotone constraints,
+    /// L1 or `max_delta_step`. The algebraically equal f64 `G²/(H+λ)` form
+    /// rounds differently, so when two candidates tie in f32 it can pick a
+    /// different split than XGBoost (seen with many categories and with
+    /// large label offsets). Without constraints the bounds are `±f32::MAX`
+    /// and the leaf values are unchanged.
     pub fn uses_given_weight(&self) -> bool {
-        self.has_monotone() || self.alpha != 0.0 || self.max_delta_step != 0.0
+        true
     }
 
     /// 某个特征的约束方向;超出列表长度的特征不约束。

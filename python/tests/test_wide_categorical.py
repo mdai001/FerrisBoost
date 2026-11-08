@@ -3,10 +3,17 @@
 Category codes are lossless bins (one bin per code up to the largest), so the
 trees, category sets and predictions are bit-identical to XGBoost 3.4.1
 `tree_method="hist"` (partition-based splits with `max_cat_threshold`,
-one-hot below `max_cat_to_onehot`) with 1,000 and 20,000 categories. 8-bit
-categorical and numeric features of the same data keep their 8-bit columns.
+one-hot below `max_cat_to_onehot`) across the supported range: from just above
+the 8-bit limit (254 categories, codes 0..=253) through 300, 1,000, 20,000 and
+60,000 categories up to the limit of 65,534, with several such features in one
+model, next to numeric features with `max_bin` above 255, and for regression,
+logistic, multiclass and ranking objectives. XGBoost loads the saved models
+and predicts the same bits, and the GPU (`gpu_math="exact"`) trains the
+byte-identical model. 8-bit categorical and numeric features of the same data
+keep their 8-bit columns. The largest cases run with FB_SLOW_TESTS=1.
 """
 import json
+import os
 
 import numpy as np
 import pytest
@@ -39,8 +46,8 @@ def make(n, levels, seed=0, missing=0.02, objective="reg:squarederror"):
     return x, y, ["q"] + ["c"] * len(levels)
 
 
-def xgb_train(x, y, ft, params, rounds):
-    d = xgb.DMatrix(x, label=y, feature_types=ft, enable_categorical=True)
+def xgb_train(x, y, ft, params, rounds, **dkw):
+    d = xgb.DMatrix(x, label=y, feature_types=ft, enable_categorical=True, **dkw)
     p = {"tree_method": "hist", "nthread": 1, "base_score": 0.5, "max_bin": 255, **params}
     return xgb.train(p, d, num_boost_round=rounds), d
 
@@ -237,3 +244,154 @@ def test_gpu_trains_the_cpu_model_with_16_bit_categorical_columns(tmp_path):
     # Up to 254 categories the GPU trains as before.
     x, y, ft = make(4000, (254,), seed=11)
     fb_train(x, y, ft, {"device": "cuda", "objective": "reg:squarederror"}, 1)
+
+
+# ------------------------------------------- the full range (254 .. 65,534 categories)
+
+SLOW = os.environ.get("FB_SLOW_TESTS") == "1"
+slow = pytest.mark.skipif(not SLOW, reason="set FB_SLOW_TESTS=1 for the largest cases")
+HAS_CUDA = _has_cuda()
+
+
+def raw(model, tmp_path, name):
+    path = tmp_path / f"{name}.json"
+    model.save_model(str(path), quiet=True)
+    return path
+
+
+def with_objective(x, y, objective, seed):
+    """Labels and train extras for `objective` from the regression target `y`."""
+    rng = np.random.default_rng(seed)
+    params, fkw, dkw = {"objective": objective}, {}, {}
+    if objective == "binary:logistic":
+        y = (y > np.median(y)).astype(np.float32)
+    elif objective == "multi:softprob":
+        y = np.digitize(y, np.quantile(y, [1 / 3, 2 / 3])).astype(np.float32)
+        params["num_class"] = 3
+    elif objective.startswith("rank:"):
+        y = np.digitize(y + rng.normal(0, 0.3, len(y)),
+                        np.quantile(y, [0.3, 0.6, 0.8, 0.95])).astype(np.float32)
+        qid = np.arange(len(y)) // 20
+        fkw["qid"], dkw["qid"] = qid, qid
+    return y, params, fkw, dkw
+
+
+def assert_matches_xgboost(x, y, ft, params, rounds, tmp_path, fkw=None, dkw=None,
+                           wide=(1,)):
+    """FerrisBoost == XGBoost 3.4.1 (trees, category sets, margins); XGBoost loads
+    the FerrisBoost JSON and predicts the same bits; GPU exact == CPU bytes."""
+    fkw, dkw = fkw or {}, dkw or {}
+    bst, d = xgb_train(x, y, ft, params, rounds, **dkw)
+    ours = fb_train(x, y, ft, params, rounds, **fkw)
+    mine, ref = trees(ours, tmp_path, "f"), trees(bst, tmp_path, "x")
+    assert len(mine) == len(ref)
+    for i, (a, b) in enumerate(zip(mine, ref)):
+        assert structure(a) == structure(b), f"tree {i} differs"
+    margin = ours.predict(x, output_margin=True)
+    np.testing.assert_array_equal(margin, bst.predict(d, output_margin=True))
+    for f in wide:  # each high-cardinality feature is split above the 8-bit range
+        assert max_set_code(mine, f) > 253, f
+    path = raw(ours, tmp_path, "cpu")
+    loaded = xgb.Booster(model_file=str(path))
+    np.testing.assert_array_equal(loaded.predict(d, output_margin=True), margin)
+    if HAS_CUDA:
+        for resident in (None, 0):  # planner's choice, then pure streaming
+            g = {"device": "cuda", "gpu_math": "exact"}
+            if resident is not None:
+                g["resident_blocks"] = resident
+            gpu = fb_train(x, y, ft, {**params, **g}, rounds, **fkw)
+            assert raw(gpu, tmp_path, "gpu").read_bytes() == path.read_bytes(), resident
+    return ours
+
+
+@pytest.mark.parametrize("k", [254, 255, 256, 300])
+def test_8_bit_to_16_bit_boundary_matches_xgboost(k, tmp_path):
+    # 254 categories (codes 0..=253) are the largest 8-bit feature; 255 switch
+    # that feature to 16 bits.
+    x, y, ft = make(6000, (k, 12), seed=k)
+    p = {"objective": "reg:squarederror", "max_depth": 5, "max_cat_threshold": 128}
+    assert_matches_xgboost(x, y, ft, p, 4, tmp_path, wide=())
+
+
+@pytest.mark.parametrize("k", [254, 255])
+def test_8_bit_to_16_bit_boundary_storage_width(k, tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y, ft = make(3000, (k, 12), seed=k)
+    path = str(tmp_path / "b.parquet")
+    pq.write_table(pa.table({**{f"f{i}": pa.array(x[:, i]) for i in range(3)},
+                             "label": pa.array(y)}), path)
+    cache = tmp_path / "cache"
+    p = {"objective": "reg:squarederror", "max_depth": 3, "nthread": 1, "base_score": 0.5,
+         "cache_path": str(cache), "cache_budget_bytes": 0}
+    fb.train(p, path, label="label", feature_types=ft, num_boost_round=1, quiet=True)
+    manifest = json.loads((cache / "manifest.json").read_text())
+    if k == 254:
+        assert manifest["version"] == 2 and 2 not in manifest.get("block_widths", [1])
+    else:
+        assert manifest["version"] == 3 and 2 in manifest["block_widths"]
+
+
+def test_several_high_cardinality_features_match_xgboost(tmp_path):
+    x, y, ft = make(12_000, (3000, 300, 12, 1500), seed=21)
+    p = {"objective": "reg:squarederror", "max_depth": 5, "max_cat_threshold": 200}
+    assert_matches_xgboost(x, y, ft, p, 4, tmp_path, wide=(1, 2, 4))
+
+
+def wide_numeric(x, y, distinct, seed):
+    """Replace the numeric column by one with `distinct` values (> 255) that
+    carries signal, so `max_bin` above 255 bins it losslessly."""
+    rng = np.random.default_rng(seed)
+    v = rng.integers(0, distinct, len(y)).astype(np.float32)
+    y = (y + 1.5 * np.sin(v / (distinct / 7.0))).astype(np.float32)
+    v[rng.random(len(y)) < 0.02] = np.nan
+    x = x.copy()
+    x[:, 0] = v * 0.5 - 10.0
+    return x, y
+
+
+@pytest.mark.parametrize("max_bin", [1024])
+def test_high_cardinality_next_to_wide_numeric_bins_matches_xgboost(max_bin, tmp_path):
+    x, y, ft = make(12_000, (2000, 12), seed=22)
+    x, y = wide_numeric(x, y, 900, 22)
+    p = {"objective": "reg:squarederror", "max_depth": 5, "max_bin": max_bin}
+    ours = assert_matches_xgboost(x, y, ft, p, 4, tmp_path)
+    # the numeric feature is split above its 255th bin somewhere
+    assert any(f == 0 and c > 255 * 0.5 - 10.0
+               for t in trees(ours, tmp_path, "n")
+               for f, c, left in zip(t["split_indices"], t["split_conditions"],
+                                     t["left_children"]) if left != -1)
+
+
+def test_60000_categories_match_xgboost(tmp_path):
+    x, y, ft = make(120_000, (60_000, 12), seed=23)
+    p = {"objective": "reg:squarederror", "max_depth": 4, "max_cat_threshold": 1000}
+    assert_matches_xgboost(x, y, ft, p, 3, tmp_path)
+
+
+@slow
+@pytest.mark.parametrize("objective", ["reg:squarederror", "binary:logistic", "multi:softprob",
+                                       "rank:ndcg", "rank:pairwise"])
+def test_60000_categories_match_xgboost_for_each_objective(objective, tmp_path):
+    x, y, ft = make(150_000, (60_000, 12), seed=24)
+    y, extra, fkw, dkw = with_objective(x, y, objective, 24)
+    p = {"max_depth": 5, "max_cat_threshold": 64, **extra}
+    assert_matches_xgboost(x, y, ft, p, 4, tmp_path, fkw=fkw, dkw=dkw)
+
+
+@slow
+def test_the_category_limit_65534_matches_xgboost(tmp_path):
+    # Every code 0..=65533 occurs: the largest feature FerrisBoost accepts.
+    x, y, ft = make(160_000, (65_534, 12), seed=25, objective="binary:logistic")
+    assert np.nanmax(x[:, 1]) == 65533
+    p = {"objective": "binary:logistic", "max_depth": 5}
+    assert_matches_xgboost(x, y, ft, p, 4, tmp_path)
+
+
+@slow
+def test_several_high_cardinality_features_with_60000_match_xgboost(tmp_path):
+    x, y, ft = make(150_000, (60_000, 300, 12, 20_000), seed=26)
+    x, y = wide_numeric(x, y, 3000, 26)
+    p = {"objective": "reg:squarederror", "max_depth": 6, "max_bin": 4096,
+         "max_cat_threshold": 500}
+    assert_matches_xgboost(x, y, ft, p, 4, tmp_path, wide=(1, 2, 4))

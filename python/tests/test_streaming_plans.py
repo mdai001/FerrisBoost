@@ -389,6 +389,8 @@ WIDE_CASES = {
     "numeric_max_bin_4096": dict(max_bin=4096),
     # 20,000 categories: one feature has more histogram slots than a shared tile
     "categorical_1000_and_20000": dict(n_cat=2, cat_k=(1000, 20000)),
+    # 60,000 categories next to 300 (both 16-bit) and numeric max_bin > 255
+    "categorical_60000": dict(max_bin=1024, n_cat=2, cat_k=(300, 60000)),
     # 8-bit categorical and numeric blocks next to 16-bit ones
     "mixed_8_and_16_bit": dict(max_bin=300, n_cat=2, cat_k=(40, 20000)),
     # sorted partition scanning more than one 256-category selection tile

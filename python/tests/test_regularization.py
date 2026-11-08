@@ -169,3 +169,40 @@ def test_gpu_fast_is_deterministic_and_close(tmp_path, extra):
     assert model_bytes(a, tmp_path, "a") == model_bytes(b, tmp_path, "b")
     cpu = fb.train(p, x, label=y, num_boost_round=8, quiet=True)
     np.testing.assert_allclose(a.predict(x), cpu.predict(x), atol=1e-4)
+
+
+# Split gains without any constraint also use XGBoost's given-weight form in f32
+# (each side rounded to f32, summed in f32, minus the f32 parent gain). The f64
+# G²/(H+λ) form is algebraically equal but, when two candidates tie in f32
+# (large label offsets, many categories), picked a different split than XGBoost.
+def _near_tie_numeric():
+    rng = np.random.default_rng(99)
+    x = rng.integers(0, 40, (3000, 4)).astype(np.float32)
+    y = (30 + 0.05 * x[:, 0] - 0.03 * x[:, 1] + rng.normal(0, 0.5, 3000)).astype(np.float32)
+    return x, y, None
+
+
+def _near_tie_categorical():
+    rng = np.random.default_rng(47)
+    c = rng.integers(0, 30, 3000)
+    c[:30] = np.arange(30)
+    q = rng.integers(0, 50, 3000).astype(np.float32)
+    x = np.stack([q, c.astype(np.float32)], axis=1)
+    y = (30 + rng.normal(0, 1, 30)[c] + 0.05 * q + rng.normal(0, 0.5, 3000)).astype(np.float32)
+    return x, y, ["q", "c"]
+
+
+@pytest.mark.parametrize("data", [_near_tie_numeric, _near_tie_categorical],
+                         ids=["numeric", "categorical"])
+def test_unconstrained_gain_ties_resolve_like_xgboost(data, tmp_path):
+    x, y, ft = data()
+    p = {"objective": "reg:squarederror", "max_depth": 6, "nthread": 1, "base_score": 0.5}
+    d = xgb.DMatrix(x, label=y, feature_types=ft, enable_categorical=ft is not None)
+    bst = xgb.train({**p, "tree_method": "hist"}, d, num_boost_round=4)
+    ours = fb.train(p, x, label=y, feature_types=ft, num_boost_round=4, quiet=True)
+    np.testing.assert_array_equal(ours.predict(x, output_margin=True),
+                                  bst.predict(d, output_margin=True))
+    if _has_cuda():
+        gpu = fb.train({**p, "device": "cuda", "gpu_math": "exact"}, x, label=y,
+                       feature_types=ft, num_boost_round=4, quiet=True)
+        assert model_bytes(gpu, tmp_path, "g") == model_bytes(ours, tmp_path, "c")
