@@ -203,7 +203,7 @@ pub(super) fn continued_feature_names(
     }
     if !old.is_empty() && *old != names {
         return Err(PyValueError::new_err(format!(
-            "the feature names of the new data {names:?} differ from those of xgb_model {old:?} (names and order must match)"
+            "the feature names of the new data {names:?} differ from those of init_model {old:?} (names and order must match)"
         )));
     }
     Ok(names)

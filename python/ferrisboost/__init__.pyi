@@ -23,6 +23,7 @@ def train(
     feature_types: Sequence[str] | None = ...,
     base_margin: Any = ...,
     base_margin_eval_set: Sequence[Any] | None = ...,
+    init_model: Any = ...,
     xgb_model: Any = ...,
     qid: Any = ...,
     group: Any = ...,
@@ -43,7 +44,8 @@ def train(
     parallel to evals with one margin (or None) per validation set; file evals
     read the same column name(s) from their own files.
 
-    xgb_model continues training: a ferrisboost.Model, a path to a FerrisBoost
+    init_model continues training (xgb_model= is accepted too, XGBoost's
+    name for it): a ferrisboost.Model, a path to a FerrisBoost
     or XGBoost model JSON, or an xgboost.Booster. Training starts from that
     model's prediction on the new training data and on every validation set,
     keeps its base_score and objective (params["objective"] defaults to the

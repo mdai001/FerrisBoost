@@ -595,20 +595,21 @@ pred = model.predict(X_new, base_margin=np.log(exposure_new))
 With lossless bins the margins, trees and SHAP values are bit-identical to XGBoost
 trained with `DMatrix(x, base_margin=...)`.
 
-## Continue training (`xgb_model`)
+## Continue training (`init_model`)
 
-`xgb_model` continues an existing model: the new trees are fitted to the
-residual of the old ones.
+`init_model` continues an existing model: the new trees are fitted to the
+residual of the old ones. XGBoost code that passes `xgb_model=` works unchanged
+(it is the same argument under XGBoost's name; give one or the other).
 
 ```python
 first = fb.train(params, X, label=y, num_boost_round=100)
-more = fb.train(params, X_new, label=y_new, num_boost_round=50, xgb_model=first)
+more = fb.train(params, X_new, label=y_new, num_boost_round=50, init_model=first)
 assert more.num_trees == 150          # 100 old trees + 50 new ones
 
-fb.train(params, X, label=y, num_boost_round=50, xgb_model="model.json")
+fb.train(params, X, label=y, num_boost_round=50, init_model="model.json")
 ```
 
-`xgb_model` is a FerrisBoost `Model`, a path to a FerrisBoost **or XGBoost** model
+`init_model` is a FerrisBoost `Model`, a path to a FerrisBoost **or XGBoost** model
 JSON, or an `xgboost.Booster`. The model passed in is not modified.
 
 - `num_boost_round` counts the **new** rounds (XGBoost 3.4.1 does the same); the
@@ -630,7 +631,7 @@ JSON, or an `xgboost.Booster`. The model passed in is not modified.
   model, so `predict(iteration_range=(0, best_iteration + 1))` is the best model,
   as in XGBoost. A `best_iteration` already stored in the continued model stays if
   early stopping is not used this time.
-- Files work too (`fb.train(params, "more.parquet", label="y", xgb_model=m)`),
+- Files work too (`fb.train(params, "more.parquet", label="y", init_model=m)`),
   also from an **XGBoost** JSON or `Booster`. File columns are bound to the model
   **by name**, so the model needs feature names: a FerrisBoost model trained from
   a DataFrame, table, Parquet or headered CSV has them, and so does an XGBoost
@@ -642,7 +643,7 @@ JSON, or an `xgboost.Booster`. The model passed in is not modified.
   columns are in another order. Continue it from an array (you own the column
   order), or set `feature_names` on the `Booster`, save it again and pass that.
   The same rule governs `predict`, `predict_to_parquet` and explanations on files.
-- `sklearn`: `fit(X, y, xgb_model=)` accepts a `Model`, another estimator, a path
+- `sklearn`: `fit(X, y, init_model=)` (or `xgb_model=`) accepts a `Model`, another estimator, a path
   or a `Booster`, and adds `n_estimators` new rounds.
 
 What holds: on lossless bins, continuing is bit-identical to XGBoost's own
@@ -1110,7 +1111,7 @@ print(clf.best_iteration, clf.evals_result()["validation_0"]["logloss"][-1])
 clf.save_model("clf.json")                # XGBoost-compatible JSON
 ```
 
-- `fit(X, y, sample_weight=, base_margin=, eval_set=, sample_weight_eval_set=, base_margin_eval_set=, xgb_model=, verbose=)`,
+- `fit(X, y, sample_weight=, base_margin=, eval_set=, sample_weight_eval_set=, base_margin_eval_set=, init_model=, verbose=)`,
   `predict`, `predict_proba`, `apply`, `score`, `get_params` / `set_params`, `clone`,
   pickling, `GridSearchCV`, `cross_val_score`, and `Pipeline` work. Constructor
   parameters use XGBoost's names (`n_estimators`, `learning_rate`, `max_depth`,
@@ -1155,10 +1156,10 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   XGBoost). `verbose` defaults to `False` (set it to see the validation metrics
   per round).
 - `load_model(path)` / `from_file(path)` read XGBoost-compatible JSON.
-- `fit(..., base_margin=, base_margin_eval_set=, xgb_model=)` and
+- `fit(..., base_margin=, base_margin_eval_set=, init_model=)` and
   `predict` / `predict_proba(..., base_margin=)` follow XGBoost; see
   [Starting margins](#starting-margins-base_margin) and
-  [Continue training](#continue-training-xgb_model).
+  [Continue training](#continue-training-init_model).
 - Not supported: `booster=` and `tree_method=`.
   `sample_weight` follows FerrisBoost's weighted-sketch semantics, so a weight of
   `k` is not the same as repeating a row `k` times.
@@ -1731,7 +1732,7 @@ The following familiar XGBoost parameters are recognized but not implemented:
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 
-Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None, base_margin=None, base_margin_eval_set=None, xgb_model=None)`:
+Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None, base_margin=None, base_margin_eval_set=None, init_model=None, xgb_model=None)`:
 - `num_boost_round`: number of boosting rounds (default `10`; multiclass builds `num_class` trees per round).
 - `evals`, `early_stopping_rounds`, `evals_result`, `verbose_eval`, `callbacks`: validation, early stopping, and monitoring; see [Validation and early stopping](#validation-and-early-stopping) and [Custom callbacks](#custom-callbacks).
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
@@ -1739,7 +1740,7 @@ Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), e
 - `weight`: per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
 - `feature_types`: `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
 - `base_margin`, `base_margin_eval_set`: per-row starting margins; see [Starting margins](#starting-margins-base_margin).
-- `xgb_model`: a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-xgb_model).
+- `init_model` (alias `xgb_model`): a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-init_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
 Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
@@ -1793,7 +1794,7 @@ propagates with its own type, and a wrong Python type for an argument raises
 
 An XGBoost model JSON trained on an array has no feature names and records no
 FerrisBoost schema mode, so `predict`, `predict_to_parquet`, explanations and
-`fb.train(..., xgb_model=)` on **files** raise `ValueError`. Use an array (you own
+`fb.train(..., init_model=)` on **files** raise `ValueError`. Use an array (you own
 the column order), or give the model names so that columns are bound by name:
 
 ```python

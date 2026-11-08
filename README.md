@@ -249,7 +249,7 @@ logging, and the complete parameter reference.
 ### 0.0.7 (unreleased)
 
 - Added `base_margin`.
-- Added training continuation (`xgb_model`).
+- Added training continuation (`init_model`).
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`) and `FerrisBoostRanker`.
 - Added unbiased learning to rank.
 - Added ranking `auc` and `aucpr`.

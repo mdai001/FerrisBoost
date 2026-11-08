@@ -731,27 +731,34 @@ def _as_base_margin(margin: Any, k: int, what: str = "base_margin") -> np.ndarra
     return np.ascontiguousarray(arr)
 
 
-def _load_prior(xgb_model: Any) -> Model | None:
-    """`xgb_model` -> a Model: a FerrisBoost Model, a path to FerrisBoost or
+def _pick_init_model(init_model: Any, xgb_model: Any) -> Any:
+    """`init_model`, or `xgb_model` (XGBoost's name for it); not both."""
+    if init_model is not None and xgb_model is not None:
+        raise TypeError("pass init_model or xgb_model (its XGBoost name), not both")
+    return xgb_model if init_model is None else init_model
+
+
+def _load_prior(model: Any) -> Model | None:
+    """`init_model` -> a Model: a FerrisBoost Model, a path to FerrisBoost or
     XGBoost JSON, or an object with `save_raw` (an `xgboost.Booster`)."""
-    if xgb_model is None:
+    if model is None:
         return None
-    if isinstance(xgb_model, Model):
-        return xgb_model
-    if isinstance(xgb_model, (str, os.PathLike)):
-        return Model.load_model(os.fspath(xgb_model), quiet=True)
-    if hasattr(xgb_model, "save_raw"):
+    if isinstance(model, Model):
+        return model
+    if isinstance(model, (str, os.PathLike)):
+        return Model.load_model(os.fspath(model), quiet=True)
+    if hasattr(model, "save_raw"):
         import tempfile
 
-        raw = bytes(xgb_model.save_raw(raw_format="json"))
+        raw = bytes(model.save_raw(raw_format="json"))
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "model.json")
             with open(path, "wb") as f:
                 f.write(raw)
             return Model.load_model(path, quiet=True)
     raise TypeError(
-        "xgb_model must be a ferrisboost.Model, a path to a model JSON "
-        f"(FerrisBoost or XGBoost) or an xgboost.Booster, got {type(xgb_model).__name__}"
+        "init_model must be a ferrisboost.Model, a path to a model JSON "
+        f"(FerrisBoost or XGBoost) or an xgboost.Booster, got {type(model).__name__}"
     )
 
 
@@ -778,7 +785,7 @@ def _check_prior(prior: Model, p: Mapping[str, Any], n_features: int | None) -> 
     continue cannot be continued with these parameters / this data."""
     if prior.objective != p["objective"]:
         raise ValueError(
-            f"xgb_model was trained with objective {prior.objective!r}, "
+            f"init_model was trained with objective {prior.objective!r}, "
             f"params ask for {p['objective']!r}"
         )
     if prior.quantile_alpha is not None or p["objective"] == "reg:quantileerror":
@@ -786,17 +793,17 @@ def _check_prior(prior: Model, p: Mapping[str, Any], n_features: int | None) -> 
         theirs = np.asarray(prior.quantile_alpha or [], dtype=np.float32)
         if ours.shape != theirs.shape or not np.array_equal(ours, theirs):
             raise ValueError(
-                f"xgb_model was trained with quantile_alpha={theirs.tolist()}, params give "
+                f"init_model was trained with quantile_alpha={theirs.tolist()}, params give "
                 f"{ours.tolist()}: continuing needs the same quantiles"
             )
     k = _num_outputs(p)
     if prior.num_class != k:
         raise ValueError(
-            f"xgb_model has {prior.num_class} output(s) per row, params give num_class={k}"
+            f"init_model has {prior.num_class} output(s) per row, params give num_class={k}"
         )
     if n_features is not None and prior.n_features != n_features:
         raise ValueError(
-            f"xgb_model was trained on {prior.n_features} features, the new data has {n_features}"
+            f"init_model was trained on {prior.n_features} features, the new data has {n_features}"
         )
 
 
@@ -833,6 +840,7 @@ def train(
     feature_types: Sequence[str] | None = None,
     base_margin: Any = None,
     base_margin_eval_set: Sequence[Any] | None = None,
+    init_model: Any = None,
     xgb_model: Any = None,
     qid: Any = None,
     group: Any = None,
@@ -889,7 +897,7 @@ def train(
     (和 `evals` 平行的列表,没有的项给 `None`);文件入口的验证集沿用同样的列名。预测时
     要自己给同样的 margin(`Model.predict(..., base_margin=...)`)。
 
-    `xgb_model`(训练继续):已有的 FerrisBoost `Model`、FerrisBoost / XGBoost 模型 JSON 的路径,
+    `init_model`(训练继续;XGBoost 的写法 `xgb_model=` 同样接受):已有的 FerrisBoost `Model`、FerrisBoost / XGBoost 模型 JSON 的路径,
     或 `xgboost.Booster`。训练从该模型在新数据(和每个验证集)上的预测起步,沿用它的
     `base_score` 和 objective,`num_boost_round` 棵**新**树接在它后面;objective / num_class /
     特征数 / 特征名 / 类别特征不一致会报错。分箱边界按新数据重新采样(旧树用的是浮点阈值,
@@ -898,7 +906,7 @@ def train(
     特征名(带 `feature_names` 的 XGBoost 模型也行);没有特征名的 XGBoost 模型只能用数组继续,
     文件入口会报 `ValueError`。
     """
-    prior = _load_prior(xgb_model)
+    prior = _load_prior(_pick_init_model(init_model, xgb_model))
     if prior is not None:
         params = _adopt_prior_params(params, prior)
     p = _normalize_params(params, num_boost_round)
@@ -1012,7 +1020,7 @@ def train(
                 cols = [str(c) for c in frame.columns]
                 absent = [n for n in prior_names if n not in cols]
                 if absent:
-                    raise ValueError(f"data is missing the features of xgb_model: {absent}")
+                    raise ValueError(f"data is missing the features of init_model: {absent}")
                 frame = frame[[c for n in prior_names for c in frame.columns if str(c) == n]]
             x, names, auto_flags, levels = _frame_matrix(frame, enable_cat)
         else:

@@ -48,9 +48,9 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
   转给 `ferrisboost.train`。pandas `category` 列在 `fit` / `predict` /
   `predict_proba` / `apply` 里都可用;估计器记住训练时的类别表,预测时按**取值**
   重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
-* `fit(..., base_margin=, base_margin_eval_set=, xgb_model=)` 和
+* `fit(..., base_margin=, base_margin_eval_set=, init_model=)`(XGBoost 的 `xgb_model=` 同样接受)和
   `predict` / `predict_proba(..., base_margin=)` 与 XGBoost 一致:`base_margin` 是每行的
-  起始 raw margin(替换 `base_score` 作为起点),`xgb_model` 接已有的 `Model` / 估计器 /
+  起始 raw margin(替换 `base_score` 作为起点),`init_model` 接已有的 `Model` / 估计器 /
   模型 JSON 路径 / `xgboost.Booster`,在它后面续训 `n_estimators` 棵新树。
 * `apply(X, iteration_range=None)` 返回每棵树的叶子节点号,形状 `(n_samples, n_trees)`,
   float32,与 `XGBModel.apply` 相同;有早停时默认用到 best_iteration。
@@ -333,7 +333,7 @@ class _FerrisBoostBase(BaseEstimator):
         feature_types: Any = None,
         base_margin: Any = None,
         base_margin_eval_set: Any = None,
-        xgb_model: Any = None,
+        init_model: Any = None,
         ranking: dict | None = None,
     ) -> None:
         # Ranking: `ranking` carries qid / group, the validation sets' query ids and
@@ -346,8 +346,8 @@ class _FerrisBoostBase(BaseEstimator):
                 "base_margin_eval_set must have the same length as eval_set: "
                 f"{len(base_margin_eval_set)} != {len(eval_set)}"
             )
-        if hasattr(xgb_model, "get_booster"):
-            xgb_model = xgb_model.get_booster()
+        if hasattr(init_model, "get_booster"):
+            init_model = init_model.get_booster()
         if sample_weight is not None:
             if per_group:
                 sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
@@ -401,7 +401,7 @@ class _FerrisBoostBase(BaseEstimator):
             feature_types=feature_types if self.feature_types is None else self.feature_types,
             base_margin=base_margin,
             base_margin_eval_set=base_margin_eval_set,
-            xgb_model=xgb_model,
+            init_model=init_model,
             **({} if ranking is None else ranking),
         )
         self.evals_result_ = result
@@ -553,9 +553,13 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         eval_set: Any = None,
         sample_weight_eval_set: Any = None,
         base_margin_eval_set: Any = None,
+        init_model: Any = None,
         xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostRegressor:
+        from . import _pick_init_model
+
+        init_model = _pick_init_model(init_model, xgb_model)
         if y is None:
             raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
         X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
@@ -572,7 +576,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
             feature_types=flags,
             base_margin=base_margin,
             base_margin_eval_set=base_margin_eval_set,
-            xgb_model=xgb_model,
+            init_model=init_model,
         )
         return self
 
@@ -623,9 +627,13 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         eval_set: Any = None,
         sample_weight_eval_set: Any = None,
         base_margin_eval_set: Any = None,
+        init_model: Any = None,
         xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostClassifier:
+        from . import _pick_init_model
+
+        init_model = _pick_init_model(init_model, xgb_model)
         from sklearn.utils.multiclass import check_classification_targets
 
         if y is None:
@@ -641,13 +649,13 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         self.classes_ = classes
         self.n_classes_ = len(classes)
         params = self.get_ferrisboost_params()
-        if hasattr(xgb_model, "get_booster"):
-            xgb_model = xgb_model.get_booster()
-        if xgb_model is not None and self.objective is None:
+        if hasattr(init_model, "get_booster"):
+            init_model = init_model.get_booster()
+        if init_model is not None and self.objective is None:
             # Continuation keeps the objective of the model being continued.
             from . import _load_prior
 
-            params["objective"] = _load_prior(xgb_model).objective
+            params["objective"] = _load_prior(init_model).objective
         if self.n_classes_ > 2:
             if params["objective"] != "multi:softmax":
                 params["objective"] = "multi:softprob"
@@ -679,7 +687,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
             feature_types=flags,
             base_margin=base_margin,
             base_margin_eval_set=base_margin_eval_set,
-            xgb_model=xgb_model,
+            init_model=init_model,
         )
         self._objective_resolved = params["objective"]
         return self
@@ -790,9 +798,13 @@ class FerrisBoostRanker(_FerrisBoostBase):
         eval_group: Any = None,
         sample_weight_eval_set: Any = None,
         base_margin_eval_set: Any = None,
+        init_model: Any = None,
         xgb_model: Any = None,
         verbose: bool | int | None = False,
     ) -> FerrisBoostRanker:
+        from . import _pick_init_model
+
+        init_model = _pick_init_model(init_model, xgb_model)
         if y is None:
             raise ValueError("This FerrisBoostRanker estimator requires y to be passed, but the target y is None.")
         objective = self.objective if self.objective is not None else self._default_objective()
@@ -845,7 +857,7 @@ class FerrisBoostRanker(_FerrisBoostBase):
             feature_types=flags,
             base_margin=base_margin,
             base_margin_eval_set=base_margin_eval_set,
-            xgb_model=xgb_model,
+            init_model=init_model,
             ranking={
                 "qid": qid,
                 "group": group,
