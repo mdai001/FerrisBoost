@@ -286,11 +286,27 @@ impl CpuInferenceModel {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn predict_margins(
         &self,
         row_major: &[f32],
         n_features: usize,
         n_trees: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        self.predict_margins_from(row_major, n_features, n_trees, None, out)
+    }
+
+    /// Like `predict_margins`, but with an optional per-row starting margin
+    /// (`base_margin`) replacing the model's intercept: row `i` accumulates
+    /// `init[i] + leaf_1 + leaf_2 + ...` in tree order, the same order and
+    /// rounding as the intercept path.
+    pub(crate) fn predict_margins_from(
+        &self,
+        row_major: &[f32],
+        n_features: usize,
+        n_trees: usize,
+        init: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()> {
         if n_features != self.n_features {
@@ -310,7 +326,19 @@ impl CpuInferenceModel {
                 out.len()
             );
         }
-        out.fill(self.base_margin);
+        match init {
+            Some(init) => {
+                if init.len() != out.len() {
+                    bail!(
+                        "base_margin has {} values for {} rows",
+                        init.len(),
+                        out.len()
+                    );
+                }
+                out.copy_from_slice(init);
+            }
+            None => out.fill(self.base_margin),
+        }
         let upto = n_trees.min(self.trees.len());
         for (rows, margins) in row_major
             .chunks(CPU_PREDICTION_BLOCK_ROWS * n_features)

@@ -17,6 +17,10 @@ class Model:
     @property
     def n_features(self) -> int: ...
     @property
+    def feature_names(self) -> list[str]:
+        """Feature names; empty for a model trained from positional (numpy) data."""
+        ...
+    @property
     def objective(self) -> str:
         """XGBoost objective name, for example "binary:logistic"."""
         ...
@@ -39,8 +43,19 @@ class Model:
         pred_interactions: bool = False,
         pred_leaf: bool = False,
         missing: float = ...,
+        base_margin: Any = None,
     ) -> NDArray[np.float32]:
         """Return ordered float32 predictions from an array or path specs.
+
+        base_margin (XGBoost semantics) is a per-row starting raw margin that
+        replaces the model's base_score: each row is base_margin plus its leaf
+        values, accumulated in tree order. Arrays give shape (n,) ((n,
+        num_class) for multiclass); file inputs give the column name (a list of
+        num_class names for multiclass) of a column that sits next to the
+        features, which requires a model with feature names. It also becomes
+        the bias term of pred_contribs / pred_interactions. pred_leaf ignores
+        it. use_gpu=True with base_margin raises ValueError (the device
+        predictor has no per-row start); predict on the CPU.
 
         The result is 1-D with shape (n,), except for multiclass models:
         multi:softprob returns (n, num_class) probabilities, multi:softmax
@@ -117,6 +132,7 @@ class Model:
         prediction_column: str = "prediction",
         iteration_range: tuple[int, int] | None = None,
         missing: float = ...,
+        base_margin: str | Sequence[str] | None = None,
     ) -> int:
         """CPU-score file inputs and write ordered float32 predictions to Parquet.
 
@@ -125,7 +141,8 @@ class Model:
         (multi:softprob or output_margin=True) or one class-index column
         (multi:softmax); in this version that path builds the output in memory
         before writing (the input is still read once). missing has the same
-        meaning as in predict.
+        meaning as in predict. base_margin names the file column(s) holding the
+        per-row starting margin (see predict).
         """
         ...
     def save_model(
@@ -160,6 +177,9 @@ def train_dense(
     feature_names: Sequence[str] | None = ...,
     qid: NDArray[np.uint64] | None = ...,
     group: NDArray[np.uint64] | None = ...,
+    base_margin: NDArray[np.float32] | None = ...,
+    eval_base_margins: Sequence[NDArray[np.float32] | None] | None = ...,
+    prior_model: Model | None = ...,
 ) -> Model:
     """Train a dense model; early stopping needs evals and retains all trained trees.
 
@@ -191,6 +211,10 @@ def train_file(
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
     weight: str | int | None = ...,
     qid: str | int | None = ...,
+    base_margin: str | int | Sequence[str] | Sequence[int] | None = ...,
+    start_margin: NDArray[np.float32] | None = ...,
+    eval_start_margins: Sequence[NDArray[np.float32] | None] | None = ...,
+    prior_model: Model | None = ...,
 ) -> Model:
     """Train from files; early stopping needs evals and retains all trained trees."""
     ...

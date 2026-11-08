@@ -868,6 +868,9 @@ struct CacheManifest {
     /// 必须进身份校验:换一个权重列,特征集合就变了,而特征**数**可能不变。
     #[serde(default)]
     weight: Option<String>,
+    /// Excluded `base_margin` columns (same identity argument as `weight`).
+    #[serde(default)]
+    base_margin: Vec<String>,
     /// Excluded query-id column (ranking); absent in older caches = none.
     #[serde(default)]
     qid: Option<String>,
@@ -1377,6 +1380,7 @@ impl ParquetBlockSource {
             source_mtime_ns,
             label: targets.label.to_string(),
             weight: targets.weight.map(str::to_string),
+            base_margin: targets.base_margin.map(<[String]>::to_vec).unwrap_or_default(),
             qid: targets.qid.map(str::to_string),
             max_bins,
             cols_per_block,
@@ -1424,6 +1428,12 @@ impl ParquetBlockSource {
             "缓存权重列不一致(缓存 {:?},本次 {:?})",
             manifest.weight,
             targets.weight
+        );
+        anyhow::ensure!(
+            manifest.base_margin.as_slice() == targets.base_margin.unwrap_or(&[]),
+            "缓存 base_margin 列不一致(缓存 {:?},本次 {:?})",
+            manifest.base_margin,
+            targets.base_margin
         );
         anyhow::ensure!(
             manifest.qid.as_deref() == targets.qid,

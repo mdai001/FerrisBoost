@@ -500,6 +500,113 @@ For continuous features, FerrisBoost and XGBoost use different quantile-sketch
 implementations, with or without weights, so individual bin boundaries can sit
 slightly apart; both are accurate weighted quantiles.
 
+## Starting margins (`base_margin`)
+
+`base_margin` gives every row its own starting raw margin, like XGBoost's
+`DMatrix(base_margin=...)`. Training starts each row's prediction from it
+instead of from `base_score`; an offset (log exposure for Poisson counts, the
+output of an earlier model, ...) therefore enters the model without being a
+feature.
+
+```python
+model = fb.train(
+    {"objective": "count:poisson"},
+    X_train, label=y_train, base_margin=np.log(exposure_train),
+    evals=[(X_valid, y_valid, "valid")],
+    base_margin_eval_set=[np.log(exposure_valid)],
+    num_boost_round=100,
+)
+pred = model.predict(X_new, base_margin=np.log(exposure_new))
+```
+
+- Shape: `(n,)` (or `(n, 1)`) for one output, `(n, num_class)` for
+  `multi:softprob` / `multi:softmax`. Lists, pandas Series and PyArrow arrays work.
+  Values are raw margins (before the sigmoid, exp or softmax) and must be finite.
+- It **replaces** the intercept; it is not added to it. As in XGBoost the
+  intercept is still estimated from the labels (or taken from `base_score`) and
+  stored in the model; the margin only changes where each row starts. A
+  `predict` without `base_margin` therefore starts from that intercept, so give
+  prediction the same kind of margin you trained with.
+- Validation sets take `base_margin_eval_set`: a list parallel to `evals` with a
+  margin or `None` per set.
+- Prediction: `Model.predict(..., base_margin=)` for arrays, DataFrames and
+  tables; `output_margin=True`, `iteration_range`, and the transformed output
+  all apply on top of it. `pred_contribs` / `pred_interactions` put the margin
+  in the bias column, as XGBoost does (rows still sum to the raw prediction);
+  `pred_leaf` ignores it.
+- Files: `base_margin` names a column (a list of `num_class` names for
+  multiclass; a zero-based index for headerless CSV training). The column is
+  excluded from the features, like `label` and `weight`, and file validation
+  sets read the same column from their own files. `Model.predict` and
+  `predict_to_parquet` read the column next to the features, which needs a model
+  with feature names (trained from a table or file).
+
+  ```python
+  model = fb.train(params, "train.parquet", label="y", base_margin="offset",
+                   evals=[("valid.parquet", "valid")])
+  model.predict("new.parquet", base_margin="offset")
+  ```
+- The margin lives in a plain per-row array next to the labels and weights; it is
+  not part of the column-blocked feature storage. With `gpu_math="fast"` the
+  device prediction buffer is initialized directly from it (the buffer exists
+  anyway, so the memory plan is unchanged). CPU and `gpu_math="exact"` GPU
+  training stay byte-identical with margins; fast mode stays deterministic.
+- `use_gpu=True` prediction does not support `base_margin` yet and raises
+  `ValueError` (the device predictor has no per-row start): predict on the CPU.
+
+With lossless bins the margins, trees and SHAP values are bit-identical to XGBoost
+trained with `DMatrix(x, base_margin=...)`.
+
+## Continue training (`xgb_model`)
+
+`xgb_model` continues an existing model: the new trees are fitted to the
+residual of the old ones.
+
+```python
+first = fb.train(params, X, label=y, num_boost_round=100)
+more = fb.train(params, X_new, label=y_new, num_boost_round=50, xgb_model=first)
+assert more.num_trees == 150          # 100 old trees + 50 new ones
+
+fb.train(params, X, label=y, num_boost_round=50, xgb_model="model.json")
+```
+
+`xgb_model` is a FerrisBoost `Model`, a path to a FerrisBoost **or XGBoost** model
+JSON, or an `xgboost.Booster`. The model passed in is not modified.
+
+- `num_boost_round` counts the **new** rounds (XGBoost 3.4.1 does the same); the
+  result holds the old trees followed by the new ones.
+- Training starts from the old model's prediction on the new training data and on
+  every validation set, and keeps its `base_score` / per-class margins. A given
+  `base_margin` replaces the old intercept (the start is `base_margin` plus the
+  old trees, as in XGBoost). The old trees are scored on the raw feature values
+  through their stored float thresholds, so they do not depend on bin boundaries.
+- The bin boundaries of the new trees are sketched afresh from the new data
+  (XGBoost does the same). Categorical features and multiclass models work.
+- The objective follows the model: leave `params["objective"]` (and `num_class`) out
+  to use the model's. A different objective, `num_class`, feature count, feature
+  names (a DataFrame / table is bound to the model's names, in any column order;
+  numpy data continues by position) or categorical feature types raise
+  `ValueError`. An explicit `base_score` that differs from the model's is an error.
+- `evals_result` and the round numbers passed to callbacks cover the new rounds
+  only. Early stopping reports `best_iteration` as the round in the **whole**
+  model, so `predict(iteration_range=(0, best_iteration + 1))` is the best model,
+  as in XGBoost. A `best_iteration` already stored in the continued model stays if
+  early stopping is not used this time.
+- Files work too (`fb.train(params, "more.parquet", label="y", xgb_model=m)`); the
+  model must record its feature schema, which any FerrisBoost-saved model does.
+- `sklearn`: `fit(X, y, xgb_model=)` accepts a `Model`, another estimator, a path
+  or a `Booster`, and adds `n_estimators` new rounds.
+
+What holds: on lossless bins, continuing is bit-identical to XGBoost's own
+continuation (also from an XGBoost-trained JSON). On the **same** data, N rounds
+followed by M continued rounds is byte-identical to N+M uninterrupted rounds,
+including `subsample` and `colsample_*`, because FerrisBoost keys its sampling on
+the absolute round. On different data the old trees stay as they are and the new
+trees learn from the new data's cuts, so there is no uninterrupted equivalent.
+CPU and `gpu_math="exact"` GPU continuation are byte-identical; `gpu_math="fast"`
+initializes the device predictions from the old model's margins and stays
+deterministic.
+
 ## Feature sampling
 
 Three nested parameters follow XGBoost's `ColumnSampler`: `colsample_bytree`
@@ -913,7 +1020,7 @@ print(clf.best_iteration, clf.evals_result()["validation_0"]["logloss"][-1])
 clf.save_model("clf.json")                # XGBoost-compatible JSON
 ```
 
-- `fit(X, y, sample_weight=, eval_set=, sample_weight_eval_set=, verbose=)`,
+- `fit(X, y, sample_weight=, base_margin=, eval_set=, sample_weight_eval_set=, base_margin_eval_set=, xgb_model=, verbose=)`,
   `predict`, `predict_proba`, `apply`, `score`, `get_params` / `set_params`, `clone`,
   pickling, `GridSearchCV`, `cross_val_score`, and `Pipeline` work. Constructor
   parameters use XGBoost's names (`n_estimators`, `learning_rate`, `max_depth`,
@@ -958,7 +1065,11 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   XGBoost). `verbose` defaults to `False` (set it to see the validation metrics
   per round).
 - `load_model(path)` / `from_file(path)` read XGBoost-compatible JSON.
-- Not supported: `booster=`, `tree_method=`, and base margins.
+- `fit(..., base_margin=, base_margin_eval_set=, xgb_model=)` and
+  `predict` / `predict_proba(..., base_margin=)` follow XGBoost; see
+  [Starting margins](#starting-margins-base_margin) and
+  [Continue training](#continue-training-xgb_model).
+- Not supported: `booster=` and `tree_method=`.
   `sample_weight` follows FerrisBoost's weighted-sketch semantics, so a weight of
   `k` is not the same as repeating a row `k` times.
 
@@ -1382,7 +1493,7 @@ Names are the model's feature names (the column names of a pandas DataFrame, PyA
 
 `pred_leaf=True` returns, for every row, the node index of the leaf it reaches in each tree, as `float32` like XGBoost; indices are node ids within the tree. The result has shape `(n, n_trees)` (a multiclass model has `num_class` trees per round).
 
-These options accept a two-dimensional `float32` array or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU, and `base_margin` per-row offsets are not supported because FerrisBoost prediction has no such input.
+These options accept a two-dimensional `float32` array or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU. A per-row `base_margin` replaces the intercept in the bias column, as in XGBoost (see [Starting margins](#starting-margins-base_margin)); `pred_leaf` ignores it.
 
 ## Save, load, and exchange models with XGBoost
 
@@ -1498,16 +1609,18 @@ The following familiar XGBoost parameters are recognized but not implemented:
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 
-Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None)`:
+Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None, base_margin=None, base_margin_eval_set=None, xgb_model=None)`:
 - `num_boost_round`: number of boosting rounds (default `10`; multiclass builds `num_class` trees per round).
 - `evals`, `early_stopping_rounds`, `evals_result`, `verbose_eval`, `callbacks`: validation, early stopping, and monitoring; see [Validation and early stopping](#validation-and-early-stopping) and [Custom callbacks](#custom-callbacks).
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
 - `weight`: per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
 - `feature_types`: `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
+- `base_margin`, `base_margin_eval_set`: per-row starting margins; see [Starting margins](#starting-margins-base_margin).
+- `xgb_model`: a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-xgb_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
-Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, and `missing`. `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
+Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
 ## Common errors
 

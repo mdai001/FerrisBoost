@@ -541,6 +541,13 @@ impl<T> HostSlice<T> for PinnedPrefix<'_, T> {
     }
 }
 
+/// Starting prediction for `gpu_math = "fast"`: one raw margin per output, or
+/// one per row and output (class-major).
+enum FastInit<'a> {
+    PerOutput(&'a [f32]),
+    PerRow(&'a [f32]),
+}
+
 pub struct GpuTrainCtx {
     split_features_fn: Option<CudaFunction>,
     split_nodes_fn: Option<CudaFunction>,
@@ -2549,6 +2556,36 @@ impl GpuTrainCtx {
                 self.n_outputs
             );
         }
+        self.init_fast_math_impl(labels, weights, FastInit::PerOutput(margins))
+    }
+
+    /// Like [`Self::init_fast_math`], but every row starts from its own raw
+    /// margin (`base_margin`): `row_margins` is class-major `K x n`, uploaded
+    /// straight into the resident prediction buffer (which is already sized
+    /// `K x n`, so the memory plan has no extra term).
+    pub fn init_fast_math_rows(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        row_margins: &[f32],
+    ) -> Result<()> {
+        if row_margins.len() != self.n_rows * self.n_outputs {
+            bail!(
+                "逐行初始 margin 有 {} 个,应为 {} 行 × {} 个输出",
+                row_margins.len(),
+                self.n_rows,
+                self.n_outputs
+            );
+        }
+        self.init_fast_math_impl(labels, weights, FastInit::PerRow(row_margins))
+    }
+
+    fn init_fast_math_impl(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        init: FastInit<'_>,
+    ) -> Result<()> {
         if labels.len() != self.n_rows {
             bail!(
                 "label 长度 {} 与训练行数 {} 不符",
@@ -2587,6 +2624,27 @@ impl GpuTrainCtx {
         // 后者在 margin 不是 +0.0 时(比如 logit(0.5) = −0.0)会实打实占用
         // 4 B/行的常驻内存。值逐元素相同,结果不变。
         const FILL_CHUNK: usize = 1 << 20;
+        if let FastInit::PerRow(rows) = init {
+            // Per-row margins are already class-major on the host: upload in
+            // chunks straight from the caller's slice (no staging copy).
+            let mut start = 0usize;
+            while start < rows.len() {
+                let end = (start + FILL_CHUNK).min(rows.len());
+                let mut dst = pred.slice_mut(start..end);
+                self.stream
+                    .memcpy_htod(&rows[start..end], &mut dst)
+                    .context("逐行初始 prediction H2D")?;
+                self.stream
+                    .synchronize()
+                    .context("逐行初始 prediction H2D 同步")?;
+                start = end;
+            }
+            self.stream.synchronize().context("等待 fast-math 初始化")?;
+            return Ok(());
+        }
+        let FastInit::PerOutput(margins) = init else {
+            unreachable!("PerRow handled above")
+        };
         for (k, &margin) in margins.iter().enumerate() {
             let chunk = vec![margin; FILL_CHUNK.min(self.n_rows).max(1)];
             let mut start = 0usize;

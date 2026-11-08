@@ -248,6 +248,8 @@ logging, and the complete parameter reference.
 
 ### 0.0.7 (unreleased)
 
+- Added `base_margin`.
+- Added training continuation (`xgb_model`).
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
 
 ### 0.0.6 (unreleased)
