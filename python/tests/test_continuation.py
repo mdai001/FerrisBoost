@@ -443,3 +443,18 @@ def test_ranking_continuation_with_validation_sets_and_margins():
           "max_bin": 16}
     cont = xgb.train(xp, d, 3, xgb_model=xgb.train(xp, d, 3))
     np.testing.assert_array_equal(raw(m2, x, base_margin=margin), xraw(cont, x, margin))
+
+
+def test_unbiased_ranking_cannot_be_continued():
+    # XGBoost blocks continuing unbiased LambdaMART; so do we, with a clear error.
+    rng = np.random.default_rng(41)
+    x = rng.integers(0, 8, (400, 3)).astype(np.float32)
+    y = rng.integers(0, 3, 400).astype(np.float32)
+    qid = np.repeat(np.arange(20), 20)
+    p = {"objective": "rank:ndcg", "lambdarank_unbiased": True, "max_depth": 3}
+    m = fb.train(p, x, label=y, qid=qid, num_boost_round=2, quiet=True)
+    with pytest.raises(Exception, match="unbiased"):
+        fb.train(p, x, label=y, qid=qid, num_boost_round=2, xgb_model=m, quiet=True)
+    with pytest.raises(Exception, match="unbiased"):
+        fb.train({**p, "lambdarank_unbiased": False}, x, label=y, qid=qid, num_boost_round=2,
+                 xgb_model=m, quiet=True)

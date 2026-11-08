@@ -1005,10 +1005,6 @@ def train(
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):
             raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
-        if (qid is not None or group is not None) and not ranking:
-            raise ValueError(
-                f"qid / group are only used by the rank:* objectives, not {p['objective']}"
-            )
         if ranking and qid is None and group is None:
             raise ValueError(
                 f"{p['objective']} needs query groups: pass qid= (one id per row) or group= "

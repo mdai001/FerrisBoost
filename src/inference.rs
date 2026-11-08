@@ -492,6 +492,7 @@ mod tests {
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
+            rank_bias: None,
         };
         let before = canonical.to_xgboost_json().unwrap();
         let compact = CompactInferenceModel::new(&canonical).unwrap();
@@ -554,6 +555,7 @@ mod tests {
             class_base_margins: Vec::new(),
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
+            rank_bias: None,
         };
         let predictor = CpuInferenceModel::new(&model).unwrap();
         let patterns = [

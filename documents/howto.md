@@ -408,8 +408,8 @@ model = fb.train(
 | `logloss` | `binary:logistic` | Negative log-likelihood |
 | `error` | `binary:logistic` | Error rate at threshold 0.5 (`p > 0.5` counts as positive) |
 | `error@t` | `binary:logistic` | Error rate at threshold `t`, for example `error@0.7` |
-| `auc` | `binary:logistic` | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it |
-| `aucpr` | `binary:logistic` | Area under the precision-recall curve. Larger is better, so early stopping maximizes it |
+| `auc` | `binary:logistic`, ranking objectives | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it. With query groups: mean over the groups, see [Learning to rank](#learning-to-rank) |
+| `aucpr` | `binary:logistic`, ranking objectives | Area under the precision-recall curve. Larger is better, so early stopping maximizes it. With query groups: mean over the groups |
 | `poisson-nloglik` | `count:poisson` | Negative Poisson log-likelihood |
 | `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
 | `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
@@ -606,6 +606,8 @@ trees learn from the new data's cuts, so there is no uninterrupted equivalent.
 CPU and `gpu_math="exact"` GPU continuation are byte-identical; `gpu_math="fast"`
 initializes the device predictions from the old model's margins and stays
 deterministic.
+
+A model trained with `lambdarank_unbiased=True` cannot be continued, as in XGBoost; train it again from the start.
 
 ## Feature sampling
 
@@ -841,7 +843,10 @@ column** (the column index for a headerless CSV): it is excluded from the
 features like `label`, and the validation files reuse it. The ids must be
 non-decreasing along the rows (an unsorted `qid` is an error, not a silent
 regrouping), and a group cannot be empty. A ranking objective without query
-groups, or query groups with another objective, raises `ValueError`.
+groups raises `ValueError` (XGBoost would treat the data as one group; here
+the message asks for `qid=` / `group=`). Array inputs of other objectives
+accept query groups too, as in XGBoost: they do not change training, but
+`auc` and `aucpr` on data with groups are scored per group (see Metrics).
 
 **Weights are per query group**, as in XGBoost: `weight` has one value per group
 (not per row). For files, the weight column repeats the group's weight on every
@@ -857,7 +862,8 @@ also weight the quantile sketch of the bin boundaries, like row weights do.
 | `lambdarank_normalization` | `True` | Normalize the gradient of each group (by `log2(1 + sum)` for `topk`, by the pair count for `mean`) |
 | `lambdarank_score_normalization` | `True` | Divide the metric change by the score difference |
 | `ndcg_exp_gain` | `True` | NDCG gain `2^label - 1` (labels must be integers in `[0, 31]`); `False` uses the label itself |
-| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART is not supported yet; `lambdarank_unbiased=True` raises `ValueError` |
+| `lambdarank_unbiased` | `False` | Unbiased LambdaMART: estimate the position bias of click data and divide it out of the pair gradients (see below) |
+| `lambdarank_bias_norm` | `1.0` | Exponent control of the position-bias update: the ratios are raised to `1 / (1 + lambdarank_bias_norm)`; at least 0 |
 
 `rank:map` needs binary labels (0 / 1). `rank:pairwise` optimizes the RankNet
 pairwise loss without a metric weighting. Documents that share a label inside a
@@ -870,6 +876,19 @@ generator (one draw of the training `std::mt19937` per round, `seed` selects
 the stream), so models match XGBoost's on losslessly binned data when
 `subsample` and `colsample_*` are 1.
 
+**Unbiased learning to rank.** With `lambdarank_unbiased=True` the rows of a
+query group are taken to be in the order the documents were **displayed**, and
+the labels to be clicks. Every round FerrisBoost estimates how likely a click
+at each display position is (`ti+` for relevant documents, `tj-` for the
+others, following the Unbiased LambdaMART paper and XGBoost) and divides these
+position biases out of the pair gradients. Positions beyond
+`lambdarank_num_pair_per_sample` (`topk`; at most 32 for `mean`) are not
+tracked. The estimates are stored with the objective in the model JSON as
+`ti+` / `tj-` (32-bit arrays, as in XGBoost); they do not change predictions.
+Models match XGBoost's bit for bit on losslessly binned data, on the CPU and
+with `gpu_math="exact"` (byte-identical to the CPU). `gpu_math="fast"` does not
+support it and raises an error; use `"exact"`.
+
 **Metrics.** `ndcg`, `map` and `pre`, with XGBoost's syntax and values: `ndcg@k`
 and `map@k` truncate at `k`, a trailing `-` (`ndcg-`, `ndcg@5-`) scores a group
 without relevant documents as 0 instead of 1. A metric without `@k` is
@@ -879,7 +898,21 @@ default metric is `ndcg@32` for `rank:ndcg` and `rank:pairwise` and `map@32` for
 `rank:map` (`k` follows `lambdarank_num_pair_per_sample`; with the `mean` method
 `ndcg` covers the whole list). Early stopping maximizes them. With group weights
 the group scores are averaged with those weights. Ranking objectives accept
-only these metrics, and the ranking metrics are rejected for other objectives.
+these metrics plus `auc` and `aucpr`, and the other ranking metrics are
+rejected for other objectives.
+
+`auc` and `aucpr` on data with query groups are computed **per group** and
+averaged, as in XGBoost. `auc` counts every pair of a group ordered by label (1
+when the scores keep the label order, 0.5 for tied scores, 0 otherwise; groups
+with fewer than 3 documents are skipped), so it is not the pooled ROC AUC;
+`aucpr` is the binary PR-AUC of each group (labels in `[0, 1]`; groups without a
+positive or without a negative document are skipped). The group weight
+multiplies both sides of the ratio of `auc`, so it only matters as 0. The mean
+is over the groups that can be scored, and the value is `NaN` when none can.
+Both work for early stopping. XGBoost uses the same per-group path for
+`binary:logistic` whenever the validation data has `qid` / `group`, and so does
+FerrisBoost (arrays only; the weights of that set must then be per group, which
+`binary:logistic` cannot use, so such a set takes no weights).
 
 **Starting score.** Without `base_score`, the estimate is one Newton step on the
 objective's gradients at score 0, as in XGBoost; it is close to 0.
@@ -1334,6 +1367,8 @@ memory budget, without manual chunk or batch tuning:
   about 28 bytes per row plus 16 for `rank:map`, 12 for the `mean` method and
   20 per query group; the planner counts them. Very large groups can overflow
   the fixed-point accumulators and are rejected with an error.
+  `lambdarank_unbiased=True` is not available in fast mode (error); use
+  `gpu_math="exact"`.
 - **Extra GPU memory in fast mode**: `gpu_math="fast"` keeps the running
   prediction and the labels on the device (4 bytes per row each) and, with
   sample weights, the weights (4 more bytes per row). Multiclass keeps one
@@ -1562,7 +1597,8 @@ empty `evals_result()`.
 | Parameter | Default | Notes |
 |---|---:|---|
 | `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
-| `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank). `lambdarank_unbiased` and `lambdarank_bias_norm` are accepted but `lambdarank_unbiased=True` is rejected |
+| `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank) |
+| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation (CPU and `gpu_math="exact"`); see [Learning to rank](#learning-to-rank) |
 | `quantile_alpha` | `None` | Required for `reg:quantileerror`: one quantile in `[0, 1]` (a length-1 list is accepted). Several quantiles (multi-output) are not supported and raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
@@ -1656,8 +1692,8 @@ need binary 0 / 1 labels.
 
 ### Ranking needs query groups
 
-`rank:ndcg`, `rank:pairwise` and `rank:map` raise `ValueError` when neither
-`qid` nor `group` is given (a `qid` column name for file input), when `qid` is
+`rank:ndcg`, `rank:pairwise` and `rank:map` raise `ValueError` (asking for
+`qid=` / `group=`) when neither `qid` nor `group` is given (a `qid` column name for file input), when `qid` is
 not sorted along the rows, when group sizes do not add up to the row count, or
 when the weights are not one per query group. Validation sets need
 `eval_qid` / `eval_group` too. See [Learning to rank](#learning-to-rank).
@@ -1669,8 +1705,8 @@ when the weights are not one per query group. Validation sets need
 
 ### A metric does not fit the objective
 
-Binary metrics (`logloss`, `error`, `error@t`, `auc`, `aucpr`) require
-`binary:logistic`. `mlogloss` and `merror` require a multiclass objective, and
+Binary metrics (`logloss`, `error`, `error@t`) require `binary:logistic`; `auc`
+and `aucpr` also accept the ranking objectives. `mlogloss` and `merror` require a multiclass objective, and
 multiclass objectives accept only those two. `quantile` requires
 `reg:quantileerror`. `tweedie-nloglik` must be written with its variance power,
 such as `tweedie-nloglik@1.5`.

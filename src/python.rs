@@ -3540,12 +3540,8 @@ fn train_dense(
                 cfg.objective.name()
             )))
         }
-        (false, true) => {
-            return Err(PyValueError::new_err(format!(
-                "qid / group are only used by the rank:* objectives, not {}",
-                cfg.objective.name()
-            )))
-        }
+        // Other objectives accept query groups too (XGBoost does): they do not change
+        // training, but `auc` / `aucpr` on data with groups are scored per group.
         _ => {}
     }
     cfg.group_ptr = group_ptr.clone();
@@ -3563,7 +3559,10 @@ fn train_dense(
     apply_resolved_geometry(&mut cfg, &plan);
     if let Some(w) = &weights {
         // Ranking weights are one per query group.
-        let expected = group_ptr.as_ref().map_or(n_rows, |g| g.len() - 1);
+        let expected = match (&group_ptr, ranking) {
+            (Some(g), true) => g.len() - 1,
+            _ => n_rows,
+        };
         if w.len() != expected {
             return Err(PyValueError::new_err(if ranking {
                 format!(
@@ -3586,8 +3585,8 @@ fn train_dense(
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     // Ranking: the group weight is repeated on the rows of its group.
-    let unrolled_weights: Option<Vec<f32>> = match (&weights, &group_ptr) {
-        (Some(w), Some(g)) => Some(crate::rank::unroll_group_weights(w, g)),
+    let unrolled_weights: Option<Vec<f32>> = match (&weights, &group_ptr, ranking) {
+        (Some(w), Some(g), true) => Some(crate::rank::unroll_group_weights(w, g)),
         _ => None,
     };
     let sketch_weights: Option<&[f32]> = unrolled_weights.as_deref().or(weights.as_deref());
@@ -4491,7 +4490,7 @@ fn train_file(
     ))
 }
 
-/// A ranking metric (`ndcg`, `ndcg@k`, `ndcg@k-`, `map`, `map@k`, `pre@k`) of scores
+/// A ranking metric (`ndcg`, `ndcg@k`, `ndcg@k-`, `map`, `map@k`, `pre@k`, `auc`, `aucpr`) of scores
 /// against labels, with XGBoost's semantics. `qid` gives the query groups and
 /// `weight` is one value per group. Used by `FerrisBoostRanker.score`.
 #[pyfunction]
@@ -4524,6 +4523,17 @@ fn rank_score(
                 group_ptr.len() - 1
             )));
         }
+    }
+    let auc_kind = match metric {
+        "auc" => Some(crate::rank::GroupAucKind::Roc),
+        "aucpr" => Some(crate::rank::GroupAucKind::Pr),
+        _ => None,
+    };
+    if let Some(kind) = auc_kind {
+        use crate::metrics::Metric;
+        let m = crate::rank::GroupAuc::new(kind, false);
+        m.check_labels(label, "labels").map_err(value_err)?;
+        return Ok(m.score(pred, label, weight.as_deref(), &group_ptr));
     }
     let m = crate::rank::RankMetric::parse(metric, ndcg_exp_gain).map_err(value_err)?;
     m.validate_labels(label, "labels").map_err(value_err)?;

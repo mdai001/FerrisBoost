@@ -250,7 +250,9 @@ logging, and the complete parameter reference.
 
 - Added `base_margin`.
 - Added training continuation (`xgb_model`).
-- Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
+- Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`) and `FerrisBoostRanker`.
+- Added unbiased learning to rank.
+- Added ranking `auc` and `aucpr`.
 - GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6 (unreleased)
