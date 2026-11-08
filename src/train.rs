@@ -1199,14 +1199,6 @@ fn train_with_backend(
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
     let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
-    if let Some((_, rp)) = ranking {
-        crate::ensure_input!(
-            !(rp.unbiased && fast_requested && gpu_device.is_some()),
-            "lambdarank_unbiased is not supported with gpu_math=\"fast\" (the position-bias \
-             estimation has no deterministic device implementation yet); use gpu_math=\"exact\" \
-             (byte-identical to the CPU) or the CPU"
-        );
-    }
     let rank_grad = match (ranking, cfg.group_ptr.as_deref()) {
         (Some((kind, params)), Some(groups)) => Some(crate::rank::RankGradient::new(
             kind,
@@ -1546,6 +1538,8 @@ fn train_with_backend(
                                 n_groups: (g.len() - 1) as u64,
                                 map: kind == crate::rank::RankKind::Map,
                                 mean: params.pair_method == crate::rank::PairMethod::Mean,
+                                n_positions: params
+                                    .device_bias_positions(crate::rank::max_group_size(g)),
                             })
                         }
                         _ => None,
@@ -2031,7 +2025,13 @@ fn train_with_backend(
     }
     // Unbiased LambdaMART: the position biases as of the last round, saved with the
     // objective config like XGBoost does.
-    if let Some((ti_plus, tj_minus)) = rank_grad.as_ref().and_then(|rg| rg.position_bias()) {
+    // With `gpu_math = "fast"` the estimate lives on the device (the host state was
+    // never advanced).
+    let rank_bias = match (fast_math, gpu.as_ref()) {
+        (true, Some(ctx)) if rank_grad.is_some() => ctx.fast_rank_bias()?,
+        _ => rank_grad.as_ref().and_then(|rg| rg.position_bias()),
+    };
+    if let Some((ti_plus, tj_minus)) = rank_bias {
         model.rank_bias = Some(crate::tree::RankBias { ti_plus, tj_minus });
     }
 

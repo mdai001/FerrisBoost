@@ -98,7 +98,7 @@ def train(
     eval_group, lists parallel to evals. XGBoost's lambdarank_pair_method
     ("topk" or "mean"), lambdarank_num_pair_per_sample, lambdarank_normalization,
     lambdarank_score_normalization, ndcg_exp_gain and lambdarank_unbiased /
-    lambdarank_bias_norm (unbiased LambdaMART; not with gpu_math="fast") are
+    lambdarank_bias_norm (unbiased LambdaMART) are
     supported. The default metric is ndcg@32 (map@32 for rank:map); auc and
     aucpr are scored per query group.
 

@@ -336,3 +336,56 @@ fn unbiased_lambdamart_keeps_its_position_bias_in_the_model() {
     let doc: serde_json::Value = serde_json::from_str(&plain.to_xgboost_json().unwrap()).unwrap();
     assert!(doc["learner"]["objective"].get("ti+").is_none());
 }
+
+#[cfg(feature = "cuda")]
+mod gpu_fast_unbiased {
+    use super::*;
+    use ferrisboost::train::train_gpu_weighted;
+    use ferrisboost::types::GpuMath;
+
+    fn fit_fast(d: &Data, kind: RankKind, rank: RankParams, clicks: &[f32]) -> Model {
+        let src = source(d);
+        let mut cfg = config(kind, rank, 1, &d.group_ptr);
+        cfg.params.gpu_math = GpuMath::Fast;
+        train_gpu_weighted(0, &src, clicks, None, &[], &cfg, &mut [], &Local).unwrap()
+    }
+
+    #[test]
+    fn unbiased_fast_ranking_is_reproducible_and_tracks_the_host_position_bias() {
+        let d = data(8);
+        let clicks: Vec<f32> = d.y.iter().map(|&v| f32::from(v > 1.0)).collect();
+        for kind in [RankKind::Ndcg, RankKind::Pairwise, RankKind::Map] {
+            let unbiased = RankParams {
+                unbiased: true,
+                bias_norm: 0.5,
+                ..RankParams::default()
+            };
+            let a = fit_fast(&d, kind, unbiased, &clicks);
+            let b = fit_fast(&d, kind, unbiased, &clicks);
+            // two device runs: the same model and the same saved biases, bit for bit
+            assert_eq!(a.to_xgboost_json().unwrap(), b.to_xgboost_json().unwrap());
+            let bias = a.rank_bias.as_ref().expect("the device estimate is saved");
+            assert_eq!((bias.ti_plus.len(), bias.tj_minus.len()), (32, 32));
+            assert_eq!((bias.ti_plus[0], bias.tj_minus[0]), (1.0, 1.0));
+            assert!(bias.ti_plus.iter().any(|&v| v != 1.0));
+            // the host estimate on the same pairs (topk): equal up to arithmetic order
+            let src = source(&d);
+            let cfg = config(kind, unbiased, 1, &d.group_ptr);
+            let host =
+                ferrisboost::train::train_weighted(&src, &clicks, None, &[], &cfg, &mut [], &Local)
+                    .unwrap();
+            let h = host.rank_bias.as_ref().unwrap();
+            for (x, y) in bias
+                .ti_plus
+                .iter()
+                .chain(&bias.tj_minus)
+                .zip(h.ti_plus.iter().chain(&h.tj_minus))
+            {
+                assert!((x - y).abs() <= 5e-3 * y.abs(), "{kind:?}: {x} vs {y}");
+            }
+            // without unbiased the device model carries no biases
+            let plain = fit_fast(&d, kind, RankParams::default(), &clicks);
+            assert!(plain.rank_bias.is_none());
+        }
+    }
+}

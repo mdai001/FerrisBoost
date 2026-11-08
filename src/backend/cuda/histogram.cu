@@ -2411,6 +2411,8 @@ extern "C" __global__ void predict_margin_soa(
 //   6. `rank_finalize`      fixed point -> f32, lambdarank normalization, group weight,
 //                           row sampling -> interleaved f32 gpair (then the usual
 //                           max / scale / quantize tail)
+// `lambdarank_unbiased` replaces steps 4 to 6 by the bound / scale / accumulate sequence of
+// the "unbiased LambdaMART" section at the end of this file.
 // Pair enumeration: topk = every (i, j > i) with i < k on the rank list; mean = each
 // document samples `num_pair` partners outside its label bucket with a counter based
 // hash of (seed, group, document, sample). The pairs, the arithmetic order and the
@@ -2513,22 +2515,27 @@ extern "C" __global__ void rank_map_stat(
     }
 }
 
-// One pair (rank positions ra, rb): the lambda of the higher-labelled document is added to
-// it, the negative to the other, both Hessians; all as fixed-point integers.
-__device__ __forceinline__ void rank_pair(
+// What every pair evaluation yields: the documents (indices inside the group; `dh` is
+// the higher-labelled one), the sigmoid of their score difference and the metric weight
+// (|delta metric|, already divided by the score difference when that is on).
+struct RankPairEval {
+    uint32_t dh, dl;
+    double sig, dm;
+};
+
+// The arithmetic every pair shares (plain and unbiased paths). False: no pair (equal labels).
+__device__ __forceinline__ bool rank_pair_eval(
     uint32_t ra, uint32_t rb, uint32_t base, uint32_t cnt,
     const float* __restrict__ pred, const float* __restrict__ label,
     const uint32_t* __restrict__ rank_idx,
     uint32_t kind, uint32_t exp_gain, uint32_t norm_by_diff, bool best_ne_worst,
     double inv_idcg, const double* __restrict__ n_rel, const double* __restrict__ acc,
-    double scale,
-    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
-    long long* __restrict__ group_sum) {
+    RankPairEval* out) {
     const uint32_t da = rank_idx[base + ra];
     const uint32_t db = rank_idx[base + rb];
     const float ya = label[base + da];
     const float yb = label[base + db];
-    if (ya == yb) return;
+    if (ya == yb) return false;
     uint32_t rh = ra, rl = rb, dh = da, dl = db;
     float yh = ya, yl = yb;
     if (ya < yb) { rh = rb; rl = ra; dh = db; dl = da; yh = yb; yl = ya; }
@@ -2566,6 +2573,29 @@ __device__ __forceinline__ void rank_pair(
     }
     double dm = fabs(raw);
     if (norm_by_diff && best_ne_worst) dm = dm / (delta_score + 0.01);
+    out->dh = dh;
+    out->dl = dl;
+    out->sig = sig;
+    out->dm = dm;
+    return true;
+}
+
+// One pair (rank positions ra, rb): the lambda of the higher-labelled document is added to
+// it, the negative to the other, both Hessians; all as fixed-point integers.
+__device__ __forceinline__ void rank_pair(
+    uint32_t ra, uint32_t rb, uint32_t base, uint32_t cnt,
+    const float* __restrict__ pred, const float* __restrict__ label,
+    const uint32_t* __restrict__ rank_idx,
+    uint32_t kind, uint32_t exp_gain, uint32_t norm_by_diff, bool best_ne_worst,
+    double inv_idcg, const double* __restrict__ n_rel, const double* __restrict__ acc,
+    double scale,
+    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
+    long long* __restrict__ group_sum) {
+    RankPairEval e;
+    if (!rank_pair_eval(ra, rb, base, cnt, pred, label, rank_idx, kind, exp_gain, norm_by_diff,
+                        best_ne_worst, inv_idcg, n_rel, acc, &e)) return;
+    const uint32_t dh = e.dh, dl = e.dl;
+    const double sig = e.sig, dm = e.dm;
     const double lambda_ij = (sig - 1.0) * dm;
     const double hessian_ij = fmax(sig * (1.0 - sig), 1e-16) * dm * 2.0;
     const float pg = (float)lambda_ij;
@@ -2578,6 +2608,53 @@ __device__ __forceinline__ void rank_pair(
     atomicAdd((unsigned long long*)&acc_h[base + dh], (unsigned long long)qh);
     atomicAdd((unsigned long long*)&acc_h[base + dl], (unsigned long long)qh);
     atomicAdd((unsigned long long*)group_sum, (unsigned long long)qs);
+}
+
+// The pairs one initiator slot `t` owns (topk: the rank position `t - init_ptr[g]` against
+// every lower one; mean: its sampled partners outside the label bucket), as calls
+// `op(ra, rb, g, base, cnt, best_ne_worst, inv_idcg, n_rel, acc)` with rank positions.
+// Shared by the plain and the unbiased kernels, so both enumerate the same pairs.
+template <typename Op>
+__device__ __forceinline__ void rank_slot_pairs(
+    uint32_t t, const float* __restrict__ pred, const uint32_t* __restrict__ group_ptr,
+    const uint32_t* __restrict__ init_ptr, uint32_t n_groups,
+    const uint32_t* __restrict__ rank_idx, const uint32_t* __restrict__ rank_pos,
+    const double* __restrict__ inv_idcg, const double* __restrict__ n_rel,
+    const double* __restrict__ acc, const uint32_t* __restrict__ y_order,
+    const uint32_t* __restrict__ bucket_lo, const uint32_t* __restrict__ bucket_hi,
+    uint32_t kind, uint32_t is_topk, uint32_t num_pair, unsigned long long seed, Op&& op) {
+    const uint32_t g = rank_group_of(init_ptr, n_groups, t);
+    const uint32_t s = t - init_ptr[g];
+    const uint32_t base = group_ptr[g];
+    const uint32_t cnt = group_ptr[g + 1] - base;
+    const bool best_ne_worst =
+        pred[base + rank_idx[base]] != pred[base + rank_idx[base + cnt - 1u]];
+    const double inv = (kind == 0u) ? inv_idcg[g] : 0.0;
+    const double* nr = (kind == 2u) ? n_rel + base : n_rel;
+    const double* ac = (kind == 2u) ? acc + base : acc;
+    if (is_topk) {
+        for (uint32_t j = s + 1u; j < cnt; ++j) {
+            op(s, j, g, base, cnt, best_ne_worst, inv, nr, ac);
+        }
+    } else {
+        const uint32_t doc = y_order[base + s];
+        const uint32_t lo = bucket_lo[base + s];
+        const uint32_t hi = bucket_hi[base + s];
+        const uint32_t n_lefts = lo;
+        const uint32_t n_rights = cnt - hi;
+        if (n_lefts + n_rights == 0u) return;
+        for (uint32_t q = 0; q < num_pair; ++q) {
+            const unsigned long long h = fb_mix(
+                seed ^ ((unsigned long long)g * 0x9E3779B97F4A7C15ULL)
+                ^ ((unsigned long long)s * 0xD6E8FEB86659FD93ULL)
+                ^ ((unsigned long long)(q + 1u) * 0xBF58476D1CE4E5B9ULL));
+            uint32_t r = (uint32_t)(h % (unsigned long long)(n_lefts + n_rights));
+            if (r >= n_lefts) r = r - lo + hi;
+            const uint32_t pdoc = y_order[base + r];
+            op(rank_pos[base + doc], rank_pos[base + pdoc], g, base, cnt, best_ne_worst, inv,
+               nr, ac);
+        }
+    }
 }
 
 extern "C" __global__ void rank_pairs(
@@ -2601,41 +2678,67 @@ extern "C" __global__ void rank_pairs(
     long long* __restrict__ group_sum) {
     for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total_slots;
          t += (uint32_t)blockDim.x * gridDim.x) {
-        const uint32_t g = rank_group_of(init_ptr, n_groups, t);
-        const uint32_t s = t - init_ptr[g];
-        const uint32_t base = group_ptr[g];
-        const uint32_t cnt = group_ptr[g + 1] - base;
-        const bool best_ne_worst =
-            pred[base + rank_idx[base]] != pred[base + rank_idx[base + cnt - 1u]];
-        const double inv = (kind == 0u) ? inv_idcg[g] : 0.0;
-        const double* nr = (kind == 2u) ? n_rel + base : n_rel;
-        const double* ac = (kind == 2u) ? acc + base : acc;
-        if (is_topk) {
-            for (uint32_t j = s + 1u; j < cnt; ++j) {
-                rank_pair(s, j, base, cnt, pred, label, rank_idx, kind, exp_gain, norm_by_diff,
-                          best_ne_worst, inv, nr, ac, scale, acc_g, acc_h, group_sum + g);
-            }
+        rank_slot_pairs(t, pred, group_ptr, init_ptr, n_groups, rank_idx, rank_pos, inv_idcg,
+                        n_rel, acc, y_order, bucket_lo, bucket_hi, kind, is_topk, num_pair, seed,
+                        [&](uint32_t ra, uint32_t rb, uint32_t g, uint32_t base, uint32_t cnt,
+                            bool best_ne_worst, double inv, const double* nr, const double* ac) {
+                            rank_pair(ra, rb, base, cnt, pred, label, rank_idx, kind, exp_gain,
+                                      norm_by_diff, best_ne_worst, inv, nr, ac, scale, acc_g,
+                                      acc_h, group_sum + g);
+                        });
+    }
+}
+
+// Fixed point -> f32 gpair of row `i` (normalization, group weight, row sampling).
+// Returns whether both values are finite (always true for sane inputs).
+__device__ __forceinline__ bool rank_finalize_row(
+    uint32_t i, uint32_t g,
+    const long long* __restrict__ acc_g,
+    const long long* __restrict__ acc_h,
+    const long long* __restrict__ group_sum,
+    const float* __restrict__ group_weight,
+    uint32_t has_group_weight,
+    float weight_norm,
+    uint32_t is_topk, uint32_t num_pair, uint32_t normalization,
+    double scale,
+    float* __restrict__ gpair_out,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
+    float gr = (float)((double)acc_g[i] / scale);
+    float he = (float)((double)acc_h[i] / scale);
+    if (normalization) {
+        double norm = 1.0;
+        if (!is_topk) {
+            norm = 1.0 / (double)num_pair;
         } else {
-            const uint32_t doc = y_order[base + s];
-            const uint32_t lo = bucket_lo[base + s];
-            const uint32_t hi = bucket_hi[base + s];
-            const uint32_t n_lefts = lo;
-            const uint32_t n_rights = cnt - hi;
-            if (n_lefts + n_rights == 0u) continue;
-            for (uint32_t q = 0; q < num_pair; ++q) {
-                const unsigned long long h = fb_mix(
-                    seed ^ ((unsigned long long)g * 0x9E3779B97F4A7C15ULL)
-                    ^ ((unsigned long long)s * 0xD6E8FEB86659FD93ULL)
-                    ^ ((unsigned long long)(q + 1u) * 0xBF58476D1CE4E5B9ULL));
-                uint32_t r = (uint32_t)(h % (unsigned long long)(n_lefts + n_rights));
-                if (r >= n_lefts) r = r - lo + hi;
-                const uint32_t pdoc = y_order[base + r];
-                rank_pair(rank_pos[base + doc], rank_pos[base + pdoc], base, cnt, pred, label,
-                          rank_idx, kind, exp_gain, norm_by_diff, best_ne_worst, inv, nr, ac,
-                          scale, acc_g, acc_h, group_sum + g);
-            }
+            const double sum = (double)group_sum[g] / scale;
+            if (sum > 0.0) norm = log2(1.0 + sum) / sum;
+        }
+        if (norm != 1.0) {
+            const float n = (float)norm;
+            gr = __fmul_rn(gr, n);
+            he = __fmul_rn(he, n);
         }
     }
+    const float w = has_group_weight ? group_weight[g] : 1.0f;
+    gr = __fmul_rn(__fmul_rn(gr, w), weight_norm);
+    he = __fmul_rn(__fmul_rn(he, w), weight_norm);
+    const bool finite = isfinite(gr) && isfinite(he);
+    if (subsample_threshold != ~0ULL) {
+        const unsigned long long hsh = fb_mix(
+            subsample_seed
+            ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
+               | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
+            ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
+        if ((hsh >> 11) >= subsample_threshold) {
+            gr = 0.0f;
+            he = 0.0f;
+        }
+    }
+    gpair_out[(uint64_t)i * 2] = gr;
+    gpair_out[(uint64_t)i * 2 + 1] = he;
+    return finite;
 }
 
 extern "C" __global__ void rank_finalize(
@@ -2657,38 +2760,241 @@ extern "C" __global__ void rank_finalize(
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
         const uint32_t g = rank_group_of(group_ptr, n_groups, i);
-        float gr = (float)((double)acc_g[i] / scale);
-        float he = (float)((double)acc_h[i] / scale);
-        if (normalization) {
-            double norm = 1.0;
-            if (!is_topk) {
-                norm = 1.0 / (double)num_pair;
-            } else {
-                const double sum = (double)group_sum[g] / scale;
-                if (sum > 0.0) norm = log2(1.0 + sum) / sum;
-            }
-            if (norm != 1.0) {
-                const float n = (float)norm;
-                gr = __fmul_rn(gr, n);
-                he = __fmul_rn(he, n);
-            }
+        rank_finalize_row(i, g, acc_g, acc_h, group_sum, group_weight, has_group_weight,
+                          weight_norm, is_topk, num_pair, normalization, scale, gpair_out,
+                          subsample_threshold, subsample_seed, subsample_tree);
+    }
+}
+
+// ---------------------------------------------------------------- unbiased LambdaMART
+//
+// `lambdarank_unbiased` on the device (XGBoost semantics: pair lambdas / hessians divided
+// by t+(i) t-(j), per-position costs li / lj accumulated from the same pairs, biases
+// re-estimated after the gradients of every round).
+//
+// The scaled lambdas are unbounded (t+ and t- go down to 1e-16, so 1 / (t+ t-) reaches
+// 1e32), which no fixed scale chosen up front can hold. Each round is therefore two passes
+// over the same pairs:
+//   `rank_pairs_ub` mode 0  bound: the exact maximum of every quantity that will be added,
+//                           as an order independent integer max of the double bit patterns
+//   `rank_bias_scales`      one power of two per quantity group such that (maximum x
+//                           number of terms that can reach one accumulator) < 2^61
+//   `rank_pairs_ub` mode 1  accumulate the fixed-point integers (exact, order independent)
+//   `rank_finalize_ub`      like `rank_finalize`, but with the device scale
+//   `rank_bias_update`      t+ / t- from the integer cost sums
+// A non finite maximum or gradient (diverged scores) sets a status word that the host
+// turns into an error; nothing saturates silently. There are no float atomics, so a run
+// is bit-reproducible.
+//
+// The cost of a pair, -log(1 - sigmoid) x metric weight, is infinite once the f32 sigmoid
+// rounds to 1 (score gap above ~16.6); with it XGBoost's estimate is NaN. Here 1 - sigmoid
+// is floored at its smallest nonzero f32 value (2^-24), the cost of the most separated pair
+// the f32 sigmoid can tell apart.
+#define RANK_BIAS_REPLICAS 64u
+#define RANK_BIAS_CTL_WORDS 8u
+#define RANK_CTL_MAX_GH 0u
+#define RANK_CTL_MAX_COST 1u
+#define RANK_CTL_SCALE_GH 2u
+#define RANK_CTL_SCALE_COST 3u
+#define RANK_CTL_STATUS 4u
+#define RANK_STATUS_BOUND 1ULL
+#define RANK_STATUS_GRADIENT 2ULL
+#define RANK_BIAS_EPS 1e-16
+
+// Order preserving integer key of a non-negative double; NaN sorts above infinity.
+__device__ __forceinline__ unsigned long long rank_key(double v) {
+    return (v != v) ? 0x7FF8000000000000ULL : (unsigned long long)__double_as_longlong(fabs(v));
+}
+
+__device__ __forceinline__ double rank_pow2_scale(double v) {
+    if (!(v > 0.0)) return 1.0;
+    int e = (int)floor(61.0 - log2(v));
+    e = max(-1000, min(1000, e));
+    return ldexp(1.0, e);
+}
+
+// One pair of the unbiased path. mode 0: fold the magnitudes into (m_gh, m_cost).
+// mode 1: add the fixed-point contributions; `repl` is this block's replica of the cost sums.
+__device__ __forceinline__ void rank_pair_ub(
+    const RankPairEval& e, uint32_t mode,
+    const double* __restrict__ ti, const double* __restrict__ tj, uint32_t n_pos,
+    double scale_gh, double scale_cost,
+    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
+    long long* __restrict__ group_sum, uint32_t base,
+    long long* __restrict__ repl,
+    unsigned long long* m_gh, unsigned long long* m_cost) {
+    const double sig = e.sig, dm = e.dm;
+    // 1 - sigmoid is 0 or >= 2^-24 (f32): floor it, see the section comment
+    const double one_minus = fmax(1.0 - sig, 5.9604644775390625e-08);
+    const double cost = log(1.0 / one_minus) * dm;
+    double lambda_ij = (sig - 1.0) * dm;
+    double hessian_ij = fmax(sig * (1.0 - sig), 1e-16) * dm * 2.0;
+    const bool tracked = e.dh < n_pos && e.dl < n_pos;
+    const double tiv = tracked ? ti[e.dh] : 0.0;
+    const double tjv = tracked ? tj[e.dl] : 0.0;
+    if (tracked && tjv >= RANK_BIAS_EPS && tiv >= RANK_BIAS_EPS) {
+        lambda_ij /= tiv * tjv;
+        hessian_ij /= tiv * tjv;
+    }
+    const float pg = (float)lambda_ij;
+    const float ph = (float)hessian_ij;
+    const double li_c = (tracked && tjv >= RANK_BIAS_EPS) ? cost / tjv : 0.0;
+    const double lj_c = (tracked && tiv >= RANK_BIAS_EPS) ? cost / tiv : 0.0;
+    if (mode == 0u) {
+        const unsigned long long k1 = rank_key(2.0 * (double)pg);
+        const unsigned long long k2 = rank_key((double)ph);
+        const unsigned long long k3 = rank_key(li_c);
+        const unsigned long long k4 = rank_key(lj_c);
+        const unsigned long long kg = k1 > k2 ? k1 : k2;
+        const unsigned long long kc = k3 > k4 ? k3 : k4;
+        if (kg > *m_gh) *m_gh = kg;
+        if (kc > *m_cost) *m_cost = kc;
+        return;
+    }
+    const long long qg = __double2ll_rn((double)pg * scale_gh);
+    const long long qh = __double2ll_rn((double)ph * scale_gh);
+    const long long qs = __double2ll_rn(-2.0 * (double)pg * scale_gh);
+    atomicAdd((unsigned long long*)&acc_g[base + e.dh], (unsigned long long)qg);
+    atomicAdd((unsigned long long*)&acc_g[base + e.dl], (unsigned long long)(-qg));
+    atomicAdd((unsigned long long*)&acc_h[base + e.dh], (unsigned long long)qh);
+    atomicAdd((unsigned long long*)&acc_h[base + e.dl], (unsigned long long)qh);
+    atomicAdd((unsigned long long*)group_sum, (unsigned long long)qs);
+    if (li_c != 0.0) {
+        atomicAdd((unsigned long long*)&repl[e.dh],
+                  (unsigned long long)__double2ll_rn(li_c * scale_cost));
+    }
+    if (lj_c != 0.0) {
+        atomicAdd((unsigned long long*)&repl[n_pos + e.dl],
+                  (unsigned long long)__double2ll_rn(lj_c * scale_cost));
+    }
+}
+
+extern "C" __global__ void rank_pairs_ub(
+    const float* __restrict__ pred,
+    const float* __restrict__ label,
+    const uint32_t* __restrict__ group_ptr,
+    const uint32_t* __restrict__ init_ptr,
+    uint32_t n_groups,
+    uint32_t total_slots,
+    const uint32_t* __restrict__ rank_idx,
+    const uint32_t* __restrict__ rank_pos,
+    const double* __restrict__ inv_idcg,
+    const double* __restrict__ n_rel,
+    const double* __restrict__ acc,
+    const uint32_t* __restrict__ y_order,
+    const uint32_t* __restrict__ bucket_lo,
+    const uint32_t* __restrict__ bucket_hi,
+    uint32_t kind, uint32_t is_topk, uint32_t num_pair, uint32_t exp_gain, uint32_t norm_by_diff,
+    unsigned long long seed,
+    const double* __restrict__ ti, const double* __restrict__ tj, uint32_t n_pos,
+    uint32_t mode,
+    unsigned long long* __restrict__ ctl,
+    long long* __restrict__ repl_all,
+    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
+    long long* __restrict__ group_sum) {
+    const double scale_gh = __longlong_as_double((long long)ctl[RANK_CTL_SCALE_GH]);
+    const double scale_cost = __longlong_as_double((long long)ctl[RANK_CTL_SCALE_COST]);
+    long long* repl = repl_all + (size_t)(blockIdx.x & (RANK_BIAS_REPLICAS - 1u)) * 2u * n_pos;
+    unsigned long long m_gh = 0ULL, m_cost = 0ULL;
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total_slots;
+         t += (uint32_t)blockDim.x * gridDim.x) {
+        rank_slot_pairs(t, pred, group_ptr, init_ptr, n_groups, rank_idx, rank_pos, inv_idcg,
+                        n_rel, acc, y_order, bucket_lo, bucket_hi, kind, is_topk, num_pair, seed,
+                        [&](uint32_t ra, uint32_t rb, uint32_t g, uint32_t base, uint32_t cnt,
+                            bool best_ne_worst, double inv, const double* nr, const double* ac) {
+                            RankPairEval e;
+                            if (!rank_pair_eval(ra, rb, base, cnt, pred, label, rank_idx, kind,
+                                                exp_gain, norm_by_diff, best_ne_worst, inv, nr,
+                                                ac, &e)) return;
+                            rank_pair_ub(e, mode, ti, tj, n_pos, scale_gh, scale_cost, acc_g,
+                                         acc_h, group_sum + g, base, repl, &m_gh, &m_cost);
+                        });
+    }
+    if (mode == 0u) {
+        // warp max, then one atomic max per warp (integer max: order independent)
+        for (int d = 16; d > 0; d >>= 1) {
+            const unsigned long long a = __shfl_down_sync(0xffffffffu, m_gh, d);
+            const unsigned long long b = __shfl_down_sync(0xffffffffu, m_cost, d);
+            if (a > m_gh) m_gh = a;
+            if (b > m_cost) m_cost = b;
         }
-        const float w = has_group_weight ? group_weight[g] : 1.0f;
-        gr = __fmul_rn(__fmul_rn(gr, w), weight_norm);
-        he = __fmul_rn(__fmul_rn(he, w), weight_norm);
-        if (subsample_threshold != ~0ULL) {
-            const unsigned long long hsh = fb_mix(
-                subsample_seed
-                ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
-                   | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
-                ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
-            if ((hsh >> 11) >= subsample_threshold) {
-                gr = 0.0f;
-                he = 0.0f;
-            }
+        if ((threadIdx.x & 31u) == 0u) {
+            if (m_gh != 0ULL) atomicMax(&ctl[RANK_CTL_MAX_GH], m_gh);
+            if (m_cost != 0ULL) atomicMax(&ctl[RANK_CTL_MAX_COST], m_cost);
         }
-        gpair_out[(uint64_t)i * 2] = gr;
-        gpair_out[(uint64_t)i * 2 + 1] = he;
+    }
+}
+
+// One thread: the fixed-point scales of this round from the bounds.
+// `bound_row`: most terms that can reach one row accumulator or a group sum;
+// `bound_total`: terms that can reach one position cost sum (all groups).
+extern "C" __global__ void rank_bias_scales(
+    unsigned long long* __restrict__ ctl, double bound_row, double bound_total) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    const unsigned long long inf_key = 0x7FF0000000000000ULL;
+    const unsigned long long kg = ctl[RANK_CTL_MAX_GH];
+    const unsigned long long kc = ctl[RANK_CTL_MAX_COST];
+    double sg = 1.0, sc = 1.0;
+    if (kg >= inf_key || kc >= inf_key) {
+        ctl[RANK_CTL_STATUS] |= RANK_STATUS_BOUND;
+    } else {
+        sg = rank_pow2_scale(__longlong_as_double((long long)kg) * bound_row);
+        sc = rank_pow2_scale(__longlong_as_double((long long)kc) * bound_total);
+    }
+    ctl[RANK_CTL_SCALE_GH] = (unsigned long long)__double_as_longlong(sg);
+    ctl[RANK_CTL_SCALE_COST] = (unsigned long long)__double_as_longlong(sc);
+}
+
+extern "C" __global__ void rank_finalize_ub(
+    const uint32_t* __restrict__ group_ptr,
+    uint32_t n_groups,
+    uint32_t n_rows,
+    const long long* __restrict__ acc_g,
+    const long long* __restrict__ acc_h,
+    const long long* __restrict__ group_sum,
+    const float* __restrict__ group_weight,
+    uint32_t has_group_weight,
+    float weight_norm,
+    uint32_t is_topk, uint32_t num_pair, uint32_t normalization,
+    unsigned long long* __restrict__ ctl,
+    float* __restrict__ gpair_out,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
+    const double scale = __longlong_as_double((long long)ctl[RANK_CTL_SCALE_GH]);
+    bool ok = true;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        const uint32_t g = rank_group_of(group_ptr, n_groups, i);
+        ok = rank_finalize_row(i, g, acc_g, acc_h, group_sum, group_weight, has_group_weight,
+                               weight_norm, is_topk, num_pair, normalization, scale, gpair_out,
+                               subsample_threshold, subsample_seed, subsample_tree) && ok;
+    }
+    if (!ok) atomicOr(&ctl[RANK_CTL_STATUS], RANK_STATUS_GRADIENT);
+}
+
+// t+(i) = (li(i) / li(0))^regularizer from the integer cost sums of all replicas (exact),
+// the same guards as XGBoost: l(0) must not be tiny. One block.
+extern "C" __global__ void rank_bias_update(
+    double* __restrict__ ti, double* __restrict__ tj,
+    const long long* __restrict__ repl_all, const unsigned long long* __restrict__ ctl,
+    uint32_t n_pos, double regularizer) {
+    const double sc = __longlong_as_double((long long)ctl[RANK_CTL_SCALE_COST]);
+    for (uint32_t k = 0; k < 2u; ++k) {
+        double* t = k == 0u ? ti : tj;
+        unsigned long long z = 0ULL;
+        for (uint32_t r = 0; r < RANK_BIAS_REPLICAS; ++r) {
+            z += (unsigned long long)repl_all[((size_t)r * 2u + k) * n_pos];
+        }
+        const double l0 = (double)(long long)z / sc;
+        if (!(l0 >= RANK_BIAS_EPS)) continue;
+        for (uint32_t i = threadIdx.x; i < n_pos; i += blockDim.x) {
+            unsigned long long a = 0ULL;
+            for (uint32_t r = 0; r < RANK_BIAS_REPLICAS; ++r) {
+                a += (unsigned long long)repl_all[((size_t)r * 2u + k) * n_pos + i];
+            }
+            t[i] = pow(((double)(long long)a / sc) / l0, regularizer);
+        }
     }
 }
 

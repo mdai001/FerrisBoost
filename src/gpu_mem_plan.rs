@@ -102,12 +102,25 @@ pub struct FastRankShape {
     /// `lambdarank_pair_method=mean` keeps the label-sorted order and the bucket
     /// bounds (three u32 per row).
     pub mean: bool,
+    /// `lambdarank_unbiased`: how many display positions the device position-bias
+    /// estimation tracks (0 = off). Adds the biases, the per-replica cost sums and a
+    /// small control block; the planner upper-bounds it when the groups are not known.
+    pub n_positions: u64,
 }
+
+/// Replicas of the per-position cost sums of the unbiased device path (each pair adds to
+/// the replica of its block, the update sums them exactly): spreads the atomic contention.
+/// Must equal `RANK_BIAS_REPLICAS` in `histogram.cu` (a unit test compares the source).
+pub(crate) const RANK_BIAS_REPLICAS: u64 = 64;
+/// u64 words of the unbiased path's control block (bounds, scales, status); must equal
+/// `RANK_BIAS_CTL_WORDS` in `histogram.cu`.
+pub(crate) const RANK_BIAS_CTL_WORDS: u64 = 8;
 
 /// Device bytes of the fast ranking path. Per row: rank list, scratch list and rank
 /// position (3 x u32) and two int64 fixed-point accumulators; `map` adds two f64,
 /// `mean` three u32. Per group: row offset, initiator offset, 1/IDCG (f64), group
-/// weight (f32) and an int64 normalization sum.
+/// weight (f32) and an int64 normalization sum. Unbiased: `t+` / `t-` (2 x f64 per
+/// position), `RANK_BIAS_REPLICAS` x 2 int64 cost sums per position and the control block.
 pub fn fast_rank_bytes(n_rows: u64, shape: &FastRankShape) -> u64 {
     let mut bytes = n_rows * (3 * 4 + 2 * 8);
     if shape.map {
@@ -115,6 +128,9 @@ pub fn fast_rank_bytes(n_rows: u64, shape: &FastRankShape) -> u64 {
     }
     if shape.mean {
         bytes += n_rows * 3 * 4;
+    }
+    if shape.n_positions > 0 {
+        bytes += shape.n_positions * 8 * (2 + 2 * RANK_BIAS_REPLICAS) + RANK_BIAS_CTL_WORDS * 8;
     }
     bytes + (shape.n_groups + 1) * 4 * 2 + shape.n_groups * (8 + 4 + 8)
 }
@@ -1296,6 +1312,7 @@ mod resolve_tests {
             n_groups: 10_000,
             map: false,
             mean: false,
+            n_positions: 0,
         };
         // 3 x u32 + 2 x i64 per row; two u32 offsets, f64 + f32 + i64 per group.
         assert_eq!(
@@ -1315,6 +1332,15 @@ mod resolve_tests {
             fast_rank_bytes(rows, &mean) - fast_rank_bytes(rows, &shape),
             rows * 12
         );
+        // unbiased: t+ / t- (2 x f64), 64 replicas of 2 x i64 cost sums, 8 control words
+        let unbiased = FastRankShape {
+            n_positions: 32,
+            ..shape
+        };
+        assert_eq!(
+            fast_rank_bytes(rows, &unbiased) - fast_rank_bytes(rows, &shape),
+            32 * 8 * (2 + 2 * 64) + 8 * 8
+        );
         let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
         assert_eq!(
             base.with_fast_rank(rows, &shape).fixed_bytes,
@@ -1323,6 +1349,16 @@ mod resolve_tests {
         // the CUDA constants the formula relies on
         let cu = include_str!("backend/cuda/histogram.cu");
         assert!(cu.contains("rank_sort_groups") && cu.contains("rank_pairs"));
+        assert!(
+            cu.contains(&format!("#define RANK_BIAS_REPLICAS {RANK_BIAS_REPLICAS}u")),
+            "histogram.cu RANK_BIAS_REPLICAS differs from gpu_mem_plan"
+        );
+        assert!(
+            cu.contains(&format!(
+                "#define RANK_BIAS_CTL_WORDS {RANK_BIAS_CTL_WORDS}u"
+            )),
+            "histogram.cu RANK_BIAS_CTL_WORDS differs from gpu_mem_plan"
+        );
     }
 
     #[test]

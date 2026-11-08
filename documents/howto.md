@@ -935,8 +935,12 @@ position biases out of the pair gradients. Positions beyond
 tracked. The estimates are stored with the objective in the model JSON as
 `ti+` / `tj-` (32-bit arrays, as in XGBoost); they do not change predictions.
 Models match XGBoost's bit for bit on losslessly binned data, on the CPU and
-with `gpu_math="exact"` (byte-identical to the CPU). `gpu_math="fast"` does not
-support it and raises an error; use `"exact"`.
+with `gpu_math="exact"` (byte-identical to the CPU). With `gpu_math="fast"` the
+bias estimation runs on the device too: reproducible from run to run, close to
+but not byte-identical to the CPU (the same caveat as fast ranking in general).
+Every round it makes two passes over the pairs, the first finding the exact
+maximum of what will be added so the fixed-point scale fits the bias-divided
+gradients, and a gradient or statistic that is not finite is an error.
 
 **Metrics.** `ndcg`, `map` and `pre`, with XGBoost's syntax and values: `ndcg@k`
 and `map@k` truncate at `k`, a trailing `-` (`ndcg-`, `ndcg@5-`) scores a group
@@ -1420,8 +1424,9 @@ memory budget, without manual chunk or batch tuning:
   about 28 bytes per row plus 16 for `rank:map`, 12 for the `mean` method and
   20 per query group; the planner counts them. Very large groups can overflow
   the fixed-point accumulators and are rejected with an error.
-  `lambdarank_unbiased=True` is not available in fast mode (error); use
-  `gpu_math="exact"`.
+  `lambdarank_unbiased=True` also runs in fast mode: the position biases live on
+  the device (a few KB per tracked position), each round makes a second pass over
+  the pairs, and the estimate is saved with the model at the end.
 - **Extra GPU memory in fast mode**: `gpu_math="fast"` keeps the running
   prediction and the labels on the device (4 bytes per row each) and, with
   sample weights, the weights (4 more bytes per row). Multiclass keeps one
@@ -1678,7 +1683,7 @@ empty `evals_result()`.
 |---|---:|---|
 | `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
 | `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank) |
-| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation (CPU and `gpu_math="exact"`); see [Learning to rank](#learning-to-rank) |
+| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation; see [Learning to rank](#learning-to-rank) |
 | `quantile_alpha` | `None` | Required for `reg:quantileerror`: a quantile in `[0, 1]`, or an ascending list of up to 64 quantiles for one multi-output model (one tree per quantile per round; `predict` returns `(n, n_quantiles)`). Unsorted or out-of-range values raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |

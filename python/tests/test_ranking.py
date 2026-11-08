@@ -559,12 +559,111 @@ def test_unbiased_gpu_exact_is_byte_identical_to_cpu(obj, pair_method, tmp_path)
     assert _fb_bias(cpu, tmp_path, "c.json") == _fb_bias(gpu, tmp_path, "g.json")
 
 
+def _clicks(seed=11, n_groups=300):
+    """Position-biased clicks: groups in display order, early positions clicked more."""
+    rng = np.random.default_rng(seed)
+    sizes = rng.integers(2, 60, size=n_groups)
+    n = int(sizes.sum())
+    x = rng.integers(0, 12, size=(n, 6)).astype(np.float32)
+    s = x[:, 0] * 0.5 + x[:, 1] * 0.3 - x[:, 2] * 0.2 + rng.normal(0, 1.5, n)
+    qid = np.repeat(np.arange(n_groups), sizes)
+    pos = np.concatenate([np.arange(k) for k in sizes])
+    p = 1 / (1 + np.exp(-(s - s.mean()))) / (1 + pos) ** 0.8
+    y = (rng.random(n) < p * 1.6).astype(np.float32)
+    w = rng.uniform(0.5, 2.0, n_groups).astype(np.float32)
+    return x, y, qid, w
+
+
+def _bias_arrays(model, tmp_path, name):
+    ti, tj = _fb_bias(model, tmp_path, name)
+    return np.array(ti, dtype=np.float64), np.array(tj, dtype=np.float64)
+
+
 @cuda
-def test_unbiased_gpu_fast_is_an_error():
-    x, y, qid, _, _ = make(binary=True)
-    with pytest.raises(Exception, match="lambdarank_unbiased.*gpu_math"):
-        fb_train("rank:ndcg", x, y, qid, None, 2,
-                 {"lambdarank_unbiased": True, "device": "cuda", "gpu_math": "fast"}, evals=False)
+@pytest.mark.parametrize("obj,pair_method,weighted,bias_norm", list(itertools.product(
+    ["rank:ndcg", "rank:pairwise", "rank:map"], ["topk", "mean"], [False, True], [0.0, 0.5])))
+def test_unbiased_gpu_fast_is_deterministic_and_close_to_exact(
+        obj, pair_method, weighted, bias_norm, tmp_path):
+    x, y, qid, w = _clicks()
+    w = w if weighted else None
+    extra = {"lambdarank_unbiased": True, "lambdarank_pair_method": pair_method,
+             "lambdarank_bias_norm": bias_norm, "max_depth": 4, "max_bin": 16}
+    fast_p = {**extra, "device": "cuda", "gpu_math": "fast"}
+    fast = [fb_train(obj, x, y, qid, w, 12, fast_p, evals=False)[0] for _ in range(2)]
+    # reproducible: the model and the saved position biases are byte-identical
+    np.testing.assert_array_equal(f32_bits(fast[0].predict(x)), f32_bits(fast[1].predict(x)))
+    ti, tj = _bias_arrays(fast[0], tmp_path, "f0.json")
+    assert _fb_bias(fast[0], tmp_path, "f0.json") == _fb_bias(fast[1], tmp_path, "f1.json")
+    exact, _ = fb_train(obj, x, y, qid, w, 12, extra, evals=False)
+    eti, etj = _bias_arrays(exact, tmp_path, "e.json")
+    assert ti.shape == eti.shape == (32,)
+    assert ti[0] == tj[0] == 1.0 and np.isfinite(ti).all() and np.isfinite(tj).all()
+    name = "map@32" if obj == "rank:map" else "ndcg@32"
+
+    def score(m):
+        return fb._core.rank_score(name, m.predict(x), y, qid.astype(np.uint64), None, True)
+
+    if pair_method == "topk":
+        # the same pairs: only the order of the arithmetic differs
+        assert score(fast[0]) == pytest.approx(score(exact), abs=0.01)
+        np.testing.assert_allclose(ti, eti, rtol=5e-3)
+        np.testing.assert_allclose(tj, etj, rtol=5e-3)
+    else:
+        # sampled pairs differ from the host's generator: same quality, noisy biases
+        assert score(fast[0]) == pytest.approx(score(exact), abs=0.04)
+        assert ((ti > 0) & (ti < 20)).all() and ((tj > 0) & (tj < 20)).all()
+    # the biases are estimated, not left at one, and the unbiased model differs from the plain one
+    assert (ti[1:] != 1.0).any() and (tj[1:] != 1.0).any()
+    plain, _ = fb_train(obj, x, y, qid, w, 12, {**fast_p, "lambdarank_unbiased": False},
+                        evals=False)
+    assert not np.array_equal(f32_bits(plain.predict(x)), f32_bits(fast[0].predict(x)))
+
+
+@cuda
+def test_unbiased_gpu_fast_options_and_saturated_sigmoids(tmp_path):
+    x, y, qid, w = _clicks(seed=7, n_groups=400)
+    # few positions, a large truncation level, no normalization, row sampling
+    for extra in ({"lambdarank_num_pair_per_sample": 3},
+                  {"lambdarank_num_pair_per_sample": 80},
+                  {"lambdarank_normalization": False, "lambdarank_score_normalization": False},
+                  {"subsample": 0.7, "seed": 3}):
+        p = {"lambdarank_unbiased": True, "max_depth": 4, "max_bin": 16,
+             "device": "cuda", "gpu_math": "fast", **extra}
+        a, _ = fb_train("rank:ndcg", x, y, qid, w, 8, p, evals=False)
+        b, _ = fb_train("rank:ndcg", x, y, qid, w, 8, p, evals=False)
+        np.testing.assert_array_equal(f32_bits(a.predict(x)), f32_bits(b.predict(x)))
+        ti, _ = _bias_arrays(a, tmp_path, "a.json")
+        assert ti.size == extra.get("lambdarank_num_pair_per_sample", 32)
+    # score gaps far above 16.6 round the f32 sigmoid to one, where the pair cost is infinite
+    # (the host estimate turns NaN, like XGBoost's); the device floors it and stays finite
+    p = {"lambdarank_unbiased": True, "max_depth": 5, "max_bin": 16, "eta": 3.0,
+         "device": "cuda", "gpu_math": "fast"}
+    m, _ = fb_train("rank:ndcg", x, y, qid, None, 80, p, evals=False)
+    assert np.abs(m.predict(x)).max() > 17
+    ti, tj = _bias_arrays(m, tmp_path, "sat.json")
+    assert np.isfinite(ti).all() and np.isfinite(tj).all() and ti[0] == tj[0] == 1.0
+    assert (ti > 0).all() and (tj > 0).all()
+    # scores that overflow are an error, not a silently saturated fixed-point sum
+    with pytest.raises(Exception, match="non-finite"):
+        fb_train("rank:ndcg", x, y, qid, None, 30, {**p, "eta": 3e38}, evals=False)
+
+
+@cuda
+def test_unbiased_gpu_fast_with_validation_and_early_stopping(tmp_path):
+    x, y, qid, _ = _clicks()
+    vx, vy, vqid, _ = _clicks(seed=5, n_groups=60)
+    res = {}
+    p = {"objective": "rank:ndcg", "device": "cuda", "gpu_math": "fast", "max_depth": 3,
+         "lambdarank_unbiased": True, "seed": 2}
+    m = fb.train(p, x, label=y, qid=qid, num_boost_round=40, quiet=True,
+                 evals=[(vx, vy, "v")], eval_qid=[vqid], early_stopping_rounds=4,
+                 evals_result=res)
+    assert 0 <= m.best_iteration < 40 and 1 <= len(res["v"]["ndcg@32"]) <= 40
+    ti, _ = _bias_arrays(m, tmp_path, "es.json")
+    assert ti[0] == 1.0 and np.isfinite(ti).all()
+    # like XGBoost, an unbiased model cannot be continued
+    with pytest.raises(Exception, match="unbiased"):
+        fb.train(p, x, label=y, qid=qid, num_boost_round=2, quiet=True, xgb_model=m)
 
 
 # ---------------------------------------------------------------- auc / aucpr per group

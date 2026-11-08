@@ -764,7 +764,7 @@ class FerrisBoostRanker(_FerrisBoostBase):
     `rank:ndcg`, `rank:pairwise` and `rank:map` with XGBoost's `lambdarank_pair_method`,
     `lambdarank_num_pair_per_sample`, `lambdarank_normalization`,
     `lambdarank_score_normalization`, `ndcg_exp_gain` and the unbiased
-    `lambdarank_unbiased` / `lambdarank_bias_norm` (not with `gpu_math="fast"`).
+    `lambdarank_unbiased` / `lambdarank_bias_norm`.
 
     `fit(X, y, qid=...)` needs the query groups: `qid` (one id per row, rows sorted by it) or
     `group` (the size of every group). A pandas `qid` column in `X` is used like the `qid`

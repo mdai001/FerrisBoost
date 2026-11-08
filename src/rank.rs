@@ -148,6 +148,25 @@ impl RankParams {
             max_group_size.min(32)
         }
     }
+
+    /// Positions the device unbiased path allocates for (0 = not unbiased); the planner
+    /// and the allocation both come through here.
+    pub fn device_bias_positions(&self, max_group_size: usize) -> u64 {
+        if self.unbiased {
+            self.max_position_size(max_group_size).max(1) as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// Size of the largest query group.
+pub fn max_group_size(group_ptr: &[u32]) -> usize {
+    group_ptr
+        .windows(2)
+        .map(|w| (w[1] - w[0]) as usize)
+        .max()
+        .unwrap_or(0)
 }
 
 // ------------------------------------------------------------------ groups
@@ -482,6 +501,9 @@ impl<'a> RankGradient<'a> {
             group_weights: self.group_weights,
             weight_norm: self.weight_norm,
             inv_idcg: &self.inv_idcg,
+            n_positions: self.bias.as_ref().map_or(0, |b| {
+                b.lock().unwrap_or_else(|e| e.into_inner()).ti_plus.len()
+            }),
         }
     }
 

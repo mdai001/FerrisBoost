@@ -10,9 +10,15 @@
 //! Deterministic by construction: the sort is a pure function of the scores, pair
 //! contributions are added as fixed-point int64 (exact, order independent), and the
 //! only reductions are integer. There are no float atomics.
+//!
+//! `lambdarank_unbiased` adds a position-bias state on the device (`t+` / `t-`, the
+//! integer cost sums, a control block) and replaces steps 4 to 6 of the round by the
+//! bound / scale / accumulate sequence described in `histogram.cu`: the fixed-point scale
+//! of the divided-by-bias lambdas cannot be fixed up front, so it is derived each round
+//! from an exact device maximum. The biases are copied to the host once, at the end.
 
 use super::*;
-use crate::gpu_mem_plan::FastRankShape;
+use crate::gpu_mem_plan::{FastRankShape, RANK_BIAS_CTL_WORDS, RANK_BIAS_REPLICAS};
 use crate::rank::{PairMethod, RankKind, RankParams};
 
 /// Static inputs of the device ranking path, prepared on the host from the training
@@ -28,6 +34,8 @@ pub struct RankDeviceInputs<'a> {
     pub weight_norm: f64,
     /// `1 / IDCG@k` per group (only read by `rank:ndcg`).
     pub inv_idcg: &'a [f64],
+    /// Display positions tracked by the unbiased estimation; 0 without `lambdarank_unbiased`.
+    pub n_positions: usize,
 }
 
 /// Per-training constants decided by `init_fast_rank`.
@@ -44,6 +52,27 @@ struct RankRun {
     total_slots: u32,
     weight_norm: f32,
     scale: f64,
+    /// Tracked positions of the unbiased path (0 = plain), `regularizer` of its update and
+    /// the term-count bounds of its scales (see `rank_bias_scales`).
+    n_pos: u32,
+    regularizer: f64,
+    bound_row: f64,
+    bound_total: f64,
+}
+
+/// Device state of `lambdarank_unbiased`.
+struct RankBiasDevice {
+    pairs: CudaFunction,
+    scales: CudaFunction,
+    finalize: CudaFunction,
+    update: CudaFunction,
+    /// `t+` / `t-` (`shape.n_positions` each)
+    ti: CudaSlice<f64>,
+    tj: CudaSlice<f64>,
+    /// `RANK_BIAS_REPLICAS` x 2 x positions fixed-point cost sums
+    repl: CudaSlice<i64>,
+    /// bounds, scales and status words (`RANK_BIAS_CTL_WORDS`)
+    ctl: CudaSlice<u64>,
 }
 
 pub(super) struct RankFns {
@@ -72,6 +101,7 @@ pub(super) struct RankDevice {
     group_sum: CudaSlice<i64>,
     n_rel: Option<CudaSlice<f64>>,
     acc: Option<CudaSlice<f64>>,
+    bias: Option<RankBiasDevice>,
     run: Option<RankRun>,
 }
 
@@ -146,6 +176,28 @@ impl RankDevice {
                 .then(|| stream.alloc_zeros::<f64>(rows))
                 .transpose()
                 .context("rank acc alloc")?,
+            bias: shape
+                .n_positions
+                .gt(&0)
+                .then(|| -> Result<RankBiasDevice> {
+                    let np = usize::try_from(shape.n_positions).context("position count")?;
+                    let repl_len = RANK_BIAS_REPLICAS as usize * 2 * np;
+                    Ok(RankBiasDevice {
+                        pairs: load("rank_pairs_ub")?,
+                        scales: load("rank_bias_scales")?,
+                        finalize: load("rank_finalize_ub")?,
+                        update: load("rank_bias_update")?,
+                        ti: stream.alloc_zeros::<f64>(np).context("rank t+ alloc")?,
+                        tj: stream.alloc_zeros::<f64>(np).context("rank t- alloc")?,
+                        repl: stream
+                            .alloc_zeros::<i64>(repl_len)
+                            .context("rank cost sums alloc")?,
+                        ctl: stream
+                            .alloc_zeros::<u64>(RANK_BIAS_CTL_WORDS as usize)
+                            .context("rank control block alloc")?,
+                    })
+                })
+                .transpose()?,
             run: None,
         })
     }
@@ -174,6 +226,21 @@ pub(crate) fn rank_fixed_scale(group_ptr: &[u32], params: &RankParams) -> Result
          use gpu_math=\"exact\""
     );
     Ok(2f64.powi(e as i32))
+}
+
+/// Most terms that can reach one row accumulator (or a group sum) in a round, and, summed
+/// over the groups, one position cost sum: the same per-group count `rank_fixed_scale`
+/// bounds (`k` partners per initiator as initiator and as partner).
+fn rank_term_bounds(group_ptr: &[u32], params: &RankParams) -> (f64, f64) {
+    let k = u64::from(params.num_pair());
+    let (mut row, mut total) = (1.0f64, 0.0f64);
+    for w in group_ptr.windows(2) {
+        let cnt = u64::from(w[1] - w[0]);
+        let n = (k.min(cnt) * cnt + (cnt + 1) * (k + 1)) as f64;
+        row = row.max(n);
+        total += n;
+    }
+    (row, total.max(1.0))
 }
 
 impl GpuTrainCtx {
@@ -260,6 +327,33 @@ impl GpuTrainCtx {
                 .memcpy_htod(&hi, rank.bucket_hi.as_mut().context("bucket_hi")?)
                 .context("rank bucket_hi H2D")?;
         }
+        let n_pos = inputs.n_positions;
+        match (rank.bias.as_mut(), n_pos) {
+            (None, 0) => {}
+            (Some(b), n) if n > 0 => {
+                ensure!(
+                    n as u64 <= rank.shape.n_positions,
+                    "device ranking buffers track {} positions, the data needs {n}",
+                    rank.shape.n_positions
+                );
+                // every position starts unbiased
+                let ones = vec![1.0f64; rank.shape.n_positions as usize];
+                stream
+                    .memcpy_htod(&ones, &mut b.ti)
+                    .context("rank t+ H2D")?;
+                stream
+                    .memcpy_htod(&ones, &mut b.tj)
+                    .context("rank t- H2D")?;
+            }
+            (Some(_), _) => anyhow::bail!(
+                "the device ranking buffers were allocated for lambdarank_unbiased but the \
+                 data tracks no position"
+            ),
+            (None, _) => anyhow::bail!(
+                "lambdarank_unbiased needs the position-bias buffers, which were not allocated"
+            ),
+        }
+        let (bound_row, bound_total) = rank_term_bounds(inputs.group_ptr, &inputs.params);
         rank.run = Some(RankRun {
             kind: match inputs.kind {
                 RankKind::Ndcg => 0,
@@ -275,7 +369,16 @@ impl GpuTrainCtx {
             n_groups: n_groups as u32,
             total_slots: u32::try_from(total).context("too many pair initiators")?,
             weight_norm: inputs.weight_norm as f32,
-            scale: rank_fixed_scale(inputs.group_ptr, &inputs.params)?,
+            // the unbiased path derives its scales every round instead
+            scale: if n_pos == 0 {
+                rank_fixed_scale(inputs.group_ptr, &inputs.params)?
+            } else {
+                1.0
+            },
+            n_pos: u32::try_from(n_pos).context("position count")?,
+            regularizer: inputs.params.regularizer(),
+            bound_row,
+            bound_total,
         });
         Ok(())
     }
@@ -356,88 +459,319 @@ impl GpuTrainCtx {
                     .arg(rank.acc.as_mut().context("acc")?);
                 unsafe { l.launch(cfg) }.context("launch rank_map_stat")?;
             }
-            // 4. fixed-point accumulators
-            self.stream
-                .memset_zeros(&mut rank.acc_g)
-                .context("zero rank grad accumulator")?;
-            self.stream
-                .memset_zeros(&mut rank.acc_h)
-                .context("zero rank hess accumulator")?;
-            self.stream
-                .memset_zeros(&mut rank.group_sum)
-                .context("zero rank group sums")?;
-            // 5. pairs (integer atomics)
-            {
-                let cfg = LaunchConfig {
-                    grid_dim: (run.total_slots.div_ceil(256).clamp(1, 1 << 16), 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let seed = u64::from(round_seed);
-                let mut l = self.stream.launch_builder(&rank.fns.pairs);
-                // The optional buffers are only read for the kinds / methods that own them;
-                // other launches pass an always-valid dummy of the same type.
-                let n_rel = rank.n_rel.as_ref().unwrap_or(&rank.inv_idcg);
-                let acc = rank.acc.as_ref().unwrap_or(&rank.inv_idcg);
-                let y_order = rank.y_order.as_ref().unwrap_or(&rank.rank_pos);
-                let lo = rank.bucket_lo.as_ref().unwrap_or(&rank.rank_pos);
-                let hi = rank.bucket_hi.as_ref().unwrap_or(&rank.rank_pos);
-                l.arg(&*pred)
-                    .arg(label)
-                    .arg(&rank.group_ptr)
-                    .arg(&rank.init_ptr)
-                    .arg(&run.n_groups)
-                    .arg(&run.total_slots)
-                    .arg(&rank.rank_idx)
-                    .arg(&rank.rank_pos)
-                    .arg(&rank.inv_idcg)
-                    .arg(n_rel)
-                    .arg(acc)
-                    .arg(y_order)
-                    .arg(lo)
-                    .arg(hi)
-                    .arg(&run.kind)
-                    .arg(&run.is_topk)
-                    .arg(&run.num_pair)
-                    .arg(&run.exp_gain)
-                    .arg(&run.score_norm)
-                    .arg(&seed)
-                    .arg(&run.scale)
-                    .arg(&mut rank.acc_g)
-                    .arg(&mut rank.acc_h)
-                    .arg(&mut rank.group_sum);
-                unsafe { l.launch(cfg) }.context("launch rank_pairs")?;
-            }
-            // 6. finalize into the f32 gpair (normalization, group weight, row sampling)
-            {
-                let cfg = LaunchConfig {
-                    grid_dim: (grid_rows, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut l = self.stream.launch_builder(&rank.fns.finalize);
-                l.arg(&rank.group_ptr)
-                    .arg(&run.n_groups)
-                    .arg(&n_rows)
-                    .arg(&rank.acc_g)
-                    .arg(&rank.acc_h)
-                    .arg(&rank.group_sum)
-                    .arg(&rank.group_weight)
-                    .arg(&run.has_group_weight)
-                    .arg(&run.weight_norm)
-                    .arg(&run.is_topk)
-                    .arg(&run.num_pair)
-                    .arg(&run.normalization)
-                    .arg(&run.scale)
-                    .arg(out)
-                    .arg(&subsample_threshold)
-                    .arg(&subsample_seed)
-                    .arg(&subsample_tree);
-                unsafe { l.launch(cfg) }.context("launch rank_finalize")?;
+            if rank.bias.is_some() {
+                // 4. - 6. bound, scale, accumulate, finalize, bias update
+                self.unbiased_pairs_and_finalize(
+                    rank,
+                    run,
+                    pred,
+                    label,
+                    out,
+                    round_seed,
+                    (subsample_threshold, subsample_seed, subsample_tree),
+                    grid_rows,
+                )?;
+            } else {
+                // 4. fixed-point accumulators
+                self.stream
+                    .memset_zeros(&mut rank.acc_g)
+                    .context("zero rank grad accumulator")?;
+                self.stream
+                    .memset_zeros(&mut rank.acc_h)
+                    .context("zero rank hess accumulator")?;
+                self.stream
+                    .memset_zeros(&mut rank.group_sum)
+                    .context("zero rank group sums")?;
+                // 5. pairs (integer atomics)
+                {
+                    let cfg = LaunchConfig {
+                        grid_dim: (run.total_slots.div_ceil(256).clamp(1, 1 << 16), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let seed = u64::from(round_seed);
+                    let mut l = self.stream.launch_builder(&rank.fns.pairs);
+                    // The optional buffers are only read for the kinds / methods that own them;
+                    // other launches pass an always-valid dummy of the same type.
+                    let n_rel = rank.n_rel.as_ref().unwrap_or(&rank.inv_idcg);
+                    let acc = rank.acc.as_ref().unwrap_or(&rank.inv_idcg);
+                    let y_order = rank.y_order.as_ref().unwrap_or(&rank.rank_pos);
+                    let lo = rank.bucket_lo.as_ref().unwrap_or(&rank.rank_pos);
+                    let hi = rank.bucket_hi.as_ref().unwrap_or(&rank.rank_pos);
+                    l.arg(&*pred)
+                        .arg(label)
+                        .arg(&rank.group_ptr)
+                        .arg(&rank.init_ptr)
+                        .arg(&run.n_groups)
+                        .arg(&run.total_slots)
+                        .arg(&rank.rank_idx)
+                        .arg(&rank.rank_pos)
+                        .arg(&rank.inv_idcg)
+                        .arg(n_rel)
+                        .arg(acc)
+                        .arg(y_order)
+                        .arg(lo)
+                        .arg(hi)
+                        .arg(&run.kind)
+                        .arg(&run.is_topk)
+                        .arg(&run.num_pair)
+                        .arg(&run.exp_gain)
+                        .arg(&run.score_norm)
+                        .arg(&seed)
+                        .arg(&run.scale)
+                        .arg(&mut rank.acc_g)
+                        .arg(&mut rank.acc_h)
+                        .arg(&mut rank.group_sum);
+                    unsafe { l.launch(cfg) }.context("launch rank_pairs")?;
+                }
+                // 6. finalize into the f32 gpair (normalization, group weight, row sampling)
+                {
+                    let cfg = LaunchConfig {
+                        grid_dim: (grid_rows, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut l = self.stream.launch_builder(&rank.fns.finalize);
+                    l.arg(&rank.group_ptr)
+                        .arg(&run.n_groups)
+                        .arg(&n_rows)
+                        .arg(&rank.acc_g)
+                        .arg(&rank.acc_h)
+                        .arg(&rank.group_sum)
+                        .arg(&rank.group_weight)
+                        .arg(&run.has_group_weight)
+                        .arg(&run.weight_norm)
+                        .arg(&run.is_topk)
+                        .arg(&run.num_pair)
+                        .arg(&run.normalization)
+                        .arg(&run.scale)
+                        .arg(out)
+                        .arg(&subsample_threshold)
+                        .arg(&subsample_seed)
+                        .arg(&subsample_tree);
+                    unsafe { l.launch(cfg) }.context("launch rank_finalize")?;
+                }
             }
         }
         // The finalize kernel already applied the row sampling; the quantize tail
         // scans gpair_f32 for the maximum (like the quantile path).
         self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false)
+    }
+
+    /// Steps 4 to 6 of a round with `lambdarank_unbiased`: zero the accumulators, bound
+    /// every magnitude (pass 0), derive the fixed-point scales, accumulate (pass 1),
+    /// finalize into the f32 gpair and re-estimate the position biases. Errors when the
+    /// round produced a non-finite magnitude.
+    #[allow(clippy::too_many_arguments)]
+    fn unbiased_pairs_and_finalize(
+        &self,
+        rank: &mut RankDevice,
+        run: RankRun,
+        pred: &CudaSlice<f32>,
+        label: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        round_seed: u32,
+        (subsample_threshold, subsample_seed, subsample_tree): (u64, u64, u64),
+        grid_rows: u32,
+    ) -> Result<()> {
+        let RankDevice {
+            acc_g,
+            acc_h,
+            group_sum,
+            group_ptr,
+            init_ptr,
+            inv_idcg,
+            group_weight,
+            y_order,
+            bucket_lo,
+            bucket_hi,
+            rank_idx,
+            rank_pos,
+            n_rel,
+            acc,
+            bias,
+            ..
+        } = rank;
+        let b = bias.as_mut().context("position-bias buffers")?;
+        self.stream
+            .memset_zeros(acc_g)
+            .context("zero rank grad accumulator")?;
+        self.stream
+            .memset_zeros(acc_h)
+            .context("zero rank hess accumulator")?;
+        self.stream
+            .memset_zeros(group_sum)
+            .context("zero rank group sums")?;
+        self.stream
+            .memset_zeros(&mut b.repl)
+            .context("zero rank cost sums")?;
+        self.stream
+            .memset_zeros(&mut b.ctl)
+            .context("zero rank control block")?;
+        let seed = u64::from(round_seed);
+        let pair_cfg = LaunchConfig {
+            grid_dim: (run.total_slots.div_ceil(256).clamp(1, 1 << 16), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // The optional buffers are only read for the kinds / methods that own them;
+        // other launches pass an always-valid dummy of the same type.
+        let n_rel = n_rel.as_ref().unwrap_or(&*inv_idcg);
+        let acc = acc.as_ref().unwrap_or(&*inv_idcg);
+        let y_order = y_order.as_ref().unwrap_or(&*rank_pos);
+        let lo = bucket_lo.as_ref().unwrap_or(&*rank_pos);
+        let hi = bucket_hi.as_ref().unwrap_or(&*rank_pos);
+        let RankBiasDevice {
+            pairs,
+            scales,
+            finalize,
+            update,
+            ti,
+            tj,
+            repl,
+            ctl,
+        } = b;
+        let mut launch_pairs = |mode: u32,
+                                ctl: &mut CudaSlice<u64>,
+                                repl: &mut CudaSlice<i64>,
+                                acc_g: &mut CudaSlice<i64>,
+                                acc_h: &mut CudaSlice<i64>,
+                                group_sum: &mut CudaSlice<i64>|
+         -> Result<()> {
+            let mut l = self.stream.launch_builder(pairs);
+            l.arg(pred)
+                .arg(label)
+                .arg(&*group_ptr)
+                .arg(&*init_ptr)
+                .arg(&run.n_groups)
+                .arg(&run.total_slots)
+                .arg(&*rank_idx)
+                .arg(&*rank_pos)
+                .arg(&*inv_idcg)
+                .arg(n_rel)
+                .arg(acc)
+                .arg(y_order)
+                .arg(lo)
+                .arg(hi)
+                .arg(&run.kind)
+                .arg(&run.is_topk)
+                .arg(&run.num_pair)
+                .arg(&run.exp_gain)
+                .arg(&run.score_norm)
+                .arg(&seed)
+                .arg(&*ti)
+                .arg(&*tj)
+                .arg(&run.n_pos)
+                .arg(&mode)
+                .arg(ctl)
+                .arg(repl)
+                .arg(acc_g)
+                .arg(acc_h)
+                .arg(group_sum);
+            unsafe { l.launch(pair_cfg) }.context("launch rank_pairs_ub")?;
+            Ok(())
+        };
+        // 4. bound pass (reads t+ / t-, writes the maxima into the control block)
+        launch_pairs(0, ctl, repl, acc_g, acc_h, group_sum)?;
+        // the scales from the bounds
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = self.stream.launch_builder(scales);
+            l.arg(&mut *ctl).arg(&run.bound_row).arg(&run.bound_total);
+            unsafe { l.launch(cfg) }.context("launch rank_bias_scales")?;
+        }
+        // 5. accumulate pass
+        launch_pairs(1, ctl, repl, acc_g, acc_h, group_sum)?;
+        // 6. finalize with the device scale
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (grid_rows, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let n_rows = u32::try_from(self.n_rows).context("行数超过 u32")?;
+            let mut l = self.stream.launch_builder(finalize);
+            l.arg(&*group_ptr)
+                .arg(&run.n_groups)
+                .arg(&n_rows)
+                .arg(&*acc_g)
+                .arg(&*acc_h)
+                .arg(&*group_sum)
+                .arg(&*group_weight)
+                .arg(&run.has_group_weight)
+                .arg(&run.weight_norm)
+                .arg(&run.is_topk)
+                .arg(&run.num_pair)
+                .arg(&run.normalization)
+                .arg(&mut *ctl)
+                .arg(out)
+                .arg(&subsample_threshold)
+                .arg(&subsample_seed)
+                .arg(&subsample_tree);
+            unsafe { l.launch(cfg) }.context("launch rank_finalize_ub")?;
+        }
+        // the biases for the next round (after this round's gradients, like XGBoost)
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut l = self.stream.launch_builder(update);
+            l.arg(&mut *ti)
+                .arg(&mut *tj)
+                .arg(&*repl)
+                .arg(&*ctl)
+                .arg(&run.n_pos)
+                .arg(&run.regularizer);
+            unsafe { l.launch(cfg) }.context("launch rank_bias_update")?;
+        }
+        // one word back: the status of the round
+        let mut status = [0u64; 1];
+        self.stream
+            .memcpy_dtoh(&ctl.slice(4..5), &mut status)
+            .context("rank status D2H")?;
+        self.stream.synchronize().context("rank status sync")?;
+        ensure!(
+            status[0] == 0,
+            "lambdarank_unbiased on the device met a non-finite {} (diverged scores, or a \
+             position-bias estimate that degenerated); use gpu_math=\"exact\" to reproduce it \
+             on the host",
+            if status[0] & 1 != 0 {
+                "pair statistic"
+            } else {
+                "gradient"
+            }
+        );
+        Ok(())
+    }
+
+    /// The position biases `(t+, t-)` of the device estimation as stored in the model
+    /// (f32); `None` without `lambdarank_unbiased`.
+    pub fn fast_rank_bias(&self) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        let guard = self.lock()?;
+        let Some(rank) = guard.rank.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(b), Some(run)) = (rank.bias.as_ref(), rank.run) else {
+            return Ok(None);
+        };
+        let n = run.n_pos as usize;
+        let (mut ti, mut tj) = (vec![0.0f64; n], vec![0.0f64; n]);
+        self.stream
+            .memcpy_dtoh(&b.ti.slice(0..n), &mut ti)
+            .context("rank t+ D2H")?;
+        self.stream
+            .memcpy_dtoh(&b.tj.slice(0..n), &mut tj)
+            .context("rank t- D2H")?;
+        self.stream.synchronize().context("rank bias sync")?;
+        Ok(Some((
+            ti.iter().map(|&v| v as f32).collect(),
+            tj.iter().map(|&v| v as f32).collect(),
+        )))
     }
 }

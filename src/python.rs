@@ -305,6 +305,13 @@ fn resolve_blocking(
                                     .map_or(rows, |g| (g.len() - 1) as u64),
                                 map: kind == crate::rank::RankKind::Map,
                                 mean: params.pair_method == crate::rank::PairMethod::Mean,
+                                // the largest group is not known for file inputs: the
+                                // row count is an upper bound
+                                n_positions: params.device_bias_positions(
+                                    cfg.group_ptr
+                                        .as_deref()
+                                        .map_or(rows as usize, crate::rank::max_group_size),
+                                ),
                             },
                         ),
                         _ => model,
