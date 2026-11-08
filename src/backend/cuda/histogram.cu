@@ -2124,9 +2124,17 @@ extern "C" __global__ void partition_scan_blocks(
 
 // One fixed-size AoS descriptor per node:
 // input offset, length, original-local feature, split bin, missing-left,
-// count base, offset base, output offset, level-total slot, cumulative block end.
-// All pointers are ordinary tracked allocations; no per-node pointer table.
-enum { PART_DESC_WORDS = 10 };
+// count base, offset base, output offset, level-total slot, cumulative block end,
+// resident-block table index.
+// The resident blocks a batch reads (one level's nodes may split on features of
+// several blocks) travel as a small by-value table of base pointers and widths,
+// so one launch triple partitions a whole level instead of one per block.
+enum { PART_DESC_WORDS = 11 };
+#define PART_MAX_BLOCKS 32u
+struct PartBlocks {
+    unsigned long long base[PART_MAX_BLOCKS];
+    uint32_t n_feats[PART_MAX_BLOCKS];
+};
 
 __device__ __forceinline__ uint32_t partition_batch_node(
     const uint32_t* descriptors, uint32_t nodes, uint32_t block) {
@@ -2140,8 +2148,8 @@ __device__ __forceinline__ uint32_t partition_batch_node(
 }
 
 extern "C" __global__ void partition_count_batched(
-    const uint8_t* bins, const uint32_t* rows, const uint32_t* descriptors,
-    uint32_t nodes, uint32_t n_rows, uint32_t n_feats, uint32_t row_major,
+    const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
+    uint32_t nodes, uint32_t n_rows, uint32_t row_major,
     uint8_t* flags, uint32_t* counts) {
     const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
     const uint32_t* d = descriptors + node * PART_DESC_WORDS;
@@ -2149,6 +2157,8 @@ extern "C" __global__ void partition_count_batched(
     const uint32_t idx = local_block * blockDim.x + threadIdx.x;
     uint32_t left = 0;
     if (idx < d[1]) {
+        const uint8_t* bins = (const uint8_t*)blocks.base[d[10]];
+        const uint32_t n_feats = blocks.n_feats[d[10]];
         const uint32_t arena = d[0] + idx;
         const uint32_t row = rows[arena];
         const uint64_t address = row_major ? (uint64_t)row * n_feats + d[2]

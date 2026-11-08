@@ -337,6 +337,12 @@ pub mod cuda {
         ) -> Result<Option<GpuPartitionSession<'_>>> {
             match self.0 {}
         }
+        pub fn partition_session_resident_blocks(
+            &self,
+            _blocks: &[usize],
+        ) -> Result<Option<GpuPartitionSession<'_>>> {
+            match self.0 {}
+        }
     }
 
     pub struct GpuBlockSession<'a>(std::convert::Infallible, std::marker::PhantomData<&'a ()>);
@@ -390,6 +396,12 @@ pub mod cuda {
         pub fn partition_resident_batch(
             &mut self,
             _requests: &[(GpuRowSpan, usize, u32, bool)],
+        ) -> Result<Vec<usize>> {
+            match self.0 {}
+        }
+        pub fn partition_resident_multi(
+            &mut self,
+            _requests: &[(GpuRowSpan, usize, usize, u32, bool)],
         ) -> Result<Vec<usize>> {
             match self.0 {}
         }

@@ -17,7 +17,10 @@
 /// of layer width. Keep allocation and planning on the same geometry.
 pub(crate) const GPU_PARTITION_THREADS: u32 = 512;
 pub(crate) const PARTITION_BATCH_CAPACITY: usize = 32;
-pub(crate) const PARTITION_DESCRIPTOR_WORDS: usize = 10;
+pub(crate) const PARTITION_DESCRIPTOR_WORDS: usize = 11;
+/// Resident blocks one batched partition launch can read (by-value pointer
+/// table, `PART_MAX_BLOCKS` in histogram.cu).
+pub(crate) const PARTITION_MAX_BLOCKS: usize = 32;
 /// Fixed packet staging window; independent of level width and dataset rows.
 pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
 /// 32-bit words in one categorical winner's category set (a bitset over the

@@ -3357,15 +3357,22 @@ fn build_tree(
                         .extend(node_idxs.iter().map(|&i| (i, local)));
                 }
             }
+            // Categorical nodes take the single-node route of their block's
+            // session (the batched kernel only knows ordered bins). Numeric
+            // nodes of every resident block go into level-wide batches: one
+            // descriptor upload and one count/scan/scatter triple per
+            // PARTITION_BATCH_CAPACITY nodes instead of per block.
+            let mut numeric: Vec<(usize, usize, usize)> = Vec::new();
             for (block, nodes) in resident_groups {
+                let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
+                    .into_iter()
+                    .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
+                numeric.extend(nodes.into_iter().map(|(i, local)| (i, block, local)));
+                if cat_nodes.is_empty() {
+                    continue;
+                }
                 if let Some(mut session) = ctx.partition_session_resident(block, 0)? {
                     let started = std::time::Instant::now();
-                    // The batched kernel only knows ordered bins. Categorical
-                    // nodes take the single-node route (same stream, same stable
-                    // partition), numeric nodes keep the batch.
-                    let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
-                        .into_iter()
-                        .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
                     for (i, local) in cat_nodes {
                         let c = chosen[i].expect("resident group contains chosen nodes");
                         let cats = c.cats.expect("partitioned by categorical");
@@ -3375,19 +3382,6 @@ fn build_tree(
                             &cats,
                             c.missing_left,
                         )?);
-                    }
-                    for chunk in nodes.chunks(crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY) {
-                        let requests: Vec<_> = chunk
-                            .iter()
-                            .map(|&(i, local)| {
-                                let c = chosen[i].expect("resident group contains chosen nodes");
-                                (level[i].rows.device(), local, c.bin, c.missing_left)
-                            })
-                            .collect();
-                        let tokens = session.partition_resident_batch(&requests)?;
-                        for (&(i, _), token) in chunk.iter().zip(tokens) {
-                            part_tokens[i] = Some(token);
-                        }
                     }
                     let timing = session.timing();
                     drop(session);
@@ -3401,6 +3395,42 @@ fn build_tree(
                         &prof::GPU_PART_HOST,
                     );
                 }
+            }
+            let mut blocks: Vec<usize> = numeric.iter().map(|&(_, b, _)| b).collect();
+            blocks.dedup(); // `numeric` is grouped by ascending block
+            for block_chunk in blocks.chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS) {
+                let Some(mut session) = ctx.partition_session_resident_blocks(block_chunk)? else {
+                    continue; // nonresident: the per-feature fallback below
+                };
+                let started = std::time::Instant::now();
+                let nodes: Vec<_> = numeric
+                    .iter()
+                    .filter(|(_, b, _)| block_chunk.binary_search(b).is_ok())
+                    .collect();
+                for chunk in nodes.chunks(crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY) {
+                    let requests: Vec<_> = chunk
+                        .iter()
+                        .map(|&&(i, block, local)| {
+                            let c = chosen[i].expect("resident group contains chosen nodes");
+                            (level[i].rows.device(), block, local, c.bin, c.missing_left)
+                        })
+                        .collect();
+                    let tokens = session.partition_resident_multi(&requests)?;
+                    for (&&(i, _, _), token) in chunk.iter().zip(tokens) {
+                        part_tokens[i] = Some(token);
+                    }
+                }
+                let timing = session.timing();
+                drop(session);
+                prof::record_gpu(
+                    &timing,
+                    started.elapsed().as_nanos() as u64,
+                    &prof::GPU_PART_COL_H2D,
+                    &prof::GPU_PART_ROWS_H2D,
+                    &prof::GPU_PART_KERNEL,
+                    &prof::GPU_PART_D2H,
+                    &prof::GPU_PART_HOST,
+                );
             }
         }
         if gpu.is_none() {
