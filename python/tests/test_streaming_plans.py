@@ -569,6 +569,81 @@ def test_csv_plans_reject_overrides_over_a_set_budget_and_honor_explicit_widths(
     _, info = _gpu(capfd, p, csv, kw, gpu_memory_budget=budget)
     assert info["residency"] != "full_resident"
 
+# Fast ranking keeps per-query-group buffers on the device (two u32 offsets, f64 +
+# f32 + i64 per group: 28 bytes), so the planner must charge the real groups for
+# every input kind, not one group per row.
+RANK_GROUP_BYTES = 28
+RANK_CASES = {
+    "ndcg": {"objective": "rank:ndcg"},
+    "pairwise_mean": {"objective": "rank:pairwise", "lambdarank_pair_method": "mean"},
+    "map": {"objective": "rank:map"},
+    "unbiased": {"objective": "rank:ndcg", "lambdarank_unbiased": True},
+}
+
+
+def _rank_table(n, n_feats, seed, binary=False):
+    """Ranking data with varying group sizes (5..40 rows) and sorted query ids."""
+    rng = np.random.default_rng(seed)
+    sizes = rng.integers(5, 41, n // 5)
+    sizes = sizes[np.cumsum(sizes) <= n]
+    sizes = np.r_[sizes, n - sizes.sum()] if sizes.sum() < n else sizes
+    qid = np.repeat(np.arange(len(sizes)), sizes).astype(np.int64)
+    x = rng.normal(size=(n, n_feats)).astype(np.float32)
+    s = x[:, 0] - 0.6 * x[:, 3 % n_feats] + rng.normal(0, 0.7, n)
+    y = (s > 0.3).astype(np.float32) if binary else np.clip(np.round(s + 1.5), 0, 4).astype(
+        np.float32)
+    cols = {**{f"f{i}": x[:, i] for i in range(n_feats)}, "qid": qid, "label": y}
+    return pa.table(cols), len(sizes)
+
+
+def _plan_mb(log, key):
+    return float(re.search(rf"{key}:\s+([\d.]+) MB", log).group(1))
+
+
+@cuda
+@pytest.mark.parametrize("case", list(RANK_CASES))
+def test_fast_ranking_plans_the_real_query_groups_for_every_input(tmp_path, capfd, case):
+    """Single and multi-file Parquet, CSV and arrays plan the same fast ranking
+    buffers: the query groups read from the qid column, not one group per row. The
+    same rows with one row per query are charged exactly the extra group buffers."""
+    n = 60_000
+    table, n_groups = _rank_table(n, 6, 0, binary=case == "map")
+    path = str(tmp_path / "rank.parquet")
+    pq.write_table(table, path, row_group_size=10_000)
+    parts = tmp_path / "parts"
+    parts.mkdir()
+    for i in range(3):
+        pq.write_table(table.slice(i * 20_000, 20_000), str(parts / f"part{i}.parquet"))
+    csv = str(tmp_path / "rank.csv")
+    table.to_pandas().to_csv(csv, index=False)
+    per_row = table.set_column(table.schema.get_field_index("qid"), "qid",
+                               pa.array(np.arange(n, dtype=np.int64)))
+    per_row_path = str(tmp_path / "per_row.parquet")
+    pq.write_table(per_row, per_row_path, row_group_size=10_000)
+
+    p = {**RANK_CASES[case], "device": "cuda", "gpu_math": "fast", "max_depth": 4,
+         "max_bin": 32, "seed": 3, "cols_per_block": 3, "hist_streams": 1,
+         "resident_blocks": 0}
+    kw = {"num_boost_round": 2}
+    fixed, models = {}, {}
+    for name, src in (("parquet", path), ("multi_parquet", str(parts)), ("csv", csv),
+                      ("per_row", per_row_path)):
+        capfd.readouterr()
+        model = fb.train(p, src, label="label", qid="qid", **kw)
+        fixed[name] = _plan_mb(capfd.readouterr().err, "fixed_bytes")
+        models[name] = _bytes(model, tmp_path, name)
+    x = np.column_stack([table.column(f"f{i}").to_numpy() for i in range(6)])
+    capfd.readouterr()
+    model = fb.train(p, x, label=table.column("label").to_numpy(),
+                     qid=table.column("qid").to_numpy(), **kw)
+    fixed["array"] = _plan_mb(capfd.readouterr().err, "fixed_bytes")
+    assert fixed["parquet"] == fixed["multi_parquet"] == fixed["csv"] == fixed["array"], fixed
+    # The file inputs train the same model; one query per row is another problem.
+    assert models["parquet"] == models["multi_parquet"] == models["csv"]
+    extra = (n - n_groups) * RANK_GROUP_BYTES / MB
+    assert fixed["per_row"] - fixed["parquet"] == pytest.approx(extra, abs=0.11), fixed
+
+
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
 def _used_mb():
@@ -732,3 +807,56 @@ def test_large_wide_bin_plans_stay_within_the_planner_estimate(tmp_path, capfd, 
         seen[budget] = out
     assert "pure_streaming" in labels or "hybrid_partial_resident" in labels, labels
     assert len(set(seen.values())) == 1
+
+
+@pytest.fixture(scope="module")
+def large_rank_parquet(tmp_path_factory):
+    """3M ranking rows x 20 features, query groups of 5..40 rows (sorted qid), graded
+    and binary labels (rank:map)."""
+    d = tmp_path_factory.mktemp("large_rank")
+    out = {}
+    for binary in (False, True):
+        table, n_groups = _rank_table(3_000_000, 20, 1, binary=binary)
+        path = str(d / f"rank_{int(binary)}.parquet")
+        pq.write_table(table, path, row_group_size=200_000)
+        out[binary] = (path, n_groups)
+    return out
+
+
+@cuda
+@slow
+@pytest.mark.parametrize("case", list(RANK_CASES))
+def test_large_fast_ranking_estimate_covers_observed_memory_and_tight_budgets_train(
+        large_rank_parquet, tmp_path, capfd, case):
+    """On 3M rows the fast ranking estimate stays above the observed device memory
+    without the old one-group-per-row overcharge, and a budget between the real need
+    and that overcharge now trains: fast stays plan-invariant, exact matches the CPU."""
+    path, n_groups = large_rank_parquet[case == "map"]
+    n = 3_000_000
+    p = {**RANK_CASES[case], "max_depth": 6, "nthread": 4, "seed": 1, "cols_per_block": 4}
+    kw = {"label": "label", "qid": "qid", "num_boost_round": 3}
+    fb.train({"device": "cuda", "max_depth": 1}, np.zeros((64, 2), np.float32),
+             np.zeros(64, np.float32), num_boost_round=1, quiet=True)
+    base = _used_mb()
+    with _PeakVram() as peak:
+        ref, info = _gpu(capfd, p, path, kw, gpu_math="fast")
+    est = _plan_mb(info["log"], "estimated_peak")
+    if base is not None:
+        assert peak.peak - base <= est + 1, (peak.peak - base, est)
+        # the old charge added (n - n_groups) x 28 bytes on top of this estimate
+        assert est - (peak.peak - base) < (n - n_groups) * RANK_GROUP_BYTES / MB, (
+            peak.peak - base, est)
+    ref = _bytes(ref, tmp_path, "fast_ref")
+    # The minimum plan at this width: pure streaming with one histogram stream.
+    _, info = _gpu(capfd, p, path, kw, gpu_math="fast", resident_blocks=0, hist_streams=1)
+    minimum = _plan_mb(info["log"], "estimated_peak")
+    overcharge = (n - n_groups) * RANK_GROUP_BYTES / MB
+    reserve = 512.0
+    budget = int((reserve + minimum + overcharge / 2) * MB)  # refused before the fix
+    model, info = _gpu(capfd, p, path, kw, gpu_math="fast", hist_streams=1,
+                       gpu_memory_budget=budget)
+    assert _bytes(model, tmp_path, "fast_budget") == ref, info["residency"]
+    cpu = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    model, _ = _gpu(capfd, p, path, kw, gpu_math="exact", hist_streams=1,
+                    gpu_memory_budget=budget)
+    assert _bytes(model, tmp_path, "exact_budget") == cpu

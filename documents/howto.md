@@ -1430,7 +1430,8 @@ memory budget, without manual chunk or batch tuning:
   fixed-point integer additions only, so a run is reproducible but not
   byte-identical to the CPU (the sampled pairs of `mean` also differ). It needs
   about 28 bytes per row plus 16 for `rank:map`, 12 for the `mean` method and
-  20 per query group; the planner counts them. Very large groups can overflow
+  28 per query group; the planner counts them for the real query groups (file
+  inputs read the query-id column before planning). Very large groups can overflow
   the fixed-point accumulators and are rejected with an error.
   `lambdarank_unbiased=True` also runs in fast mode: the position biases live on
   the device (a few KB per tracked position), each round makes a second pass over

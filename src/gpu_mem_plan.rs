@@ -186,8 +186,8 @@ pub(crate) fn fast_multi_output_extra_bytes(
 /// [`fast_rank_bytes`] for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FastRankShape {
-    /// Number of query groups (the planner uses the row count when the groups are
-    /// not known before the data is opened: an upper bound).
+    /// Number of query groups. File inputs read their query-id column before
+    /// planning, so the planner always charges the real groups.
     pub n_groups: u64,
     /// `rank:map` keeps two f64 statistics per row.
     pub map: bool,
@@ -196,8 +196,26 @@ pub struct FastRankShape {
     pub mean: bool,
     /// `lambdarank_unbiased`: how many display positions the device position-bias
     /// estimation tracks (0 = off). Adds the biases, the per-replica cost sums and a
-    /// small control block; the planner upper-bounds it when the groups are not known.
+    /// small control block.
     pub n_positions: u64,
+}
+
+impl FastRankShape {
+    /// The shape for the training groups `group_ptr` (`n_groups + 1` row offsets).
+    /// The planner and the `GpuTrainCtx` allocation both build it here, so the
+    /// planned charge is the allocation.
+    pub fn for_groups(
+        kind: crate::rank::RankKind,
+        params: &crate::rank::RankParams,
+        group_ptr: &[u32],
+    ) -> Self {
+        FastRankShape {
+            n_groups: group_ptr.len().saturating_sub(1) as u64,
+            map: kind == crate::rank::RankKind::Map,
+            mean: params.pair_method == crate::rank::PairMethod::Mean,
+            n_positions: params.device_bias_positions(crate::rank::max_group_size(group_ptr)),
+        }
+    }
 }
 
 /// Replicas of the per-position cost sums of the unbiased device path (each pair adds to
@@ -1533,6 +1551,44 @@ mod resolve_tests {
                 "#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u"
             )),
             "QUANTILE_REDUCE_BLOCKS in histogram.cu disagrees with gpu_mem_plan"
+        );
+    }
+
+    #[test]
+    fn fast_rank_shape_comes_from_the_real_groups() {
+        use crate::rank::{PairMethod, RankKind, RankParams};
+        // three groups of 5, 12 and 3 rows
+        let groups = [0u32, 5, 17, 20];
+        let ndcg = RankParams::default();
+        assert_eq!(
+            FastRankShape::for_groups(RankKind::Ndcg, &ndcg, &groups),
+            FastRankShape {
+                n_groups: 3,
+                map: false,
+                mean: false,
+                n_positions: 0,
+            }
+        );
+        let mean_unbiased = RankParams {
+            pair_method: PairMethod::Mean,
+            unbiased: true,
+            ..RankParams::default()
+        };
+        // `mean` has no truncation: the tracked positions are the largest group (<= 32)
+        let shape = FastRankShape::for_groups(RankKind::Map, &mean_unbiased, &groups);
+        assert_eq!(
+            shape,
+            FastRankShape {
+                n_groups: 3,
+                map: true,
+                mean: true,
+                n_positions: 12,
+            }
+        );
+        let wide = [0u32, 100, 101];
+        assert_eq!(
+            FastRankShape::for_groups(RankKind::Map, &mean_unbiased, &wide).n_positions,
+            32
         );
     }
 
