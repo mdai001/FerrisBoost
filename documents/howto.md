@@ -322,6 +322,7 @@ as XGBoost 2.0 and later do:
 | `reg:pseudohubererror` | One Newton step from margin `0` |
 | `reg:squarederror`, `binary:logistic`, `reg:gamma` with `scale_pos_weight != 1` | One Newton step from margin `0` |
 | `multi:softprob`, `multi:softmax` | Per-class log-frequency margins, centered to mean zero |
+| `rank:ndcg`, `rank:pairwise`, `rank:map` | One Newton step from score `0` on the objective's gradients (close to `0`) |
 
 Because the estimate depends on the data, default models of `binary:logistic`
 and `reg:squarederror` differ from those trained with FerrisBoost 0.0.4, which
@@ -416,6 +417,9 @@ model = fb.train(
 | `quantile` | `reg:quantileerror` | Pinball loss at `quantile_alpha`; the objective's default metric |
 | `mlogloss` | `multi:softprob`, `multi:softmax` | Multiclass negative log-likelihood |
 | `merror` | `multi:softprob`, `multi:softmax` | Multiclass error rate |
+| `ndcg`, `ndcg@k`, `ndcg@k-` | ranking objectives | Mean NDCG over the query groups (group weights if given); `@k` truncates, `-` scores a group without relevant documents as 0; see [Learning to rank](#learning-to-rank) |
+| `map`, `map@k`, `map@k-` | ranking objectives | Mean average precision (binary labels) |
+| `pre@k` | ranking objectives | Precision at `k` (binary labels) |
 
 The likelihood and deviance metrics are meant for the objective they are listed
 with: they are computed on the transformed prediction and assume it is
@@ -429,7 +433,7 @@ Without `eval_metric`, the objective selects the default: `logloss` for
 `binary:logistic`, `rmse` for `reg:squarederror`, `poisson-nloglik` for
 `count:poisson`, `gamma-deviance` for `reg:gamma`, `tweedie-nloglik@rho` (with
 the objective's `tweedie_variance_power`) for `reg:tweedie`, `mphe` for
-`reg:pseudohubererror`, `quantile` for `reg:quantileerror`, and `mlogloss` for both multiclass objectives. With
+`reg:pseudohubererror`, `quantile` for `reg:quantileerror`, `mlogloss` for both multiclass objectives, and `ndcg@32` (`map@32` for `rank:map`) for the ranking objectives. With
 weighted validation data every metric is weighted the same way XGBoost does it.
 
 Like `xgboost.Booster.predict`, `Model.predict()` uses all trees by default,
@@ -694,6 +698,101 @@ categorical run enumerates splits on the host from downloaded histograms (the
 same exact fallback used for streaming) and does not use the resident GPU split
 cache; histogram building, row partitioning, and gradients stay on the device.
 Expect categorical GPU training to be slower than numeric GPU training.
+
+## Learning to rank
+
+`rank:ndcg`, `rank:pairwise` and `rank:map` train LambdaMART rankers with
+XGBoost's semantics, parameter names and model JSON. The rows of one query
+(search, user, session) form a **query group**; the model learns to order the
+documents inside a group by relevance.
+
+```python
+import numpy as np
+import ferrisboost as fb
+
+# 3 queries with 4, 3 and 5 documents; graded relevance labels 0-4.
+# The rows must be sorted by query.
+qid = np.array([0] * 4 + [1] * 3 + [2] * 5)
+model = fb.train(
+    {"objective": "rank:ndcg", "eta": 0.1, "max_depth": 4,
+     "eval_metric": "ndcg@5"},
+    X, label=relevance, qid=qid, num_boost_round=200,
+    evals=[(X_valid, relevance_valid, "valid")], eval_qid=[qid_valid],
+    early_stopping_rounds=10,
+)
+scores = model.predict(X_valid)      # raw ranking scores, higher = more relevant
+```
+
+**Query groups.** Array inputs take `qid` (one query id per row, rows sorted by
+it: every run of equal ids is one group) or `group` (the size of every group,
+in row order); give one of them. Validation sets take `eval_qid` / `eval_group`,
+lists parallel to `evals`. For Parquet and CSV files, `qid` is the **name of a
+column** (the column index for a headerless CSV): it is excluded from the
+features like `label`, and the validation files reuse it. The ids must be
+non-decreasing along the rows (an unsorted `qid` is an error, not a silent
+regrouping), and a group cannot be empty. A ranking objective without query
+groups, or query groups with another objective, raises `ValueError`.
+
+**Weights are per query group**, as in XGBoost: `weight` has one value per group
+(not per row). For files, the weight column repeats the group's weight on every
+row of the group (different values inside a group are an error). Group weights
+also weight the quantile sketch of the bin boundaries, like row weights do.
+
+**Objectives and parameters.** XGBoost's names and defaults:
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `lambdarank_pair_method` | `"topk"` | `"topk"`: every pair of a top-`k` document with a lower-ranked one, `k` = `lambdarank_num_pair_per_sample`. `"mean"`: sample `lambdarank_num_pair_per_sample` partners with a different label for every document |
+| `lambdarank_num_pair_per_sample` | `32` (`topk`), `1` (`mean`) | Truncation level / number of sampled pairs; at least 1 |
+| `lambdarank_normalization` | `True` | Normalize the gradient of each group (by `log2(1 + sum)` for `topk`, by the pair count for `mean`) |
+| `lambdarank_score_normalization` | `True` | Divide the metric change by the score difference |
+| `ndcg_exp_gain` | `True` | NDCG gain `2^label - 1` (labels must be integers in `[0, 31]`); `False` uses the label itself |
+| `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART is not supported yet; `lambdarank_unbiased=True` raises `ValueError` |
+
+`rank:map` needs binary labels (0 / 1). `rank:pairwise` optimizes the RankNet
+pairwise loss without a metric weighting. Documents that share a label inside a
+group form no pair; a group of one document or with equal labels contributes
+nothing. `subsample` and `colsample_*` work as for every objective: rows are
+sampled after the group gradients are computed.
+
+With `lambdarank_pair_method="mean"` the sampled pairs come from XGBoost's
+generator (one draw of the training `std::mt19937` per round, `seed` selects
+the stream), so models match XGBoost's on losslessly binned data when
+`subsample` and `colsample_*` are 1.
+
+**Metrics.** `ndcg`, `map` and `pre`, with XGBoost's syntax and values: `ndcg@k`
+and `map@k` truncate at `k`, a trailing `-` (`ndcg-`, `ndcg@5-`) scores a group
+without relevant documents as 0 instead of 1. A metric without `@k` is
+truncated at 32 (as in XGBoost, so `ndcg` is `ndcg@32`; write
+`ndcg@1000000` for the whole list). `map` and `pre` need binary labels. The
+default metric is `ndcg@32` for `rank:ndcg` and `rank:pairwise` and `map@32` for
+`rank:map` (`k` follows `lambdarank_num_pair_per_sample`; with the `mean` method
+`ndcg` covers the whole list). Early stopping maximizes them. With group weights
+the group scores are averaged with those weights. Ranking objectives accept
+only these metrics, and the ranking metrics are rejected for other objectives.
+
+**Starting score.** Without `base_score`, the estimate is one Newton step on the
+objective's gradients at score 0, as in XGBoost; it is close to 0.
+
+**scikit-learn.** `FerrisBoostRanker` (`XGBRanker`) takes `qid` or `group` in
+`fit`, `eval_qid` / `eval_group` for `eval_set`, and also accepts a pandas
+`qid` column in `X`. `sample_weight` is per group. `predict` returns the scores
+and `score(X, y)` (with a `qid` column in `X`) returns the ranking metric.
+
+```python
+from ferrisboost.sklearn import FerrisBoostRanker
+
+ranker = FerrisBoostRanker(n_estimators=200, learning_rate=0.1, max_depth=4)
+ranker.fit(X, relevance, qid=qid, eval_set=[(X_valid, relevance_valid)],
+           eval_qid=[qid_valid])
+ranker.predict(X_valid)
+```
+
+XGBoost `rank:*` models load with `Model.load_model` (and FerrisBoost ones in
+XGBoost); the objective parameters are stored in the model JSON. On the GPU,
+`gpu_math="exact"` computes the group gradients on the host and stays
+byte-identical to the CPU; `gpu_math="fast"` computes them on the device (see
+[Train on GPU](#train-on-gpu)).
 
 ## Multiclass classification
 
@@ -1098,7 +1197,7 @@ memory budget, without manual chunk or batch tuning:
   not guaranteed to be bit-identical; FerrisBoost does not promise universal
   parity with XGBoost GPU training.
 - **Objectives and parameters on GPU**: Every objective (including the
-  multiclass ones and `reg:quantileerror`) and the `alpha`, `max_delta_step`,
+  multiclass ones, `reg:quantileerror` and the ranking objectives) and the `alpha`, `max_delta_step`,
   `scale_pos_weight`, sample-weight, `monotone_constraints`, `subsample`, and
   `colsample_*` options work with `device="cuda"`. `gpu_math="exact"` stays
   byte-identical to CPU training for all of them.
@@ -1111,6 +1210,16 @@ memory budget, without manual chunk or batch tuning:
   `reg:quantileerror` the per-round global scale is reduced on the device in a
   fixed order, so it is deterministic but not byte-identical to CPU. Fast mode
   requires `device_quantize=True` (the default).
+- **Ranking on the GPU**: with `gpu_math="exact"` the group gradients are
+  computed on the host and the model is byte-identical to the CPU model. With
+  `gpu_math="fast"` the whole LambdaMART step runs on the device: a stable
+  segmented sort of every group's scores, pair generation (`topk` or `mean`),
+  the NDCG / MAP metric change and the per-row accumulation, which uses
+  fixed-point integer additions only, so a run is reproducible but not
+  byte-identical to the CPU (the sampled pairs of `mean` also differ). It needs
+  about 28 bytes per row plus 16 for `rank:map`, 12 for the `mean` method and
+  20 per query group; the planner counts them. Very large groups can overflow
+  the fixed-point accumulators and are rejected with an error.
 - **Extra GPU memory in fast mode**: `gpu_math="fast"` keeps the running
   prediction and the labels on the device (4 bytes per row each) and, with
   sample weights, the weights (4 more bytes per row). Multiclass keeps one
@@ -1338,7 +1447,8 @@ empty `evals_result()`.
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax` |
+| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
+| `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank). `lambdarank_unbiased` and `lambdarank_bias_norm` are accepted but `lambdarank_unbiased=True` is rejected |
 | `quantile_alpha` | `None` | Required for `reg:quantileerror`: one quantile in `[0, 1]` (a length-1 list is accepted). Several quantiles (multi-output) are not supported and raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
@@ -1386,13 +1496,14 @@ The following familiar XGBoost parameters are recognized but not implemented:
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 
-Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None)`:
+Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), early_stopping_rounds=None, evals_result=None, verbose_eval=False, callbacks=None, header=True, quiet=False, weight=None, feature_types=None, qid=None, group=None, eval_qid=None, eval_group=None)`:
 - `num_boost_round`: number of boosting rounds (default `10`; multiclass builds `num_class` trees per round).
 - `evals`, `early_stopping_rounds`, `evals_result`, `verbose_eval`, `callbacks`: validation, early stopping, and monitoring; see [Validation and early stopping](#validation-and-early-stopping) and [Custom callbacks](#custom-callbacks).
 - `quiet`: Set `True` to suppress routine progress logging on stderr.
 - `header`: Set `False` for headerless CSV files using positional column indices.
 - `weight`: per-row sample weights; an array for array input, or a column name (column index for headerless CSV) for file input.
 - `feature_types`: `"c"` / `"q"` per feature; see [Categorical features](#categorical-features).
+- `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
 Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, and `missing`. `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
@@ -1423,7 +1534,17 @@ do not include the label as a prediction feature.
 Training validates labels before the first round: `binary:logistic` needs
 labels in `[0, 1]`, `count:poisson` and `reg:tweedie` need non-negative labels,
 `reg:gamma` needs strictly positive labels, and multiclass objectives need
-integer labels in `[0, num_class)`.
+integer labels in `[0, num_class)`. `rank:ndcg` with `ndcg_exp_gain=True` needs
+integer relevance in `[0, 31]`, and `rank:map` (and the `map` / `pre` metrics)
+need binary 0 / 1 labels.
+
+### Ranking needs query groups
+
+`rank:ndcg`, `rank:pairwise` and `rank:map` raise `ValueError` when neither
+`qid` nor `group` is given (a `qid` column name for file input), when `qid` is
+not sorted along the rows, when group sizes do not add up to the row count, or
+when the weights are not one per query group. Validation sets need
+`eval_qid` / `eval_group` too. See [Learning to rank](#learning-to-rank).
 
 ### A multiclass objective is missing `num_class`
 

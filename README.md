@@ -223,7 +223,7 @@ File-to-file CPU scoring is also available through `Model.predict_to_parquet()`;
 
 ### Objectives and metrics
 
-Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, and `multi:softmax`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, and `merror`. See the Python API How-To for which metrics apply to which objective.
+Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, and the ranking objectives `rank:ndcg`, `rank:pairwise` and `rank:map`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, `merror`, and, for ranking, `ndcg`, `map` and `pre` (with `@k`). See the Python API How-To for which metrics apply to which objective.
 
 ### Known limitations
 
@@ -245,6 +245,10 @@ Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
+
+### 0.0.7 (unreleased)
+
+- Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
 
 ### 0.0.6 (unreleased)
 

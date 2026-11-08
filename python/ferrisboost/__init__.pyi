@@ -3,6 +3,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from ._core import Model as Model
 from .sklearn import FerrisBoostClassifier as FerrisBoostClassifier
 from .sklearn import FerrisBoostRegressor as FerrisBoostRegressor
+from .sklearn import FerrisBoostRanker as FerrisBoostRanker
 
 __version__: str
 
@@ -20,6 +21,10 @@ def train(
     quiet: bool = ...,
     weight: Any = ...,
     feature_types: Sequence[str] | None = ...,
+    qid: Any = ...,
+    group: Any = ...,
+    eval_qid: Sequence[Any] | None = ...,
+    eval_group: Sequence[Any] | None = ...,
 ) -> Model:
     """Train a model from arrays, file paths, a pandas DataFrame, or a PyArrow table.
 
@@ -31,7 +36,8 @@ def train(
 
     params["objective"] is one of binary:logistic, reg:squarederror,
     count:poisson, reg:gamma, reg:tweedie, reg:pseudohubererror,
-    reg:quantileerror, multi:softprob, multi:softmax. Multiclass objectives require
+    reg:quantileerror, multi:softprob, multi:softmax, rank:ndcg, rank:pairwise,
+    rank:map. Multiclass objectives require
     params["num_class"] (>= 2) and integer labels in [0, num_class); each
     round builds num_class trees. Objective-specific parameters:
     tweedie_variance_power (default 1.5, in [1, 2)), huber_slope (default 1,
@@ -46,10 +52,21 @@ def train(
     params["eval_metric"] takes a metric name or list of names: rmse, mae,
     mape, mphe, logloss, error, error@t, auc, aucpr, poisson-nloglik,
     gamma-nloglik, gamma-deviance, tweedie-nloglik@rho, quantile, mlogloss, merror.
-    Multiclass objectives accept only mlogloss and merror. Without
+    Multiclass objectives accept only mlogloss and merror; the ranking
+    objectives accept ndcg, ndcg@k, ndcg@k-, map, map@k and pre@k. Without
     eval_metric the objective picks the default metric. params["monotone_constraints"]
     takes 1 / -1 / 0 per feature as a tuple, list, "(1,-1,0)" string, or
     {feature_name: direction} dict.
+
+    Ranking (rank:ndcg, rank:pairwise, rank:map) needs query groups: qid (one
+    query id per row, rows sorted by it) or group (the size of every group) for
+    array inputs, and a qid column name for files (excluded from the features,
+    like label). Weights are per query group. Validation sets take eval_qid /
+    eval_group, lists parallel to evals. XGBoost's lambdarank_pair_method
+    ("topk" or "mean"), lambdarank_num_pair_per_sample, lambdarank_normalization,
+    lambdarank_score_normalization and ndcg_exp_gain are supported;
+    lambdarank_unbiased is not yet. The default metric is ndcg@32 (map@32 for
+    rank:map). gpu_math="fast" is not yet supported for ranking.
 
     colsample_bytree, colsample_bylevel and colsample_bynode (each in (0, 1])
     nest as in XGBoost (tree set, then per-level subset, then per-node subset);
