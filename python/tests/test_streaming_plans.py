@@ -64,8 +64,23 @@ PATH_RE = re.compile(
 STREAMS_RE = re.compile(r"hist_streams=(\d+)")
 
 
+def _string_categories(codes, seed, rows_per_group=1000):
+    """Codes -> string dictionary chunks, each row group listing the values in its
+    own order (named categories must be coded consistently across them)."""
+    rng = np.random.default_rng(seed)
+    chunks = []
+    for start in range(0, len(codes), rows_per_group):
+        part = codes[start:start + rows_per_group]
+        present = sorted({int(c) for c in part if not np.isnan(c)})
+        order = [present[i] for i in rng.permutation(len(present))]
+        where = {c: i for i, c in enumerate(order)}
+        keys = pa.array([None if np.isnan(c) else where[int(c)] for c in part], pa.int32())
+        chunks.append(pa.DictionaryArray.from_arrays(keys, pa.array([f"v{c}" for c in order])))
+    return pa.chunked_array(chunks)
+
+
 def _write(tmp_path, name, objective, n, n_feats, seed, n_cat=0, weights=False,
-           base_margin=False, num_class=4, cat_k=(12, 40)):
+           base_margin=False, num_class=4, cat_k=(12, 40), string_cats=False):
     rng = np.random.default_rng(seed)
     x = rng.normal(size=(n, n_feats)).astype(np.float32)
     cats = CAT_FEATURES[:n_cat]
@@ -77,6 +92,9 @@ def _write(tmp_path, name, objective, n, n_feats, seed, n_cat=0, weights=False,
     for c in cats:
         s += 0.5 * np.sin(1.7 * xs[:, c])
     cols = {f"f{i}": pa.array(x[:, i]) for i in range(n_feats)}
+    if string_cats:
+        for c in cats:
+            cols[f"f{c}"] = _string_categories(x[:, c], seed + 31 * c)
     ranking = objective.startswith("rank:")
     if ranking:
         qid = np.repeat(np.arange(n // 20 + 1), 20)[:n].astype(np.int64)
@@ -116,14 +134,14 @@ def _bytes(model, tmp_path, name):
 
 def _setup(tmp_path, objective, layout, n=4000, seed=0, sampling=None, n_cat=0,
            weights=False, base_margin=False, evals=False, init_model=False, rounds=4,
-           max_depth=5, cat_k=(12, 40), **extra):
+           max_depth=5, cat_k=(12, 40), string_cats=False, **extra):
     """Data, params and train kwargs for one matrix case (CPU params; add the GPU keys)."""
     lay = LAYOUTS[layout]
     unbiased = objective.endswith("+unbiased")
     objective = objective.split("+")[0]
     tag = f"{objective.replace(':', '_')}_{layout}_{seed}"
     path = _write(tmp_path, tag, objective, n, lay["n_feats"], seed, n_cat, weights, base_margin,
-                  cat_k=cat_k)
+                  cat_k=cat_k, string_cats=string_cats)
     p = {"objective": objective, "max_depth": max_depth, "eta": 0.3, "nthread": 2,
          "cols_per_block": lay["cols_per_block"], "seed": 7, "max_bin": 64,
          **(sampling or {}), **extra}
@@ -146,7 +164,7 @@ def _setup(tmp_path, objective, layout, n=4000, seed=0, sampling=None, n_cat=0,
             [f"bm{j}" for j in range(4)] if objective == "multi:softprob" else "bm0")
     if evals:
         vpath = _write(tmp_path, tag + "_val", objective, n // 2, lay["n_feats"], seed + 1,
-                       n_cat, weights, base_margin, cat_k=cat_k)
+                       n_cat, weights, base_margin, cat_k=cat_k, string_cats=string_cats)
         kw.update(evals=[(vpath, "val")], early_stopping_rounds=2, num_boost_round=12)
     if init_model:
         prior_kw = {**kw, "num_boost_round": 2}
@@ -234,6 +252,10 @@ FEATURES = {
     "regularized_monotone": dict(
         sampling={"colsample_bytree": 0.8}, reg_lambda=3.0, reg_alpha=0.5, gamma=0.2,
         min_child_weight=5, max_delta_step=0.7),
+    # string dictionaries in another order in every row group (named categories),
+    # with an eval file and a continued model coded with the same lists
+    "string_categories": dict(n_cat=2, string_cats=True, weights=True, evals=True,
+                              init_model=True, sampling=SAMPLE_ALL),
 }
 
 
@@ -403,6 +425,8 @@ WIDE_CASES = {
     "wide_constrained_bynode": dict(max_bin=1024, n_cat=2, cat_k=(600, 3000),
                                     monotone_constraints={"f0": 1, "f5": -1},
                                     alpha=0.3, max_delta_step=0.8, colsample_bynode=0.7),
+    # 20,000 named (string) categories, every row group with its own dictionary order
+    "string_categories_20000": dict(n_cat=2, cat_k=(300, 20000), string_cats=True),
 }
 
 

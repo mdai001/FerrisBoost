@@ -578,6 +578,7 @@ fn cuts_only_observed<'a>(
             false,
             categorical,
             targets.missing,
+            targets.categories,
         )
         .map(|(cuts, _)| cuts);
     };
@@ -595,6 +596,7 @@ fn cuts_only_observed<'a>(
         true,
         categorical,
         targets.missing,
+        targets.categories,
     )
     .map(|(cuts, _)| cuts)
 }
@@ -777,6 +779,7 @@ pub(crate) fn open_many_observed<'a>(
                 true,
                 targets.categorical.unwrap_or(&[]),
                 targets.missing,
+                targets.categories,
             )?;
             Some(c)
         }
@@ -798,6 +801,7 @@ pub(crate) fn open_many_observed<'a>(
             bins_plan.1,
             targets.categorical.unwrap_or(&[]),
             targets.missing,
+            targets.categories,
         )?,
     };
 
@@ -932,6 +936,10 @@ struct CacheManifest {
     /// Bytes per bin of each block (version 3 only; version 2 = all 1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     block_widths: Vec<u8>,
+    /// Category names of named categorical features (XGBoost `cats` layout);
+    /// absent when the data has none, so other caches keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    categories: Option<crate::category_names::XgbCats>,
 }
 
 /// Cache format of all-8-bit caches.
@@ -1280,6 +1288,11 @@ impl ParquetBlockSource {
                 // 直接比是免费的,而且比任何哈希都强。哈希只用来发现
                 // manifest 自身被改坏。
                 crate::ensure_input!(
+                    cuts.categories().map(|t| &**t) == src.cuts().categories().map(|t| &**t),
+                    "the given category names differ from the cached ones; refusing to use \
+                     quantized data coded with other categories"
+                );
+                crate::ensure_input!(
                     cuts.values == src.cuts().values && cuts.offsets == src.cuts().offsets,
                     "the given cuts differ from the cached ones; refusing to use stale quantized data; \
                      a validation set must use the training cuts but must **not share cache_path** with the training set: \
@@ -1485,6 +1498,7 @@ impl ParquetBlockSource {
             groups: self.groups.clone(),
             block_hashes,
             block_widths: if wide { widths } else { Vec::new() },
+            categories: self.cuts.categories().map(|t| t.to_xgb()),
         })
     }
 
@@ -1588,6 +1602,31 @@ impl ParquetBlockSource {
         )
         .with_categorical(&manifest.categorical)
         .map_err(|e| anyhow::anyhow!("cached categorical feature metadata is corrupt: {e}"))?;
+        let cached_categories = match &manifest.categories {
+            None => None,
+            Some(c) => crate::category_names::CategoryTable::from_xgb(c, manifest.n_features)
+                .and_then(|t| {
+                    if let Some(t) = &t {
+                        t.check_against(manifest.n_features, &manifest.categorical)?;
+                    }
+                    Ok(t)
+                })
+                .map_err(|e| anyhow::anyhow!("cached category names are corrupt: {e}"))?,
+        };
+        // A continued model codes named columns with its own lists: the cache
+        // must have been built with exactly those (never re-code silently).
+        if let Some(seed) = targets.categories {
+            for f in 0..manifest.n_features {
+                if let Some(c) = seed.get(f) {
+                    crate::ensure_input!(
+                        cached_categories.as_ref().and_then(|t| t.get(f)) == Some(c),
+                        "the cached category names of feature {f} differ from the existing \
+                         model's; use another cache_path or rebuild the cache"
+                    );
+                }
+            }
+        }
+        let cuts = cuts.with_categories(cached_categories.map(std::sync::Arc::new));
         anyhow::ensure!(
             cuts_hash(&cuts) == manifest.cuts_hash,
             "cache cuts hash differs"
@@ -1728,6 +1767,10 @@ fn cuts_hash(cuts: &BinCuts) -> String {
                 hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
             }
         }
+    }
+    // Likewise category names: only caches of named categories mix them in.
+    if let Some(t) = cuts.categories() {
+        hash = t.hash_into(hash);
     }
     format!("{hash:016x}")
 }
@@ -2006,8 +2049,10 @@ impl ParquetBlockSource {
     ) -> anyhow::Result<()> {
         debug_assert_eq!(out.len(), feat_ids.len() * n_rows);
         let mut row_base = 0usize;
+        let mut recoder =
+            crate::source::cat_recode::Recoder::fixed(self.cuts.categories().map(|t| &**t));
         for batch in batch_reader(&self.path, file_cols, BATCH_SIZE)? {
-            let batch = batch?;
+            let batch = recoder.recode(batch?, |c| feat_ids.get(c).map(|&f| f as usize))?;
             let n = batch.num_rows();
             for (local, &f) in feat_ids.iter().enumerate() {
                 let values =
@@ -3201,5 +3246,85 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Two row groups per file, every row group with its own string dictionary
+    /// order: one category list (first appearance in rows), the same bins from the lazy
+    /// single-file source, the multi-file dataset and a validation file.
+    #[test]
+    fn string_dictionaries_get_one_category_list() {
+        use crate::category_names::CategoryValues;
+        use arrow::array::{DictionaryArray, Int32Array, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "c",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("target", DataType::Float32, false),
+        ]));
+        let dir = std::env::temp_dir().join(format!("fb_parquet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, groups: &[(&[&str], &[Option<i32>])]| -> PathBuf {
+            let path = dir.join(format!("{name}.parquet"));
+            let mut w =
+                ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+            for (dict, keys) in groups {
+                let c = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(keys.to_vec()),
+                    Arc::new(StringArray::from(dict.to_vec())),
+                )
+                .unwrap();
+                let y = Float32Array::from((0..keys.len()).map(|i| i as f32).collect::<Vec<_>>());
+                let b =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(c), Arc::new(y)]).unwrap();
+                w.write(&b).unwrap();
+                w.flush().unwrap(); // one row group per batch
+            }
+            w.close().unwrap();
+            path
+        };
+        // rows: b a b ∅ | c a | (file 2) a d c
+        let a = write(
+            "dict_a",
+            &[
+                (&["b", "a"], &[Some(0), Some(1), Some(0), None]),
+                (&["a", "c"], &[Some(1), Some(0)]),
+            ],
+        );
+        let b = write(
+            "dict_b",
+            &[(&["d", "c", "a"], &[Some(2), Some(0), Some(1)])],
+        );
+
+        let (lazy, _) = ParquetBlockSource::open(&a, "target", 16, 1).unwrap();
+        let t = lazy.cuts().categories().expect("named categories").clone();
+        assert_eq!(
+            t.get(0).unwrap().values(),
+            &CategoryValues::Str(vec!["b".into(), "a".into(), "c".into()])
+        );
+        let column = lazy.feature_column(0).unwrap();
+        let missing = lazy.cuts().bin_width(0).missing();
+        let bins: Vec<u32> = (0..6).map(|r| column.as_slice().get(r)).collect();
+        assert_eq!(bins, vec![0, 1, 0, missing, 2, 1]);
+
+        // A validation file is coded with the training list: "d" is unseen.
+        let Err(e) = ParquetBlockSource::with_cuts(&b, "target", lazy.cuts().clone(), 1) else {
+            panic!("an unseen category must be rejected")
+        };
+        assert!(e.to_string().contains("\"d\""), "{e}");
+
+        let many = open_many(&[a.clone(), b.clone()], "target", None, 16, 1).unwrap();
+        let t2 = many.source.cuts().categories().unwrap();
+        assert_eq!(
+            t2.get(0).unwrap().values(),
+            &CategoryValues::Str(vec!["b".into(), "a".into(), "c".into(), "d".into()])
+        );
+        let got: Vec<u32> = (6..9).map(|r| many.source.bin_at(r, 0)).collect();
+        assert_eq!(got, vec![1, 3, 2]); // rows a, d, c
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 }

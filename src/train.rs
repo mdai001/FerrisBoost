@@ -1103,6 +1103,20 @@ fn validate_start_margins(
             == flags(source.cuts().categorical_flags(), n_features),
         "categorical features (feature_types) of the continued training data do not match the existing model"
     );
+    // A continued model keeps its category lists (XGBoost keeps them too);
+    // named training data is coded with them, so a list built from the data
+    // must start from the prior's.
+    if let (Some(theirs), Some(ours)) = (&prior.categories, source.cuts().categories()) {
+        for f in 0..n_features {
+            if let Some(c) = theirs.get(f) {
+                crate::ensure_input!(
+                    ours.get(f) == Some(c),
+                    "the category names of feature {f} differ from the existing model's; continued \
+                     training data must be coded with the model's categories"
+                );
+            }
+        }
+    }
     // The new trees can only split on codes the current training supports
     // (`MAX_CAT_CODE_WIDE`); refuse a model that already splits on larger ones
     // rather than carrying (or truncating) them.
@@ -1494,6 +1508,14 @@ fn train_with_backend(
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: source.cuts().categorical_flags().to_vec(),
         rank_bias: None,
+        // Named categories come from the data (a continued model's lists are
+        // the seed of the data's, see `validate_start_margins`); a continued model
+        // trained on bare codes keeps the prior's lists.
+        categories: source
+            .cuts()
+            .categories()
+            .cloned()
+            .or_else(|| cfg.prior_model.as_ref().and_then(|m| m.categories.clone())),
         // 和 XGBoost 一样,续训时旧模型的 best_iteration / best_score 属性原样保留,
         // 本次若开了早停再覆盖。
         best_iteration: cfg.prior_model.as_ref().and_then(|m| m.best_iteration),
@@ -2146,6 +2168,7 @@ pub fn train_gpu_one_tree(
             scale_pos_weight: cfg.params.scale_pos_weight,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -2195,6 +2218,7 @@ pub fn train_gpu_one_tree(
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: Vec::new(),
         rank_bias: None,
+        categories: None,
         trees: vec![tree],
         base_score,
         objective: cfg.objective,

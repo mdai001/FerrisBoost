@@ -129,6 +129,12 @@ class Model:
           tree, shape (n, n_trees).
         """
         ...
+    def get_categories(self) -> list[list[str] | list[int] | None] | None:
+        """Category names stored in the model, one entry per feature (a list in
+        code order, or None for a numeric / integer-coded feature); None when no
+        feature has names. DataFrame, Arrow table and Parquet input are re-coded
+        by value with these lists."""
+        ...
     def get_score(self, importance_type: str = "weight") -> dict[str, float]:
         """Feature importance as in XGBoost's Booster.get_score.
 

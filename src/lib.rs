@@ -8,6 +8,7 @@ pub mod backend;
 pub mod bins;
 pub mod callback;
 pub mod categorical;
+pub mod category_names;
 pub mod colsample;
 pub mod columns;
 pub mod comm;

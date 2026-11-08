@@ -253,6 +253,7 @@ logging, and the complete parameter reference.
 - Wide bins and many categories train on CPU and GPU.
 - GPU speed optimization for wide features.
 - Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.
+- Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost `cats` layout); named input is re-coded by value, and unseen categories raise `ValueError`.
 
 ### 0.0.7 (unreleased)
 

@@ -66,6 +66,11 @@ pub struct BinCuts {
     /// in XGBoost). Quantization goes through `find_bin`, which maps unseen
     /// codes to a bin that is in no category set.
     categorical: Vec<bool>,
+    /// Category names of the categorical features whose input named them
+    /// (string dictionaries): code `i` of feature `f` is the `i`-th entry.
+    /// Readers of named input re-code by value with this table, and training
+    /// stores it in the model. `None` for numeric / integer-coded data.
+    categories: Option<std::sync::Arc<crate::category_names::CategoryTable>>,
 }
 
 impl BinCuts {
@@ -110,7 +115,22 @@ impl BinCuts {
             offsets,
             hist_offsets,
             categorical: Vec::new(),
+            categories: None,
         }
+    }
+
+    /// Attach the category names of named categorical features.
+    pub fn with_categories(
+        mut self,
+        categories: Option<std::sync::Arc<crate::category_names::CategoryTable>>,
+    ) -> Self {
+        self.categories = categories;
+        self
+    }
+
+    /// Category names of named categorical features (see the field docs).
+    pub fn categories(&self) -> Option<&std::sync::Arc<crate::category_names::CategoryTable>> {
+        self.categories.as_ref()
     }
 
     /// Cuts of a categorical feature whose largest code is `max_code`:

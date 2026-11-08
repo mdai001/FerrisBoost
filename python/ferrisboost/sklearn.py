@@ -88,7 +88,8 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import Model, _frame_matrix, _is_pandas_frame, train
+from . import (Model, _categories_wire, _frame_matrix, _is_pandas_frame, _load_prior,
+               _model_refs, train)
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 
@@ -288,7 +289,7 @@ class _FerrisBoostBase(BaseEstimator):
 
     # ------------------------------------------------------------------ 输入
     def _prepare_X(
-        self, X: Any, y: Any = None, *, reset: bool, **kwargs: Any
+        self, X: Any, y: Any = None, *, reset: bool, prior: Any = None, **kwargs: Any
     ) -> tuple[Any, Any, list[str] | None]:
         """sklearn validation plus pandas `category` handling.
 
@@ -296,13 +297,23 @@ class _FerrisBoostBase(BaseEstimator):
         (category columns as their integer codes, NaN for a missing value) and
         `feature_types` the per-feature "c" / "q" list detected from the frame
         (None when the frame has no category column). Training stores the
-        categories; later calls re-code onto them by value.
+        categories (in the booster too); later calls re-code onto them by
+        value. A continued model (`prior`) codes the training frame with its
+        own categories.
         """
         flags = None
         if _is_pandas_frame(X) and _has_category_column(X):
             import pandas as pd
 
-            levels = None if reset else getattr(self, "_cat_levels_", None)
+            if reset:
+                if hasattr(prior, "get_booster"):
+                    prior = prior.get_booster()
+                levels = _model_refs(_load_prior(prior)) if prior is not None else None
+            else:
+                # This fit's categories first (eval sets are prepared before the
+                # booster exists); a loaded model brings its own.
+                levels = getattr(self, "_cat_levels_", None) or _model_refs(
+                    getattr(self, "_Booster", None))
             matrix, _, flag_list, new_levels = _frame_matrix(
                 X, bool(self.enable_categorical), levels, "X"
             )
@@ -350,6 +361,15 @@ class _FerrisBoostBase(BaseEstimator):
             )
         if hasattr(init_model, "get_booster"):
             init_model = init_model.get_booster()
+        # The booster stores the category names the training frame was coded with.
+        types = feature_types if self.feature_types is None else self.feature_types
+        wire = _categories_wire(
+            getattr(self, "_cat_levels_", None) or {},
+            None if types is None else [t == "c" for t in types],
+            X.shape[1],
+        )
+        if wire is not None:
+            params = {**params, "_categories": wire}
         if sample_weight is not None:
             if per_group:
                 sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
@@ -564,7 +584,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         init_model = _pick_init_model(init_model, xgb_model)
         if y is None:
             raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
         params = self.get_ferrisboost_params()
         self._fit_booster(
             X,
@@ -640,7 +660,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
 
         if y is None:
             raise ValueError("This FerrisBoostClassifier estimator requires y to be passed, but the target y is None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, dtype=np.float32)
         check_classification_targets(y)
         classes, encoded = np.unique(y, return_inverse=True)
         if len(classes) < 2:
@@ -817,7 +837,7 @@ class FerrisBoostRanker(_FerrisBoostBase):
             raise ValueError("Either `group` or `qid` is required for ranking task")
         if qid is not None and group is not None:
             raise ValueError("Either one of `group` or `qid` should be None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
         eval_set = list(eval_set) if eval_set else None
         eq_list: list = []
         eg_list: list = []
