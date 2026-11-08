@@ -1179,9 +1179,10 @@ fn predict_files_to_parquet(
     } else {
         None
     };
-    let projected_features: Vec<usize> = match &single {
-        Some(inference) => inference.canonical_features().to_vec(),
-        None => (0..canonical_n_features).collect(),
+    let projected_features: Vec<usize> = match (&single, &multi) {
+        (Some(inference), _) => inference.canonical_features().to_vec(),
+        (None, Some((_, infs))) => union_features(infs),
+        (None, None) => unreachable!("either a single or a multi-output predictor"),
     };
     let n_features = projected_features.len();
     // `multi:softmax` writes one class-index column; every other multi-output result
@@ -1353,7 +1354,7 @@ fn predict_files_to_parquet(
                             upto,
                             data,
                             n_rows,
-                            canonical_n_features,
+                            &projected_features,
                             false,
                             workers,
                             &mut predict_pool,
@@ -1476,7 +1477,9 @@ fn score_multi_output_batch(
     upto: usize,
     data: &[f32],
     n_rows: usize,
-    canonical_n_features: usize,
+    // Canonical feature ids held by the columns of `data` (ascending): the union
+    // of every view's features, so a file is read for those columns only.
+    layout: &[usize],
     gpu_batch: bool,
     workers: usize,
     pool: &mut Option<rayon::ThreadPool>,
@@ -1488,15 +1491,19 @@ fn score_multi_output_batch(
     for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
         let nt = model.class_tree_count(upto, c);
         let gathered;
-        let vdata: &[f32] = if vinf.is_identity(canonical_n_features) {
+        let vdata: &[f32] = if vinf.canonical_features() == layout {
             data
         } else {
-            gathered = project_canonical_rows(
-                data,
-                n_rows,
-                canonical_n_features,
-                vinf.canonical_features(),
-            )?;
+            let positions = vinf
+                .canonical_features()
+                .iter()
+                .map(|feature| {
+                    layout
+                        .binary_search(feature)
+                        .map_err(|_| anyhow::anyhow!("prediction layout lacks feature {feature}"))
+                })
+                .collect::<anyhow::Result<Vec<usize>>>()?;
+            gathered = project_canonical_rows(data, n_rows, layout.len(), &positions)?;
             &gathered
         };
         let col_init: Option<Vec<f32>> =
@@ -1535,6 +1542,18 @@ fn score_multi_output_batch(
         }
     }
     Ok(margins)
+}
+
+/// Ascending union of the canonical features the output views of a
+/// multi-output model read.
+fn union_features(infs: &[Arc<crate::inference::CompactInferenceModel>]) -> Vec<usize> {
+    let mut union: Vec<usize> = infs
+        .iter()
+        .flat_map(|inf| inf.canonical_features().iter().copied())
+        .collect();
+    union.sort_unstable();
+    union.dedup();
+    union
 }
 
 fn project_canonical_rows(
@@ -2111,7 +2130,7 @@ impl PyModel {
         let canonical_n_features = self.inner.n_features;
         let upto = n_trees.unwrap_or(self.inner.trees.len());
         let k_out = self.inner.num_outputs();
-        // 多分类:文件只读一遍。每个 batch 按**完整**规范特征投影一次,
+        // 多分类:文件只读一遍。每个 batch 只读各类别视图用到的特征的**并集**,
         // 然后每个类别视图在内存里 gather 自己(压缩过)的特征子集、用自己的
         // 单输出预测器打分,按行交错后做 softmax / argmax。
         let multiclass: Option<MulticlassPredictors> = if k_out > 1 {
@@ -2130,9 +2149,10 @@ impl PyModel {
         } else {
             None
         };
-        let projected_features: Vec<usize> = match &single {
-            Some(inference) => inference.canonical_features().to_vec(),
-            None => (0..canonical_n_features).collect(),
+        let projected_features: Vec<usize> = match (&single, &multiclass) {
+            (Some(inference), _) => inference.canonical_features().to_vec(),
+            (None, Some((_, infs))) => union_features(infs),
+            (None, None) => unreachable!("either a single or a multi-output predictor"),
         };
         let n_features = projected_features.len();
         let mut out: Vec<f32> = Vec::new();
@@ -2242,7 +2262,7 @@ impl PyModel {
                                 upto,
                                 data,
                                 n_rows,
-                                canonical_n_features,
+                                &projected_features,
                                 gpu_batch,
                                 workers,
                                 &mut predict_pool,
@@ -3942,6 +3962,9 @@ fn train_file(
         .map_err(|e| PyValueError::new_err(format!("{e}")))?
         .with_qid(qid_owned.as_deref())
         .with_base_margin(&margin_names);
+    if !prior_names.is_empty() {
+        targets = targets.with_features(&prior_names);
+    }
     // **peek schema → 定 blocking → 才真正 open**。Parquet / CSV 在 open
     // 之前不知道特征数,而自动选块宽需要它;单独 peek 一次(只读 footer /
     // 只推断 schema,不解压数据)就能把策略决定留在这一层,
@@ -3962,9 +3985,6 @@ fn train_file(
             "feature_types 有 {} 项,文件有 {n_features} 个特征列(不含标签/权重列)",
             cfg.categorical.len()
         )));
-    if !prior_names.is_empty() {
-        targets = targets.with_features(&prior_names);
-    }
     }
     let categorical_flags = cfg.categorical.clone();
     let targets = targets

@@ -336,6 +336,25 @@ impl Model {
             .then_some(SchemaMode::Named)
     }
 
+    /// Ascending, de-duplicated ids of the features that any of the first
+    /// `n_trees` trees splits on. Never empty (feature 0 stands in for a model
+    /// without splits), so a reader always has one column to count rows by.
+    pub fn used_split_features(&self, n_trees: usize) -> Vec<usize> {
+        let mut used: Vec<usize> = self.trees[..n_trees.min(self.trees.len())]
+            .iter()
+            .flat_map(|tree| tree.nodes.iter())
+            .filter(|node| !node.is_leaf)
+            .map(|node| node.feat as usize)
+            .filter(|&feature| feature < self.n_features)
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        if used.is_empty() {
+            used.push(0);
+        }
+        used
+    }
+
     /// 每行几个输出:多分类是 `num_class`,其余 1。
     pub fn num_outputs(&self) -> usize {
         self.class_base_margins.len().max(1)
@@ -1350,6 +1369,20 @@ mod tests {
         m.feature_names = Vec::new();
         m.schema_mode = Some(SchemaMode::Named);
         assert_eq!(m.file_schema_mode(), Some(SchemaMode::Named));
+    }
+
+    #[test]
+    fn used_split_features_is_sorted_unique_and_never_empty() {
+        let mut m = fixture_model();
+        m.n_features = 5;
+        assert_eq!(m.used_split_features(1), vec![0, 1]);
+        assert_eq!(m.used_split_features(99), vec![0, 1]);
+        m.trees.clear();
+        assert_eq!(m.used_split_features(0), vec![0]);
+        // Splits beyond the declared width are ignored rather than indexed.
+        let mut m = fixture_model();
+        m.n_features = 1;
+        assert_eq!(m.used_split_features(1), vec![0]);
     }
 
     fn many_tree_model(n_trees: usize) -> Model {
