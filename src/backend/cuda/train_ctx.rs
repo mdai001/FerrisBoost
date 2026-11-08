@@ -33,6 +33,25 @@ use super::{device_state, DeviceState, SharedHistogramConfig};
 /// `gpair_max_abs` / `gpair_quantize` 的 launch 几何。两个 kernel 都是
 /// grid-stride,所以 block 数只要够填满卡,不随行数线性增长。
 const GPAIR_THREADS: usize = 256;
+
+/// Terminal nodes per `assign_leaf_values_batched` launch; must equal
+/// `FB_LEAF_BATCH` in histogram.cu. The table is a kernel parameter.
+const LEAF_BATCH: usize = 64;
+
+/// Kernel-parameter layout of `LeafBatch` in histogram.cu.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LeafBatch {
+    n: u32,
+    blk_ptr: [u32; LEAF_BATCH + 1],
+    offset: [u32; LEAF_BATCH],
+    len: [u32; LEAF_BATCH],
+    value: [f32; LEAF_BATCH],
+}
+
+// SAFETY: plain `repr(C)` integers and floats with the same layout as the
+// CUDA struct, passed by value as a kernel parameter.
+unsafe impl cudarc::driver::DeviceRepr for LeafBatch {}
 const GPAIR_BLOCKS: usize = 1024;
 /// fast 的 device scale 结果:`[grad_scale, hess_scale, max_grad, max_hess]`。
 const GPAIR_SCALE_WORDS: usize = 4;
@@ -606,6 +625,7 @@ pub struct GpuTrainCtx {
     partition_batch_scan_fn: CudaFunction,
     partition_batch_scatter_fn: CudaFunction,
     assign_leaf_fn: CudaFunction,
+    assign_leaves_fn: CudaFunction,
     init_tree_fn: CudaFunction,
     start_event: CudaEvent,
     end_event: CudaEvent,
@@ -953,6 +973,10 @@ impl GpuTrainCtx {
             .module
             .load_function("assign_leaf_value")
             .context("PTX 中找不到 assign_leaf_value")?;
+        let assign_leaves_fn = state
+            .module
+            .load_function("assign_leaf_values_batched")
+            .context("assign_leaf_values_batched missing from the PTX")?;
         let init_tree_fn = state
             .module
             .load_function("init_tree_rows")
@@ -1635,6 +1659,7 @@ impl GpuTrainCtx {
             partition_batch_scan_fn,
             partition_batch_scatter_fn,
             assign_leaf_fn,
+            assign_leaves_fn,
             init_tree_fn,
             start_event,
             end_event,
@@ -1995,6 +2020,54 @@ impl GpuTrainCtx {
             .arg(&value)
             .arg(prediction_delta);
         unsafe { launch.launch(cfg) }.context("launch assign_leaf_value")?;
+        Ok(())
+    }
+
+    /// Assign several terminal nodes' values in one launch per
+    /// [`LEAF_BATCH`] nodes (instead of one launch per node). The rows of all
+    /// spans must be disjoint, which holds for the terminal nodes of one tree.
+    pub fn assign_leaf_values(&self, leaves: &[(GpuRowSpan, f32)]) -> Result<()> {
+        for (span, _) in leaves {
+            if span.offset.saturating_add(span.len) > self.n_rows {
+                bail!("leaf row span out of range: {span:?}");
+            }
+        }
+        const THREADS: u32 = 256;
+        let mut buf = self.lock()?;
+        let GpuBuffers {
+            rows,
+            prediction_delta,
+            ..
+        } = &mut *buf;
+        let nonempty: Vec<_> = leaves.iter().filter(|(span, _)| span.len > 0).collect();
+        for chunk in nonempty.chunks(LEAF_BATCH) {
+            let mut batch = LeafBatch {
+                n: chunk.len() as u32,
+                blk_ptr: [0; LEAF_BATCH + 1],
+                offset: [0; LEAF_BATCH],
+                len: [0; LEAF_BATCH],
+                value: [0.0; LEAF_BATCH],
+            };
+            let mut blocks = 0u32;
+            for (i, (span, value)) in chunk.iter().enumerate() {
+                batch.blk_ptr[i] = blocks;
+                batch.offset[i] = span.offset as u32;
+                batch.len[i] = span.len as u32;
+                batch.value[i] = *value;
+                blocks = blocks
+                    .checked_add((span.len as u32).div_ceil(THREADS))
+                    .context("leaf batch grid exceeds u32")?;
+            }
+            batch.blk_ptr[chunk.len()] = blocks;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(&self.assign_leaves_fn);
+            launch.arg(&*rows).arg(&mut *prediction_delta).arg(&batch);
+            unsafe { launch.launch(cfg) }.context("launch assign_leaf_values_batched")?;
+        }
         Ok(())
     }
 

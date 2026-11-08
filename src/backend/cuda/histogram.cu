@@ -2350,6 +2350,41 @@ extern "C" __global__ void assign_leaf_value(
     }
 }
 
+// Up to `FB_LEAF_BATCH` terminal nodes in one launch. The table travels as a
+// kernel parameter (well under the 4 KB parameter limit), so a level's leaves
+// cost one launch and no H2D. `blk_ptr` is the exclusive prefix of per-leaf CTA
+// counts; leaf `i` owns CTAs [blk_ptr[i], blk_ptr[i+1]). Every row belongs to
+// exactly one terminal node, so the stores are disjoint and order free.
+#define FB_LEAF_BATCH 64u
+struct LeafBatch {
+    uint32_t n;
+    uint32_t blk_ptr[FB_LEAF_BATCH + 1];
+    uint32_t offset[FB_LEAF_BATCH];
+    uint32_t len[FB_LEAF_BATCH];
+    float value[FB_LEAF_BATCH];
+};
+
+extern "C" __global__ void assign_leaf_values_batched(
+    const uint32_t* rows,
+    float* prediction_delta,
+    const LeafBatch batch) {
+    // Largest i with blk_ptr[i] <= blockIdx.x (empty leaves own no CTA).
+    uint32_t lo = 0;
+    uint32_t hi = batch.n;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (batch.blk_ptr[mid] <= blockIdx.x) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const uint32_t j = (blockIdx.x - batch.blk_ptr[lo]) * blockDim.x + threadIdx.x;
+    if (j < batch.len[lo]) {
+        prediction_delta[rows[batch.offset[lo] + j]] = batch.value[lo];
+    }
+}
+
 extern "C" __global__ void init_tree_rows(
     uint32_t n_rows,
     uint32_t* rows,

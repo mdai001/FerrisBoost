@@ -3518,13 +3518,15 @@ fn build_tree(
         let _next_phase = crate::diagnostic::Phase::new(b"fb.host.next_level\0");
         let _t = prof::Timer::new(&prof::NEXT_LEVEL);
         let mut next: Vec<LevelNode> = Vec::new();
+        // GPU 终叶整层攒起来,一次 launch 写完(见 `assign_leaf_values`)。
+        let mut gpu_leaves: Vec<(crate::backend::cuda::GpuRowSpan, f32)> = Vec::new();
         for (i, ln) in level.into_iter().enumerate() {
             let Some(c) = chosen[i] else {
                 // 这个节点到此就是终叶。行分区已经是答案,现在直接累加
                 // 比训练结束后再沿树下降一遍便宜得多。
                 let value = t.nodes[ln.node].leaf_value;
-                if let Some(ctx) = gpu {
-                    ctx.assign_leaf_value(ln.rows.device(), value)?;
+                if gpu.is_some() {
+                    gpu_leaves.push((ln.rows.device(), value));
                 } else {
                     let _t_pred = prof::Timer::new(&prof::UPDATE_PRED);
                     for &row in ln.rows.host(&rows_cur) {
@@ -3602,6 +3604,8 @@ fn build_tree(
         drop(_t);
         parent_hists = hists;
         if let Some(ctx) = gpu {
+            // 这些行还在本层的行缓冲里;下一层的分区在同一条 stream 上排在后面。
+            ctx.assign_leaf_values(&gpu_leaves)?;
             ctx.finish_partition_level()?;
         }
         // 孩子的行已经在 `rows_next` 里;本层不分裂的叶子刚才已从 `rows_cur`
@@ -3617,10 +3621,14 @@ fn build_tree(
     {
         let _t = prof::Timer::new(&prof::UPDATE_PRED);
         if let Some(ctx) = gpu {
-            for ln in level {
-                debug_assert!(t.nodes[ln.node].is_leaf);
-                ctx.assign_leaf_value(ln.rows.device(), t.nodes[ln.node].leaf_value)?;
-            }
+            let leaves: Vec<_> = level
+                .iter()
+                .map(|ln| {
+                    debug_assert!(t.nodes[ln.node].is_leaf);
+                    (ln.rows.device(), t.nodes[ln.node].leaf_value)
+                })
+                .collect();
+            ctx.assign_leaf_values(&leaves)?;
         } else {
             let leaves: Vec<(&[RowId], f32)> = level
                 .iter()

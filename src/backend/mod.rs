@@ -297,6 +297,9 @@ pub mod cuda {
         pub fn assign_leaf_value(&self, _span: GpuRowSpan, _value: f32) -> Result<()> {
             match self.0 {}
         }
+        pub fn assign_leaf_values(&self, _leaves: &[(GpuRowSpan, f32)]) -> Result<()> {
+            match self.0 {}
+        }
         pub fn download_prediction_delta(&self) -> Result<f32> {
             match self.0 {}
         }
