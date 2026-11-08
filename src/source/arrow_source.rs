@@ -202,8 +202,9 @@ pub(crate) fn build_cuts_and_count_weighted(
 /// `build_cuts_and_count_weighted` with categorical features.
 ///
 /// `categorical[f]` marks feature `f` (in batch column order, weights
-/// excluded) as categorical; an empty slice means "none declared". Dictionary
-/// typed columns are categorical regardless of the list. A categorical
+/// excluded) as categorical; an empty slice means "none declared", and then
+/// dictionary-typed columns are detected as categorical. A non-empty list is
+/// authoritative (a dictionary column declared "q" is numeric). A categorical
 /// feature's cuts are one bin per integer code `0..=max_code`.
 ///
 /// Feature values equal to `missing` are skipped by the sketch like NaN (NaN =
@@ -281,10 +282,12 @@ pub(crate) fn build_cuts_and_count_typed(
                 .take(n_feats)
                 .map(|f| f.name().clone())
                 .collect();
+            // An explicit feature_types list decides; otherwise dictionary-typed
+            // columns are detected as categorical (same rule as in-memory input).
             let flags: Vec<bool> = (0..n_feats)
-                .map(|f| {
-                    categorical.get(f).copied().unwrap_or(false)
-                        || matches!(schema.field(f).data_type(), DataType::Dictionary(_, _))
+                .map(|f| match categorical.get(f) {
+                    Some(&declared) => declared,
+                    None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
                 })
                 .collect();
             sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));

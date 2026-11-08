@@ -630,3 +630,57 @@ def test_fractional_validation_category_scores_like_predict():
     np.testing.assert_array_equal(pred, m.predict(np.trunc(xv).astype(np.float32)))
     rmse = float(np.sqrt(np.mean((pred.astype(np.float64) - yv) ** 2)))
     assert hist["v"]["rmse"][-1] == pytest.approx(rmse, rel=1e-6)
+
+
+def test_quantized_cache_rejects_reuse_without_the_categorical_types(tmp_path):
+    # A cache built with categorical features must not be reused by a run that
+    # omits feature_types: a fresh build would bin those columns as numeric.
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y, ft = make_data(n=500, cat_levels=(7,), seed=25)
+    cols = {f"f{i}": pa.array(x[:, i]) for i in range(x.shape[1])}
+    cols["label"] = pa.array(y)
+    path = str(tmp_path / "c.parquet")
+    pq.write_table(pa.table(cols), path)
+    p = {"objective": "reg:squarederror", "max_depth": 3, "nthread": 1, "cache_path": str(tmp_path / "cache")}
+    fb.train(p, path, label="label", num_boost_round=2, feature_types=ft, quiet=True)
+    with pytest.raises(Exception, match="feature_types"):
+        fb.train(p, path, label="label", num_boost_round=2, quiet=True)
+
+
+def test_quantized_cache_reuses_a_dictionary_column_declared_numeric(tmp_path):
+    # An explicit feature_types list is authoritative for files too: a numeric
+    # dictionary column declared "q" trains as numeric, and the same
+    # declaration reuses the cache it built. Without a declaration the
+    # dictionary column is categorical, which does not match that cache.
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y, _ = make_data(n=600, cat_levels=(6,), seed=26)
+    table = pa.table({"a": pa.array(x[:, 0]), "b": pa.array(x[:, 1]),
+                      "c": pa.array(x[:, 2].astype(np.int64)).dictionary_encode(), "label": pa.array(y)})
+    path = str(tmp_path / "d.parquet")
+    pq.write_table(table, path)
+    p = {"objective": "reg:squarederror", "max_depth": 3, "nthread": 1, "base_score": 0.5,
+         "cache_path": str(tmp_path / "cache")}
+    first = fb.train(p, path, label="label", num_boost_round=3, feature_types=["q", "q", "q"], quiet=True)
+    second = fb.train(p, path, label="label", num_boost_round=3, feature_types=["q", "q", "q"], quiet=True)
+    np.testing.assert_array_equal(first.predict(x, output_margin=True), second.predict(x, output_margin=True))
+    numeric = fb.train({k: v for k, v in p.items() if k != "cache_path"}, x, label=y, num_boost_round=3, quiet=True)
+    np.testing.assert_array_equal(first.predict(x, output_margin=True), numeric.predict(x, output_margin=True))
+    with pytest.raises(Exception, match="feature_types"):
+        fb.train(p, path, label="label", num_boost_round=3, quiet=True)
+
+
+@pytest.mark.parametrize("index_type", ["int8", "int16", "int32", "int64"])
+def test_arrow_dictionary_indices_of_any_width(index_type):
+    # pandas category columns become Arrow dictionaries with int8 indices.
+    pa = pytest.importorskip("pyarrow")
+    x, y, ft = make_data(n=600, cat_levels=(6,), seed=27)
+    idx = pa.array(x[:, 2].astype(index_type))
+    codes = pa.DictionaryArray.from_arrays(idx, pa.array(np.arange(6, dtype=np.int64)))
+    table = pa.table({"a": pa.array(x[:, 0]), "b": pa.array(x[:, 1]), "c": codes})
+    p = {"objective": "reg:squarederror", "max_depth": 3, "nthread": 1, "base_score": 0.5,
+         "enable_categorical": True}
+    m = fb.train(p, table, label=y, num_boost_round=3, quiet=True)
+    ref = fb.train(p, x, label=y, num_boost_round=3, feature_types=ft, quiet=True)
+    np.testing.assert_array_equal(m.predict(table, output_margin=True), ref.predict(x, output_margin=True))

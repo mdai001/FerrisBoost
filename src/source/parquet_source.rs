@@ -453,6 +453,37 @@ fn feature_columns<'a>(
     targets.select_features(&columns)
 }
 
+/// The final categorical flags of the feature columns `feat_cols`, resolved
+/// exactly as a fresh cut build does: an explicit `declared` list decides;
+/// without one, dictionary-typed columns are categorical.
+fn resolve_categorical_flags(
+    path: &Path,
+    feat_cols: &[usize],
+    declared: Option<&[bool]>,
+) -> anyhow::Result<Vec<bool>> {
+    let declared = declared.unwrap_or(&[]);
+    anyhow::ensure!(
+        declared.is_empty() || declared.len() == feat_cols.len(),
+        "feature_types has {} entries but the data has {} feature columns",
+        declared.len(),
+        feat_cols.len()
+    );
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    Ok(feat_cols
+        .iter()
+        .enumerate()
+        .map(|(f, &col)| match declared.get(f) {
+            Some(&d) => d,
+            None => matches!(
+                schema.field(col).data_type(),
+                arrow::datatypes::DataType::Dictionary(_, _)
+            ),
+        })
+        .collect())
+}
+
 /// 读一整列 f32(单文件 parquet 的权重列用)。不量化、不留其它列。
 #[cfg_attr(not(feature = "python"), allow(dead_code))] // Called from the Python ingest path.
 pub(crate) fn read_f32_column(path: impl AsRef<Path>, name: &str) -> anyhow::Result<Vec<f32>> {
@@ -1439,16 +1470,19 @@ impl ParquetBlockSource {
             describe_missing(manifest.missing_bits),
             describe_missing(missing_bits(targets.missing))
         );
-        // A run that declares feature types must match the cached binning:
-        // a categorical feature and a numeric one bin differently.
-        if let Some(flags) = targets.categorical {
-            let cached = |f: usize| manifest.categorical.get(f).copied().unwrap_or(false);
-            anyhow::ensure!(
-                flags.len() == manifest.n_features
-                    && (0..flags.len()).all(|f| flags[f] == cached(f)),
-                "缓存的特征类型(categorical)和本次 feature_types 不一致"
-            );
-        }
+        // The cached binning is only valid for the same final feature types.
+        // Resolve them exactly as a fresh build does (declared "c", or a
+        // dictionary-typed column when nothing is declared), then compare:
+        // omitting `feature_types` on a cache built with categorical features
+        // must not silently keep training them as categorical, and the same
+        // declaration must always reuse the cache it built.
+        let resolved = resolve_categorical_flags(&path, &feat_cols, targets.categorical)?;
+        let cached = |f: usize| manifest.categorical.get(f).copied().unwrap_or(false);
+        anyhow::ensure!(
+            (0..manifest.n_features).all(|f| resolved[f] == cached(f)),
+            "缓存的特征类型(categorical)和本次解析出的特征类型不一致\
+             (feature_types 参数或文件里的字典列变了);请换一个 cache_path 或重建缓存"
+        );
         let cuts = BinCuts::new(
             manifest
                 .cuts_values_bits
