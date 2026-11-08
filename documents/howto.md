@@ -816,10 +816,9 @@ value; negative, fractional, or larger values raise `ValueError`. One feature
 can have at most 65,534 categories, because the two largest bins are reserved:
 one for missing values and one for categories seen only at validation or
 prediction time, which always go left, as in prediction. At validation and prediction time a fractional value is read as its integer part (`1.5` is category `1`), as in XGBoost; training data must hold whole codes. A feature
-whose largest code is at most 253 is stored with 8-bit bins; a larger code
-stores that feature (only) with 16-bit bins. GPU training supports 8-bit
-categorical features only in this version (codes up to 253) and reports an
-error for a larger code. XGBoost allows codes up to 2^24.
+whose largest code is at most 253 is stored with one byte per value; a larger
+code stores that feature (only) with two bytes per value. CPU and GPU training
+support the full range. XGBoost allows codes up to 2^24.
 Codes need not be contiguous, but each code up to the feature's largest costs one
 histogram bin, so prefer compact codes.
 
@@ -831,7 +830,8 @@ the training categories.
 Split search follows XGBoost:
 
 - a feature with fewer than `max_cat_to_onehot` categories (default 4) is split
-  one-versus-rest;
+  one-versus-rest (a large `max_cat_to_onehot` over thousands of categories is
+  slow);
 - otherwise the categories are sorted by their leaf weight and prefixes of that
   order are scanned, at most `max_cat_threshold` (default 64) per direction;
 - both missing-value directions are tried, and ties resolve to the earlier
@@ -853,7 +853,7 @@ category decisions and bit-identical results (see [Prediction](#prediction)).
 
 Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
 `feature_types` list) and load in XGBoost in both directions. A loaded XGBoost
-model may use category ids above 254; prediction follows its sets, with
+model may use category ids above 65533; prediction follows its sets, with
 unknown or invalid values going left.
 
 On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
@@ -1281,7 +1281,8 @@ individual column blocks efficiently, so it is fully quantized in memory.
 Cache settings belong in the parameter dictionary.
 
 `cache_budget_bytes` limits how much quantized feature data may remain in
-memory. Data beyond the budget spills to local files:
+memory (one byte per value, two for features with more than 255 bins or
+categorical codes above 253). Data beyond the budget spills to local files:
 
 ```python
 model = fb.train(
@@ -1698,7 +1699,7 @@ empty `evals_result()`.
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
-| `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 16-bit storage (CPU only for now) |
+| `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 2 bytes per value instead of 1 (CPU and GPU) |
 | `eta` | `0.3` | Alias: `learning_rate` |
 | `lambda` | `1.0` | Alias: `reg_lambda` |
 | `gamma` | `0.0` | Minimum split loss |
@@ -1729,7 +1730,7 @@ empty `evals_result()`.
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 | `missing` | `NaN` | Feature value treated exactly like `NaN` (XGBoost's `DMatrix` `missing`), in training, validation, and prediction. Finite `float32` or `NaN`; `inf` and `float32` max are rejected. Not stored in the model: pass the same `missing` to `predict`. See [Missing values](#missing-values-and-the-missing-sentinel) |
 | `enable_categorical` | `False` | Detect pandas `category` and PyArrow dictionary columns as categorical features; see [Categorical features](#categorical-features) |
-| `max_cat_to_onehot` | `4` | Categorical features with fewer categories than this use one-vs-rest splits, the others sorted-partition splits (`>= 1`) |
+| `max_cat_to_onehot` | `4` | Categorical features with fewer categories than this use one-vs-rest splits, the others sorted-partition splits (`>= 1`). Large values over thousands of categories are slow |
 | `max_cat_threshold` | `64` | Most categories a partition split scans per direction (`>= 1`) |
 
 Unknown parameters raise `ValueError`; they are not silently ignored.
@@ -1872,8 +1873,6 @@ or a sorted list such as `[0.1, 0.5, 0.9]`.
   hold integer codes in `0..=65533`, with `NaN` or null for a missing value.
   Negative, fractional, or larger codes are rejected; re-encode the categories
   compactly. A feature can have at most 65,534 categories.
-- `GPU training does not support 16-bit bin columns yet`: a categorical feature
-  has a code above 253 (or `max_bin` is above 255); train on the CPU.
 - `... is a category dtype` / `... is a dictionary type`: set
   `params["enable_categorical"] = True` (or declare the column with
   `feature_types`) so a categorical column is never trained as one by accident.

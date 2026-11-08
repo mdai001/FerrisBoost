@@ -48,7 +48,8 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
 * `enable_categorical` / `feature_types` / `max_cat_to_onehot` / `max_cat_threshold`
   转给 `ferrisboost.train`。pandas `category` 列在 `fit` / `predict` /
   `predict_proba` / `apply` 里都可用;估计器记住训练时的类别表,预测时按**取值**
-  重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
+  重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。每个特征最多
+  65534 个类别(码 0..=65533),`max_bin` 取 1..=65535,CPU 和 GPU 相同。
 * `fit(..., base_margin=, base_margin_eval_set=, init_model=)`(XGBoost 的 `xgb_model=` 同样接受)和
   `predict` / `predict_proba(..., base_margin=)` 与 XGBoost 一致:`base_margin` 是每行的
   起始 raw margin(替换 `base_score` 作为起点),`init_model` 接已有的 `Model` / 估计器 /

@@ -128,8 +128,8 @@ def train(
     params["enable_categorical"] = True, pandas category and PyArrow dictionary
     columns are detected as categorical; Parquet dictionary columns of integers
     are always categorical. Category values are integer codes in 0..=65533
-    (NaN / null = missing), so a feature has at most 65,534 categories (254 for
-    GPU training in this version); anything else raises ValueError. params["max_cat_to_onehot"]
+    (NaN / null = missing), so a feature has at most 65,534 categories, on CPU
+    and GPU; anything else raises ValueError. params["max_bin"] is 1..=65535. params["max_cat_to_onehot"]
     (default 4) and params["max_cat_threshold"] (default 64) match XGBoost.
 
     params["missing"] (default NaN) is XGBoost's DMatrix `missing`: a feature

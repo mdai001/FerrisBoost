@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** at most 65,534 categories per feature (codes `0..=65533`); GPU training supports up to 254 categories per feature in this version.
+* **Bins and categories:** `max_bin` is at most 65535, and a categorical feature has at most 65,534 categories (codes `0..=65533`).
 * **Explanations:** SHAP values, interactions, and leaf indices run on the GPU with `use_gpu=True` (bit-identical to the CPU); the device path uses GPU 0 only.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -245,6 +245,14 @@ Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
+
+### 0.0.8 (unreleased)
+
+- Added `max_bin` above 255 (up to 65535).
+- Up to 65,534 categories per feature (was 254).
+- Wide bins and many categories train on CPU and GPU.
+- GPU speed optimization for wide features.
+- Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.
 
 ### 0.0.7 (unreleased)
 

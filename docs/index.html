@@ -97,6 +97,14 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
+      <h3>0.0.8 (unreleased)</h3>
+      <ul>
+        <li>Added <code>max_bin</code> above 255 (up to 65535).</li>
+        <li>Up to 65,534 categories per feature (was 254).</li>
+        <li>Wide bins and many categories train on CPU and GPU.</li>
+        <li>GPU speed optimization for wide features.</li>
+        <li>Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.</li>
+      </ul>
       <h3>0.0.7 (unreleased)</h3>
       <ul>
         <li>Added <code>base_margin</code>.</li>
