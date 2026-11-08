@@ -1054,19 +1054,18 @@ fn prediction_parquet_writer(
         .context("创建 prediction Parquet writer 失败")?;
     let mut rows_written = 0usize;
     let mut pending: Vec<Vec<f32>> = vec![Vec::new(); n_columns];
-    let write_group = |writer: &mut ArrowWriter<std::fs::File>,
-                       columns: Vec<Vec<f32>>|
-     -> anyhow::Result<()> {
-        let arrays: Vec<ArrayRef> = columns
-            .into_iter()
-            .map(|values| Arc::new(Float32Array::from(values)) as ArrayRef)
-            .collect();
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-            .context("创建 prediction Arrow batch 失败")?;
-        writer
-            .write(&batch)
-            .context("写 prediction Parquet batch 失败")
-    };
+    let write_group =
+        |writer: &mut ArrowWriter<std::fs::File>, columns: Vec<Vec<f32>>| -> anyhow::Result<()> {
+            let arrays: Vec<ArrayRef> = columns
+                .into_iter()
+                .map(|values| Arc::new(Float32Array::from(values)) as ArrayRef)
+                .collect();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+                .context("创建 prediction Arrow batch 失败")?;
+            writer
+                .write(&batch)
+                .context("写 prediction Parquet batch 失败")
+        };
     loop {
         match receiver.recv() {
             Ok(PredictionParquetMessage::Batch(columns)) => {
@@ -2573,8 +2572,16 @@ impl PyModel {
             );
         }
         let x: PyReadonlyArray2<'py, f32> = array_input(py, data)?;
-        self.predict_array_from(py, x, output_margin, n_trees, predict_threads, use_gpu, init)
-            .map(Bound::into_any)
+        self.predict_array_from(
+            py,
+            x,
+            output_margin,
+            n_trees,
+            predict_threads,
+            use_gpu,
+            init,
+        )
+        .map(Bound::into_any)
     }
 
     #[pyo3(signature = (x, output_margin=false, n_trees=None, *,
@@ -2588,7 +2595,15 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        self.predict_array_from(py, x, output_margin, n_trees, predict_threads, use_gpu, None)
+        self.predict_array_from(
+            py,
+            x,
+            output_margin,
+            n_trees,
+            predict_threads,
+            use_gpu,
+            None,
+        )
     }
 
     /// 存成 XGBoost 能加载的 JSON。
@@ -3097,7 +3112,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                 let k: Option<u32> = get!("num_class");
                 k.unwrap_or(0)
             },
-       )
+        )
         .with_quantile_alphas(quantile_alpha.as_deref().unwrap_or(&[0.5]))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let objective = match objective {
@@ -3416,7 +3431,8 @@ fn bind_named_table<'py>(
     if !is_table {
         return Ok(data.clone());
     }
-    fb.getattr("_as_predict_matrix")?.call1((data, names.to_vec()))
+    fb.getattr("_as_predict_matrix")?
+        .call1((data, names.to_vec()))
 }
 
 /// Apply the XGBoost `missing` sentinel to array-like prediction input.
@@ -3668,7 +3684,12 @@ fn train_dense(
     let (mut train_cfg, lower_is_better) = cfg.train_config()?;
     let k_out = train_cfg.objective.num_outputs();
     if let Some(bm) = &base_margin {
-        train_cfg.base_margin = Some(margin::class_major_margin(bm, n_rows, k_out, "base_margin")?);
+        train_cfg.base_margin = Some(margin::class_major_margin(
+            bm,
+            n_rows,
+            k_out,
+            "base_margin",
+        )?);
     }
     if let Some(list) = eval_base_margins {
         for (i, item) in list.iter().enumerate() {
@@ -3944,10 +3965,14 @@ fn train_file(
         _ => {}
     }
     if qid_owned.is_some() && qid_owned.as_deref() == Some(label) {
-        return Err(PyValueError::new_err("qid column must differ from the label column"));
+        return Err(PyValueError::new_err(
+            "qid column must differ from the label column",
+        ));
     }
     if qid_owned.is_some() && qid_owned == weight_owned {
-        return Err(PyValueError::new_err("qid column must differ from the weight column"));
+        return Err(PyValueError::new_err(
+            "qid column must differ from the weight column",
+        ));
     }
     let k_out = cfg.objective.num_outputs();
     let margin_names: Vec<String> = match base_margin {
@@ -4519,7 +4544,9 @@ fn rank_score(
     }
     let group_ptr = crate::rank::group_ptr_from_qid(qid.as_slice()?).map_err(value_err)?;
     crate::rank::validate_group_ptr(&group_ptr, pred.len(), "qid").map_err(value_err)?;
-    let weight = weight.map(|w| w.as_slice().map(<[f32]>::to_vec)).transpose()?;
+    let weight = weight
+        .map(|w| w.as_slice().map(<[f32]>::to_vec))
+        .transpose()?;
     if let Some(w) = &weight {
         if w.len() != group_ptr.len() - 1 {
             return Err(PyValueError::new_err(format!(

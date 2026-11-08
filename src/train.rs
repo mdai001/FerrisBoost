@@ -1046,8 +1046,13 @@ fn validate_start_margins(
     anyhow::ensure!(
         prior.objective.quantile_alphas() == cfg.objective.quantile_alphas(),
         "续训的 quantile_alpha 是 {:?},已有模型的是 {:?}:续训必须使用相同的分位数",
-        cfg.objective.quantile_alphas().map(|a| a.as_slice().to_vec()),
-        prior.objective.quantile_alphas().map(|a| a.as_slice().to_vec())
+        cfg.objective
+            .quantile_alphas()
+            .map(|a| a.as_slice().to_vec()),
+        prior
+            .objective
+            .quantile_alphas()
+            .map(|a| a.as_slice().to_vec())
     );
     anyhow::ensure!(
         prior.num_outputs() == k,
@@ -1215,7 +1220,8 @@ fn train_with_backend(
     // One draw of the training RNG per round (XGBoost seeds the sampled pairs of
     // `lambdarank_pair_method=mean` from it); the base-score estimation takes the
     // first one when the base score is not given.
-    let mut round_seeds = ranking.map(|(_, params)| crate::rank::RoundSeeds::new(&params, cfg.params.seed));
+    let mut round_seeds =
+        ranking.map(|(_, params)| crate::rank::RoundSeeds::new(&params, cfg.params.seed));
     // Continuation: skip the draws the earlier rounds (and the base-score
     // estimation) would have consumed, so the pair sampling of N+M rounds equals
     // N continued by M. A first run with an explicit `base_score` drew one less;
@@ -2273,9 +2279,10 @@ fn train_multiclass_rounds(
                         weights,
                         &mut grads,
                     ),
-                    None => cfg
-                        .objective
-                        .softmax_gradients(&class_preds, labels, weights, &mut grads),
+                    None => {
+                        cfg.objective
+                            .softmax_gradients(&class_preds, labels, weights, &mut grads)
+                    }
                 }
             });
         }
@@ -2312,7 +2319,10 @@ fn train_multiclass_rounds(
                 let (q, root, _ms) = if multi_quantile {
                     ctx.fast_multiquantile_gradient_and_quantize(
                         class,
-                        cfg.objective.quantile_alphas().expect("multi quantile").as_slice()[class],
+                        cfg.objective
+                            .quantile_alphas()
+                            .expect("multi quantile")
+                            .as_slice()[class],
                         crate::subsample::threshold_for(cfg.params.subsample),
                         cfg.params.seed,
                         tree_index,
@@ -5641,7 +5651,9 @@ mod tests {
     fn multi_quantile_trains_one_tree_per_alpha_and_equals_single_alpha_models() {
         let (x, y, nf) = wiggly_data(2000, 5);
         let alphas = [0.1f32, 0.5, 0.9];
-        let multi_obj = Objective::quantile(0.5).with_quantile_alphas(&alphas).unwrap();
+        let multi_obj = Objective::quantile(0.5)
+            .with_quantile_alphas(&alphas)
+            .unwrap();
         let mut p = params(4, 6);
         p.nthread = 1;
         let (multi, src) = train_on(&x, &y, nf, p.clone(), multi_obj);
@@ -6152,7 +6164,11 @@ mod tests {
         };
         let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
         let mean = y.iter().sum::<f32>() / n as f32;
-        assert!((model.base_score - mean).abs() < 1e-5, "{}", model.base_score);
+        assert!(
+            (model.base_score - mean).abs() < 1e-5,
+            "{}",
+            model.base_score
+        );
         // gradient = pred - y = -1 for every row, hessian 1: leaf = +1.
         assert_eq!(model.trees[0].nodes[0].leaf_value, 1.0);
     }
@@ -6221,9 +6237,7 @@ mod tests {
         let with = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
         assert_eq!(trees_bits(&plain), trees_bits(&with));
         // A genuinely different start changes the trees.
-        let skew: Vec<f32> = (0..3 * n)
-            .map(|i| if i < n { 2.0 } else { 0.0 })
-            .collect();
+        let skew: Vec<f32> = (0..3 * n).map(|i| if i < n { 2.0 } else { 0.0 }).collect();
         let cfg = TrainConfig {
             base_margin: Some(skew),
             ..TrainConfig::new(p, obj)
@@ -6421,7 +6435,9 @@ mod tests {
         assert_eq!(full.class_base_margins, joined.class_base_margins);
         // Other quantiles (same count or not) are refused.
         for alphas in [&[0.1f32, 0.5, 0.9][..], &[0.2, 0.8][..]] {
-            let other = Objective::quantile(0.5).with_quantile_alphas(alphas).unwrap();
+            let other = Objective::quantile(0.5)
+                .with_quantile_alphas(alphas)
+                .unwrap();
             let cfg = TrainConfig {
                 base_margin: Some(vec![0.0; 120 * alphas.len()]),
                 prior_model: Some(first.clone()),

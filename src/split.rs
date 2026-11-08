@@ -1275,7 +1275,11 @@ mod tests {
         let node = case.f(case.node_sum());
         let parent = node.0 * node.0 / (node.1 + p.lambda as f64);
         let (l, r) = case.partition(c);
-        assert_eq!((l, r), (c.left, c.right), "candidate sums must match its partition");
+        assert_eq!(
+            (l, r),
+            (c.left, c.right),
+            "candidate sums must match its partition"
+        );
         let (lf, rf) = (case.f(l), case.f(r));
         (lf.0 * lf.0 / (lf.1 + p.lambda as f64) + rf.0 * rf.0 / (rf.1 + p.lambda as f64)
             - parent
@@ -1313,7 +1317,15 @@ mod tests {
                         if lf.1 < p.min_child_weight as f64 || rf.1 < p.min_child_weight as f64 {
                             continue;
                         }
-                        let g = recomputed_gain(&case, &SplitCandidate { left: l, right: r, ..cand }, &p);
+                        let g = recomputed_gain(
+                            &case,
+                            &SplitCandidate {
+                                left: l,
+                                right: r,
+                                ..cand
+                            },
+                            &p,
+                        );
                         #[allow(clippy::neg_cmp_op_on_partial_ord)]
                         if !(g > MIN_GAIN_EPS) {
                             continue;
@@ -1365,10 +1377,22 @@ mod tests {
                         -g / (h + p.lambda as f64)
                     })
                     .collect();
-                let inside_max = (0..9u32).filter(|&k| cats.contains(k)).map(|k| w[k as usize]).fold(f64::MIN, f64::max);
-                let inside_min = (0..9u32).filter(|&k| cats.contains(k)).map(|k| w[k as usize]).fold(f64::MAX, f64::min);
-                let outside_max = (0..9u32).filter(|&k| !cats.contains(k)).map(|k| w[k as usize]).fold(f64::MIN, f64::max);
-                let outside_min = (0..9u32).filter(|&k| !cats.contains(k)).map(|k| w[k as usize]).fold(f64::MAX, f64::min);
+                let inside_max = (0..9u32)
+                    .filter(|&k| cats.contains(k))
+                    .map(|k| w[k as usize])
+                    .fold(f64::MIN, f64::max);
+                let inside_min = (0..9u32)
+                    .filter(|&k| cats.contains(k))
+                    .map(|k| w[k as usize])
+                    .fold(f64::MAX, f64::min);
+                let outside_max = (0..9u32)
+                    .filter(|&k| !cats.contains(k))
+                    .map(|k| w[k as usize])
+                    .fold(f64::MIN, f64::max);
+                let outside_min = (0..9u32)
+                    .filter(|&k| !cats.contains(k))
+                    .map(|k| w[k as usize])
+                    .fold(f64::MAX, f64::min);
                 assert!(
                     inside_min >= outside_max || inside_max <= outside_min,
                     "seed {seed}: set is not contiguous in weight order"
@@ -1400,7 +1424,10 @@ mod tests {
         let c = best_categorical(&case, &p).expect("a clear split exists");
         let set: Vec<u32> = c.cats.unwrap().iter().collect();
         assert!(set == vec![0, 2, 4] || set == vec![1, 3, 5], "got {set:?}");
-        assert!(!c.missing_left || c.missing_left, "no missing rows: direction is free");
+        assert!(
+            !c.missing_left || c.missing_left,
+            "no missing rows: direction is free"
+        );
     }
 
     #[test]
@@ -1452,7 +1479,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(onehot.cats.unwrap().count(), 1);
-        assert!(part.gain >= onehot.gain, "partition sees a superset of one-hot splits here");
+        assert!(
+            part.gain >= onehot.gain,
+            "partition sees a superset of one-hot splits here"
+        );
     }
 
     #[test]
@@ -1461,7 +1491,10 @@ mod tests {
         let p = TrainParams::default();
         let a = best_categorical(&case, &p).unwrap();
         let b = best_categorical(&case, &p).unwrap();
-        assert_eq!((a.gain, a.cats, a.left, a.right), (b.gain, b.cats, b.left, b.right));
+        assert_eq!(
+            (a.gain, a.cats, a.left, a.right),
+            (b.gain, b.cats, b.left, b.right)
+        );
     }
 
     #[test]

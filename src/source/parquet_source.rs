@@ -507,7 +507,9 @@ pub(crate) fn read_u64_columns(paths: &[PathBuf], name: &str) -> anyhow::Result<
     for path in paths {
         let col = column_index(path, name)?;
         for batch in batch_reader(path, &[col], BATCH_SIZE)? {
-            out.extend(crate::source::arrow_source::column_as_u64(&batch?, 0, name)?);
+            out.extend(crate::source::arrow_source::column_as_u64(
+                &batch?, 0, name,
+            )?);
         }
     }
     Ok(out)
@@ -775,15 +777,13 @@ pub(crate) fn open_many_observed<'a>(
         (c, _) => c,
     };
     let source = match cuts {
-        Some(c) => {
-            ArrowSource::with_cuts_and_nthread_missing(
-                || feats(true),
-                c,
-                cols_per_block,
-                bins_plan.1,
-                targets.missing,
-            )?
-        }
+        Some(c) => ArrowSource::with_cuts_and_nthread_missing(
+            || feats(true),
+            c,
+            cols_per_block,
+            bins_plan.1,
+            targets.missing,
+        )?,
         None => ArrowSource::new_typed_with_phase_threads(
             feats,
             max_bins,
@@ -1411,7 +1411,10 @@ impl ParquetBlockSource {
             source_mtime_ns,
             label: targets.label.to_string(),
             weight: targets.weight.map(str::to_string),
-            base_margin: targets.base_margin.map(<[String]>::to_vec).unwrap_or_default(),
+            base_margin: targets
+                .base_margin
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
             qid: targets.qid.map(str::to_string),
             max_bins,
             cols_per_block,
@@ -1883,7 +1886,8 @@ impl ParquetBlockSource {
             let batch = batch?;
             let n = batch.num_rows();
             for (local, &f) in feat_ids.iter().enumerate() {
-                let values = crate::source::arrow_source::feature_as_f32(&batch, local, self.missing)?;
+                let values =
+                    crate::source::arrow_source::feature_as_f32(&batch, local, self.missing)?;
                 let dst = &mut out[local * n_rows + row_base..][..n];
                 for (slot, v) in dst.iter_mut().zip(values) {
                     // null 和 NaN 都是缺失
@@ -2852,7 +2856,11 @@ mod tests {
         let (first, _) = open(-999.0).unwrap();
         assert_eq!(first.parquet_load_count(), first.n_blocks());
         let (second, _) = open(-999.0).unwrap();
-        assert_eq!(second.parquet_load_count(), 0, "same sentinel reuses the cache");
+        assert_eq!(
+            second.parquet_load_count(),
+            0,
+            "same sentinel reuses the cache"
+        );
         for other in [0.0, f32::NAN] {
             let Err(err) = open(other) else {
                 panic!("a cache built for a different sentinel must be rejected");

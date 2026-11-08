@@ -154,11 +154,11 @@ pub(crate) fn read_u64_column(
             .fields()
             .iter()
             .position(|f| f.name() == name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("{} 里没有列 {name:?}", path.display())
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("{} 里没有列 {name:?}", path.display()))?;
         for batch in batch_reader(path, schema, has_header, vec![col])? {
-            out.extend(crate::source::arrow_source::column_as_u64(&batch?, 0, name)?);
+            out.extend(crate::source::arrow_source::column_as_u64(
+                &batch?, 0, name,
+            )?);
         }
     }
     Ok(out)

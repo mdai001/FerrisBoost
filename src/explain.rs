@@ -1016,14 +1016,20 @@ mod tests {
         let model = model_of(trees, nf, 1);
         // Codes 0..6 (5 is outside every set), invalid values, and missing.
         let pool = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, -1.0, 40.0, f32::NAN];
-        let rows: Vec<f32> = (0..16 * nf).map(|_| pool[(rng.next() % 9) as usize]).collect();
+        let rows: Vec<f32> = (0..16 * nf)
+            .map(|_| pool[(rng.next() % 9) as usize])
+            .collect();
         let out = run(&model, Kind::Contribs { approx: false }, &rows, 1);
         let nc = nf + 1;
         for (r, feats) in rows.chunks_exact(nf).enumerate() {
             let expect = brute_shap(&model, 0, feats);
             for c in 0..nc {
                 let got = out[r * nc + c] as f64;
-                assert!((got - expect[c]).abs() < 2e-5, "row {r} col {c}: {got} vs {}", expect[c]);
+                assert!(
+                    (got - expect[c]).abs() < 2e-5,
+                    "row {r} col {c}: {got} vs {}",
+                    expect[c]
+                );
             }
             // Contributions sum to the margin, which follows the same decisions.
             let sum: f64 = (0..nc).map(|c| out[r * nc + c] as f64).sum();
@@ -1036,7 +1042,11 @@ mod tests {
                 let mut i = 0usize;
                 while !tree.nodes[i].is_leaf {
                     let n = &tree.nodes[i];
-                    i = if n.goes_left(feats[n.feat as usize]) { n.left } else { n.right } as usize;
+                    i = if n.goes_left(feats[n.feat as usize]) {
+                        n.left
+                    } else {
+                        n.right
+                    } as usize;
                 }
                 assert_eq!(leaves[r * model.trees.len() + t], i as f32);
             }

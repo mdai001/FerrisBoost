@@ -150,7 +150,9 @@ impl<'a> Targets<'a> {
         name == self.label
             || self.weight == Some(name)
             || self.qid == Some(name)
-            || self.base_margin.is_some_and(|cols| cols.iter().any(|c| c == name))
+            || self
+                .base_margin
+                .is_some_and(|cols| cols.iter().any(|c| c == name))
     }
 }
 
@@ -379,7 +381,9 @@ mod targets_tests {
         let cols = ["label", "b", "w", "a", "c"];
         let t = Targets::new("label", Some("w")).unwrap();
         // a qid column is excluded from the features too
-        let q = Targets::new("label", Some("w")).unwrap().with_qid(Some("b"));
+        let q = Targets::new("label", Some("w"))
+            .unwrap()
+            .with_qid(Some("b"));
         assert_eq!(
             q.select_features(&cols).unwrap(),
             (vec![3, 4], vec!["a".into(), "c".into()])

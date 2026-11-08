@@ -146,9 +146,7 @@ fn fast_quantile_first_round_matches_host_formulas() {
                 acc.hess += f.hess;
                 acc
             });
-            let (dq, dsum, _) = ctx
-                .fast_gradient_and_quantize(obj, u64::MAX, 0, 0)
-                .unwrap();
+            let (dq, dsum, _) = ctx.fast_gradient_and_quantize(obj, u64::MAX, 0, 0).unwrap();
             let what = format!("n_rows={n_rows} weighted={weighted}");
             assert_eq!(dq.grad_scale(), hq.grad_scale(), "{what}: grad scale");
             assert_eq!(dq.hess_scale(), hq.hess_scale(), "{what}: hess scale");
@@ -161,9 +159,7 @@ fn fast_quantile_first_round_matches_host_formulas() {
                 "{what}: device {dsum:?} vs host {host_sum:?}"
             );
             // Repeating the call (delta is still zero) reproduces it exactly.
-            let (dq2, dsum2, _) = ctx
-                .fast_gradient_and_quantize(obj, u64::MAX, 0, 0)
-                .unwrap();
+            let (dq2, dsum2, _) = ctx.fast_gradient_and_quantize(obj, u64::MAX, 0, 0).unwrap();
             assert_eq!(dq2.grad_scale(), dq.grad_scale());
             assert_eq!(dsum2, dsum, "{what}: repeat differs");
         }

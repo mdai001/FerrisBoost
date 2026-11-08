@@ -65,9 +65,17 @@ fn data(n: usize) -> (Vec<f32>, Vec<f32>, usize, Vec<bool>) {
     let mut y = Vec::new();
     for i in 0..n {
         let a = ((i * 7) % 9) as f32;
-        let b = if i % 11 == 0 { f32::NAN } else { ((i * 5) % 6) as f32 };
+        let b = if i % 11 == 0 {
+            f32::NAN
+        } else {
+            ((i * 5) % 6) as f32
+        };
         let c1 = ((i * 3 + i / 7) % 5) as f32;
-        let c2 = if i % 13 == 0 { f32::NAN } else { ((i * 17 + i / 5) % 40) as f32 };
+        let c2 = if i % 13 == 0 {
+            f32::NAN
+        } else {
+            ((i * 17 + i / 5) % 40) as f32
+        };
         let up = matches!(c1 as i32, 1 | 3) || matches!(c2 as i32, 2 | 5 | 9 | 21 | 33);
         x.extend([a, b, c1, c2]);
         y.push(if up { 1.0 } else { 0.0 } + 0.05 * a);

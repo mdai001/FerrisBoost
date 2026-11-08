@@ -1441,7 +1441,9 @@ impl GpuTrainCtx {
         let qt_scratch = if fast_math {
             Some(
                 stream
-                    .alloc_zeros::<f64>(crate::gpu_mem_plan::QUANTILE_REDUCE_BLOCKS as usize * 2 + 1)
+                    .alloc_zeros::<f64>(
+                        crate::gpu_mem_plan::QUANTILE_REDUCE_BLOCKS as usize * 2 + 1,
+                    )
                     .context("fast quantile 归约暂存分配")?,
             )
         } else {
@@ -2211,8 +2213,8 @@ impl GpuTrainCtx {
             // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
             // 归约几何(grid-stride,和 `gpair_quantize` 一致)。
             let threads = GPAIR_THREADS as u32;
-            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
-                .context("归约 block 数超过 u32")?;
+            let blocks =
+                u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
             let GpuBuffers {
                 pred_resident,
                 label_resident,
@@ -2463,8 +2465,8 @@ impl GpuTrainCtx {
         {
             // 同时产出每 block 的 max,launch 几何 = 归约几何。
             let threads = GPAIR_THREADS as u32;
-            let blocks = u32::try_from(buf.gpair_max_host.len() / 2)
-                .context("归约 block 数超过 u32")?;
+            let blocks =
+                u32::try_from(buf.gpair_max_host.len() / 2).context("归约 block 数超过 u32")?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (threads, 1, 1),

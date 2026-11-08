@@ -18,7 +18,11 @@ use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
 
 /// A query-id column as u64. Integer columns of any width, and floating point
 /// columns holding integral values; nulls and negative values are errors.
-pub(crate) fn column_as_u64(batch: &RecordBatch, col: usize, name: &str) -> anyhow::Result<Vec<u64>> {
+pub(crate) fn column_as_u64(
+    batch: &RecordBatch,
+    col: usize,
+    name: &str,
+) -> anyhow::Result<Vec<u64>> {
     use arrow::array::{cast::AsArray, ArrayRef};
     use arrow::compute::cast;
     use arrow::datatypes::{Float64Type, UInt64Type};
@@ -1083,7 +1087,12 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
         let ints = RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from(vec![Some(5), Some(-999), None, Some(0)]))],
+            vec![Arc::new(Int64Array::from(vec![
+                Some(5),
+                Some(-999),
+                None,
+                Some(0),
+            ]))],
         )
         .unwrap();
         let v = feature_as_f32(&ints, 0, -999.0).unwrap();
@@ -1099,8 +1108,11 @@ mod tests {
     fn sentinel_does_not_disable_the_inf_and_max_checks() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float32, false)]));
         let mk = |v: f32| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float32Array::from(vec![1.0, v]))])
-                .unwrap()
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Float32Array::from(vec![1.0, v]))],
+            )
+            .unwrap()
         };
         assert!(feature_as_f32(&mk(f32::INFINITY), 0, -999.0).is_err());
         assert!(feature_as_f32(&mk(f32::MAX), 0, -999.0).is_err());
@@ -1159,8 +1171,9 @@ mod tests {
     fn two_pass_source_with_sentinel_equals_source_with_nulls() {
         let bs = sentinel_batches(-999.0);
         let nan_bs = batches();
-        let a = ArrowSource::new_typed_with_phase_threads(|_| Ok(feed(&bs)), 16, 2, 1, 1, &[], -999.0)
-            .unwrap();
+        let a =
+            ArrowSource::new_typed_with_phase_threads(|_| Ok(feed(&bs)), 16, 2, 1, 1, &[], -999.0)
+                .unwrap();
         let b = ArrowSource::new(|| Ok(feed(&nan_bs)), 16, 2).unwrap();
         // Column b matches in bins; columns a / c hold identical data.
         for row in 0..6 {

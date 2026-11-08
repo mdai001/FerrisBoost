@@ -474,9 +474,9 @@ impl GpuBlockSession<'_> {
         let _submit_phase = crate::diagnostic::Phase::new(b"fb.host.packet_submit\0");
         let packet_stride = cache.packet_stride;
         let stride_arg = packet_stride as u32;
-        let mut packet_output = cache.packets.slice_mut(
-            packet_offset * packet_stride..(packet_offset + nodes) * packet_stride,
-        );
+        let mut packet_output = cache
+            .packets
+            .slice_mut(packet_offset * packet_stride..(packet_offset + nodes) * packet_stride);
         let nodes_fn = if cache.cat_enabled {
             self.ctx.split_nodes_cat_fn.as_ref()
         } else {

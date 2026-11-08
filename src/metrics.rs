@@ -437,10 +437,9 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
         Objective::Quantile { alphas } if alphas.len() > 1 => {
             Box::new(MultiQuantile::new(alphas.as_slice()))
         }
-        Objective::Quantile { alphas } => Box::new(Elementwise::new(
-            Ew::Quantile(alphas.as_slice()[0]),
-            obj,
-        )),
+        Objective::Quantile { alphas } => {
+            Box::new(Elementwise::new(Ew::Quantile(alphas.as_slice()[0]), obj))
+        }
         Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
             Box::new(MultiClass::new(MultiKind::LogLoss, num_class as usize))
         }
@@ -1076,7 +1075,9 @@ mod tests {
     #[test]
     fn multi_quantile_metric_is_the_mean_of_per_alpha_losses_on_sorted_rows() {
         let alphas = [0.2f32, 0.8];
-        let obj = Objective::quantile(0.5).with_quantile_alphas(&alphas).unwrap();
+        let obj = Objective::quantile(0.5)
+            .with_quantile_alphas(&alphas)
+            .unwrap();
         let m = for_objective("quantile", obj).unwrap();
         assert_eq!(m.name(), "quantile");
         assert_eq!(default_metric(obj).name(), "quantile");
@@ -1095,7 +1096,11 @@ mod tests {
             }
         }
         let got = m.eval_weighted(&pred, &label, Some(&w));
-        assert!((f64::from(got) - e / ws).abs() < 1e-6, "{got} vs {}", e / ws);
+        assert!(
+            (f64::from(got) - e / ws).abs() < 1e-6,
+            "{got} vs {}",
+            e / ws
+        );
         // Other elementwise metrics need prediction and label of equal length.
         let err = for_objective("mae", obj).err().unwrap();
         assert!(err.contains("quantile"), "{err}");

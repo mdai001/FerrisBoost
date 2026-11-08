@@ -784,9 +784,7 @@ fn rank_params_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<R
 
 /// 解析 `quantile_loss_param.quantile_alpha`("[0.9]"、"0.9"、"(0.9)"、
 /// "[1E-1,5E-1,9E-1]"、JSON 数组)。
-fn quantile_alphas_from_json(
-    rest: &BTreeMap<String, serde_json::Value>,
-) -> Option<QuantileAlphas> {
+fn quantile_alphas_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<QuantileAlphas> {
     let raw = rest.get("quantile_loss_param")?.get("quantile_alpha")?;
     let values: Vec<f32> = match raw {
         serde_json::Value::String(s) => s
@@ -863,7 +861,9 @@ impl Objective {
     /// `quantiles(t)`:第 t 个 alpha 的标签分位数;单个 alpha 就是标量截距)。
     pub fn initial_quantile_margins(self, labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
         match self {
-            Objective::Quantile { alphas } => quantile_intercepts(alphas.as_slice(), labels, weights),
+            Objective::Quantile { alphas } => {
+                quantile_intercepts(alphas.as_slice(), labels, weights)
+            }
             _ => unreachable!("initial_quantile_margins 只用于 reg:quantileerror"),
         }
     }
@@ -1206,7 +1206,10 @@ mod tests {
         let g = Objective::quantile_gradient(0.3, 0.0, 1.0, 2.0);
         assert_eq!((g.grad, g.hess), (0.0, 0.0));
         // 预测恰好等于标签:scale = 0。
-        assert_eq!(Objective::quantile_scale(&[1.0, 2.0], &[1.0, 2.0], None), 0.0);
+        assert_eq!(
+            Objective::quantile_scale(&[1.0, 2.0], &[1.0, 2.0], None),
+            0.0
+        );
         assert!(Objective::quantile_scale(&[0.0, 0.0], &[1.0, 4.0], None) > 0.0);
     }
 

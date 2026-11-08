@@ -379,7 +379,9 @@ mod categorical_cut_tests {
         let max = crate::categorical::MAX_CAT_CODE as usize;
         let ok: Vec<f32> = (1..=max).map(|c| c as f32).collect();
         let ok_len = ok.len() as u32;
-        assert!(BinCuts::new(ok, vec![0, ok_len]).with_categorical(&[true]).is_ok());
+        assert!(BinCuts::new(ok, vec![0, ok_len])
+            .with_categorical(&[true])
+            .is_ok());
         // One more code would use the bin reserved for unseen categories.
         let over: Vec<f32> = (1..=max + 1).map(|c| c as f32).collect();
         let over_len = over.len() as u32;

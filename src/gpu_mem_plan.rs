@@ -77,7 +77,11 @@ pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
 /// 同上,但 `softmax_stats = false` 时不含每行 softmax 统计量:多个 `quantile_alpha`
 /// 的 fast 训练只多出 `(K-1) × n` 的 prediction 列(每个目标的 scale 复用同一块
 /// 固定大小的归约暂存,逐个目标串行用完)。
-pub(crate) fn fast_multi_output_extra_bytes(n_rows: u64, n_outputs: u64, softmax_stats: bool) -> u64 {
+pub(crate) fn fast_multi_output_extra_bytes(
+    n_rows: u64,
+    n_outputs: u64,
+    softmax_stats: bool,
+) -> u64 {
     if n_outputs <= 1 {
         0
     } else {
@@ -923,7 +927,8 @@ mod tests {
     fn categorical_split_cache_prices_set_outputs_and_wide_packets() {
         let base = higgs_model();
         assert_eq!(
-            base.with_categorical_split_cache(1).resident_extra_col_bytes,
+            base.with_categorical_split_cache(1)
+                .resident_extra_col_bytes,
             0
         );
         let plain = base.with_resident_split_cache(255, 16);
@@ -1277,7 +1282,9 @@ mod resolve_tests {
         // 归约形状常量必须和 kernel 里的 #define 一致。
         let cu = include_str!("backend/cuda/histogram.cu");
         assert!(
-            cu.contains(&format!("#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u")),
+            cu.contains(&format!(
+                "#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u"
+            )),
             "histogram.cu 的 QUANTILE_REDUCE_BLOCKS 与 gpu_mem_plan 不一致"
         );
     }
@@ -1296,9 +1303,18 @@ mod resolve_tests {
             rows * 28 + 10_001 * 8 + 10_000 * 20
         );
         let map = FastRankShape { map: true, ..shape };
-        assert_eq!(fast_rank_bytes(rows, &map) - fast_rank_bytes(rows, &shape), rows * 16);
-        let mean = FastRankShape { mean: true, ..shape };
-        assert_eq!(fast_rank_bytes(rows, &mean) - fast_rank_bytes(rows, &shape), rows * 12);
+        assert_eq!(
+            fast_rank_bytes(rows, &map) - fast_rank_bytes(rows, &shape),
+            rows * 16
+        );
+        let mean = FastRankShape {
+            mean: true,
+            ..shape
+        };
+        assert_eq!(
+            fast_rank_bytes(rows, &mean) - fast_rank_bytes(rows, &shape),
+            rows * 12
+        );
         let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
         assert_eq!(
             base.with_fast_rank(rows, &shape).fixed_bytes,

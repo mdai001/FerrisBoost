@@ -62,7 +62,11 @@ fn make(n: usize, levels: &[u32], classes: u32, seed: u64) -> Data {
         for (k, &l) in levels.iter().enumerate() {
             let code = rng.below(l as u64) as usize;
             z += effects[k][code];
-            x.push(if rng.below(16) == 0 { f32::NAN } else { code as f32 });
+            x.push(if rng.below(16) == 0 {
+                f32::NAN
+            } else {
+                code as f32
+            });
         }
         z += 0.2 * (rng.unit() - 0.5);
         y.push(if classes > 1 {
@@ -168,7 +172,10 @@ fn assert_exact(d: &Data, c: &TrainConfig, weighted: bool, what: &str) -> Run {
     let cpu = run_cpu(d, c, weighted);
     // `max_cat_threshold = 1` scans no prefix, so such a model has no categorical split.
     if c.params.max_cat_threshold > 1 {
-        assert!(cpu.has_categorical_splits(), "{what}: data must reward categorical splits");
+        assert!(
+            cpu.has_categorical_splits(),
+            "{what}: data must reward categorical splits"
+        );
     }
     let gpu = run_gpu(d, c, weighted);
     assert_eq!(json(&cpu), json(&gpu.model), "{what}: GPU != CPU");
@@ -215,7 +222,10 @@ fn weights_missing_regularization_and_thresholds_match_cpu() {
         ("max_cat_to_onehot=8", Box::new(|p| p.max_cat_to_onehot = 8)),
         ("max_cat_threshold=1", Box::new(|p| p.max_cat_threshold = 1)),
         ("max_cat_threshold=3", Box::new(|p| p.max_cat_threshold = 3)),
-        ("max_cat_threshold=64", Box::new(|p| p.max_cat_threshold = 64)),
+        (
+            "max_cat_threshold=64",
+            Box::new(|p| p.max_cat_threshold = 64),
+        ),
         (
             "lambda/alpha/mds",
             Box::new(|p| {

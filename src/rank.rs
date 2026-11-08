@@ -457,7 +457,11 @@ impl<'a> RankGradient<'a> {
     /// The position biases `(ti+, tj-)` as stored in the model JSON (f32, like
     /// XGBoost's `F32Array`); `None` unless `lambdarank_unbiased` is on.
     pub fn position_bias(&self) -> Option<(Vec<f32>, Vec<f32>)> {
-        let st = self.bias.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        let st = self
+            .bias
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Some((
             st.ti_plus.iter().map(|&v| v as f32).collect(),
             st.tj_minus.iter().map(|&v| v as f32).collect(),
@@ -505,7 +509,11 @@ impl<'a> RankGradient<'a> {
         match &self.bias {
             None => self.gradients_with(preds, seed, out, None),
             Some(state) => {
-                let n_pos = state.lock().unwrap_or_else(|e| e.into_inner()).ti_plus.len();
+                let n_pos = state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ti_plus
+                    .len();
                 let mut fresh = BiasState::new(n_pos, self.labels.len());
                 self.gradients_with(preds, seed, out, Some(&mut fresh));
             }
@@ -547,10 +555,7 @@ impl<'a> RankGradient<'a> {
             .zip(lj_tails)
             .enumerate()
             .for_each_init(Scratch::default, |scratch, (g, ((out_g, li_g), lj_g))| {
-                let (b, e) = (
-                    self.group_ptr[g] as usize,
-                    self.group_ptr[g + 1] as usize,
-                );
+                let (b, e) = (self.group_ptr[g] as usize, self.group_ptr[g + 1] as usize);
                 self.group_gradient(
                     g,
                     &preds[b..e],
@@ -782,9 +787,17 @@ fn delta_ndcg(
     inv_idcg: f64,
     discount: &[f64],
 ) -> f64 {
-    let gain_high = if exp_gain { dcg_gain(y_high) } else { f64::from(y_high) };
+    let gain_high = if exp_gain {
+        dcg_gain(y_high)
+    } else {
+        f64::from(y_high)
+    };
     let discount_high = discount[rank_high];
-    let gain_low = if exp_gain { dcg_gain(y_low) } else { f64::from(y_low) };
+    let gain_low = if exp_gain {
+        dcg_gain(y_low)
+    } else {
+        f64::from(y_low)
+    };
     let discount_low = discount[rank_low];
     let original = gain_high * discount_high + gain_low * discount_low;
     let changed = gain_low * discount_high + gain_high * discount_low;
@@ -1025,7 +1038,10 @@ impl RankMetric {
             RankParams::default().num_pair()
         } else {
             let k: u32 = digits.parse().map_err(|_| {
-                anyhow::anyhow!("invalid ranking metric {name:?}: expected {}@<k>[-]", kind.base())
+                anyhow::anyhow!(
+                    "invalid ranking metric {name:?}: expected {}@<k>[-]",
+                    kind.base()
+                )
             })?;
             anyhow::ensure!(k >= 1, "invalid ranking metric {name:?}: k must be >= 1");
             k
@@ -1268,7 +1284,10 @@ impl GroupAuc {
         }
         let transformed: Vec<f32>;
         let pred = if self.sigmoid {
-            transformed = pred.iter().map(|&r| crate::metrics::sigmoid_f32(r)).collect();
+            transformed = pred
+                .iter()
+                .map(|&r| crate::metrics::sigmoid_f32(r))
+                .collect();
             &transformed[..]
         } else {
             pred
@@ -1448,7 +1467,10 @@ pub fn group_ptr_from_inputs(
 pub fn unroll_group_weights(group_weights: &[f32], group_ptr: &[u32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(*group_ptr.last().unwrap_or(&0) as usize);
     for (g, w) in group_ptr.windows(2).enumerate() {
-        out.extend(std::iter::repeat_n(group_weights[g], (w[1] - w[0]) as usize));
+        out.extend(std::iter::repeat_n(
+            group_weights[g],
+            (w[1] - w[0]) as usize,
+        ));
     }
     out
 }
@@ -1538,8 +1560,8 @@ mod tests {
     fn groups_of_one_and_equal_labels_give_zero_gradients() {
         let labels = [1.0f32, 2.0, 2.0, 2.0];
         let ptr = [0u32, 1, 4];
-        let g = RankGradient::new(RankKind::Ndcg, RankParams::default(), &labels, &ptr, None)
-            .unwrap();
+        let g =
+            RankGradient::new(RankKind::Ndcg, RankParams::default(), &labels, &ptr, None).unwrap();
         let mut out = Vec::new();
         g.gradients(&[0.3, 0.1, 0.2, 0.4], 0, &mut out);
         assert!(out.iter().all(|p| p.grad == 0.0 && p.hess == 0.0));
@@ -1573,7 +1595,10 @@ mod tests {
         g.gradients(&preds, 5, &mut a);
         g.gradients(&preds, 5, &mut b);
         g.gradients(&preds, 6, &mut c);
-        assert!(a.iter().zip(&b).all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
+        assert!(a
+            .iter()
+            .zip(&b)
+            .all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
         assert!(a.iter().zip(&c).any(|(x, y)| x.grad != y.grad));
     }
 
@@ -1591,7 +1616,12 @@ mod tests {
         assert!((worse - dcg2 / idcg).abs() < 1e-6);
         // all-zero group counts as a perfect score
         assert_eq!(m.eval(&[0.1, 0.2], &[0.0, 0.0]), 1.0);
-        assert_eq!(RankMetric::parse("ndcg-", true).unwrap().eval(&[0.1, 0.2], &[0.0, 0.0]), 0.0);
+        assert_eq!(
+            RankMetric::parse("ndcg-", true)
+                .unwrap()
+                .eval(&[0.1, 0.2], &[0.0, 0.0]),
+            0.0
+        );
     }
 
     #[test]
@@ -1605,13 +1635,19 @@ mod tests {
             pair_method: PairMethod::Mean,
             ..RankParams::default()
         };
-        assert_eq!(RankMetric::default_for(RankKind::Pairwise, &mean).name(), "ndcg");
+        assert_eq!(
+            RankMetric::default_for(RankKind::Pairwise, &mean).name(),
+            "ndcg"
+        );
         assert_eq!(RankMetric::default_for(RankKind::Map, &mean).name(), "map");
         let five = RankParams {
             num_pair_per_sample: Some(5),
             ..RankParams::default()
         };
-        assert_eq!(RankMetric::default_for(RankKind::Map, &five).name(), "map@5");
+        assert_eq!(
+            RankMetric::default_for(RankKind::Map, &five).name(),
+            "map@5"
+        );
         assert!(!d.lower_is_better());
     }
 
@@ -1652,8 +1688,14 @@ mod tests {
     #[test]
     fn unbiased_first_round_is_the_plain_gradient_and_the_bias_moves_afterwards() {
         let (labels, ptr, preds) = unbiased_fixture();
-        let plain = RankGradient::new(RankKind::Pairwise, RankParams::default(), &labels, &ptr, None)
-            .unwrap();
+        let plain = RankGradient::new(
+            RankKind::Pairwise,
+            RankParams::default(),
+            &labels,
+            &ptr,
+            None,
+        )
+        .unwrap();
         assert!(plain.position_bias().is_none());
         let params = RankParams {
             unbiased: true,
@@ -1667,11 +1709,17 @@ mod tests {
         plain.gradients(&preds, 0, &mut a);
         g.gradients(&preds, 0, &mut b);
         // the biases are all ones, so the division is exact: the same gradients
-        assert!(a.iter().zip(&b).all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
+        assert!(a
+            .iter()
+            .zip(&b)
+            .all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
         // the update: position 0 is the reference, the others are ratios in (0, inf)
         let (ti, tj) = g.position_bias().unwrap();
         assert_eq!((ti[0], tj[0]), (1.0, 1.0));
-        assert!(ti[1..4].iter().chain(&tj[1..4]).any(|&v| v != 1.0), "{ti:?} {tj:?}");
+        assert!(
+            ti[1..4].iter().chain(&tj[1..4]).any(|&v| v != 1.0),
+            "{ti:?} {tj:?}"
+        );
         // positions never seen in any group keep a zero loss -> bias 0
         assert!(ti[4..].iter().all(|&v| v == 0.0), "{ti:?}");
         // the next round uses them
@@ -1687,14 +1735,8 @@ mod tests {
             ..RankParams::default()
         };
         let g = RankGradient::new(RankKind::Ndcg, params, &labels, &ptr, None).unwrap();
-        let plain = RankGradient::new(
-            RankKind::Ndcg,
-            RankParams::default(),
-            &labels,
-            &ptr,
-            None,
-        )
-        .unwrap();
+        let plain =
+            RankGradient::new(RankKind::Ndcg, RankParams::default(), &labels, &ptr, None).unwrap();
         // the estimate uses all-ones biases (a throwaway copy in XGBoost)
         assert_eq!(estimate_base_score(&g, 0), estimate_base_score(&plain, 0));
         let (ti, tj) = g.position_bias().unwrap();
@@ -1724,7 +1766,9 @@ mod tests {
                 let mut out = Vec::new();
                 let mut last = Vec::new();
                 for r in 0..4 {
-                    let preds: Vec<f32> = (0..n).map(|i| ((i * 13 + r * 7) % 17) as f32 * 0.1).collect();
+                    let preds: Vec<f32> = (0..n)
+                        .map(|i| ((i * 13 + r * 7) % 17) as f32 * 0.1)
+                        .collect();
                     g.gradients(&preds, r as u32, &mut out);
                     last = out.clone();
                 }
@@ -1733,7 +1777,10 @@ mod tests {
         };
         let (a, ba) = run(1);
         let (b, bb) = run(4);
-        assert!(a.iter().zip(&b).all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
+        assert!(a
+            .iter()
+            .zip(&b)
+            .all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
         assert_eq!(ba, bb);
     }
 
@@ -1788,7 +1835,10 @@ mod tests {
         let raw = [40.0f32, 30.0, 0.2, -0.1, 0.0, 0.5];
         let ptr = [0u32, 3, 6];
         let grouped = Auc.eval_grouped(&raw, &label, None, Some(&ptr));
-        let prob: Vec<f32> = raw.iter().map(|&r| crate::metrics::sigmoid_f32(r)).collect();
+        let prob: Vec<f32> = raw
+            .iter()
+            .map(|&r| crate::metrics::sigmoid_f32(r))
+            .collect();
         let want = GroupAuc::new(GroupAucKind::Roc, false).score(&prob, &label, None, &ptr);
         assert_eq!(f64::from(grouped), f64::from(want as f32));
         // without groups the binary AUC is used

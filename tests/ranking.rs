@@ -20,9 +20,13 @@ struct Data {
 
 fn data(seed: u64) -> Data {
     // small deterministic generator
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let mut next = move || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f64) / ((1u64 << 31) as f64)
     };
     let n_features = 4;
@@ -30,7 +34,9 @@ fn data(seed: u64) -> Data {
     let mut total = 0u32;
     for &n in &SIZES {
         for _ in 0..n {
-            let row: Vec<f32> = (0..n_features).map(|_| (next() * 10.0).floor() as f32).collect();
+            let row: Vec<f32> = (0..n_features)
+                .map(|_| (next() * 10.0).floor() as f32)
+                .collect();
             let score = f64::from(row[0]) * 0.5 + f64::from(row[1]) * 0.3 + next() * 2.0;
             y.push((score / 2.0).floor().clamp(0.0, 4.0) as f32);
             x.extend(row);
@@ -66,14 +72,22 @@ fn source(d: &Data) -> DenseSource {
     DenseSource::from_row_major(&d.x, d.y.len(), d.n_features, 16, 2)
 }
 
-fn fit(d: &Data, kind: RankKind, rank: RankParams, nthread: usize, weights: Option<&[f32]>) -> Model {
+fn fit(
+    d: &Data,
+    kind: RankKind,
+    rank: RankParams,
+    nthread: usize,
+    weights: Option<&[f32]>,
+) -> Model {
     let src = source(d);
     let cfg = config(kind, rank, nthread, &d.group_ptr);
     ferrisboost::train::train_weighted(&src, &d.y, weights, &[], &cfg, &mut [], &Local).unwrap()
 }
 
 fn predictions(m: &Model, d: &Data) -> Vec<f32> {
-    d.x.chunks(d.n_features).map(|r| m.predict_margin(r)).collect()
+    d.x.chunks(d.n_features)
+        .map(|r| m.predict_margin(r))
+        .collect()
 }
 
 #[test]
@@ -141,18 +155,31 @@ fn group_weights_scale_gradients_and_must_match_the_group_count() {
     let n_groups = d.group_ptr.len() - 1;
     let uniform = vec![1.0f32; n_groups];
     let plain = fit(&d, RankKind::Pairwise, RankParams::default(), 1, None);
-    let ones = fit(&d, RankKind::Pairwise, RankParams::default(), 1, Some(&uniform));
+    let ones = fit(
+        &d,
+        RankKind::Pairwise,
+        RankParams::default(),
+        1,
+        Some(&uniform),
+    );
     assert_eq!(predictions(&plain, &d), predictions(&ones, &d));
     let varying: Vec<f32> = (0..n_groups).map(|g| 0.5 + g as f32 * 0.25).collect();
-    let weighted = fit(&d, RankKind::Pairwise, RankParams::default(), 1, Some(&varying));
+    let weighted = fit(
+        &d,
+        RankKind::Pairwise,
+        RankParams::default(),
+        1,
+        Some(&varying),
+    );
     assert_ne!(predictions(&plain, &d), predictions(&weighted, &d));
     // one weight per row is an error for ranking
     let src = source(&d);
     let cfg = config(RankKind::Pairwise, RankParams::default(), 1, &d.group_ptr);
     let per_row = vec![1.0f32; d.y.len()];
-    let err = ferrisboost::train::train_weighted(&src, &d.y, Some(&per_row), &[], &cfg, &mut [], &Local)
-        .unwrap_err()
-        .to_string();
+    let err =
+        ferrisboost::train::train_weighted(&src, &d.y, Some(&per_row), &[], &cfg, &mut [], &Local)
+            .unwrap_err()
+            .to_string();
     assert!(err.contains("权重"), "{err}");
 }
 
@@ -165,11 +192,15 @@ fn groups_are_required_and_validated() {
         params: RankParams::default(),
     };
     let none = TrainConfig::new(params(1), rank);
-    let err = train(&src, &d.y, &[], &none, &mut [], &Local).unwrap_err().to_string();
+    let err = train(&src, &d.y, &[], &none, &mut [], &Local)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("needs query groups"), "{err}");
     let mut short = TrainConfig::new(params(1), rank);
     short.group_ptr = Some(vec![0, 3, 5]);
-    let err = train(&src, &d.y, &[], &short, &mut [], &Local).unwrap_err().to_string();
+    let err = train(&src, &d.y, &[], &short, &mut [], &Local)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("group sizes sum"), "{err}");
     // other objectives accept groups (XGBoost does) and do not train differently
     let mut other = TrainConfig::new(params(1), Objective::SquaredError);
@@ -179,7 +210,9 @@ fn groups_are_required_and_validated() {
     let ungrouped = train(&src, &d.y, &[], &plain, &mut [], &Local).unwrap();
     assert_eq!(predictions(&grouped, &d), predictions(&ungrouped, &d));
     other.group_ptr = Some(vec![0, 3, 5]);
-    let err = train(&src, &d.y, &[], &other, &mut [], &Local).unwrap_err().to_string();
+    let err = train(&src, &d.y, &[], &other, &mut [], &Local)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("group sizes sum"), "{err}");
     // an evaluation set needs its own groups
     let cfg = config(RankKind::Ndcg, RankParams::default(), 1, &d.group_ptr);
@@ -190,7 +223,9 @@ fn groups_are_required_and_validated() {
         weights: None,
         group_ptr: None,
     };
-    let err = train(&src, &d.y, &[eval], &cfg, &mut [], &Local).unwrap_err().to_string();
+    let err = train(&src, &d.y, &[eval], &cfg, &mut [], &Local)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("needs query groups"), "{err}");
 }
 
@@ -253,7 +288,9 @@ fn ranking_metric_validation_follows_xgboost() {
     train(&src, &fractional, &[], &cfg, &mut [], &Local).unwrap();
     // rank:map and the map metric need binary labels
     let cfg = config(RankKind::Map, RankParams::default(), 1, &d.group_ptr);
-    let err = train(&src, &d.y, &[], &cfg, &mut [], &Local).unwrap_err().to_string();
+    let err = train(&src, &d.y, &[], &cfg, &mut [], &Local)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("binary"), "{err}");
 }
 
@@ -266,7 +303,10 @@ fn unbiased_lambdamart_keeps_its_position_bias_in_the_model() {
         ..RankParams::default()
     };
     let m = fit(&d, RankKind::Ndcg, unbiased, 1, None);
-    let bias = m.rank_bias.as_ref().expect("position bias is stored in the model");
+    let bias = m
+        .rank_bias
+        .as_ref()
+        .expect("position bias is stored in the model");
     // topk: one entry per tracked position, the first position is the reference
     assert_eq!(bias.ti_plus.len(), 32);
     assert_eq!(bias.tj_minus.len(), 32);

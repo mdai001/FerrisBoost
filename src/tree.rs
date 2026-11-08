@@ -626,7 +626,8 @@ impl Model {
         };
         // ⚠️ 多目标模型必须拒绝,除非是多分位数的 `reg:quantileerror`(每个 alpha 一个目标,
         // `one_output_per_tree`):当成单目标读会把所有目标的树加在一起,静默给出错的预测。
-        if num_target > 1 && !(objective.is_multi_quantile() && num_target == objective.num_outputs())
+        if num_target > 1
+            && !(objective.is_multi_quantile() && num_target == objective.num_outputs())
         {
             return Err(unsupported(format_args!(
                 "多目标模型不支持(num_target = {num_target});只支持多个 quantile_alpha 的 \
@@ -1086,7 +1087,9 @@ mod xgb {
                 let (begin, size) = (self.categories_segments[k], self.categories_sizes[k]);
                 let end = begin.checked_add(size);
                 let range = match end {
-                    Some(end) if begin >= 0 && size >= 0 && end as usize <= self.categories.len() => {
+                    Some(end)
+                        if begin >= 0 && size >= 0 && end as usize <= self.categories.len() =>
+                    {
                         begin as usize..end as usize
                     }
                     _ => {
