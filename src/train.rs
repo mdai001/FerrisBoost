@@ -1637,6 +1637,8 @@ fn train_with_backend(
 
     // 融合路径把「施加 delta」推迟到下一轮开头,所以要记着是否欠一次。
     let mut pending_delta = false;
+    // host 量化的定点梯度缓冲,跨轮复用(见 `quantize_host`)。
+    let mut fixed_buf: Vec<GradPairFixed> = Vec::new();
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
         // 采样种子按模型里的**绝对**轮次取:续训接着旧模型的轮次往下走,
@@ -1771,50 +1773,15 @@ fn train_with_backend(
         let mut gpair_f32 = gpair_f32;
         let device_quant = gpu.as_ref().is_some_and(|c| c.device_quantize_enabled());
         // Device quantization masks in its existing max scan before selecting
-        // scale. CPU and explicit host quantization retain the host mask below.
-        if cfg.params.subsample < 1.0 && !fast_math && !device_quant {
-            let _phase = crate::diagnostic::Phase::new(b"fb.host.exact.subsample\0");
-            let kept = pool.install(|| {
-                let _t = prof::Timer::new(&prof::SAMPLE);
-                // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
-                //
-                // 采样身份只由 `(seed, tree, row)` 逐行独立哈希决定(见
-                // subsample 模块),行与行之间没有顺序依赖,所以按行并行
-                // 与串行逐位相同;`kept` 是整数求和,同样与顺序无关。
-                // 这一遍以前是串行的:1050 万次 SplitMix 哈希挂在训练线程上,
-                // 其余线程全程空等。
-                let th = crate::subsample::threshold_for(cfg.params.subsample);
-                let (seed, tree) = (cfg.params.seed, key_round as u64);
-                gpair_f32
-                    .par_iter_mut()
-                    .enumerate()
-                    .map(|(i, g)| {
-                        if crate::subsample::row_selected(i as u64, th, seed, tree) {
-                            1usize
-                        } else {
-                            *g = GradPair {
-                                grad: 0.0,
-                                hess: 0.0,
-                            };
-                            0usize
-                        }
-                    })
-                    .sum::<usize>()
-            });
-            if prof::enabled() && round == 0 {
-                eprintln!(
-                    "SUBSAMPLE rate={} kept={kept}/{} ({:.1}%)",
-                    cfg.params.subsample,
-                    gpair_f32.len(),
-                    100.0 * kept as f64 / gpair_f32.len().max(1) as f64
-                );
-            }
-        }
+        // scale. CPU and explicit host quantization mask in `mask_and_bounds`
+        // below, fused with the quantization bound scan.
         // device-side quantization:求 scale、转定点、归约 root sum 都在 device 上,
         // 走 PCIe 的是 f32(8 B/行)而不是定点(16 B/行)。位精确的理由见
         // `GpuTrainCtx::upload_and_quantize_gpair`。CPU 路径完全不变。
         let quantize_phase = crate::diagnostic::Phase::new(b"fb.host.quantize\0");
-        let (quantizer, fixed, dev_root_sum) = if fast_math {
+        // `known_root_sum`:根节点的和已经顺手求出(device 量化、或 host 转定点
+        // 那一趟);`host_nonzero`:host 转定点时记下的非零行位图。
+        let (quantizer, fixed, known_root_sum, host_nonzero) = if fast_math {
             // prediction D2H、host 按行 gradient、gpair H2D —— 三项都不存在。
             // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
             let ctx = gpu.as_ref().expect("fast_math 蕴含 gpu 存在");
@@ -1839,7 +1806,7 @@ fn train_with_backend(
             };
             // delta 已经被 device kernel 吃掉,不再欠 host 一次施加。
             pending_delta = false;
-            (q, Vec::new(), Some(root))
+            (q, Vec::new(), Some(root), None)
         } else if device_quant {
             let ctx = gpu.as_ref().expect("device_quant 蕴含 gpu 存在");
             let _t = prof::Timer::new(&prof::QUANTIZE);
@@ -1861,16 +1828,38 @@ fn train_with_backend(
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-            (q, Vec::new(), Some(root))
+            (q, Vec::new(), Some(root), None)
         } else {
             pool.install(|| {
+                // 采样掩码和求 scale 的 max 合成一趟(以前是采样一趟、max 一趟)。
+                // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
+                let mask = (cfg.params.subsample < 1.0).then(|| {
+                    (
+                        crate::subsample::threshold_for(cfg.params.subsample),
+                        cfg.params.seed,
+                        key_round as u64,
+                    )
+                });
+                let (max_grad, max_hess, kept) = {
+                    let _phase = crate::diagnostic::Phase::new(b"fb.host.exact.subsample\0");
+                    let _t = prof::Timer::new(&prof::SAMPLE);
+                    mask_and_bounds(&mut gpair_f32, mask)
+                };
+                if prof::enabled() && round == 0 && mask.is_some() {
+                    eprintln!(
+                        "SUBSAMPLE rate={} kept={kept}/{} ({:.1}%)",
+                        cfg.params.subsample,
+                        gpair_f32.len(),
+                        100.0 * kept as f64 / gpair_f32.len().max(1) as f64
+                    );
+                }
                 let _t = prof::Timer::new(&prof::QUANTIZE);
-                let quantizer = GradQuantizer::try_new(&gpair_f32, n)?;
-                let fixed: Vec<GradPairFixed> = gpair_f32
-                    .par_iter()
-                    .map(|&g| quantizer.to_fixed(g))
-                    .collect();
-                Ok::<_, anyhow::Error>((quantizer, fixed, None))
+                let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, n)?;
+                // 定点缓冲跨轮复用:每轮新分配 16 B/行要重新缺页一遍。
+                // 它本来就活过整个 build_tree,复用不抬高峰值。
+                let mut fixed = std::mem::take(&mut fixed_buf);
+                let (root, nonzero) = quantize_host(&gpair_f32, &quantizer, &mut fixed);
+                Ok::<_, anyhow::Error>((quantizer, fixed, Some(root), Some(nonzero)))
             })?
         };
         drop(quantize_phase);
@@ -1914,7 +1903,8 @@ fn train_with_backend(
             build_tree(
                 source,
                 &fixed,
-                dev_root_sum,
+                known_root_sum,
+                host_nonzero,
                 &quantizer,
                 &mut predictions,
                 cfg,
@@ -1929,6 +1919,7 @@ fn train_with_backend(
                 ),
             )
         })?;
+        fixed_buf = fixed;
         // GPU 路径的叶子增量留在 device buffer 里没有施加,记一笔债;
         // CPU 路径是按行 scatter 进 `predictions` 的,没有可推迟的 delta。
         if gpu.is_some() {
@@ -2378,6 +2369,7 @@ fn train_multiclass_rounds(
                     source,
                     &fixed,
                     dev_root_sum,
+                    None,
                     &quantizer,
                     if fast_math {
                         &mut no_host_pred
@@ -2749,7 +2741,10 @@ fn build_tree(
     gpair: &[GradPairFixed],
     // GPU device-quantization 路径上 root 的 node_sum 已经在 device 上归约好,
     // host 那份定点数组因此不再物化;CPU 路径传 None,照常从 `gpair` 求。
-    dev_root_sum: Option<GradPairFixed>,
+    known_root_sum: Option<GradPairFixed>,
+    // host 转定点那一趟记下的非零行位图(见 `quantize_host`);`None` 时
+    // 下面自己扫 `gpair`。
+    host_nonzero: Option<NonzeroBits>,
     q: &GradQuantizer,
     predictions: &mut [f32],
     cfg: &TrainConfig,
@@ -2865,7 +2860,7 @@ fn build_tree(
 
     let mut t = Tree::default();
     let setup_timer = prof::Timer::new(&prof::TREE_SETUP);
-    let root_sum = dev_root_sum.unwrap_or_else(|| hist::node_sum(gpair, None));
+    let root_sum = known_root_sum.unwrap_or_else(|| hist::node_sum(gpair, None));
     let root = t.push_leaf(leaf_of(root_sum, q, p), hess_of(root_sum, q));
 
     // 梯度全零的行(行采样没选中的行,或梯度恰好为零)对每个直方图 bin 和
@@ -2875,8 +2870,15 @@ fn build_tree(
     // 一次性下降,而不是随每层分区一起搬 —— 见 `apply_dropped_rows`。
     // 只在 CPU、source 的每一列都能随机访问、且确实能省下可观的行数时启用。
     let kept_rows: Option<Vec<RowId>> = if gpu.is_none() && source.has_resident_columns() {
-        let kept = nonzero_rows(gpair);
-        (kept.len() <= gpair.len() - gpair.len() / 8).then_some(kept)
+        let worth = |kept: usize| kept <= gpair.len() - gpair.len() / 8;
+        match host_nonzero {
+            // 位图已经给出个数:不划算时连行下标都不写。
+            Some(bits) => worth(bits.count()).then(|| bits.rows()),
+            None => {
+                let kept = nonzero_rows(gpair);
+                worth(kept.len()).then_some(kept)
+            }
+        }
     } else {
         None
     };
@@ -3731,6 +3733,142 @@ fn apply_dropped_rows(
             }
         });
     Ok(())
+}
+
+/// host 量化那几趟逐行工作的分块大小(行)。是 64 的倍数,每块的非零位图
+/// 恰好占整数个 `u64`。
+const PREP_CHUNK: usize = 1 << 16;
+
+/// 行采样掩码和量化上界合成一趟:未选中的行置零(工作副本,见调用处),
+/// 同时对置零之后的值求 `GradQuantizer::try_new` 要的 `(max |grad|,
+/// max |hess|)`。返回 `(max_grad, max_hess, 选中行数)`。
+///
+/// 采样身份只由 `(seed, tree, row)` 逐行独立哈希决定,max 精确、行数是整数
+/// 求和,三者都与分块和线程数无关;上界与「先置零、再 `try_new`」逐位相同。
+fn mask_and_bounds(gpair: &mut [GradPair], mask: Option<(u64, u64, u64)>) -> (f64, f64, usize) {
+    gpair
+        .par_chunks_mut(PREP_CHUNK)
+        .enumerate()
+        .map(|(c, chunk)| {
+            let base = (c * PREP_CHUNK) as u64;
+            let (mut mg, mut mh, mut kept) = (0.0f64, 0.0f64, 0usize);
+            for (i, g) in chunk.iter_mut().enumerate() {
+                if let Some((th, seed, tree)) = mask {
+                    if !crate::subsample::row_selected(base + i as u64, th, seed, tree) {
+                        *g = GradPair {
+                            grad: 0.0,
+                            hess: 0.0,
+                        };
+                    } else {
+                        kept += 1;
+                    }
+                } else {
+                    kept += 1;
+                }
+                let (gb, hb) = GradQuantizer::bound_of(*g);
+                mg = mg.max(gb);
+                mh = mh.max(hb);
+            }
+            (mg, mh, kept)
+        })
+        .reduce(
+            || (0.0, 0.0, 0),
+            |a, b| (a.0.max(b.0), a.1.max(b.1), a.2 + b.2),
+        )
+}
+
+/// 定点梯度不为零的行,一行一位(`PREP_CHUNK` 行一块),外加每块的个数。
+struct NonzeroBits {
+    words: Vec<u64>,
+    chunk_counts: Vec<usize>,
+}
+
+impl NonzeroBits {
+    fn count(&self) -> usize {
+        self.chunk_counts.iter().sum()
+    }
+
+    /// 位为 1 的行下标(升序),与 `nonzero_rows` 逐位相同。各块写自己那段。
+    fn rows(&self) -> Vec<RowId> {
+        let mut rows = vec![0 as RowId; self.count()];
+        let mut parts: Vec<&mut [RowId]> = Vec::with_capacity(self.chunk_counts.len());
+        let mut rest = rows.as_mut_slice();
+        for &c in &self.chunk_counts {
+            let (head, tail) = rest.split_at_mut(c);
+            parts.push(head);
+            rest = tail;
+        }
+        parts
+            .into_par_iter()
+            .zip(self.words.par_chunks(PREP_CHUNK / 64))
+            .enumerate()
+            .for_each(|(ci, (out, words))| {
+                let base = ci * PREP_CHUNK;
+                let mut k = 0usize;
+                for (wi, &w) in words.iter().enumerate() {
+                    let mut w = w;
+                    while w != 0 {
+                        out[k] = (base + wi * 64 + w.trailing_zeros() as usize) as RowId;
+                        k += 1;
+                        w &= w - 1;
+                    }
+                }
+                debug_assert_eq!(k, out.len());
+            });
+        rows
+    }
+}
+
+/// 转定点的同一趟里顺手求根节点的和与非零位图:以前这是三趟
+/// (转定点、`node_sum`、`nonzero_rows` 的计数和写入)各读一遍 16 B/行的
+/// 定点数组。`out` 跨轮复用,长度不符时才重新分配。
+///
+/// 定点加法按模 2^64 精确、与顺序无关,所以分块求和与 `hist::node_sum`
+/// 逐位相同;每行的定点值与 `to_fixed` 逐行 map 相同。
+fn quantize_host(
+    gpair: &[GradPair],
+    q: &GradQuantizer,
+    out: &mut Vec<GradPairFixed>,
+) -> (GradPairFixed, NonzeroBits) {
+    let n = gpair.len();
+    if out.len() != n {
+        *out = vec![GradPairFixed::default(); n];
+    }
+    let mut words = vec![0u64; n.div_ceil(64)];
+    let zero = GradPairFixed::default();
+    let parts: Vec<(GradPairFixed, usize)> = out
+        .par_chunks_mut(PREP_CHUNK)
+        .zip(gpair.par_chunks(PREP_CHUNK))
+        .zip(words.par_chunks_mut(PREP_CHUNK / 64))
+        .map(|((dst, src), bits)| {
+            let mut sum = GradPairFixed::default();
+            let mut count = 0usize;
+            for ((d, s), w) in dst.chunks_mut(64).zip(src.chunks(64)).zip(bits.iter_mut()) {
+                let mut word = 0u64;
+                for (j, (d, &s)) in d.iter_mut().zip(s).enumerate() {
+                    let f = q.to_fixed(s);
+                    *d = f;
+                    sum += f;
+                    word |= ((f != zero) as u64) << j;
+                }
+                *w = word;
+                count += word.count_ones() as usize;
+            }
+            (sum, count)
+        })
+        .collect();
+    let mut sum = GradPairFixed::default();
+    for &(s, _) in &parts {
+        sum += s;
+    }
+    let chunk_counts = parts.into_iter().map(|(_, c)| c).collect();
+    (
+        sum,
+        NonzeroBits {
+            words,
+            chunk_counts,
+        },
+    )
 }
 
 /// 梯度不全为零的行下标(升序)。按块并行:先数、再前缀和、最后各块写
@@ -4827,6 +4965,76 @@ mod tests {
             let want_right: Vec<u8> = (0..8).filter(|&j| mask & (1 << j) == 0).collect();
             assert_eq!(&order.left[..order.n_left as usize], want_left);
             assert_eq!(&order.right[..8 - order.n_left as usize], want_right);
+        }
+    }
+
+    #[test]
+    fn fused_host_quantization_matches_the_separate_passes() {
+        // 跨多个块并带不足 64 行的尾巴;含零梯度行和被采样掉的行。
+        let n = 3 * PREP_CHUNK + 77;
+        let base: Vec<GradPair> = (0..n)
+            .map(|i| GradPair {
+                grad: if i % 11 == 0 {
+                    0.0
+                } else {
+                    ((i % 97) as f32 - 48.0) * 0.013
+                },
+                hess: if i % 11 == 0 {
+                    0.0
+                } else {
+                    0.05 + (i % 13) as f32 * 0.01
+                },
+            })
+            .collect();
+        for mask in [
+            None,
+            Some((crate::subsample::threshold_for(0.6), 7u64, 3u64)),
+        ] {
+            let run = |nthread| {
+                crate::threading::build_pool(nthread).unwrap().install(|| {
+                    let mut g = base.clone();
+                    let (mg, mh, kept) = mask_and_bounds(&mut g, mask);
+                    let q = GradQuantizer::try_from_bounds(mg, mh, n).unwrap();
+                    let mut fixed = Vec::new();
+                    let (sum, bits) = quantize_host(&g, &q, &mut fixed);
+                    (g, kept, fixed, sum, bits.rows(), bits.count())
+                })
+            };
+            let (g, kept, fixed, sum, rows, count) = run(1);
+            let eight = run(8);
+            assert_eq!(fixed, eight.2);
+            assert_eq!(rows, eight.4);
+            assert_eq!((kept, sum, count), (eight.1, eight.3, eight.5));
+
+            // 分开做的参照:先置零、再 try_new、逐行 to_fixed、node_sum、nonzero_rows。
+            let mut want = base.clone();
+            let mut want_kept = n;
+            if let Some((th, seed, tree)) = mask {
+                want_kept = 0;
+                for (i, w) in want.iter_mut().enumerate() {
+                    if crate::subsample::row_selected(i as u64, th, seed, tree) {
+                        want_kept += 1;
+                    } else {
+                        *w = GradPair {
+                            grad: 0.0,
+                            hess: 0.0,
+                        };
+                    }
+                }
+            }
+            let bits_of = |v: &[GradPair]| {
+                v.iter()
+                    .map(|g| (g.grad.to_bits(), g.hess.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits_of(&g), bits_of(&want));
+            assert_eq!(kept, want_kept);
+            let q = GradQuantizer::try_new(&want, n).unwrap();
+            let want_fixed: Vec<GradPairFixed> = want.iter().map(|&g| q.to_fixed(g)).collect();
+            assert_eq!(fixed, want_fixed);
+            assert_eq!(sum, hist::node_sum(&want_fixed, None));
+            assert_eq!(rows, nonzero_rows(&want_fixed));
+            assert_eq!(count, rows.len());
         }
     }
 
