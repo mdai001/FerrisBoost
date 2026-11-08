@@ -152,21 +152,24 @@ pub struct GpuHostMemoryBudget {
     pub rm_stage_bytes: usize,
     /// 一轮定点梯度的 pinned staging buffer。
     pub gpair_bytes: usize,
+    /// Pinned mirrors of the resident split caches' packet windows.
+    pub split_packets_bytes: usize,
 }
 
 impl GpuHostMemoryBudget {
     pub fn total(&self) -> usize {
-        self.block_bins_bytes + self.rm_stage_bytes + self.gpair_bytes
+        self.block_bins_bytes + self.rm_stage_bytes + self.gpair_bytes + self.split_packets_bytes
     }
 
     pub fn report(&self) -> String {
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         format!(
-            "pinned host {:.1} MB = column-block staging {:.1} + row-major staging {:.1} + gpair staging {:.1}",
+            "pinned host {:.1} MB = column-block staging {:.1} + row-major staging {:.1} + gpair staging {:.1} + split packets {:.3}",
             mb(self.total()),
             mb(self.block_bins_bytes),
             mb(self.rm_stage_bytes),
             mb(self.gpair_bytes),
+            mb(self.split_packets_bytes),
         )
     }
 }
@@ -1630,6 +1633,20 @@ impl GpuTrainCtx {
                 0
             },
             gpair_bytes: usize::from(use_pinned) * n_rows * 2 * 8,
+            split_packets_bytes: if split_cache_enabled {
+                resident_block_count
+                    * (hist_nodes_per_batch
+                        * (crate::gpu_mem_plan::SPLIT_PACKET_BYTES
+                            + if split_cat_enabled {
+                                crate::gpu_mem_plan::CAT_SET_WORDS * 4
+                            } else {
+                                0
+                            })
+                        * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES)
+                        .max(1)
+            } else {
+                0
+            },
         };
 
         let start_event = state
