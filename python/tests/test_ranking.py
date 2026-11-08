@@ -249,7 +249,7 @@ def test_label_rules_and_unsupported_options():
         fb.train({**p, "lambdarank_unbiased": True}, x, label=y, qid=qid, quiet=True)
     with pytest.raises(ValueError, match="ranking metric|ranking objective"):
         fb.train({**p, "eval_metric": "rmse"}, x, label=y, qid=qid, quiet=True)
-    with pytest.raises(ValueError, match="ranking"):
+    with pytest.raises(ValueError, match="rank:ndcg"):
         fb.train(dict(objective="reg:squarederror", eval_metric="ndcg@3"), x, label=y, quiet=True)
 
 

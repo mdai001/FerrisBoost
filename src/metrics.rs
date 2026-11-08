@@ -433,8 +433,8 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
     }
     if crate::rank::is_rank_metric_name(name) {
         return Err(format!(
-            "eval_metric {name:?} is a ranking metric and needs a ranking objective \
-             (rank:ndcg / rank:pairwise / rank:map) with query groups"
+            "eval_metric {name:?} 不支持:它是排序指标,需要排序 objective \
+             (rank:ndcg / rank:pairwise / rank:map)和 query groups"
         ));
     }
     // 多分类只接 mlogloss / merror(XGBoost 对其它指标会因为预测长度不符报错)。
