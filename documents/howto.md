@@ -1437,7 +1437,8 @@ memory budget, without manual chunk or batch tuning:
 | Histograms, row partition, gradients | GPU, for every supported objective and both `gpu_math` modes |
 | Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
 | Feature binning and file ingest | Host |
-| Prediction (`use_gpu=True`) | GPU 0 when worthwhile; CPU for small batches, models with categorical splits, `predict_to_parquet`, and the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) |
+| Prediction (`use_gpu=True`) | GPU 0 when worthwhile; CPU for small batches, models with categorical splits, and `predict_to_parquet` scores |
+| Explanations (`use_gpu=True`) | `pred_contribs` (exact and `approx_contribs`), `pred_interactions` and `pred_leaf` run on GPU 0 for every call, categorical splits included, with values bit-identical to the CPU path. With `use_gpu=False` they run on the CPU |
 
 What raises an error instead of falling back: `device="cuda"` on a build without
 CUDA, `max_depth` above 14 (on CPU too), `gpu_math="fast"` together with
@@ -1569,7 +1570,26 @@ Names are the model's feature names (the column names of a pandas DataFrame, PyA
 
 `pred_leaf=True` returns, for every row, the node index of the leaf it reaches in each tree, as `float32` like XGBoost; indices are node ids within the tree. The result has shape `(n, n_trees)` (a multiclass model has `num_class` trees per round).
 
-These options accept a two-dimensional `float32` array or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. They always run on the CPU: `use_gpu` is accepted and ignored for them. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU. A per-row `base_margin` replaces the intercept in the bias column, as in XGBoost (see [Starting margins](#starting-margins-base_margin)); `pred_leaf` ignores it.
+These options accept a two-dimensional `float32` array, a pandas DataFrame, a PyArrow table, or file paths (bound by column name, streamed in batches). `n_trees` limits the trees used, with the same meaning as in normal prediction, and `predict_threads` controls CPU workers; results are identical for every thread count. Only one of `pred_contribs`, `pred_interactions`, and `pred_leaf` can be set per call, and none combines with `output_margin`. Exact SHAP uses the same fixed 8-point quadrature TreeSHAP as XGBoost 3.4.1 on CPU. A per-row `base_margin` replaces the intercept in the bias column, as in XGBoost (see [Starting margins](#starting-margins-base_margin)); `pred_leaf` ignores it.
+
+#### `strict_shape`
+
+`predict(..., strict_shape=True)` gives the output a shape that does not depend on the model type, exactly as XGBoost's `strict_shape`. The default shapes drop the output-group axis when there is a single group; with `strict_shape=True` it is always present:
+
+| Output | Default | `strict_shape=True` |
+|---|---|---|
+| Prediction / `output_margin` | `(n,)`, or `(n, groups)` for multiclass probabilities, multiclass margins and multi-quantile models | `(n, groups)`; `groups` is 1 for regression, binary, ranking, single-quantile and `multi:softmax` class indices |
+| `pred_contribs` | `(n, F + 1)`, or `(n, groups, F + 1)` | `(n, groups, F + 1)` |
+| `pred_interactions` | `(n, F + 1, F + 1)`, or `(n, groups, F + 1, F + 1)` | `(n, groups, F + 1, F + 1)` |
+| `pred_leaf` | `(n, n_trees)` | `(n, rounds, groups, 1)` (the last axis is the trees per round and group, always 1 here); `n_trees` must be a whole number of rounds |
+
+It only reshapes the finished array (a view of the same values) and applies to every input type and to `iteration_range`; `rounds` counts the rounds actually used. `predict_to_parquet` has its own column layout and no such option.
+
+#### SHAP on the GPU
+
+`predict(..., use_gpu=True, pred_contribs=True)` (also `approx_contribs=True`, `pred_interactions=True` and `pred_leaf=True`) computes the explanations on GPU 0 in CUDA builds, for every call with rows (there is no small-batch fallback, unlike plain scoring), and for every kind of model, including models with categorical splits and models loaded from XGBoost. The result is **bit-identical** to the CPU path (and so to XGBoost 3.4.1 on the CPU in the same cases): the device runs the same fixed 8-point quadrature TreeSHAP with the same `float32` operation order, one thread per row and output group walking the trees in model order, with no atomics and no cross-thread reductions, so results are also identical from run to run. A per-row `base_margin` works on the device too.
+
+Device memory is bounded: the ensemble is uploaded once per model, and rows are processed in batches sized from the free device memory (at most about 512 MiB per batch, including the per-thread traversal scratch, which grows with the deepest tree used). A model so wide that even one row's interaction matrix does not fit raises an error; use the CPU for it. Prediction scoring (`use_gpu=True` without an explanation option) is unchanged.
 
 ## Save, load, and exchange models with XGBoost
 
@@ -1697,7 +1717,7 @@ Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), e
 - `xgb_model`: a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-xgb_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
-Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
+Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
 ## Common errors
 

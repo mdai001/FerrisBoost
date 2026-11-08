@@ -13,8 +13,10 @@
 //! * Leaf indices are node ids in the tree arrays, which is how the JSON model
 //!   numbers them.
 //!
-//! Everything is CPU-only and row-parallel; each row is computed serially in
-//! model order, so the result does not depend on the worker count.
+//! This is the host implementation: row-parallel, each row computed serially in
+//! model order, so the result does not depend on the worker count. The device
+//! kernels (`backend::cuda::explain`) replay this exact float32 operation order
+//! per row and group and are bit-identical to it.
 
 // Index loops over the fixed 8-point buffers deliberately mirror XGBoost's
 // operation order, which is what keeps the float32 results identical.
@@ -171,7 +173,17 @@ fn rule() -> &'static Rule {
     RULE.get_or_init(make_rule)
 }
 
-fn branch_weight(cover: f32, parent_cover: f32) -> f32 {
+/// The quadrature nodes then weights, as the 16 floats the device kernels read.
+#[cfg(feature = "cuda")]
+pub(crate) fn rule_values() -> [f32; 2 * POINTS] {
+    let r = rule();
+    let mut out = [0.0f32; 2 * POINTS];
+    out[..POINTS].copy_from_slice(&r.nodes);
+    out[POINTS..].copy_from_slice(&r.weights);
+    out
+}
+
+pub(crate) fn branch_weight(cover: f32, parent_cover: f32) -> f32 {
     if parent_cover <= 0.0 {
         return 0.5;
     }
@@ -394,7 +406,7 @@ impl<F: Formulation> Runner<'_, F> {
 
 /// Cover-weighted mean leaf value of every node, in float32 like XGBoost's
 /// `FillNodeMeanValues`.
-fn fill_node_means(nodes: &[Node], idx: usize, means: &mut [f32]) -> f32 {
+pub(crate) fn fill_node_means(nodes: &[Node], idx: usize, means: &mut [f32]) -> f32 {
     let node = &nodes[idx];
     let value = if node.is_leaf {
         node.leaf_value
@@ -533,6 +545,28 @@ impl<'a> Explainer<'a> {
             group_root_mean,
             approx_means,
         })
+    }
+
+    /// Trees explained (the prefix length).
+    pub fn n_trees(&self) -> usize {
+        self.n_trees
+    }
+
+    /// Number of output groups.
+    pub fn groups(&self) -> usize {
+        self.k
+    }
+
+    /// Margin-space base score of each output group.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn group_bias(&self) -> &[f32] {
+        &self.group_bias
+    }
+
+    /// Cover-weighted root mean of each group (the exact-SHAP bias term).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn group_root_mean(&self) -> &[f32] {
+        &self.group_root_mean
     }
 
     /// Number of f32 values produced per input row.
@@ -1237,5 +1271,76 @@ mod tests {
                 Some(&[0.0, 1.0])
             )
             .is_err());
+    }
+
+    /// The device kernels replay the host's float32 operation order, so every
+    /// explanation must match bit for bit (not just to a tolerance), for
+    /// multiclass, categorical, missing-value, root-only and deep models, with
+    /// a tree prefix and with per-row base margins.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_matches_cpu_bit_for_bit() {
+        let mut rng = Rng(0xc0ff_ee11);
+        // (outputs, features, depth, categorical)
+        let cases = [
+            (1usize, 5usize, 4usize, false),
+            (3, 4, 5, false),
+            (1, 4, 4, true),
+            (2, 3, 6, true),
+            (1, 2, 9, false),
+            (1, 6, 0, false),
+        ];
+        for (k, nf, depth, cat) in cases {
+            let mut trees: Vec<Tree> = (0..5 * k)
+                .map(|_| random_tree(&mut rng, nf, depth))
+                .collect();
+            if cat {
+                trees.iter_mut().for_each(|t| categorize(&mut rng, t));
+            }
+            let model = model_of(trees, nf, k);
+            let gpu = match crate::backend::cuda::GpuExplainModel::new(&model, 0) {
+                Ok(gpu) => gpu,
+                Err(e) => {
+                    eprintln!("skipping the device comparison: {e:#}");
+                    return;
+                }
+            };
+            let n = 37;
+            let pool = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, -1.0, 40.0, f32::NAN];
+            let rows: Vec<f32> = if cat {
+                (0..n * nf)
+                    .map(|_| pool[(rng.next() % 9) as usize])
+                    .collect()
+            } else {
+                random_rows(&mut rng, n, nf)
+            };
+            let margin: Vec<f32> = (0..n * k).map(|_| rng.unit() - 0.5).collect();
+            for kind in [
+                Kind::Contribs { approx: false },
+                Kind::Contribs { approx: true },
+                Kind::Interactions,
+                Kind::Leaf,
+            ] {
+                for upto in [model.trees.len(), model.trees.len() - k, 0] {
+                    let ex = Explainer::new(&model, upto, kind).unwrap();
+                    for m in [None, Some(margin.as_slice())] {
+                        let cpu = ex
+                            .compute_with_margin(kind, &rows, n, 1, &mut None, m)
+                            .unwrap();
+                        let dev = gpu.compute(&ex, kind, &rows, n, m).unwrap();
+                        assert_eq!(cpu.len(), dev.len());
+                        for (i, (a, b)) in cpu.iter().zip(&dev).enumerate() {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "k={k} depth={depth} cat={cat} {kind:?} upto={upto} margin={} \
+                                 at {i}: {a} vs {b}",
+                                m.is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

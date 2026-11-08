@@ -15,8 +15,10 @@ use std::{
 
 use crate::types::{Bin, GradPairFixed, RowId, MISSING_BIN};
 
+mod explain;
 mod inference;
 mod train_ctx;
+pub use explain::GpuExplainModel;
 pub use inference::GpuInferenceModel;
 pub(crate) use train_ctx::GpuSplitGroup;
 pub use train_ctx::{

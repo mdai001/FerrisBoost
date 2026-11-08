@@ -3,7 +3,9 @@
 //! The numerics live in `crate::explain`; this layer only resolves inputs
 //! (NumPy arrays or file specs), picks the worker count and shapes the output.
 //!
-//! These outputs are always computed on the CPU, whatever `use_gpu` says.
+//! The values come from the CPU by default and from the device with
+//! `use_gpu=True` (`crate::backend::cuda::GpuExplainModel`); both are
+//! bit-identical, so this layer only picks the engine.
 
 use numpy::ndarray::IxDyn;
 
@@ -54,6 +56,33 @@ impl ExplainRequest {
     }
 }
 
+/// The device engine of a call, when `use_gpu` selected it.
+#[cfg(feature = "cuda")]
+pub(super) type GpuEngine = Option<Arc<crate::backend::cuda::GpuExplainModel>>;
+#[cfg(not(feature = "cuda"))]
+pub(super) type GpuEngine = Option<std::convert::Infallible>;
+
+/// One batch through the selected engine (CPU workers or the device).
+#[allow(clippy::too_many_arguments)]
+fn explain_batch(
+    explainer: &Explainer,
+    gpu: &GpuEngine,
+    kind: Kind,
+    rows: &[f32],
+    n_rows: usize,
+    workers: usize,
+    pool: &mut Option<rayon::ThreadPool>,
+    margin: Option<&[f32]>,
+) -> anyhow::Result<Vec<f32>> {
+    #[cfg(feature = "cuda")]
+    if let Some(device) = gpu {
+        return device.compute(explainer, kind, rows, n_rows, margin);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = gpu;
+    explainer.compute_with_margin(kind, rows, n_rows, workers, pool, margin)
+}
+
 /// Rough relative cost of one explained row versus a plain prediction row, so
 /// small inputs stay serial under automatic worker selection.
 const EXPLAIN_WORK_FACTOR: usize = 32;
@@ -61,6 +90,15 @@ const EXPLAIN_WORK_FACTOR: usize = 32;
 impl PyModel {
     /// `Model.get_score`: feature index -> name (`f{i}` when the model has no
     /// names, as XGBoost does) and the importance of every used feature.
+    pub(super) fn explain_engine(&self, use_gpu: bool) -> PyResult<GpuEngine> {
+        ensure_gpu_prediction_available(use_gpu)?;
+        #[cfg(feature = "cuda")]
+        if use_gpu {
+            return Ok(Some(self.gpu_explainer(0).map_err(to_py_err)?));
+        }
+        Ok(None)
+    }
+
     pub(super) fn feature_score_dict<'py>(
         &self,
         py: Python<'py>,
@@ -123,6 +161,49 @@ impl PyModel {
         Ok(())
     }
 
+    /// `strict_shape=True`: XGBoost's `CalcPredictShape` with the group axis
+    /// always present. Values and margins are `(n, groups)` (`(n, 1)` for a
+    /// single output, softmax class indices included), contributions
+    /// `(n, groups, F + 1)`, interactions `(n, groups, F + 1, F + 1)` and
+    /// leaves `(n, rounds, groups, 1)` (one tree per group per round, so the
+    /// forest axis is always 1). The default shapes drop the group axis when
+    /// there is one group, so this only inserts or splits axes of the finished
+    /// array (a view, no copy).
+    pub(super) fn strict_shaped<'py>(
+        &self,
+        out: Bound<'py, PyAny>,
+        request: ExplainRequest,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let shape: Vec<usize> = out.getattr("shape")?.extract()?;
+        let groups = self.inner.num_outputs();
+        let new_shape: Vec<usize> = if request.leaf {
+            let (rows, trees) = (shape[0], shape[1]);
+            if trees % groups != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "strict_shape with pred_leaf needs whole boosting rounds, but {trees} trees                      were used and every round has {groups} (n_trees must be a multiple of {groups})"
+                )));
+            }
+            vec![rows, trees / groups, groups, 1]
+        } else {
+            // Without a group axis the default shape has one dimension fewer
+            // than the strict one: (n,) / (n, F+1) / (n, F+1, F+1).
+            let full_dims = if request.interactions {
+                4
+            } else if request.contribs {
+                3
+            } else {
+                2
+            };
+            if shape.len() >= full_dims {
+                return Ok(out);
+            }
+            let mut dims = shape;
+            dims.insert(1, 1);
+            dims
+        };
+        out.call_method1("reshape", (new_shape,))
+    }
+
     fn explain_output_shape(&self, kind: Kind, rows: usize, n_trees: usize) -> Vec<usize> {
         let nc = self.inner.n_features + 1;
         let k = self.inner.num_outputs();
@@ -161,6 +242,7 @@ impl PyModel {
         n_trees: Option<usize>,
         header: bool,
         predict_threads: usize,
+        use_gpu: bool,
         missing: f32,
         margin: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -176,6 +258,7 @@ impl PyModel {
                 .unwrap_or(self.inner.trees.len())
                 .min(self.inner.trees.len());
             let explainer = Explainer::new(&self.inner, upto, kind).map_err(to_py_err)?;
+            let gpu = self.explain_engine(use_gpu)?;
             let work_per_row =
                 prediction_work_per_row(&self.inner, upto).saturating_mul(EXPLAIN_WORK_FACTOR);
             let n_features = self.inner.n_features;
@@ -229,7 +312,9 @@ impl PyModel {
                                     None => None,
                                 };
                                 row_offset += n_rows;
-                                out.extend(explainer.compute_with_margin(
+                                out.extend(explain_batch(
+                                    &explainer,
+                                    &gpu,
                                     kind,
                                     batch,
                                     n_rows,
@@ -288,7 +373,9 @@ impl PyModel {
             let mut pool = None;
             let out = py
                 .detach(|| {
-                    explainer.compute_with_margin(kind, rows, n_rows, workers, &mut pool, margin)
+                    explain_batch(
+                        &explainer, &gpu, kind, rows, n_rows, workers, &mut pool, margin,
+                    )
                 })
                 .map_err(to_py_err)?;
             self.explain_array(py, out, kind, n_rows, upto)

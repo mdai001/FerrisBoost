@@ -229,7 +229,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
 * **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned. Prediction from a categorical model runs on the CPU.
-* **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
+* **Explanations:** SHAP values, interactions, and leaf indices run on the GPU with `use_gpu=True` (bit-identical to the CPU); the device path uses GPU 0 only.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
 These are performance and feature limitations, not correctness failures. Future work includes GPU inference pipeline overlap and multi-GPU support.
@@ -255,6 +255,8 @@ logging, and the complete parameter reference.
 - Added ranking `auc` and `aucpr`.
 - Added multiple quantiles in one model (`quantile_alpha` list).
 - Multiclass `predict_to_parquet` now streams.
+- Added `strict_shape`.
+- SHAP values on GPU.
 - GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6

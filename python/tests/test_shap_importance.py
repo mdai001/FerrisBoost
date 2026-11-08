@@ -311,3 +311,291 @@ def test_use_gpu_is_ignored_for_explanations():
     model = train_fb({"objective": "reg:squarederror", "max_depth": 3}, x, y, rounds=3)
     np.testing.assert_array_equal(model.predict(x, pred_contribs=True, use_gpu=True),
                                   model.predict(x, pred_contribs=True))
+
+
+# ---------------------------------------------------------------------------
+# strict_shape: XGBoost's CalcPredictShape, case by case
+# ---------------------------------------------------------------------------
+
+STRICT_KINDS = {
+    "value": {},
+    "margin": {"output_margin": True},
+    "contribs": {"pred_contribs": True},
+    "approx": {"pred_contribs": True, "approx_contribs": True},
+    "interactions": {"pred_interactions": True},
+    "leaf": {"pred_leaf": True},
+}
+
+
+def _ranking_data(seed=2):
+    rng = np.random.default_rng(seed)
+    sizes = rng.integers(8, 30, 40)
+    qid = np.repeat(np.arange(len(sizes)), sizes)
+    x = rng.normal(size=(len(qid), 5)).astype(np.float32)
+    y = np.clip((x[:, 0] * 1.5 + rng.normal(0, 1, len(qid)) + 1.5).round(), 0, 4).astype(np.float32)
+    return x, y, qid
+
+
+@pytest.fixture(scope="module", params=["logistic", "squarederror", "softprob", "softmax",
+                                        "quantiles", "single_quantile", "ranking"])
+def strict_pair(request, tmp_path_factory):
+    name = request.param
+    path = tmp_path_factory.mktemp(name)
+    kw = {}
+    if name == "ranking":
+        x, y, qid = _ranking_data()
+        params = {"objective": "rank:ndcg", "max_depth": 3}
+        kw["qid"] = qid
+    elif name in ("softprob", "softmax"):
+        x, y = make(k=3, seed=2)
+        params = {"objective": f"multi:{name}", "num_class": 3, "max_depth": 3}
+    elif name == "quantiles":
+        x, y = make(seed=1)
+        params = {"objective": "reg:quantileerror", "quantile_alpha": [0.2, 0.5, 0.8],
+                  "max_depth": 3}
+    elif name == "single_quantile":
+        x, y = make(seed=1)
+        params = {"objective": "reg:quantileerror", "quantile_alpha": 0.5, "max_depth": 3}
+    else:
+        x, y = make(seed=1)
+        if name == "logistic":
+            y = (y > np.median(y)).astype(np.float32)
+        params = {"objective": f"{'binary:logistic' if name == 'logistic' else 'reg:squarederror'}",
+                  "max_depth": 3}
+    model = fb.train({**params, "nthread": 1}, x[:600], label=y[:600], num_boost_round=4,
+                     quiet=True, **{k: v[:600] for k, v in kw.items()})
+    return model, booster_of(model, path), x[:150], name
+
+
+@pytest.mark.parametrize("kind", sorted(STRICT_KINDS))
+def test_strict_shape_matches_xgboost(strict_pair, kind):
+    model, bst, x, name = strict_pair
+    flags = STRICT_KINDS[kind]
+    d = xgb.DMatrix(x)
+    ours = model.predict(x, strict_shape=True, **flags)
+    ref = bst.predict(d, strict_shape=True, **flags)
+    assert ours.shape == ref.shape, (name, kind)
+    assert ours.dtype == np.float32
+    atol = 1e-5 if "pred_interactions" in flags or "pred_contribs" in flags else 1e-6
+    np.testing.assert_allclose(ours, ref, rtol=1e-5, atol=atol)
+    # strict_shape only reshapes: the values are the default ones
+    plain = model.predict(x, **flags)
+    np.testing.assert_array_equal(ours.reshape(-1), plain.reshape(-1))
+    # and the default shapes still match XGBoost's
+    assert plain.shape == bst.predict(d, **flags).shape
+
+
+@pytest.mark.parametrize("kind", ["value", "margin", "contribs", "leaf"])
+def test_strict_shape_with_iteration_range(strict_pair, kind):
+    model, bst, x, name = strict_pair
+    flags = STRICT_KINDS[kind]
+    d = xgb.DMatrix(x)
+    # XGBoost's explanations only support ranges that begin at 0 (it asks for
+    # model slicing instead); values and margins take any range.
+    for rng in ((0, 2), (0, 3)) + ((1, 3),) * (kind in ("value", "margin")):
+        ours = model.predict(x, strict_shape=True, iteration_range=rng, **flags)
+        ref = bst.predict(d, strict_shape=True, iteration_range=rng, **flags)
+        assert ours.shape == ref.shape, (name, kind, rng)
+        np.testing.assert_allclose(ours, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_strict_shape_leaf_forest_axis_and_n_trees():
+    x, y = make(k=3, seed=2)
+    model = train_fb({"objective": "multi:softprob", "num_class": 3, "max_depth": 3}, x, y,
+                     rounds=4)
+    assert model.predict(x, pred_leaf=True, strict_shape=True).shape == (len(x), 4, 3, 1)
+    assert model.predict(x, pred_leaf=True, strict_shape=True, n_trees=6).shape == (len(x), 2, 3, 1)
+    with pytest.raises(ValueError, match="whole boosting rounds"):
+        model.predict(x, pred_leaf=True, strict_shape=True, n_trees=5)
+
+
+def test_strict_shape_file_input_and_empty_flags(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=400, seed=12)
+    cols = {f"feat_{i}": x[:, i] for i in range(x.shape[1])}
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(pa.table({**cols, "label": y}), path)
+    model = fb.train({"objective": "reg:squarederror", "max_depth": 3, "nthread": 1}, path,
+                     label="label", num_boost_round=3, quiet=True)
+    assert model.predict(path, strict_shape=True).shape == (len(x), 1)
+    assert model.predict(path, strict_shape=True, pred_contribs=True).shape == (len(x), 1, 7)
+    # default stays flat
+    assert model.predict(path).shape == (len(x),)
+
+
+# ---------------------------------------------------------------------------
+# GPU explanations: bit-identical to the CPU path
+# ---------------------------------------------------------------------------
+
+
+def _has_cuda_predict():
+    try:
+        x, y = make(n=64, seed=0)
+        m = train_fb({"objective": "reg:squarederror", "max_depth": 2}, x, y, rounds=1)
+        m.predict(x, pred_contribs=True, use_gpu=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        if "CUDA" in str(e) or "cuda" in str(e) or "GPU" in str(e):
+            return False
+        raise
+
+
+gpu = pytest.mark.skipif(not _has_cuda_predict(), reason="no usable CUDA build or device")
+
+EXPLAIN_KINDS = {
+    "contribs": {"pred_contribs": True},
+    "approx": {"pred_contribs": True, "approx_contribs": True},
+    "interactions": {"pred_interactions": True},
+    "leaf": {"pred_leaf": True},
+}
+
+
+def bits(a):
+    return np.ascontiguousarray(a).view(np.uint32)
+
+
+def assert_identical(cpu, dev, what=""):
+    assert cpu.shape == dev.shape and cpu.dtype == dev.dtype, what
+    np.testing.assert_array_equal(bits(cpu), bits(dev), err_msg=what)
+
+
+@gpu
+@pytest.mark.parametrize("kind", sorted(EXPLAIN_KINDS))
+def test_gpu_explanations_are_bit_identical_to_cpu(pair, kind):
+    model, bst, x, k = pair
+    x = x[:300]
+    flags = EXPLAIN_KINDS[kind]
+    cpu = model.predict(x, **flags)
+    dev = model.predict(x, use_gpu=True, **flags)
+    assert_identical(cpu, dev, kind)
+    # and deterministic: a second launch gives the same bits
+    assert_identical(dev, model.predict(x, use_gpu=True, **flags), kind)
+
+
+@gpu
+@pytest.mark.parametrize("max_depth", [0, 1, 2, 4, 6, 8, 10])
+def test_gpu_depth_sweep_matches_cpu_and_xgboost(max_depth, tmp_path):
+    x, y = make(n=900, seed=20 + max_depth, missing=0.2)
+    y = (y > 0).astype(np.float32)
+    model = train_fb({"objective": "binary:logistic", "max_depth": max_depth}, x, y, rounds=5)
+    bst = booster_of(model, tmp_path)
+    for kind in ("contribs", "approx"):
+        flags = EXPLAIN_KINDS[kind]
+        dev = model.predict(x, use_gpu=True, **flags)
+        assert_identical(model.predict(x, **flags), dev, kind)
+        np.testing.assert_allclose(dev, bst.predict(xgb.DMatrix(x), **flags), rtol=0, atol=SHAP_ATOL)
+    xi = x[:60]
+    dev = model.predict(xi, use_gpu=True, pred_interactions=True)
+    assert_identical(model.predict(xi, pred_interactions=True), dev, "interactions")
+    np.testing.assert_allclose(dev, bst.predict(xgb.DMatrix(xi), pred_interactions=True),
+                               rtol=0, atol=SHAP_ATOL)
+    assert_identical(model.predict(x, pred_leaf=True), model.predict(x, use_gpu=True, pred_leaf=True))
+
+
+@gpu
+def test_gpu_repeated_features_on_a_path():
+    # Many splits on few features force the previous-occurrence bookkeeping.
+    rng = np.random.default_rng(31)
+    x = rng.normal(size=(1500, 2)).astype(np.float32)
+    y = (np.sin(3 * x[:, 0]) + np.cos(2 * x[:, 1]) + rng.normal(0, 0.1, len(x))).astype(np.float32)
+    model = train_fb({"objective": "reg:squarederror", "max_depth": 9}, x, y, rounds=4)
+    for kind, flags in EXPLAIN_KINDS.items():
+        assert_identical(model.predict(x[:200], **flags),
+                         model.predict(x[:200], use_gpu=True, **flags), kind)
+
+
+@gpu
+def test_gpu_base_margin_and_ranges():
+    x, y = make(k=3, seed=2)
+    model = train_fb({"objective": "multi:softprob", "num_class": 3, "max_depth": 4}, x, y)
+    margin = np.random.default_rng(1).normal(size=(len(x), 3)).astype(np.float32)
+    xs, ms = x[:200], margin[:200]
+    for kind in ("contribs", "approx", "interactions"):
+        flags = EXPLAIN_KINDS[kind]
+        for extra in ({"base_margin": ms}, {"iteration_range": (1, 4)}, {"n_trees": 7}):
+            assert_identical(model.predict(xs, **flags, **extra),
+                             model.predict(xs, use_gpu=True, **flags, **extra), (kind, extra))
+    # base_margin lands in the bias column
+    dev = model.predict(xs, use_gpu=True, pred_contribs=True, base_margin=ms)
+    np.testing.assert_allclose(dev.sum(axis=-1), model.predict(xs, output_margin=True, base_margin=ms),
+                               atol=2e-4)
+
+
+@gpu
+def test_gpu_categorical_splits(tmp_path):
+    rng = np.random.default_rng(5)
+    n = 1500
+    num = rng.normal(size=(n, 2)).astype(np.float32)
+    cat1 = rng.integers(0, 9, n).astype(np.float32)
+    cat2 = rng.integers(0, 40, n).astype(np.float32)
+    x = np.column_stack([num, cat1, cat2])
+    x[rng.random(x.shape) < 0.07] = np.nan
+    eff1, eff2 = rng.normal(0, 1, 9), rng.normal(0, 1, 40)
+    y = (num[:, 0] + eff1[np.nan_to_num(cat1).astype(int)] + eff2[np.nan_to_num(cat2).astype(int)]
+         + rng.normal(0, 0.3, n)).astype(np.float32)
+    model = fb.train({"objective": "reg:squarederror", "max_depth": 5, "nthread": 1,
+                      "max_cat_to_onehot": 2}, x, label=y, num_boost_round=5, quiet=True,
+                     feature_types=["q", "q", "c", "c"])
+    assert model.predict(x[:10], pred_leaf=True).size  # sanity
+    probe = x[:300].copy()
+    probe[5, 2] = 77.0       # beyond the trained categories
+    probe[6, 2] = -3.0       # negative code
+    probe[7, 3] = 1e9        # absurd code
+    probe[8, 2] = 2.9        # fractional code truncates
+    for kind, flags in EXPLAIN_KINDS.items():
+        assert_identical(model.predict(probe, **flags), model.predict(probe, use_gpu=True, **flags), kind)
+    bst = booster_of(model, tmp_path)
+    d = xgb.DMatrix(probe, feature_types=["q", "q", "c", "c"], enable_categorical=True)
+    np.testing.assert_allclose(model.predict(probe, use_gpu=True, pred_contribs=True),
+                               bst.predict(d, pred_contribs=True), rtol=0, atol=SHAP_ATOL)
+
+
+@gpu
+@pytest.mark.parametrize("name", ["binary", "multi", "lossguide"])
+def test_gpu_on_xgboost_trained_models(name, tmp_path):
+    if name == "multi":
+        x, y = make(seed=4, k=4)
+        params = {"objective": "multi:softprob", "num_class": 4, "max_depth": 5}
+    else:
+        x, y = make(seed=3)
+        y = (y > 0).astype(np.float32)
+        params = {"objective": "binary:logistic", "max_depth": 7}
+        if name == "lossguide":
+            params.update(grow_policy="lossguide", max_leaves=24, max_depth=0)
+    bst = xgb.train({**params, "tree_method": "hist", "nthread": 1}, xgb.DMatrix(x, label=y), 6)
+    path = str(tmp_path / "x.json")
+    bst.save_model(path)
+    model = fb.Model.load_model(path, quiet=True)
+    d = xgb.DMatrix(x[:150])
+    dev = model.predict(x[:150], use_gpu=True, pred_contribs=True)
+    assert_identical(model.predict(x[:150], pred_contribs=True), dev)
+    np.testing.assert_allclose(dev, bst.predict(d, pred_contribs=True), rtol=0, atol=SHAP_ATOL)
+    if name != "lossguide":
+        dev = model.predict(x[:60], use_gpu=True, pred_interactions=True)
+        assert_identical(model.predict(x[:60], pred_interactions=True), dev)
+
+
+@gpu
+def test_gpu_batches_more_rows_than_one_device_batch_and_empty_input():
+    x, y = make(n=500, seed=40)
+    model = train_fb({"objective": "reg:squarederror", "max_depth": 4}, x, y)
+    big = np.tile(x, (40, 1))
+    assert_identical(model.predict(big, pred_contribs=True),
+                     model.predict(big, use_gpu=True, pred_contribs=True))
+    empty = np.zeros((0, x.shape[1]), np.float32)
+    assert model.predict(empty, use_gpu=True, pred_contribs=True).shape == (0, x.shape[1] + 1)
+
+
+@gpu
+def test_gpu_explanations_from_a_file(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=700, seed=41)
+    cols = {f"feat_{i}": x[:, i] for i in range(x.shape[1])}
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(pa.table({**cols, "label": y}), path)
+    model = fb.train({"objective": "reg:squarederror", "max_depth": 4, "nthread": 1}, path,
+                     label="label", num_boost_round=4, quiet=True)
+    for kind, flags in EXPLAIN_KINDS.items():
+        assert_identical(model.predict(path, **flags), model.predict(path, use_gpu=True, **flags), kind)

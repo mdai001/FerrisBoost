@@ -1714,6 +1714,10 @@ pub struct PyModel {
     #[cfg(feature = "cuda")]
     gpu_predictors:
         Mutex<std::collections::HashMap<usize, Arc<crate::backend::cuda::GpuInferenceModel>>>,
+    /// Device SHAP / leaf-index kernels' flattened ensemble, per device.
+    #[cfg(feature = "cuda")]
+    gpu_explainers:
+        Mutex<std::collections::HashMap<usize, Arc<crate::backend::cuda::GpuExplainModel>>>,
     /// 多分类:每类一个单输出视图(`Model::class_view`),带各自的预测缓存。
     class_views: Mutex<Option<Arc<Vec<PyModel>>>>,
 }
@@ -1776,6 +1780,8 @@ impl PyModel {
             inference_model: Mutex::new(None),
             #[cfg(feature = "cuda")]
             gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "cuda")]
+            gpu_explainers: Mutex::new(std::collections::HashMap::new()),
             class_views: Mutex::new(None),
         }
     }
@@ -1878,6 +1884,7 @@ impl PyModel {
                 // Array input: the sentinel was already mapped to NaN by `predict`.
                 f64::NAN,
                 None,
+                false,
             )?;
             let arr = out
                 .cast::<PyArray1<f32>>()
@@ -2419,6 +2426,28 @@ impl PyModel {
         Ok(model)
     }
 
+    /// The flattened ensemble the device explanation kernels read, built once
+    /// per device on first use.
+    #[cfg(feature = "cuda")]
+    fn gpu_explainer(
+        &self,
+        device_ordinal: usize,
+    ) -> anyhow::Result<Arc<crate::backend::cuda::GpuExplainModel>> {
+        let mut cache = self
+            .gpu_explainers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU explanation model cache poisoned"))?;
+        if let Some(model) = cache.get(&device_ordinal) {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(crate::backend::cuda::GpuExplainModel::new(
+            &self.inner,
+            device_ordinal,
+        )?);
+        cache.insert(device_ordinal, Arc::clone(&model));
+        Ok(model)
+    }
+
     #[cfg(feature = "cuda")]
     fn gpu_predictor(
         &self,
@@ -2450,7 +2479,8 @@ impl PyModel {
     #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, use_gpu=false, iteration_range=None,
                         pred_contribs=false, approx_contribs=false, pred_interactions=false,
-                        pred_leaf=false, missing=f64::NAN, base_margin=None))]
+                        pred_leaf=false, missing=f64::NAN, base_margin=None,
+                        strict_shape=false))]
     /// 预测。`data` 可以是:
     ///
     /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
@@ -2475,7 +2505,36 @@ impl PyModel {
         pred_leaf: bool,
         missing: f64,
         base_margin: Option<&Bound<'py, PyAny>>,
+        strict_shape: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // `strict_shape` (XGBoost semantics) only reshapes the finished output,
+        // so it is applied to the ordinary result of the same call.
+        if strict_shape {
+            let out = self.predict(
+                py,
+                data,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+                iteration_range,
+                pred_contribs,
+                approx_contribs,
+                pred_interactions,
+                pred_leaf,
+                missing,
+                base_margin,
+                false,
+            )?;
+            let request = explain::ExplainRequest {
+                contribs: pred_contribs,
+                approx: approx_contribs,
+                interactions: pred_interactions,
+                leaf: pred_leaf,
+            };
+            return self.strict_shaped(out, request);
+        }
         // `missing` (XGBoost semantics): feature values equal to it score as
         // NaN. Array-likes are normalized (and the sentinel mapped) here, once,
         // so every branch below sees a plain f32 matrix; file inputs carry the
@@ -2508,6 +2567,7 @@ impl PyModel {
                         pred_leaf,
                         f64::from(missing),
                         base_margin,
+                        false,
                     );
                 }
             }
@@ -2520,8 +2580,9 @@ impl PyModel {
             _ => None,
         };
         let init = margin_values.as_deref();
-        // SHAP contributions / interactions / leaf indices (CPU only; `use_gpu`
-        // does not apply). Single code path for all objectives and inputs.
+        // SHAP contributions / interactions / leaf indices: on the CPU, or on
+        // the device with `use_gpu` (same values bit for bit). Single code path
+        // for all objectives and inputs.
         let explain = explain::ExplainRequest {
             contribs: pred_contribs,
             approx: approx_contribs,
@@ -2537,6 +2598,7 @@ impl PyModel {
                 n_trees,
                 header,
                 predict_threads,
+                use_gpu,
                 missing,
                 init,
             );
@@ -2776,6 +2838,8 @@ impl PyModel {
                 cpu_predictor: Mutex::new(None),
                 #[cfg(feature = "cuda")]
                 gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "cuda")]
+                gpu_explainers: Mutex::new(std::collections::HashMap::new()),
                 class_views: Mutex::new(None),
                 inference_model: Mutex::new(None),
             })
@@ -3384,6 +3448,8 @@ fn finish(
         inference_model: Mutex::new(None),
         #[cfg(feature = "cuda")]
         gpu_predictors: Mutex::new(std::collections::HashMap::new()),
+        #[cfg(feature = "cuda")]
+        gpu_explainers: Mutex::new(std::collections::HashMap::new()),
         class_views: Mutex::new(None),
     }
 }

@@ -2687,3 +2687,464 @@ extern "C" __global__ void rank_finalize(
         gpair_out[(uint64_t)i * 2 + 1] = he;
     }
 }
+
+// ================================================================ SHAP explanations (shx_*)
+//
+// `Model.predict(pred_contribs / pred_interactions / pred_leaf, use_gpu=True)`.
+//
+// The device runs the same fixed 8-point QuadratureTreeSHAP as `src/explain.rs`
+// and replays its float32 operation order exactly: one thread owns one
+// (row, output group) pair and walks the group's trees in model order, so
+// nothing is reduced across threads and no float atomics exist. Every float
+// operation is a round-to-nearest intrinsic (no FMA contraction), which makes
+// the result bit-identical to the host path.
+//
+// The tree walk is the host recursion made iterative. SHAP visits every node
+// whatever the row, so all threads of a warp execute the same node sequence
+// (only the values differ). The per-level frames live in a global scratch laid
+// out structure-of-arrays over threads (word w of thread t at w * stride + t),
+// which keeps those accesses coalesced; the host sizes it from the deepest tree
+// of the requested prefix, so there is no fixed depth limit.
+//
+// Per node (precomputed on the host, flattened over all trees):
+//   child_weight  branch_weight(cover, parent cover) of the edge into the node
+//   prev_same     levels up to the nearest ancestor splitting on the same
+//                 feature (0 = none); that ancestor's edge probability is the
+//                 host's `path_prob[feat]`
+//   slot          position of the split feature in the tree's list of distinct
+//                 features, where the per-tree contribution accumulates (the
+//                 host's `tree_contribs`, summed per tree and then added to the
+//                 row so the rounding matches)
+// Interactions accumulate straight into the output matrix like the host; two
+// small kernels then symmetrise it and turn the diagonal into main effects.
+#define SHX_POINTS 8
+#define SHX_UNSEEN (-999.0f)
+// Frame layout (words per level).
+#define SHX_NODE 0u
+#define SHX_PHASE 1u
+#define SHX_EFEAT 2u
+#define SHX_W 3u
+#define SHX_PE 4u
+#define SHX_POLD 5u
+#define SHX_C 6u
+#define SHX_H (SHX_C + SHX_POINTS)
+#define SHX_FRAME_WORDS (SHX_H + SHX_POINTS)
+
+#define SHX_FMUL(a, b) __fmul_rn((a), (b))
+#define SHX_FADD(a, b) __fadd_rn((a), (b))
+#define SHX_FSUB(a, b) __fsub_rn((a), (b))
+#define SHX_FDIV(a, b) __fdiv_rn((a), (b))
+
+#define SHX_MODEL_PARAMS \
+    const uint32_t* __restrict__ tree_node_begin, \
+    const uint32_t* __restrict__ node_feature, \
+    const float* __restrict__ node_split, \
+    const uint32_t* __restrict__ node_left, \
+    const uint32_t* __restrict__ node_right, \
+    const uint8_t* __restrict__ node_flags, \
+    const float* __restrict__ node_leaf, \
+    const float* __restrict__ node_child_weight, \
+    const uint32_t* __restrict__ node_prev_same, \
+    const uint32_t* __restrict__ node_slot, \
+    const uint32_t* __restrict__ node_cat_begin, \
+    const uint32_t* __restrict__ node_cat_len, \
+    const uint32_t* __restrict__ cat_words, \
+    const uint32_t* __restrict__ tree_uniq_begin, \
+    const uint32_t* __restrict__ uniq_feats, \
+    const float* __restrict__ node_mean
+
+struct ShxModel {
+    const uint32_t* tree_node_begin;
+    const uint32_t* feature;
+    const float* split;
+    const uint32_t* left;
+    const uint32_t* right;
+    const uint8_t* flags;
+    const float* leaf;
+    const float* child_weight;
+    const uint32_t* prev_same;
+    const uint32_t* slot;
+    const uint32_t* cat_begin;
+    const uint32_t* cat_len;
+    const uint32_t* cat_words;
+    const uint32_t* uniq_begin;
+    const uint32_t* uniq_feats;
+    const float* mean;
+};
+
+#define SHX_MODEL_INIT \
+    ShxModel m{tree_node_begin, node_feature, node_split, node_left, node_right, node_flags, \
+               node_leaf, node_child_weight, node_prev_same, node_slot, node_cat_begin, \
+               node_cat_len, cat_words, tree_uniq_begin, uniq_feats, node_mean}
+
+// Node::goes_left: missing follows default_left, a categorical node tests its
+// right-going set (everything else, including out-of-range codes, goes left),
+// a numeric node compares `v < split_cond`.
+__device__ __forceinline__ bool shx_goes_left(const ShxModel& m, uint32_t nd, float v) {
+    const uint8_t fl = m.flags[nd];
+    if (v != v) return (fl & 2u) != 0u;
+    if ((fl & 4u) != 0u) {
+        if (v < 0.0f || v >= 16777216.0f) return true;
+        const uint32_t cat = (uint32_t)v;
+        const uint32_t word = cat >> 5;
+        if (word >= m.cat_len[nd]) return true;
+        return ((m.cat_words[m.cat_begin[nd] + word] >> (cat & 31u)) & 1u) == 0u;
+    }
+    return v < m.split[nd];
+}
+
+// Scratch word accessors. `su` / `sf` alias one buffer; `stride` is the number
+// of threads of the launch and `sid` this thread's slot.
+#define SHX_SU(w) su[(uint64_t)(w) * stride + sid]
+#define SHX_SF(w) sf[(uint64_t)(w) * stride + sid]
+#define SHX_FU(d, f) SHX_SU((d) * SHX_FRAME_WORDS + (f))
+#define SHX_FF(d, f) SHX_SF((d) * SHX_FRAME_WORDS + (f))
+
+__device__ __forceinline__ float shx_extract_delta(const float* rn, const float* h,
+                                                   float p_enter, float p_exit) {
+    float acc = 0.0f;
+    if (p_enter != 1.0f) {
+        const float alpha = SHX_FSUB(p_enter, 1.0f);
+#pragma unroll
+        for (int i = 0; i < SHX_POINTS; ++i) {
+            acc = SHX_FADD(acc, SHX_FDIV(SHX_FMUL(alpha, h[i]),
+                                         SHX_FADD(1.0f, SHX_FMUL(alpha, rn[i]))));
+        }
+    }
+    if (p_exit != 1.0f) {
+        const float alpha = SHX_FSUB(p_exit, 1.0f);
+#pragma unroll
+        for (int i = 0; i < SHX_POINTS; ++i) {
+            acc = SHX_FSUB(acc, SHX_FDIV(SHX_FMUL(alpha, h[i]),
+                                         SHX_FADD(1.0f, SHX_FMUL(alpha, rn[i]))));
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float shx_interaction_delta(const float* rn, const float* h,
+                                                       float p_enter, float p_exit,
+                                                       float q_partner) {
+    if (q_partner == 1.0f) return 0.0f;
+    const float alpha_partner = SHX_FSUB(q_partner, 1.0f);
+    const float alpha_enter = SHX_FSUB(p_enter, 1.0f);
+    float acc = 0.0f;
+    if (p_exit == 1.0f) {
+#pragma unroll
+        for (int i = 0; i < SHX_POINTS; ++i) {
+            const float edge = SHX_FDIV(alpha_enter, SHX_FADD(1.0f, SHX_FMUL(alpha_enter, rn[i])));
+            acc = SHX_FADD(acc, SHX_FDIV(SHX_FMUL(SHX_FMUL(alpha_partner, h[i]), edge),
+                                         SHX_FADD(1.0f, SHX_FMUL(alpha_partner, rn[i]))));
+        }
+    } else {
+        const float alpha_exit = SHX_FSUB(p_exit, 1.0f);
+#pragma unroll
+        for (int i = 0; i < SHX_POINTS; ++i) {
+            const float edge = SHX_FSUB(
+                SHX_FDIV(alpha_enter, SHX_FADD(1.0f, SHX_FMUL(alpha_enter, rn[i]))),
+                SHX_FDIV(alpha_exit, SHX_FADD(1.0f, SHX_FMUL(alpha_exit, rn[i]))));
+            acc = SHX_FADD(acc, SHX_FDIV(SHX_FMUL(SHX_FMUL(alpha_partner, h[i]), edge),
+                                         SHX_FADD(1.0f, SHX_FMUL(alpha_partner, rn[i]))));
+        }
+    }
+    return acc;
+}
+
+// Set up the frame of one child of the node `nd` at level `p`: the host's
+// `visit_child` up to the recursive call.
+__device__ __forceinline__ void shx_descend(const ShxModel& m, const float* feats, const float* rn,
+                                            uint32_t p, uint32_t nd, bool right,
+                                            uint32_t* su, float* sf, uint64_t stride,
+                                            uint64_t sid) {
+    const uint32_t feat = m.feature[nd];
+    const uint32_t child = right ? m.right[nd] : m.left[nd];
+    const float cw = m.child_weight[child];
+    const bool gl = shx_goes_left(m, nd, feats[feat]);
+    const bool satisfies = right ? !gl : gl;
+    const uint32_t off = m.prev_same[nd];
+    const float p_old = off != 0u ? SHX_FF(p - off + 1u, SHX_PE) : SHX_UNSEEN;
+    const bool seen = p_old != SHX_UNSEEN;
+    float p_e = 0.0f;
+    if (satisfies) p_e = seen ? SHX_FDIV(p_old, cw) : SHX_FDIV(1.0f, cw);
+    const float alpha_e = SHX_FSUB(p_e, 1.0f);
+    const float alpha_old = seen ? SHX_FSUB(p_old, 1.0f) : 0.0f;
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        float c = SHX_FF(p, SHX_C + i);
+        c = SHX_FMUL(c, SHX_FADD(1.0f, SHX_FMUL(alpha_e, rn[i])));
+        if (seen && alpha_old != 0.0f) c = SHX_FDIV(c, SHX_FADD(1.0f, SHX_FMUL(alpha_old, rn[i])));
+        SHX_FF(p + 1u, SHX_C + i) = c;
+    }
+    SHX_FU(p + 1u, SHX_NODE) = child;
+    SHX_FU(p + 1u, SHX_EFEAT) = feat;
+    SHX_FF(p + 1u, SHX_W) = SHX_FMUL(SHX_FF(p, SHX_W), cw);
+    SHX_FF(p + 1u, SHX_PE) = p_e;
+    SHX_FF(p + 1u, SHX_POLD) = p_old;
+}
+
+// One tree for one row. MODE 0 accumulates per-tree contributions into the
+// scratch slots starting at word `tc_base`; MODE 1 adds the diagonal and the
+// path-partner deltas straight into `mat` (`nc` x `nc` floats of this row/group).
+template <int MODE>
+__device__ void shx_run_tree(const ShxModel& m, const float* feats, const float* rn,
+                             const float* rw, uint32_t root, uint32_t* su, float* sf,
+                             uint64_t stride, uint64_t sid, uint32_t tc_base, float* mat,
+                             uint32_t nc) {
+    uint32_t d = 0;
+    SHX_FU(0, SHX_NODE) = root;
+    SHX_FF(0, SHX_W) = 1.0f;
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) SHX_FF(0, SHX_C + i) = 1.0f;
+    while (true) {
+        const uint32_t nd = SHX_FU(d, SHX_NODE);
+        if ((m.flags[nd] & 1u) != 0u) {
+            const float leaf_scale = SHX_FMUL(SHX_FF(d, SHX_W), m.leaf[nd]);
+#pragma unroll
+            for (int i = 0; i < SHX_POINTS; ++i) {
+                SHX_FF(d, SHX_H + i) = SHX_FMUL(SHX_FMUL(SHX_FF(d, SHX_C + i), leaf_scale), rw[i]);
+            }
+        } else {
+            SHX_FU(d, SHX_PHASE) = 0u;
+            shx_descend(m, feats, rn, d, nd, false, su, sf, stride, sid);
+            ++d;
+            continue;
+        }
+        // The node at level d has its result in H; unwind finished edges
+        // until a right sibling still has to be visited.
+        while (true) {
+            if (d == 0u) return;
+            const uint32_t p = d - 1u;
+            const uint32_t pn = SHX_FU(p, SHX_NODE);
+            const uint32_t feat = m.feature[pn];
+            const float p_enter = SHX_FF(d, SHX_PE);
+            const float p_old = SHX_FF(d, SHX_POLD);
+            const float p_exit = p_old == SHX_UNSEEN ? 1.0f : p_old;
+            float h[SHX_POINTS];
+#pragma unroll
+            for (int i = 0; i < SHX_POINTS; ++i) h[i] = SHX_FF(d, SHX_H + i);
+            const float delta = shx_extract_delta(rn, h, p_enter, p_exit);
+            if (MODE == 0) {
+                const uint32_t w = tc_base + m.slot[pn];
+                SHX_SF(w) = SHX_FADD(SHX_SF(w), delta);
+            } else {
+                float* diag = mat + (uint64_t)feat * nc + feat;
+                *diag = SHX_FADD(*diag, delta);
+                // Partners: the newest occurrence of every other feature on the
+                // live path, newest to oldest; older duplicates are shadowed.
+                bool skipped_current = false;
+                for (uint32_t j = d; j >= 1u; --j) {
+                    const uint32_t split = SHX_FU(j, SHX_EFEAT);
+                    bool shadowed = false;
+                    for (uint32_t jj = j + 1u; jj <= d; ++jj) {
+                        if (SHX_FU(jj, SHX_EFEAT) == split) {
+                            shadowed = true;
+                            break;
+                        }
+                    }
+                    if (shadowed) continue;
+                    if (!skipped_current && split == feat) {
+                        skipped_current = true;
+                        continue;
+                    }
+                    const float dp = shx_interaction_delta(rn, h, p_enter, p_exit,
+                                                           SHX_FF(j, SHX_PE));
+                    if (dp != 0.0f) {
+                        float* cell = mat + (uint64_t)feat * nc + split;
+                        *cell = SHX_FADD(*cell, dp);
+                    }
+                }
+            }
+            if (SHX_FU(p, SHX_PHASE) == 0u) {
+#pragma unroll
+                for (int i = 0; i < SHX_POINTS; ++i) SHX_FF(p, SHX_H + i) = h[i];
+                SHX_FU(p, SHX_PHASE) = 1u;
+                shx_descend(m, feats, rn, p, pn, true, su, sf, stride, sid);
+                break;
+            }
+#pragma unroll
+            for (int i = 0; i < SHX_POINTS; ++i) {
+                SHX_FF(p, SHX_H + i) = SHX_FADD(SHX_FF(p, SHX_H + i), h[i]);
+            }
+            d = p;
+        }
+    }
+}
+
+// Exact contributions: out[(row * k + g) * nc + f], zeroed by the host.
+extern "C" __global__ void shx_contribs(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, uint32_t k, uint32_t levels,
+    const float* __restrict__ group_root_mean, const float* __restrict__ group_bias,
+    const float* __restrict__ margin, float* __restrict__ scratch, float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t g = blockIdx.y;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * k;
+    const uint64_t sid = (uint64_t)g * n_rows + row;
+    const uint32_t nc = n_features + 1u;
+    const uint32_t tc_base = levels * SHX_FRAME_WORDS;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float* p = out + ((uint64_t)row * k + g) * nc;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        for (uint32_t u = 0; u < un; ++u) SHX_SF(tc_base + u) = 0.0f;
+        shx_run_tree<0>(m, feats, rn, rw, root, su, sf, stride, sid, tc_base, nullptr, nc);
+        for (uint32_t u = 0; u < un; ++u) {
+            const uint32_t f = m.uniq_feats[ub + u];
+            p[f] = SHX_FADD(p[f], SHX_SF(tc_base + u));
+        }
+    }
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], group_root_mean[g]);
+    const float bias = margin != nullptr ? margin[(uint64_t)row * k + g] : group_bias[g];
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], bias);
+}
+
+// Saabas (approx_contribs): the host's `saabas_row`, same slots as above.
+extern "C" __global__ void shx_saabas(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rows, uint32_t n_rows, uint32_t n_features, uint32_t n_trees,
+    uint32_t k, const float* __restrict__ group_bias, const float* __restrict__ margin,
+    float* __restrict__ scratch, float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t g = blockIdx.y;
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * k;
+    const uint64_t sid = (uint64_t)g * n_rows + row;
+    const uint32_t nc = n_features + 1u;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float* p = out + ((uint64_t)row * k + g) * nc;
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        for (uint32_t u = 0; u < un; ++u) SHX_SF(u) = 0.0f;
+        float node_value = m.mean[root];
+        // tree_contribs[bias] starts at zero and receives the root mean.
+        p[nc - 1u] = SHX_FADD(p[nc - 1u], SHX_FADD(0.0f, node_value));
+        if ((m.flags[root] & 1u) == 0u) {
+            uint32_t idx = root;
+            uint32_t split_slot = 0;
+            while ((m.flags[idx] & 1u) == 0u) {
+                split_slot = m.slot[idx];
+                const bool left = shx_goes_left(m, idx, feats[m.feature[idx]]);
+                idx = left ? m.left[idx] : m.right[idx];
+                const float new_value = m.mean[idx];
+                SHX_SF(split_slot) = SHX_FADD(SHX_SF(split_slot), SHX_FSUB(new_value, node_value));
+                node_value = new_value;
+            }
+            SHX_SF(split_slot) = SHX_FADD(SHX_SF(split_slot), SHX_FSUB(m.leaf[idx], node_value));
+        }
+        for (uint32_t u = 0; u < un; ++u) {
+            const uint32_t f = m.uniq_feats[ub + u];
+            p[f] = SHX_FADD(p[f], SHX_SF(u));
+        }
+    }
+    const float bias = margin != nullptr ? margin[(uint64_t)row * k + g] : group_bias[g];
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], bias);
+}
+
+// Interactions: matrix[(row * k + g)][a * nc + b], zeroed by the host.
+extern "C" __global__ void shx_interactions(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, uint32_t k, float* __restrict__ scratch,
+    float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t g = blockIdx.y;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * k;
+    const uint64_t sid = (uint64_t)g * n_rows + row;
+    const uint32_t nc = n_features + 1u;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float* mat = out + ((uint64_t)row * k + g) * nc * nc;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        shx_run_tree<1>(m, feats, rn, rw, root, su, sf, stride, sid, 0u, mat, nc);
+    }
+}
+
+// Averages the two directional off-diagonal estimates: one thread per
+// (row/group, r), looping over the columns right of the diagonal.
+extern "C" __global__ void shx_interactions_symmetrize(float* __restrict__ out,
+                                                       uint64_t n_groups_total, uint32_t nc) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_groups_total * nc) return;
+    const uint64_t rg = idx / nc;
+    const uint32_t r = (uint32_t)(idx % nc);
+    float* mat = out + rg * nc * nc;
+    for (uint32_t c = r + 1u; c < nc; ++c) {
+        const float sym =
+            SHX_FMUL(0.5f, SHX_FADD(mat[(uint64_t)r * nc + c], mat[(uint64_t)c * nc + r]));
+        mat[(uint64_t)r * nc + c] = sym;
+        mat[(uint64_t)c * nc + r] = sym;
+    }
+}
+
+// Diagonal = additive SHAP value minus the row's interactions; the bias cell
+// also receives the root means and the base margin.
+extern "C" __global__ void shx_interactions_diagonal(
+    float* __restrict__ out, uint64_t n_groups_total, uint32_t nc, uint32_t k,
+    const float* __restrict__ group_root_mean, const float* __restrict__ group_bias,
+    const float* __restrict__ margin) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_groups_total * nc) return;
+    const uint64_t rg = idx / nc;  // row * k + g
+    const uint32_t r = (uint32_t)(idx % nc);
+    const uint32_t g = (uint32_t)(rg % k);
+    float* mat = out + rg * nc * nc;
+    float value = mat[(uint64_t)r * nc + r];
+    if (r == nc - 1u) {
+        value = SHX_FADD(value, group_root_mean[g]);
+        value = SHX_FADD(value, margin != nullptr ? margin[rg] : group_bias[g]);
+    }
+    for (uint32_t c = 0; c < nc; ++c) {
+        if (c != r) value = SHX_FSUB(value, mat[(uint64_t)r * nc + c]);
+    }
+    mat[(uint64_t)r * nc + r] = value;
+}
+
+// pred_leaf: the node id (within its tree) of the leaf each row reaches, as f32.
+extern "C" __global__ void shx_leaf(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rows, uint32_t n_rows, uint32_t n_features, uint32_t n_trees,
+    float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const float* feats = rows + (uint64_t)row * n_features;
+    for (uint32_t t = 0; t < n_trees; ++t) {
+        const uint32_t base = m.tree_node_begin[t];
+        uint32_t idx = base;
+        while ((m.flags[idx] & 1u) == 0u) {
+            const bool left = shx_goes_left(m, idx, feats[m.feature[idx]]);
+            idx = left ? m.left[idx] : m.right[idx];
+        }
+        out[(uint64_t)row * n_trees + t] = (float)(idx - base);
+    }
+}
+// ================================================================ end SHAP explanations

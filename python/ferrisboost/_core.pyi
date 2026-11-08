@@ -49,6 +49,7 @@ class Model:
         pred_leaf: bool = False,
         missing: float = ...,
         base_margin: Any = None,
+        strict_shape: bool = False,
     ) -> NDArray[np.float32]:
         """Return ordered float32 predictions from an array or path specs.
 
@@ -100,10 +101,20 @@ class Model:
         training categories in the training order. Models with categorical
         splits always score on the CPU, even with use_gpu=True.
 
+        strict_shape=True (XGBoost's strict_shape) makes the shape independent
+        of the model type: the output-group axis is always present. Values and
+        margins are (n, groups) (groups is 1 for regression, binary, ranking,
+        single-quantile and multi:softmax), pred_contribs (n, groups, F + 1),
+        pred_interactions (n, groups, F + 1, F + 1) and pred_leaf (n, rounds,
+        groups, 1). It reshapes the finished result (a view); pred_leaf needs
+        n_trees to be a whole number of rounds.
+
         Explanations (XGBoost 3.4.1 semantics; at most one per call, not
-        combinable with output_margin; always computed on the CPU, use_gpu is
-        ignored; n_trees and predict_threads apply; same inputs as plain
-        prediction):
+        combinable with output_margin; n_trees and predict_threads apply; same
+        inputs as plain prediction). They run on the CPU, or on GPU 0 with
+        use_gpu=True (every call with rows, categorical splits and base_margin
+        included) with results bit-identical to the CPU, in bounded device
+        memory:
 
         * pred_contribs=True: exact TreeSHAP in margin space, shape
           (n, n_features + 1) with the bias last, or (n, num_class,
