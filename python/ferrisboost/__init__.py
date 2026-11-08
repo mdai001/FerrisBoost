@@ -156,9 +156,9 @@ _OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamm
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
-    "max_leaves": "leaf-wise 生长还没实现(现在是 depthwise)",
-    "tree_method": "只有 hist 一种,不用设",
-    "num_parallel_tree": "随机森林模式不支持",
+    "max_leaves": "leaf-wise growth is not implemented yet (trees grow depthwise)",
+    "tree_method": "hist is the only tree method; do not set it",
+    "num_parallel_tree": "random forest mode is not supported",
 }
 
 
@@ -167,22 +167,22 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     for key, value in dict(params).items():
         canon = _ALIASES.get(key, key)
         if canon in _UNIMPLEMENTED:
-            raise ValueError(f"参数 {key!r}:{_UNIMPLEMENTED[canon]}")
+            raise ValueError(f"parameter {key!r}: {_UNIMPLEMENTED[canon]}")
         if canon not in _DEFAULTS:
             known = ", ".join(sorted(_DEFAULTS) + sorted(_ALIASES))
-            raise ValueError(f"不认识的参数 {key!r}。支持的有:{known}")
+            raise ValueError(f"unknown parameter {key!r}; supported parameters: {known}")
         out[canon] = value
 
     if out["objective"] not in _OBJECTIVES:
         raise ValueError(
-            f"objective {out['objective']!r} 不支持,现在只有:{', '.join(_OBJECTIVES)}"
+            f"objective {out['objective']!r} is not supported; supported objectives: {', '.join(_OBJECTIVES)}"
         )
     if not 0 < out["max_bin"] <= 65535:
         # Features with more than 255 bins are stored as 16-bit columns; the
         # largest 16-bit code is the missing sentinel.
         raise ValueError(f"max_bin must be in 1..=65535, got {out['max_bin']}")
     if num_boost_round < 1:
-        raise ValueError(f"num_boost_round 要 >= 1,给的是 {num_boost_round}")
+        raise ValueError(f"num_boost_round must be >= 1, got {num_boost_round}")
 
     out["num_boost_round"] = int(num_boost_round)
     for key in (
@@ -191,25 +191,25 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     ):
         out[key] = int(out[key])
     if out["ingest_threads"] < 0:
-        raise ValueError(f"ingest_threads 要 >= 0,给的是 {out['ingest_threads']}")
+        raise ValueError(f"ingest_threads must be >= 0, got {out['ingest_threads']}")
     if out["model_io_threads"] < 0:
-        raise ValueError(f"model_io_threads 要 >= 0,给的是 {out['model_io_threads']}")
+        raise ValueError(f"model_io_threads must be >= 0, got {out['model_io_threads']}")
     # cols_per_block 保留 None 语义,不要被 int() 变成 0 之后和「用户真的
     # 传了 0」分不开。
     if out["cols_per_block"] is not None:
         out["cols_per_block"] = int(out["cols_per_block"])
         if out["cols_per_block"] < 1:
             raise ValueError(
-                f"cols_per_block 要 >= 1,给的是 {out['cols_per_block']};"
-                " 想让它自动选就别传这个参数"
+                f"cols_per_block must be >= 1, got {out['cols_per_block']};"
+                " omit it to let it be chosen automatically"
             )
     # 和 cols_per_block 同样的 None 语义:显式给了就完全按用户的来。
     if out["hist_streams"] is not None:
         out["hist_streams"] = int(out["hist_streams"])
         if out["hist_streams"] not in (1, 2):
             raise ValueError(
-                f"hist_streams 只支持 1 或 2,给的是 {out['hist_streams']};"
-                " 想让它自动选就别传这个参数"
+                f"hist_streams must be 1 or 2, got {out['hist_streams']};"
+                " omit it to let it be chosen automatically"
             )
     # 同样的 None 语义:auto 让规划器按剩余显存解,显式给了就按用户的来
     # (仍会被夹到物理块数 —— 比块还多的常驻 slot 只会白占显存)。
@@ -217,21 +217,21 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         out["resident_blocks"] = int(out["resident_blocks"])
         if out["resident_blocks"] < 0:
             raise ValueError(
-                f"resident_blocks 不能是负数,给的是 {out['resident_blocks']};"
-                " 想让它自动选就别传这个参数,0 表示纯 streaming"
+                f"resident_blocks must not be negative, got {out['resident_blocks']};"
+                " omit it to let it be chosen automatically; 0 means pure streaming"
             )
     if out["hist_nodes_per_batch"] is not None:
         out["hist_nodes_per_batch"] = int(out["hist_nodes_per_batch"])
         if not 1 <= out["hist_nodes_per_batch"] <= 32:
             raise ValueError(
-                f"hist_nodes_per_batch 要在 1..=32,给的是 {out['hist_nodes_per_batch']};"
-                "1 表示关闭多节点合并"
+                f"hist_nodes_per_batch must be in 1..=32, got {out['hist_nodes_per_batch']};"
+                " 1 disables multi-node batching"
             )
     if out["device"] is not None:
         d = str(out["device"])
         if d not in ("cpu", "cuda", "gpu") and not d.startswith("cuda:"):
             raise ValueError(
-                f'device 只支持 "cpu" / "cuda" / "cuda:N",给的是 {d!r}'
+                f'device must be "cpu", "cuda" or "cuda:N", got {d!r}'
             )
         out["device"] = d
     # max_depth 的上限由 GPU 每层节点 buffer 决定(见 Rust 的
@@ -240,29 +240,29 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     # ⚠️ 下界是 0(只有根节点的树,合法),不是 1。
     if not 0 <= int(out["max_depth"]) <= 14:
         raise ValueError(
-            f"max_depth 要在 0..=14,给的是 {out['max_depth']};"
-            " 0 表示只有根节点;上限来自 GPU 每层 partition 节点 buffer"
-            "(depth 14 正好用满 8192)"
+            f"max_depth must be in 0..=14, got {out['max_depth']};"
+            " 0 means a root-only tree; the limit comes from the GPU per-level partition node buffer"
+            " (depth 14 fills all 8192 slots)"
         )
     if out["gpu_memory_budget"] is not None:
         out["gpu_memory_budget"] = int(out["gpu_memory_budget"])
         if out["gpu_memory_budget"] <= 0:
-            raise ValueError("gpu_memory_budget 必须是正整数字节")
+            raise ValueError("gpu_memory_budget must be a positive integer number of bytes")
     if out["gpu_math"] is not None:
         out["gpu_math"] = str(out["gpu_math"])
         if out["gpu_math"] not in ("exact", "fast"):
             raise ValueError(
-                f"gpu_math 只支持 \"exact\" 或 \"fast\",给的是 {out['gpu_math']!r};"
-                "fast 不保证 CPU/GPU 模型逐字节相同"
+                f"gpu_math must be \"exact\" or \"fast\", got {out['gpu_math']!r};"
+                " fast does not guarantee byte-identical CPU/GPU models"
             )
     if out["device_quantize"] is not None:
         out["device_quantize"] = bool(out["device_quantize"])
     if out["num_class"] is not None:
         if isinstance(out["num_class"], bool) or int(out["num_class"]) != out["num_class"]:
-            raise ValueError(f"num_class 要是整数,给的是 {out['num_class']!r}")
+            raise ValueError(f"num_class must be an integer, got {out['num_class']!r}")
         out["num_class"] = int(out["num_class"])
         if out["num_class"] < 0:
-            raise ValueError("num_class 不能是负数")
+            raise ValueError("num_class must not be negative")
     if out["max_delta_step"] is not None:
         out["max_delta_step"] = float(out["max_delta_step"])
     out["quantile_alpha"] = _normalize_quantile_alpha(out["quantile_alpha"], out["objective"])
@@ -275,7 +275,7 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     if out["cache_budget_bytes"] is not None:
         out["cache_budget_bytes"] = int(out["cache_budget_bytes"])
         if out["cache_budget_bytes"] < 0:
-            raise ValueError("cache_budget_bytes 不能是负数")
+            raise ValueError("cache_budget_bytes must not be negative")
     if out["cache_path"] is not None:
         out["cache_path"] = os.fspath(out["cache_path"])
     if out["eval_metric"] is not None:
@@ -285,7 +285,7 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         )
         if not names or not all(isinstance(n, str) for n in names):
             raise ValueError(
-                f"eval_metric 要是字符串或字符串列表,给的是 {m!r}"
+                f"eval_metric must be a string or a list of strings, got {m!r}"
             )
         # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
         out["eval_metric"] = names
@@ -295,10 +295,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
     out["missing"] = _normalize_missing(out["missing"])
     for key in ("max_cat_to_onehot", "max_cat_threshold"):
         if isinstance(out[key], bool) or int(out[key]) != out[key]:
-            raise ValueError(f"{key} 要是整数,给的是 {out[key]!r}")
+            raise ValueError(f"{key} must be an integer, got {out[key]!r}")
         out[key] = int(out[key])
         if out[key] < 1:
-            raise ValueError(f"{key} 要 >= 1,给的是 {out[key]}")
+            raise ValueError(f"{key} must be >= 1, got {out[key]}")
     return out
 
 
@@ -331,11 +331,11 @@ def _normalize_missing(value: Any) -> float:
     in Rust; this only turns the value into a float and fails early on junk.
     """
     if value is None or isinstance(value, (str, bytes)):
-        raise ValueError(f"missing 要是数字(默认 NaN),给的是 {value!r}")
+        raise ValueError(f"missing must be a number (default NaN), got {value!r}")
     try:
         return float(value)
     except (TypeError, ValueError):
-        raise ValueError(f"missing 要是数字(默认 NaN),给的是 {value!r}") from None
+        raise ValueError(f"missing must be a number (default NaN), got {value!r}") from None
 
 
 def _normalize_quantile_alpha(value: Any, objective: str) -> list[float] | None:
@@ -344,8 +344,8 @@ def _normalize_quantile_alpha(value: Any, objective: str) -> list[float] | None:
     if value is None:
         if objective == "reg:quantileerror":
             raise ValueError(
-                "reg:quantileerror 需要 quantile_alpha(一个或多个 [0, 1] 内、升序的分位数,"
-                "例如 0.9 或 [0.1, 0.5, 0.9])"
+                "reg:quantileerror needs quantile_alpha (one or more ascending quantiles in [0, 1], "
+                "e.g. 0.9 or [0.1, 0.5, 0.9])"
             )
         return None
     if isinstance(value, (list, tuple, np.ndarray)):
@@ -353,18 +353,18 @@ def _normalize_quantile_alpha(value: Any, objective: str) -> list[float] | None:
     else:
         flat = [float(value)]
     if not flat:
-        raise ValueError("quantile_alpha 不能是空列表")
+        raise ValueError("quantile_alpha must not be an empty list")
     for alpha in flat:
         if not 0.0 <= alpha <= 1.0:
-            raise ValueError(f"quantile_alpha 要在 [0, 1] 内,给的是 {alpha}")
+            raise ValueError(f"quantile_alpha must be in [0, 1], got {alpha}")
     if any(a > b for a, b in zip(flat, flat[1:])):
-        raise ValueError(f"quantile_alpha 必须按升序排列(XGBoost 同样要求),给的是 {flat}")
+        raise ValueError(f"quantile_alpha must be in ascending order (as XGBoost requires), got {flat}")
     return flat
 
 
 def _monotone_sign(value: Any, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise ValueError(f"monotone_constraints 的{where}要是整数(1 / 0 / -1),给的是 {value!r}")
+        raise ValueError(f"monotone_constraints {where} must be an integer (1 / 0 / -1), got {value!r}")
     # XGBoost 只看符号:2 等价于 1,-3 等价于 -1。
     return int(np.sign(int(value)))
 
@@ -376,32 +376,32 @@ def _normalize_monotone(mc: Any) -> list[int] | dict[str, int] | None:
     if isinstance(mc, str):
         text = mc.strip()
         if not (text.startswith("(") and text.endswith(")")):
-            raise ValueError(f'monotone_constraints 字符串要写成 "(1,0,-1)",给的是 {mc!r}')
+            raise ValueError(f'a monotone_constraints string must look like "(1,0,-1)", got {mc!r}')
         body = text[1:-1].strip()
         try:
             values = [int(v) for v in body.split(",")] if body else []
         except ValueError:
-            raise ValueError(f"monotone_constraints 字符串里有非整数:{mc!r}") from None
-        return [_monotone_sign(v, "元素") for v in values]
+            raise ValueError(f"monotone_constraints string contains a non-integer: {mc!r}") from None
+        return [_monotone_sign(v, "element") for v in values]
     if isinstance(mc, Mapping):
         out = {}
         for name, value in mc.items():
             if not isinstance(name, str):
-                raise ValueError(f"monotone_constraints 字典的键要是列名字符串,给的是 {name!r}")
-            out[name] = _monotone_sign(value, f"列 {name!r} 的值")
+                raise ValueError(f"monotone_constraints dict keys must be column name strings, got {name!r}")
+            out[name] = _monotone_sign(value, f"value for column {name!r}")
         return out
     if isinstance(mc, (list, tuple, np.ndarray)):
-        return [_monotone_sign(v, "元素") for v in np.asarray(mc, dtype=object).ravel()]
+        return [_monotone_sign(v, "element") for v in np.asarray(mc, dtype=object).ravel()]
     raise ValueError(
-        "monotone_constraints 要是元组/列表、\"(1,0,-1)\" 字符串或 {列名: 方向} 字典,"
-        f"给的是 {type(mc).__name__}"
+        "monotone_constraints must be a tuple/list, a \"(1,0,-1)\" string or a {column name: direction} dict, "
+        f"got {type(mc).__name__}"
     )
 
 
 def _resolve_named_monotone(mc: dict[str, int], names: list[str]) -> list[int]:
     unknown = [k for k in mc if k not in names]
     if unknown:
-        raise ValueError(f"monotone_constraints 里的列 {unknown} 不是特征列;特征列有 {names}")
+        raise ValueError(f"monotone_constraints columns {unknown} are not feature columns; feature columns: {names}")
     return [mc.get(n, 0) for n in names]
 
 
@@ -415,7 +415,7 @@ def _as_matrix(x: Any, name: str = "data") -> np.ndarray:
     """
     arr = np.asarray(x)
     if arr.ndim != 2:
-        raise ValueError(f"{name} 要是二维数组,给的是 {arr.ndim} 维")
+        raise ValueError(f"{name} must be a 2-D array, got {arr.ndim} dimensions")
     if arr.dtype == np.float32 and arr.flags["C_CONTIGUOUS"]:
         return arr
     return np.ascontiguousarray(arr, dtype=np.float32)
@@ -424,10 +424,10 @@ def _as_matrix(x: Any, name: str = "data") -> np.ndarray:
 def _as_labels(y: Any, n_rows: int) -> np.ndarray:
     arr = np.ascontiguousarray(np.asarray(y).ravel(), dtype=np.float32)
     if arr.size != n_rows:
-        raise ValueError(f"标签有 {arr.size} 个,数据有 {n_rows} 行")
+        raise ValueError(f"label has {arr.size} entries, the data has {n_rows} rows")
     if np.isnan(arr).any():
-        raise ValueError("标签里有 NaN。缺失的标签要在上游处理掉 —— "
-                         "填 0 会被当成一个真实标签学进去")
+        raise ValueError("label contains NaN; handle missing labels upstream "
+                         "(filling them with 0 would train on 0 as a real label)")
     return arr
 
 
@@ -439,11 +439,11 @@ def _as_weights(w: Any, n_rows: int | None, name: str = "weight") -> np.ndarray:
     """
     arr = np.ascontiguousarray(np.asarray(w, dtype=np.float32).ravel())
     if n_rows is not None and arr.size != n_rows:
-        raise ValueError(f"{name} 有 {arr.size} 个,数据有 {n_rows} 行")
+        raise ValueError(f"{name} has {arr.size} entries, the data has {n_rows} rows")
     if not np.isfinite(arr).all():
-        raise ValueError(f"{name} 里有 NaN 或 inf;样本权重必须是有限值")
+        raise ValueError(f"{name} contains NaN or inf; sample weights must be finite")
     if (arr < 0).any():
-        raise ValueError(f"{name} 里有负数;样本权重必须非负")
+        raise ValueError(f"{name} contains negative values; sample weights must be non-negative")
     return arr
 
 
@@ -485,7 +485,7 @@ def _file_format(path: str) -> str:
         return "parquet"
     if lower.endswith(".csv"):
         return "csv"
-    raise ValueError(f"从后缀看不出 {path!r} 是什么格式,支持 .parquet / .csv")
+    raise ValueError(f"cannot tell the format of {path!r} from its extension; supported: .parquet / .csv")
 
 
 def _arrow_table(obj: Any) -> Any:
@@ -514,15 +514,15 @@ def _feature_flags(feature_types: Any, n_features: int | None) -> list[bool] | N
         return None
     if isinstance(feature_types, str) or not isinstance(feature_types, (list, tuple, np.ndarray)):
         raise ValueError(
-            f'feature_types 要是 "c" / "q" 的列表(每个特征一项),给的是 {feature_types!r}'
+            f'feature_types must be a list of "c" / "q" (one per feature), got {feature_types!r}'
         )
     flags = []
     for t in feature_types:
         if not isinstance(t, str):
-            raise ValueError(f'feature_types 的元素要是字符串("c" / "q"),给的是 {t!r}')
+            raise ValueError(f'feature_types elements must be strings ("c" / "q"), got {t!r}')
         flags.append(t == "c")
     if n_features is not None and len(flags) != n_features:
-        raise ValueError(f"feature_types 有 {len(flags)} 项,数据有 {n_features} 个特征")
+        raise ValueError(f"feature_types has {len(flags)} entries, the data has {n_features} features")
     return flags
 
 
@@ -553,15 +553,15 @@ def _frame_matrix(
     names = [str(c) for c in df.columns]
     if len(set(names)) != len(names):
         dups = sorted({n for n in names if names.count(n) > 1})
-        raise ValueError(f"{what} 里有重复的列名 {dups};列名必须唯一")
+        raise ValueError(f"{what} has duplicate column names {dups}; column names must be unique")
     cols, flags, levels = [], [], {}
     for i, name in enumerate(names):
         s = df.iloc[:, i]
         if isinstance(s.dtype, pd.CategoricalDtype):
             if not enable_categorical:
                 raise ValueError(
-                    f"{what} 的列 {name!r} 是 category 类型;要把它当类别特征训练,"
-                    "请设置 params['enable_categorical'] = True"
+                    f"{what} column {name!r} has category dtype; to train it as a categorical feature, "
+                    "set params['enable_categorical'] = True"
                 )
             if ref_levels is not None and i in ref_levels:
                 ref = ref_levels[i]
@@ -579,8 +579,8 @@ def _frame_matrix(
                 cols.append(s.to_numpy(dtype=np.float32, na_value=np.nan))
             except (TypeError, ValueError) as e:
                 raise ValueError(
-                    f"{what} 的列 {name!r} 的类型是 {s.dtype},不能当数值特征;"
-                    "请先转成数值,或转成 category 并设置 enable_categorical=True"
+                    f"{what} column {name!r} has dtype {s.dtype}, which is not a numeric feature; "
+                    "convert it to numeric, or to category and set enable_categorical=True"
                 ) from e
             flags.append(False)
     x = np.ascontiguousarray(np.stack(cols, axis=1)) if cols else np.empty((len(df), 0), np.float32)
@@ -607,13 +607,13 @@ def _table_matrix(
     names = list(table.column_names)
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
-        raise ValueError(f"{what} 里有重复的列名 {dups};列名必须唯一")
+        raise ValueError(f"{what} has duplicate column names {dups}; column names must be unique")
     if order is not None:
         missing = [n for n in order if n not in names]
         extra = [n for n in names if n not in order]
         if missing or extra:
             raise ValueError(
-                f"{what} 的列和训练集对不上(按列名绑定):缺少 {missing},多出 {extra}"
+                f"{what} columns do not match the training data (bound by name): missing {missing}, extra {extra}"
             )
         names = order
     if any(pa.types.is_dictionary(table.schema.field(n).type) for n in names):
@@ -624,8 +624,8 @@ def _table_matrix(
         if pa.types.is_dictionary(col.type):
             if not enable_categorical:
                 raise ValueError(
-                    f"{what} 的列 {name!r} 是 dictionary 类型;要把它当类别特征训练,"
-                    "请设置 params['enable_categorical'] = True"
+                    f"{what} column {name!r} has dictionary type; to train it as a categorical feature, "
+                    "set params['enable_categorical'] = True"
                 )
             chunks = col.chunks
             dictionary = chunks[0].dictionary if chunks else pa.array([])
@@ -660,7 +660,7 @@ def _merge_flags(auto: list[bool] | None, explicit: list[bool] | None, n: int) -
     if flags is None or not any(flags):
         return None
     if len(flags) != n:
-        raise ValueError(f"feature_types 有 {len(flags)} 项,数据有 {n} 个特征")
+        raise ValueError(f"feature_types has {len(flags)} entries, the data has {n} features")
     return list(flags)
 
 
@@ -683,7 +683,7 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
             cols = [str(c) for c in data.columns]
             absent = [n for n in names if n not in cols]
             if absent:
-                raise ValueError(f"predict data 缺少模型的特征列 {absent}")
+                raise ValueError(f"predict data is missing the model's feature columns {absent}")
             data = data[[c for n in names for c in data.columns if str(c) == n]]
         return _frame_matrix(data, True, what="predict data")[0]
     table = _arrow_table(data)
@@ -691,12 +691,12 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
         if names:
             absent = [n for n in names if n not in table.column_names]
             if absent:
-                raise ValueError(f"predict data 缺少模型的特征列 {absent}")
+                raise ValueError(f"predict data is missing the model's feature columns {absent}")
             table = table.select(list(names))
         return _table_matrix(table, list(names) if names else None, True, what="predict data")[0]
     raise ValueError(
-        "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、"
-        "pandas DataFrame 或 pyarrow Table"
+        "predict accepts file paths (single / list / directory / glob), a 2-D f32 numpy array, "
+        "a pandas DataFrame or a pyarrow Table"
     )
 
 
@@ -934,14 +934,14 @@ def train(
     specs = _as_path_specs(data)
     if specs is not None:
         if header and not isinstance(label, str):
-            raise ValueError("header=True 时文件 label 要给列名字符串")
+            raise ValueError("with header=True, a file label must be a column name string")
         if not header and (not isinstance(label, int) or isinstance(label, bool)):
-            raise ValueError("header=False 时文件 label 要给从 0 开始的列下标")
+            raise ValueError("with header=False, a file label must be a zero-based column index")
         if weight is not None:
             if header and not isinstance(weight, str):
-                raise ValueError("文件入口的 weight 要给列名字符串(header=True)")
+                raise ValueError("file inputs take weight as a column name string (header=True)")
             if not header and (not isinstance(weight, int) or isinstance(weight, bool)):
-                raise ValueError("header=False 时文件 weight 要给从 0 开始的列下标")
+                raise ValueError("with header=False, a file weight must be a zero-based column index")
         if group is not None or eval_group is not None or eval_qid is not None:
             raise ValueError(
                 "file inputs take the query groups as a qid column name (qid=\"query_id\"); "
@@ -951,9 +951,9 @@ def train(
             if not ranking:
                 raise ValueError(f"qid is only used by the rank:* objectives, not {p['objective']}")
             if header and not isinstance(qid, str):
-                raise ValueError("header=True 时文件 qid 要给列名字符串")
+                raise ValueError("with header=True, a file qid must be a column name string")
             if not header and (not isinstance(qid, int) or isinstance(qid, bool)):
-                raise ValueError("header=False 时文件 qid 要给从 0 开始的列下标")
+                raise ValueError("with header=False, a file qid must be a zero-based column index")
         elif ranking:
             raise ValueError(
                 f"{p['objective']} needs query groups: pass qid=<column name> for file inputs"
@@ -962,8 +962,8 @@ def train(
         for item in evals:
             if len(item) != 2:
                 raise ValueError(
-                    "文件入口的 evals 元素要是 (path, name);"
-                    "标签列和权重列沿用训练集的列名"
+                    "file input evals elements must be (path, name); "
+                    "the label and weight columns reuse the training column names"
                 )
             eval_specs.append((os.fspath(item[0]), item[1]))
         # Declared categorical features are positional over the file's feature
@@ -1030,14 +1030,14 @@ def train(
         if isinstance(p["monotone_constraints"], dict):
             if names is None:
                 raise ValueError(
-                    "按列名给的 monotone_constraints 需要列名:numpy 数组没有列名,"
-                    "请改用按位置的元组,或用 pyarrow Table / 带表头的文件"
+                    "monotone_constraints given by column name needs column names: a numpy array has none; "
+                    "use a positional tuple, or a pyarrow Table / a file with a header"
                 )
             p["monotone_constraints"] = _resolve_named_monotone(p["monotone_constraints"], names)
         x = _as_matrix(x)
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):
-            raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
+            raise ValueError("array inputs take weight as a 1-D array; column names are only for file inputs")
         if ranking and qid is None and group is None:
             raise ValueError(
                 f"{p['objective']} needs query groups: pass qid= (one id per row) or group= "
@@ -1066,7 +1066,7 @@ def train(
                 ed, el, ew, name = item
             else:
                 raise ValueError(
-                    "evals 的元素要是 (data, label, name) 或 (data, label, weight, name)"
+                    "evals elements must be (data, label, name) or (data, label, weight, name)"
                 )
             et = _arrow_table(ed)
             if et is not None:
@@ -1076,13 +1076,13 @@ def train(
                 if names is not None:
                     missing = [n for n in names if n not in [str(c) for c in ed.columns]]
                     if missing:
-                        raise ValueError(f"evals[{name}] 缺少训练集的列 {missing}")
+                        raise ValueError(f"evals[{name}] is missing training columns {missing}")
                     ed = ed[[c for n in names for c in ed.columns if str(c) == n]]
                 ed = _frame_matrix(ed, enable_cat, levels, f"evals[{name}]")[0]
             ex = _as_matrix(ed, f"evals[{name}]")
             if ew is not None:
                 ew = _as_weights(ew, None if ranking else ex.shape[0],
-                                 f"evals[{name}] 的 weight")
+                                 f"evals[{name}] weight")
             eq = None if eval_qid is None or eval_qid[n_eval] is None else _as_query_array(
                 eval_qid[n_eval], f"eval_qid[{n_eval}]", ex.shape[0])
             eg = None if eval_group is None or eval_group[n_eval] is None else _as_query_array(

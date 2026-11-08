@@ -287,7 +287,7 @@ fn parquet_memory_spill_and_reused_wide_cache_match_dense() {
     let err = ParquetBlockSource::open_with_cache(&path, "label", 1024, cpb, opts())
         .err()
         .expect("width mismatch must fail");
-    assert!(format!("{err:#}").contains("宽度"), "{err:#}");
+    assert!(format!("{err:#}").contains("width"), "{err:#}");
     // A version-2 manifest cannot claim 8-bit blocks for wide cuts either.
     let mut v2 = m;
     v2["version"] = serde_json::json!(2);

@@ -106,18 +106,18 @@ impl DenseSource {
         weights: Option<&[f32]>,
     ) -> Self {
         if let Some(w) = weights {
-            assert_eq!(w.len(), n_rows, "权重长度应为 n_rows");
+            assert_eq!(w.len(), n_rows, "weight length must equal n_rows");
             assert!(
                 w.iter().all(|v| v.is_finite() && *v >= 0.0),
-                "样本权重必须是有限的非负数"
+                "sample weights must be finite and non-negative"
             );
         }
         assert_eq!(
             data.len(),
             n_rows * n_features,
-            "行主序矩阵长度应为 n_rows * n_features"
+            "row-major matrix length must equal n_rows * n_features"
         );
-        assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
+        assert!(cols_per_block > 0, "cols_per_block must be > 0");
 
         let (binning, categorical): (BinningStrategy, &[bool]) = match binning {
             BinningStrategy::SketchTyped {
@@ -146,7 +146,8 @@ impl DenseSource {
                 // 代价:每个特征要跨 stride 读(行主序下同一特征的相邻
                 // 两个值隔着 n_features 个 f32)。宽数据上这不划算,
                 // 但它换来的是零同步。
-                let pool = crate::threading::build_pool(nthread).expect("分箱线程池创建失败");
+                let pool = crate::threading::build_pool(nthread)
+                    .expect("failed to create the binning thread pool");
                 let per_feat: Vec<(Vec<f32>, Option<f32>)> = pool.install(|| {
                     (0..n_features)
                         .into_par_iter()
@@ -195,7 +196,11 @@ impl DenseSource {
                     .expect("categorical cuts are consecutive codes by construction")
             }
             BinningStrategy::Provided(cuts) => {
-                assert_eq!(cuts.n_feats(), n_features, "给定的 cuts 特征数和数据对不上");
+                assert_eq!(
+                    cuts.n_feats(),
+                    n_features,
+                    "the given cuts' feature count does not match the data"
+                );
                 cuts.clone()
             }
         };
@@ -216,7 +221,11 @@ impl DenseSource {
         cols_per_block: usize,
     ) -> Self {
         assert_eq!(data.len(), n_rows * n_features);
-        assert_eq!(cuts.n_feats(), n_features, "cuts 的特征数和数据对不上");
+        assert_eq!(
+            cuts.n_feats(),
+            n_features,
+            "cuts feature count does not match the data"
+        );
         Self::quantize_row_major(data, n_rows, n_features, cuts, cols_per_block)
     }
 
@@ -271,7 +280,7 @@ impl DenseSource {
                 return b.column(local).get(row);
             }
         }
-        panic!("特征 {feat} 不在任何列块里");
+        panic!("feature {feat} is not in any column block");
     }
 }
 
@@ -320,7 +329,12 @@ impl BlockSource for DenseSource {
         self.blocks
             .get(i)
             .map(|b| b.feat_ids.clone())
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,共 {} 个", self.blocks.len()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "column block {i} does not exist ({} blocks)",
+                    self.blocks.len()
+                )
+            })
     }
 
     /// 直接从常驻的块里切一列出来。
@@ -335,7 +349,10 @@ impl BlockSource for DenseSource {
                 return Ok(b.column(local).to_owned());
             }
         }
-        anyhow::bail!("特征 {feat} 不在任何列块里,共 {} 个特征", self.n_features)
+        anyhow::bail!(
+            "feature {feat} is not in any column block ({} features)",
+            self.n_features
+        )
     }
 
     /// 驻留的块直接借出列,零拷贝(见 trait 文档)。
@@ -354,10 +371,12 @@ impl BlockSource for DenseSource {
 
     /// 全量持有,直接借出去,**零拷贝**。
     fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
-        let block = self
-            .blocks
-            .get(i)
-            .ok_or_else(|| anyhow::anyhow!("列块下标 {i} 越界,共 {} 块", self.blocks.len()))?;
+        let block = self.blocks.get(i).ok_or_else(|| {
+            anyhow::anyhow!(
+                "column block index {i} is out of range ({} blocks)",
+                self.blocks.len()
+            )
+        })?;
         f(block);
         Ok(())
     }
@@ -507,7 +526,7 @@ mod tests {
             assert_eq!(
                 a.cuts_for(f),
                 b.cuts_for(f),
-                "特征 {f}:1 线程和 8 线程分箱出的 cuts 不一样"
+                "feature {f}: cuts differ between 1 and 8 threads"
             );
         }
     }
@@ -552,9 +571,9 @@ mod tests {
         let cuts = BinCuts::from_xgboost_edges(&indptr, &edges).unwrap();
 
         assert_eq!(cuts.cuts_for(0), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-        assert_eq!(cuts.n_bins(0), 8, "8 个唯一值就该是 8 个 bin");
+        assert_eq!(cuts.n_bins(0), 8, "8 unique values should give 8 bins");
         assert_eq!(cuts.cuts_for(1), &[] as &[f32]);
-        assert_eq!(cuts.n_bins(1), 1, "常数特征只有一个 bin");
+        assert_eq!(cuts.n_bins(1), 1, "a constant feature has only one bin");
 
         // 每个唯一值各占一个 bin —— 这是"低基数分箱无损"的判据
         for v in 0..8 {
@@ -681,7 +700,7 @@ mod tests {
         let below = |c: &BinCuts| c.cuts_for(0).iter().filter(|&&v| v < 0.25).count();
         assert!(
             below(&heavy) > 2 * below(&plain),
-            "加权后 [0,0.25) 里的 cut 应明显变多:{} vs {}",
+            "weighting should clearly add cuts in [0,0.25): {} vs {}",
             below(&heavy),
             below(&plain)
         );
@@ -689,12 +708,15 @@ mod tests {
         assert!(heavy.cuts_for(1).windows(2).all(|p| p[0] < p[1]));
         for t in [2, 4, 8] {
             let again = weighted_cuts(&data, n, m, Some(&w), t);
-            assert_eq!(again.values, heavy.values, "nthread={t} 改变了加权 cuts");
+            assert_eq!(
+                again.values, heavy.values,
+                "nthread={t} changed the weighted cuts"
+            );
         }
     }
 
     #[test]
-    #[should_panic(expected = "有限的非负数")]
+    #[should_panic(expected = "finite and non-negative")]
     fn rejects_negative_weight_at_binning() {
         let (data, n, m) = toy();
         weighted_cuts(&data, n, m, Some(&[1.0, -1.0, 1.0, 1.0]), 1);

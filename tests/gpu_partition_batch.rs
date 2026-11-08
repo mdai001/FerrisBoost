@@ -62,7 +62,7 @@ fn assert_partition_scratch_budget(ctx: &GpuTrainCtx, n_rows: usize) {
     let threads = 256usize;
     let blocks = n_rows.min(n_rows.div_ceil(threads) + 32 - 1);
     let offsets = blocks + 32;
-    let descriptors = 32 * 10;
+    let descriptors = 32 * 11;
     let expected = n_rows
         + (blocks + offsets * 2 + descriptors) * std::mem::size_of::<u32>()
         + MAX_LEVEL_NODES * 2 * std::mem::size_of::<u32>();
@@ -765,4 +765,82 @@ fn resident_partition_batch_after_arena_swap_uses_narrow_tail_block() {
     ];
     let second_children = run_batch(&ctx, &tail_bins, N_ROWS, 1, &second_level);
     assert_eq!(second_children.len(), 2);
+}
+
+#[test]
+fn resident_partition_multi_batches_nodes_of_several_blocks_in_one_level() {
+    let _gpu_guard = GPU_PARTITION_TEST_LOCK.lock().unwrap();
+    // Two resident blocks of different widths (4 and 2 columns) with
+    // different contents; one level-wide batch interleaves their nodes.
+    let block0 = bins_for(N_ROWS, N_FEATURES);
+    let block1: Vec<u8> = bins_for(N_ROWS, N_FEATURES + 3)[3 * N_ROWS..5 * N_ROWS].to_vec();
+    let ctx = make_context(N_ROWS, N_FEATURES, 2, 2);
+    seed_resident(&ctx, 0, N_ROWS, N_FEATURES, &block0);
+    seed_resident(&ctx, 1, N_ROWS, 2, &block1);
+    ctx.begin_tree_rows().unwrap();
+
+    let spans: Vec<GpuRowSpan> = (0..6)
+        .map(|i| {
+            let len = if i == 5 { N_ROWS - 5 * 300 } else { 300 };
+            GpuRowSpan {
+                offset: i * 300,
+                len,
+            }
+        })
+        .collect();
+    // (span, block, local feature, split bin, missing left)
+    let requests: Vec<(GpuRowSpan, usize, usize, u32, bool)> = vec![
+        (spans[0], 0, 2, 2, true),
+        (spans[1], 1, 1, 1, false),
+        (spans[2], 0, 0, 3, false),
+        (spans[3], 1, 0, 2, true),
+        (spans[4], 1, 1, 0, true),
+        (spans[5], 0, 3, 1, false),
+    ];
+    let source_rows: Vec<Vec<RowId>> = requests
+        .iter()
+        .map(|r| ctx.download_rows(r.0).unwrap())
+        .collect();
+    let mut session = ctx
+        .partition_session_resident_blocks(&[0, 1])
+        .unwrap()
+        .expect("both blocks are resident");
+    let tokens = session.partition_resident_multi(&requests).unwrap();
+    assert_eq!(tokens, (0..requests.len()).collect::<Vec<_>>());
+    // A single request on the non-primary block takes the single-node route.
+    let single = session
+        .partition_resident_multi(&[(GpuRowSpan { offset: 0, len: 0 }, 1, 1, 1, false)])
+        .unwrap();
+    assert_eq!(single, [requests.len()]);
+    assert!(session
+        .partition_resident_multi(&[(spans[0], 2, 0, 1, false)])
+        .is_err());
+    assert!(session
+        .partition_resident_multi(&[(spans[0], 1, 2, 1, false), (spans[1], 0, 0, 1, false)])
+        .is_err());
+    drop(session);
+    let resolved = ctx.resolve_partitions().unwrap();
+    ctx.finish_partition_level().unwrap();
+    for (k, &(_, block, feat, split, missing_left)) in requests.iter().enumerate() {
+        let bins = if block == 0 { &block0 } else { &block1 };
+        let (mut want_left, mut want_right) = (Vec::new(), Vec::new());
+        for &row in &source_rows[k] {
+            if goes_left(bins[feat * N_ROWS + row as usize], split, missing_left) {
+                want_left.push(row);
+            } else {
+                want_right.push(row);
+            }
+        }
+        let (left, right) = resolved[tokens[k]];
+        assert_rows_equal(
+            &ctx.download_rows(left).unwrap(),
+            &want_left,
+            &format!("request {k} left"),
+        );
+        assert_rows_equal(
+            &ctx.download_rows(right).unwrap(),
+            &want_right,
+            &format!("request {k} right"),
+        );
+    }
 }

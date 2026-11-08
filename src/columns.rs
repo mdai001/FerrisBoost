@@ -70,20 +70,23 @@ pub struct BinCuts {
 
 impl BinCuts {
     pub fn new(values: Vec<f32>, offsets: Vec<u32>) -> Self {
-        assert!(!offsets.is_empty(), "cuts offsets 至少要有起始 0");
-        assert_eq!(offsets[0], 0, "cuts offsets 必须从 0 开始");
+        assert!(
+            !offsets.is_empty(),
+            "cuts offsets must contain at least the leading 0"
+        );
+        assert_eq!(offsets[0], 0, "cuts offsets must start at 0");
         assert_eq!(
             offsets.last().copied().map(|v| v as usize),
             Some(values.len()),
-            "cuts offsets 末尾必须等于 values 长度"
+            "the last cuts offset must equal the values length"
         );
         assert!(
             offsets.windows(2).all(|w| w[0] <= w[1]),
-            "cuts offsets 必须单调不减"
+            "cuts offsets must be non-decreasing"
         );
         assert!(
             values.iter().all(|v| v.is_finite()),
-            "cuts 必须全部是有限值"
+            "cuts must all be finite"
         );
         let n_feats = offsets.len().saturating_sub(1);
         let mut hist_offsets = Vec::with_capacity(n_feats + 1);
@@ -95,11 +98,11 @@ impl BinCuts {
             let cuts = &values[offsets[f] as usize..offsets[f + 1] as usize];
             assert!(
                 cuts.windows(2).all(|w| w[0] < w[1]),
-                "每个特征的 cuts 必须严格递增"
+                "cuts must be strictly increasing within each feature"
             );
             acc = acc
                 .checked_add(n_cuts + 1)
-                .expect("直方图总 bin 数超过 u32");
+                .expect("total histogram bin count exceeds u32");
             hist_offsets.push(acc);
         }
         Self {
@@ -275,7 +278,7 @@ impl BinCuts {
             let (lo, hi) = (indptr[f] as usize, indptr[f + 1] as usize);
             let slice = edges
                 .get(lo..hi)
-                .ok_or_else(|| anyhow::anyhow!("特征 {f} 的 indptr {lo}..{hi} 越界"))?;
+                .ok_or_else(|| anyhow::anyhow!("feature {f} indptr {lo}..{hi} is out of range"))?;
 
             // 前面的 -inf 和最后的上界哨兵都不是我们的切分点
             let slice = match slice.split_first() {
@@ -286,10 +289,13 @@ impl BinCuts {
 
             for (i, &v) in slice.iter().enumerate() {
                 if !v.is_finite() {
-                    anyhow::bail!("特征 {f} 的第 {i} 个切分点不是有限值:{v}");
+                    anyhow::bail!("cut {i} of feature {f} is not finite: {v}");
                 }
                 if i > 0 && v <= slice[i - 1] {
-                    anyhow::bail!("特征 {f} 的切分点不是严格递增:{} 之后是 {v}", slice[i - 1]);
+                    anyhow::bail!(
+                        "cuts of feature {f} are not strictly increasing: {} is followed by {v}",
+                        slice[i - 1]
+                    );
                 }
             }
             values.extend_from_slice(slice);
@@ -414,7 +420,7 @@ pub fn partition_features(n_feats: usize, cols_per_block: usize) -> Vec<Vec<Feat
 /// the cross-block split reduction breaks equal gains by feature id
 /// (`split::reduce_best`), not by block position.
 pub fn partition_features_by_width(widths: &[BinWidth], cols_per_block: usize) -> Vec<Vec<FeatId>> {
-    assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
+    assert!(cols_per_block > 0, "cols_per_block must be > 0");
     let mut classes: Vec<BinWidth> = widths.to_vec();
     classes.sort_unstable();
     classes.dedup();
@@ -439,7 +445,11 @@ mod auto_block_tests {
     fn wide_data_aligns_block_count_to_thread_count() {
         let cols = auto_cols_per_block(300, 8, 255);
         assert_eq!(cols, 38);
-        assert_eq!(300_usize.div_ceil(cols), 8, "块数应当正好等于线程数");
+        assert_eq!(
+            300_usize.div_ceil(cols),
+            8,
+            "block count should equal the thread count"
+        );
     }
 
     /// 线程少的时候对齐会让块变得太宽,直方图掉出 L2 —— 这时 cache 约束
@@ -448,14 +458,20 @@ mod auto_block_tests {
     fn cache_bound_wins_when_alignment_would_make_blocks_too_wide() {
         let cols = auto_cols_per_block(300, 1, 255);
         assert!(cols > 0, "column blocking must produce nonempty blocks");
-        assert!(cols <= 64, "300 列一块的直方图有 1.2 MB,不能选它:{cols}");
+        assert!(
+            cols <= 64,
+            "a 300-column block histogram is 1.2 MB and must not be chosen: {cols}"
+        );
     }
 
     /// 窄数据:28 列 8 线程,应当切得足够细才能喂满线程。
     #[test]
     fn narrow_data_still_produces_at_least_thread_count_blocks() {
         let cols = auto_cols_per_block(28, 8, 255);
-        assert!(cols <= 4, "28 列 8 线程应当切到 ≤4 列/块,实际 {cols}");
+        assert!(
+            cols <= 4,
+            "28 columns on 8 threads should split to <=4 columns per block, got {cols}"
+        );
         assert!(28_usize.div_ceil(cols) >= 7);
     }
 

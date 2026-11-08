@@ -28,7 +28,7 @@ BASE = {"objective": "binary:logistic", "max_depth": 3, "eta": 0.3, "nthread": 1
 # ---------------------------------------------------------------- 参数
 def test_unknown_param_raises():
     x, y = toy()
-    with pytest.raises(ValueError, match="不认识的参数"):
+    with pytest.raises(ValueError, match="unknown parameter"):
         fb.train({**BASE, "max_dpeth": 3}, x, label=y, num_boost_round=2)
 
 
@@ -613,7 +613,7 @@ def test_predict_to_parquet_rejects_overwrite_and_removes_failed_output(tmp_path
 
     existing = tmp_path / "existing.parquet"
     existing.write_bytes(b"keep")
-    with pytest.raises(FileExistsError, match="不会覆盖"):
+    with pytest.raises(FileExistsError, match="not overwriting"):
         model.predict_to_parquet(valid, str(existing))
     assert existing.read_bytes() == b"keep"
 
@@ -625,7 +625,7 @@ def test_predict_to_parquet_rejects_overwrite_and_removes_failed_output(tmp_path
             str(tmp_path / "empty-column.parquet"),
             prediction_column="   ",
         )
-    with pytest.raises(ValueError, match="只接受文件路径"):
+    with pytest.raises(ValueError, match="only accepts a file path"):
         model.predict_to_parquet(x, str(tmp_path / "numpy.parquet"))
 
 
@@ -710,9 +710,9 @@ def test_headless_csv_rejects_bad_label_and_schema_mode_mix(tmp_path):
     path = tmp_path / "headless.csv"
     np.savetxt(path, rows, delimiter=",")
 
-    with pytest.raises(ValueError, match="label|下标|越界"):
+    with pytest.raises(ValueError, match="label|column index|out of range"):
         fb.train(BASE, path, label=99, header=False, num_boost_round=2)
-    with pytest.raises(ValueError, match="label|下标"):
+    with pytest.raises(ValueError, match="label|column index"):
         fb.train(BASE, path, label="target", header=False, num_boost_round=2)
 
     model = fb.train(BASE, path, label=x.shape[1], header=False, num_boost_round=2)
@@ -722,7 +722,7 @@ def test_headless_csv_rejects_bad_label_and_schema_mode_mix(tmp_path):
     named = tmp_path / "named.csv"
     np.savetxt(named, rows, delimiter=",", header="f0,f1,f2,f3,f4,target", comments="")
     named_model = fb.train(BASE, named, label="target", num_boost_round=2)
-    with pytest.raises(ValueError, match="命名模式"):
+    with pytest.raises(ValueError, match="named features cannot predict on a positional"):
         named_model.predict(path, header=False)
 
 
@@ -734,10 +734,10 @@ def test_missing_file_is_a_clear_error():
 # ---------------------------------------------------------------- 形状 / GIL
 def test_shape_mismatch_messages():
     x, y = toy()
-    with pytest.raises(ValueError, match="标签"):
+    with pytest.raises(ValueError, match="label has"):
         fb.train(BASE, x, label=y[:10], num_boost_round=2)
     model = fb.train(BASE, x, label=y, num_boost_round=2)
-    with pytest.raises(ValueError, match="特征"):
+    with pytest.raises(ValueError, match="trained on 5 features"):
         model.predict(x[:, :2])
 
 
@@ -877,7 +877,7 @@ def test_cache_rejects_a_different_max_bin(tmp_path):
     cache = tmp_path / "mb"
     fb.train({**BASE, "max_bin": 64, "cache_path": cache}, str(path),
              label="target", num_boost_round=2)
-    with pytest.raises(ValueError, match="max_bin|缓存"):
+    with pytest.raises(ValueError, match="max_bin|cache"):
         fb.train({**BASE, "max_bin": 32, "cache_path": cache}, str(path),
                  label="target", num_boost_round=2)
 

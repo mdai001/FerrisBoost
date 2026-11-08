@@ -54,7 +54,10 @@ fn to_py_err(e: anyhow::Error) -> PyErr {
     }
     // Rejected input is tagged where it is validated (`crate::error`); the two
     // message checks cover file-open and missing-column errors that predate it.
-    if crate::error::is_input_error(&e) || msg.contains("打不开") || msg.contains("没有列") {
+    if crate::error::is_input_error(&e)
+        || msg.contains("cannot open ")
+        || msg.contains("has no column")
+    {
         return PyValueError::new_err(msg);
     }
     PyRuntimeError::new_err(msg)
@@ -69,9 +72,9 @@ fn guard<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
                 .downcast_ref::<String>()
                 .cloned()
                 .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "Rust 侧 panic,没有消息".to_string());
+                .unwrap_or_else(|| "Rust panic without a message".to_string());
             Err(PyRuntimeError::new_err(format!(
-                "ferrisboost 内部错误:{msg}"
+                "ferrisboost internal error: {msg}"
             )))
         }
     }
@@ -100,7 +103,9 @@ impl Callback for PyCallback {
             let metrics = PyDict::new(py);
             for (eval_name, metric, value) in &m.entries {
                 let per_eval = match metrics.get_item(eval_name) {
-                    Ok(Some(d)) => d.cast_into::<PyDict>().expect("上一步就是 PyDict"),
+                    Ok(Some(d)) => d
+                        .cast_into::<PyDict>()
+                        .expect("checked to be a PyDict above"),
                     _ => {
                         let d = PyDict::new(py);
                         metrics.set_item(eval_name, &d).ok();
@@ -228,11 +233,12 @@ fn resolve_blocking(
             // 分配却发生在 GPU 1。两张卡型号不同、或占用不同时,轻则规划过小
             // (白白 streaming),重则在 GPU 1 上 **OOM**。
             // 规划和分配必须看同一张卡。
-            let ctx = crate::backend::cuda::cuda_context(ordinal)
-                .map_err(|e| PyValueError::new_err(format!("打不开 CUDA device {ordinal}:{e}")))?;
-            let (free, total) = ctx
-                .mem_get_info()
-                .map_err(|e| PyValueError::new_err(format!("读不到显存信息:{e}")))?;
+            let ctx = crate::backend::cuda::cuda_context(ordinal).map_err(|e| {
+                PyValueError::new_err(format!("cannot open CUDA device {ordinal}: {e}"))
+            })?;
+            let (free, total) = ctx.mem_get_info().map_err(|e| {
+                PyValueError::new_err(format!("cannot read device memory info: {e}"))
+            })?;
             // ⚠️ 列块 buffer 是 streaming 预算里最大的一项,而 `per_col_bytes`
             // **整个乘以 stream 数** —— 所以块宽和 stream 数必须**一起解**。
             // 分开解会得到一个装不下的组合:规划器按单流选了宽块,运行时
@@ -246,7 +252,7 @@ fn resolve_blocking(
             // 「规划失败必须报错,不能悄悄回退」——顶一个假行数比报错更糟。
             let rows = n_rows.ok_or_else(|| {
                 PyValueError::new_err(
-                    "GPU 规划需要数据行数,但当前输入源在 open 前无法提供；请先用显式 cols_per_block 构造 source，再用 open 后的真实聚合行数完成规划",
+                    "GPU planning needs the row count, but this input source cannot provide it before open; construct the source with an explicit cols_per_block, and planning finishes with the real aggregate row count after open",
                 )
             })?;
             let p = resolve_gpu_streaming_plan(
@@ -347,7 +353,7 @@ fn resolve_blocking(
         }
         #[cfg(not(feature = "cuda"))]
         Some(_) => Err(PyValueError::new_err(
-            "这个构建没有 CUDA 支持:请用 --features cuda 重新构建,或改用 device=\"cpu\"",
+            "this build has no CUDA support: rebuild with --features cuda, or use device=\"cpu\"",
         )),
         None => Ok(BlockingPlan::resolve(
             cfg.requested_cols_per_block,
@@ -1061,7 +1067,7 @@ fn prediction_parquet_writer(
         .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
         .build();
     let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
-        .context("创建 prediction Parquet writer 失败")?;
+        .context("failed to create the prediction Parquet writer")?;
     let mut rows_written = 0usize;
     let mut pending: Vec<Vec<f32>> = vec![Vec::new(); n_columns];
     let write_group =
@@ -1071,27 +1077,27 @@ fn prediction_parquet_writer(
                 .map(|values| Arc::new(Float32Array::from(values)) as ArrayRef)
                 .collect();
             let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-                .context("创建 prediction Arrow batch 失败")?;
+                .context("failed to create a prediction Arrow batch")?;
             writer
                 .write(&batch)
-                .context("写 prediction Parquet batch 失败")
+                .context("failed to write a prediction Parquet batch")
         };
     loop {
         match receiver.recv() {
             Ok(PredictionParquetMessage::Batch(columns)) => {
                 anyhow::ensure!(
                     columns.len() == n_columns,
-                    "prediction batch 有 {} 列,schema 有 {n_columns} 列",
+                    "prediction batch has {} columns, schema has {n_columns}",
                     columns.len()
                 );
                 let rows = columns.first().map_or(0, Vec::len);
                 anyhow::ensure!(
                     columns.iter().all(|c| c.len() == rows),
-                    "prediction batch 各列长度不一致"
+                    "prediction batch columns have different lengths"
                 );
                 rows_written = rows_written
                     .checked_add(rows)
-                    .context("prediction 输出行数溢出")?;
+                    .context("prediction output row count overflows")?;
                 if pending[0].is_empty() && rows == PREDICTION_PARQUET_ROW_GROUP_ROWS {
                     write_group(&mut writer, columns)?;
                     continue;
@@ -1111,7 +1117,7 @@ fn prediction_parquet_writer(
                 }
             }
             Ok(PredictionParquetMessage::Finish) => break,
-            Err(_) => anyhow::bail!("prediction Parquet pipeline 在完成前被取消"),
+            Err(_) => anyhow::bail!("prediction Parquet pipeline was cancelled before completion"),
         }
     }
     if !pending[0].is_empty() {
@@ -1119,11 +1125,11 @@ fn prediction_parquet_writer(
     }
     writer
         .finish()
-        .context("完成 prediction Parquet footer 失败")?;
+        .context("failed to finish the prediction Parquet footer")?;
     writer
         .inner()
         .sync_all()
-        .context("同步 prediction Parquet 文件失败")?;
+        .context("failed to sync the prediction Parquet file")?;
     cleanup.complete = true;
     Ok(rows_written)
 }
@@ -1144,7 +1150,7 @@ fn predict_files_to_parquet(
 ) -> PyResult<usize> {
     if prediction_column.trim().is_empty() {
         return Err(PyValueError::new_err(
-            "prediction_column 不能为空或只包含空白",
+            "prediction_column cannot be empty or whitespace only",
         ));
     }
     let output_path = std::path::PathBuf::from(output_path);
@@ -1156,7 +1162,7 @@ fn predict_files_to_parquet(
         });
     if !valid_extension {
         return Err(PyValueError::new_err(
-            "prediction 输出路径必须使用 .parquet 或 .pq 扩展名",
+            "prediction output path must use the .parquet or .pq extension",
         ));
     }
 
@@ -1256,13 +1262,13 @@ fn predict_files_to_parquet(
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
-                "prediction 输出已存在,不会覆盖: {}",
+                "prediction output already exists, not overwriting: {}",
                 output_path.display()
             )))
         }
         Err(error) => {
             return Err(PyValueError::new_err(format!(
-                "无法创建 prediction 输出 {}: {error}",
+                "cannot create prediction output {}: {error}",
                 output_path.display()
             )))
         }
@@ -1279,7 +1285,7 @@ fn predict_files_to_parquet(
         Err(error) => {
             let _ = std::fs::remove_file(&output_path);
             return Err(PyRuntimeError::new_err(format!(
-                "无法启动 prediction Parquet writer: {error}"
+                "cannot start the prediction Parquet writer: {error}"
             )));
         }
     };
@@ -1398,7 +1404,7 @@ fn predict_files_to_parquet(
             match writer_result {
                 Ok(Err(writer_error)) => {
                     return Err(PyRuntimeError::new_err(format!(
-                        "prediction Parquet 写出失败: {writer_error:#}"
+                        "prediction Parquet write failed: {writer_error:#}"
                     )))
                 }
                 Err(_) => return Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
@@ -1423,11 +1429,11 @@ fn predict_files_to_parquet(
         drop(sender);
         return match writer_handle.join() {
             Ok(Err(writer_error)) => Err(PyRuntimeError::new_err(format!(
-                "prediction Parquet 写出失败: {writer_error:#}"
+                "prediction Parquet write failed: {writer_error:#}"
             ))),
             Err(_) => Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
             Ok(Ok(_)) => Err(PyRuntimeError::new_err(
-                "prediction Parquet writer 在完成信号前停止",
+                "prediction Parquet writer stopped before the completion signal",
             )),
         };
     }
@@ -1436,7 +1442,7 @@ fn predict_files_to_parquet(
         Ok(Ok(rows)) => rows,
         Ok(Err(error)) => {
             return Err(PyRuntimeError::new_err(format!(
-                "prediction Parquet 写出失败: {error:#}"
+                "prediction Parquet write failed: {error:#}"
             )))
         }
         Err(_) => return Err(PyRuntimeError::new_err("prediction Parquet writer panic")),
@@ -1444,7 +1450,7 @@ fn predict_files_to_parquet(
     if rows_read != rows_written {
         let _ = std::fs::remove_file(&output_path);
         return Err(PyRuntimeError::new_err(format!(
-            "prediction 输出行数不一致:读取 {rows_read},写入 {rows_written}"
+            "prediction output row count mismatch: read {rows_read}, wrote {rows_written}"
         )));
     }
 
@@ -1572,16 +1578,16 @@ fn project_canonical_rows(
 ) -> anyhow::Result<Vec<f32>> {
     let expected = n_rows
         .checked_mul(canonical_width)
-        .context("prediction canonical input size 溢出")?;
+        .context("prediction canonical input size overflows")?;
     if row_major.len() != expected {
         anyhow::bail!(
-            "prediction canonical input 有 {} 个值,预期 {expected}",
+            "prediction canonical input has {} values, expected {expected}",
             row_major.len()
         );
     }
     let output_len = n_rows
         .checked_mul(projected_features.len())
-        .context("prediction compact input size 溢出")?;
+        .context("prediction compact input size overflows")?;
     let mut projected = Vec::with_capacity(output_len);
     for row in row_major.chunks_exact(canonical_width) {
         for &feature in projected_features {
@@ -1667,7 +1673,7 @@ fn ensure_gpu_prediction_available(use_gpu: bool) -> PyResult<()> {
     #[cfg(not(feature = "cuda"))]
     if use_gpu {
         return Err(PyNotImplementedError::new_err(
-            "这个 FerrisBoost build 没有 CUDA prediction 支持;请使用 use_gpu=False 或安装 CUDA wheel。",
+            "this FerrisBoost build has no CUDA prediction support; use use_gpu=False or install the CUDA wheel",
         ));
     }
     let _ = use_gpu;
@@ -1742,7 +1748,7 @@ impl PyModel {
     ) -> PyResult<IterationPlan> {
         if n_trees.is_some() {
             return Err(PyValueError::new_err(
-                "iteration_range 和 n_trees 不能同时给:前者按轮次,后者按树的个数",
+                "iteration_range and n_trees cannot both be given: the former counts rounds, the latter counts trees",
             ));
         }
         let k = self.inner.num_outputs();
@@ -1750,12 +1756,12 @@ impl PyModel {
         let end = if end == 0 { rounds } else { end };
         if end > rounds {
             return Err(PyValueError::new_err(format!(
-                "iteration_range 的 end = {end} 超出了模型的 {rounds} 轮"
+                "iteration_range end = {end} exceeds the model's {rounds} rounds"
             )));
         }
         if begin > end {
             return Err(PyValueError::new_err(format!(
-                "iteration_range 的 begin = {begin} 大于 end = {end}"
+                "iteration_range begin = {begin} is greater than end = {end}"
             )));
         }
         if begin == 0 {
@@ -1973,14 +1979,14 @@ impl PyModel {
             ensure_gpu_prediction_available(use_gpu)?;
             if self.inner.num_outputs() > 1 {
                 return Err(PyValueError::new_err(
-                    "多分类模型的预测是二维的,请用 Model.predict()",
+                    "multiclass predictions are two-dimensional; use Model.predict()",
                 ));
             }
             let shape = x.shape();
             let (n_rows, n_features) = (shape[0], shape[1]);
             if n_features != self.inner.n_features {
                 return Err(PyValueError::new_err(format!(
-                    "模型是按 {} 个特征训的,传进来的是 {n_features} 列",
+                    "model was trained on {} features, got {n_features} columns",
                     self.inner.n_features
                 )));
             }
@@ -2006,7 +2012,7 @@ impl PyModel {
                     .map(|(ix, _)| ix)
                     .expect("found above");
                 return Err(PyValueError::new_err(format!(
-                    "预测数据第 {r} 行第 {c} 列是 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征"
+                    "prediction data at row {r}, column {c} is f32::MAX: this value is reserved for the missing-value split boundary and is rejected in training and prediction; rescale this feature first"
                 )));
             }
             let upto = n_trees.unwrap_or(self.inner.trees.len());
@@ -2276,7 +2282,7 @@ impl PyModel {
                             }
                             return Ok(());
                         }
-                        let inference = single.as_ref().expect("单输出 inference");
+                        let inference = single.as_ref().expect("single-output inference");
                         let inner = inference.model();
                         #[cfg(feature = "cuda")]
                         if gpu_batch {
@@ -2703,7 +2709,7 @@ impl PyModel {
         guard(|| {
             let path_specs = path_specs_of(data)?.ok_or_else(|| {
                 PyValueError::new_err(
-                    "predict_to_parquet 只接受文件路径、路径列表、目录或 glob 输入",
+                    "predict_to_parquet only accepts a file path, a list of paths, a directory or a glob",
                 )
             })?;
             // A per-row starting margin is read from file column(s) next to the features.
@@ -2745,9 +2751,9 @@ impl PyModel {
             py.detach(|| -> Result<(), ModelIoError> {
                 let json = inner
                     .to_xgboost_json_with_threads(requested)
-                    .map_err(|e| ModelIoError::Runtime(format!("导出失败:{e}")))?;
+                    .map_err(|e| ModelIoError::Runtime(format!("export failed: {e}")))?;
                 parallel_model_write(path, json.as_bytes(), requested, quiet)
-                    .map_err(|e| ModelIoError::Value(format!("写不了 {path}:{e}")))
+                    .map_err(|e| ModelIoError::Value(format!("cannot write {path}: {e}")))
             })
             .map_err(PyErr::from)
         })
@@ -2770,15 +2776,16 @@ impl PyModel {
                         if e.downcast_ref::<std::io::Error>()
                             .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
                         {
-                            ModelIoError::FileNotFound(format!("{path} 不存在"))
+                            ModelIoError::FileNotFound(format!("{path} does not exist"))
                         } else {
-                            ModelIoError::Value(format!("读不了 {path}:{e}"))
+                            ModelIoError::Value(format!("cannot read {path}: {e}"))
                         }
                     })?;
-                    let raw = String::from_utf8(raw)
-                        .map_err(|e| ModelIoError::Value(format!("{path} 不是 UTF-8 JSON:{e}")))?;
+                    let raw = String::from_utf8(raw).map_err(|e| {
+                        ModelIoError::Value(format!("{path} is not UTF-8 JSON: {e}"))
+                    })?;
                     Model::from_xgboost_json_with_threads(&raw, model_io_threads)
-                        .map_err(|e| ModelIoError::Value(format!("{path} 解析失败:{e}")))
+                        .map_err(|e| ModelIoError::Value(format!("failed to parse {path}: {e}")))
                 })
                 .map_err(PyErr::from)?;
             Ok(Self {
@@ -2887,11 +2894,11 @@ impl PyModel {
 
     fn __repr__(&self) -> String {
         format!(
-            "<ferrisboost.Model {} 棵树,{} 个特征{}>",
+            "<ferrisboost.Model {} trees, {} features{}>",
             self.inner.trees.len(),
             self.inner.n_features,
             match self.inner.best_iteration {
-                Some(b) => format!(",best_iteration={b}"),
+                Some(b) => format!(", best_iteration={b}"),
                 None => String::new(),
             }
         )
@@ -2953,7 +2960,7 @@ impl Parsed {
             Some(MonotoneSpec::Positional(v)) => {
                 if v.len() > n_features {
                     return Err(PyValueError::new_err(format!(
-                        "monotone_constraints 有 {} 个,但只有 {n_features} 个特征",
+                        "monotone_constraints has {} entries but there are only {n_features} features",
                         v.len()
                     )));
                 }
@@ -2962,15 +2969,15 @@ impl Parsed {
             Some(MonotoneSpec::Named(pairs)) => {
                 if feature_names.is_empty() {
                     return Err(PyValueError::new_err(
-                        "按列名给的 monotone_constraints 需要列名:这个输入是位置模式\
-                         (numpy 或无表头 CSV),请改用按位置的元组",
+                        "monotone_constraints given by name need column names: this input is positional \
+                         (numpy or headerless CSV); use a positional tuple instead",
                     ));
                 }
                 let mut out = vec![0i8; feature_names.len()];
                 for (name, dir) in pairs {
                     let at = feature_names.iter().position(|n| n == name).ok_or_else(|| {
                         PyValueError::new_err(format!(
-                            "monotone_constraints 里的列 {name:?} 不是特征列;特征列有 {feature_names:?}"
+                            "column {name:?} in monotone_constraints is not a feature column; feature columns: {feature_names:?}"
                         ))
                     })?;
                     out[at] = *dir;
@@ -3010,7 +3017,9 @@ fn parse_rank_params(d: &Bound<'_, PyDict>) -> PyResult<crate::rank::RankParams>
     use crate::rank::{PairMethod, RankParams};
     fn get<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
         d.get_item(key)?.ok_or_else(|| {
-            PyValueError::new_err(format!("参数 {key} 没给(Python 层应该补上默认值)"))
+            PyValueError::new_err(format!(
+                "parameter {key} is missing (the Python layer should supply a default)"
+            ))
         })
     }
     let get = |key: &str| get(d, key);
@@ -3071,7 +3080,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             d.get_item($key)?
                 .ok_or_else(|| {
                     PyValueError::new_err(format!(
-                        "参数 {} 没给(Python 层应该补上默认值)",
+                        "parameter {} is missing (the Python layer should supply a default)",
                         $key
                     ))
                 })?
@@ -3108,15 +3117,15 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     let quantile_alpha: Option<Vec<f32>> = get!("quantile_alpha");
     if objective == "reg:quantileerror" && quantile_alpha.is_none() {
         return Err(PyValueError::new_err(
-            "reg:quantileerror 需要 quantile_alpha(一个或多个 [0, 1] 内、升序的分位数,\
-             例如 0.9 或 [0.1, 0.5, 0.9]);XGBoost 没有默认值",
+            "reg:quantileerror requires quantile_alpha (one or more ascending quantiles in [0, 1], \
+             e.g. 0.9 or [0.1, 0.5, 0.9]); XGBoost has no default",
         ));
     }
     let objective = Objective::from_name(&objective)
         .filter(|_| objective != "reg:linear")
         .ok_or_else(|| {
             PyValueError::new_err(format!(
-                "objective {objective:?} 不支持;支持的有 {}",
+                "objective {objective:?} is not supported; supported: {}",
                 Objective::supported_names()
             ))
         })?
@@ -3194,14 +3203,14 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             match raw.as_deref() {
                 None | Some("cpu") => None,
                 Some(d) if d == "cuda" || d == "gpu" => Some(0),
-                Some(d) if d.starts_with("cuda:") => Some(
-                    d[5..]
-                        .parse::<usize>()
-                        .map_err(|_| PyValueError::new_err(format!("device 解析不了:{d:?}")))?,
-                ),
+                Some(d) if d.starts_with("cuda:") => {
+                    Some(d[5..].parse::<usize>().map_err(|_| {
+                        PyValueError::new_err(format!("cannot parse device: {d:?}"))
+                    })?)
+                }
                 Some(other) => {
                     return Err(PyValueError::new_err(format!(
-                        "device 只支持 \"cpu\" / \"cuda\" / \"cuda:N\",收到 {other:?}"
+                        "device must be \"cpu\" / \"cuda\" / \"cuda:N\", got {other:?}"
                     )))
                 }
             }
@@ -3422,8 +3431,8 @@ fn array_input<'py>(
                 .call1((data,))?;
             converted.extract().map_err(|_| {
                 PyValueError::new_err(
-                    "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、\
-                     pandas DataFrame 或 pyarrow Table",
+                    "predict only accepts file paths (single / list / directory / glob), a 2-D f32 numpy array, \
+                     a pandas DataFrame or a pyarrow Table",
                 )
             })
         }
@@ -3482,7 +3491,7 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     match data.iter().position(|v| v.is_infinite() || *v == f32::MAX) {
         None => Ok(()),
         Some(i) => Err(PyValueError::new_err(format!(
-            "{what}第 {} 行第 {} 列是 {}:特征不能是 ±inf 或保留的 f32::MAX(缺失值请用 NaN;极端值请先缩放)",
+            "{what} at row {}, column {} is {}: features cannot be ±inf or the reserved f32::MAX (use NaN for missing values; rescale extreme values)",
             i / n_features.max(1),
             i % n_features.max(1),
             data[i]
@@ -3503,7 +3512,7 @@ fn check_categorical_codes(
     }
     if flags.len() != n_features {
         return Err(PyValueError::new_err(format!(
-            "feature_types 有 {} 项,数据有 {n_features} 个特征",
+            "feature_types has {} entries, the data has {n_features} features",
             flags.len()
         )));
     }
@@ -3561,7 +3570,7 @@ fn train_dense(
     let labels = y.as_slice()?.to_vec();
     if labels.len() != n_rows {
         return Err(PyValueError::new_err(format!(
-            "标签有 {} 个,特征矩阵有 {n_rows} 行",
+            "got {} labels, the feature matrix has {n_rows} rows",
             labels.len()
         )));
     }
@@ -3609,18 +3618,23 @@ fn train_dense(
                     w.len()
                 )
             } else {
-                format!("weight 有 {} 个,特征矩阵有 {n_rows} 行", w.len())
+                format!(
+                    "weight has {} entries, the feature matrix has {n_rows} rows",
+                    w.len()
+                )
             }));
         }
         if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(PyValueError::new_err("样本权重必须是有限的非负数"));
+            return Err(PyValueError::new_err(
+                "sample weights must be finite and non-negative",
+            ));
         }
     }
     // The `missing` sentinel becomes NaN before any check or binning (borrowed
     // when no value matches; otherwise one corrected copy, never the caller's
     // array). Categorical codes are subject to it too, as in XGBoost.
     let x_values = crate::source::missing_as_nan(x.as_slice()?, cfg.missing);
-    reject_inf(&x_values, n_features, "训练集")?;
+    reject_inf(&x_values, n_features, "training data")?;
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     // Ranking: the group weight is repeated on the rows of its group.
@@ -3672,12 +3686,12 @@ fn train_dense(
             let eshape = ex.shape();
             if eshape[1] != n_features {
                 return Err(PyValueError::new_err(format!(
-                    "验证集 {name} 有 {} 列,训练集是 {n_features} 列",
+                    "validation set {name} has {} columns, the training set has {n_features}",
                     eshape[1]
                 )));
             }
             let ex_values = crate::source::missing_as_nan(ex.as_slice()?, cfg.missing);
-            reject_inf(&ex_values, n_features, &format!("验证集 {name} "))?;
+            reject_inf(&ex_values, n_features, &format!("validation set {name}"))?;
             let src = DenseSource::new(
                 &ex_values,
                 eshape[0],
@@ -3781,7 +3795,7 @@ fn train_dense(
                 &Local,
             ),
             #[cfg(not(feature = "cuda"))]
-            Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
+            Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
             None => train_weighted(
                 &train_src,
                 &labels,
@@ -3815,13 +3829,15 @@ fn train_dense(
         Some(names) => {
             if names.len() != n_features {
                 return Err(PyValueError::new_err(format!(
-                    "feature_names 有 {} 个,数据有 {n_features} 列",
+                    "feature_names has {} entries, the data has {n_features} columns",
                     names.len()
                 )));
             }
             let mut seen = std::collections::HashSet::new();
             if let Some(dup) = names.iter().find(|n| !seen.insert(n.as_str())) {
-                return Err(PyValueError::new_err(format!("特征列名重复:{dup:?}")));
+                return Err(PyValueError::new_err(format!(
+                    "duplicate feature column name: {dup:?}"
+                )));
             }
             names
         }
@@ -3885,26 +3901,25 @@ fn train_file(
     // CSV schema inference samples text rows, so keep the result used for
     // blocking and pass it into open instead of rescanning the first file.
     let csv_preflight = match fmt {
-        "csv" => Some(
-            csv_source::infer_schema(&paths[0], header)
-                .map_err(|e| PyValueError::new_err(format!("读 {path} 的 schema 失败:{e}")))?,
-        ),
+        "csv" => Some(csv_source::infer_schema(&paths[0], header).map_err(|e| {
+            PyValueError::new_err(format!("failed to read the schema of {path}: {e}"))
+        })?),
         _ => None,
     };
     let label_owned = match (fmt, header) {
         ("parquet", false) => {
-            return Err(PyValueError::new_err("header=False 只适用于 CSV"));
+            return Err(PyValueError::new_err("header=False only applies to CSV"));
         }
-        (_, true) => label
-            .extract::<String>()
-            .map_err(|_| PyValueError::new_err("header=True 时 label 必须是列名字符串"))?,
+        (_, true) => label.extract::<String>().map_err(|_| {
+            PyValueError::new_err("with header=True, label must be a column name string")
+        })?,
         ("csv", false) => {
             let index = label.extract::<isize>().map_err(|_| {
-                PyValueError::new_err("header=False 时 label 必须是从 0 开始的列下标")
+                PyValueError::new_err("with header=False, label must be a zero-based column index")
             })?;
             if index < 0 {
                 return Err(PyValueError::new_err(format!(
-                    "label 列下标不能是负数,给的是 {index}"
+                    "label column index cannot be negative, got {index}"
                 )));
             }
             csv_source::positional_label_name_from_schema(
@@ -3919,17 +3934,16 @@ fn train_file(
     // 权重列和标签列同样的写法:有表头给列名,无表头 CSV 给列下标。
     let weight_owned: Option<String> = match weight {
         None => None,
-        Some(w) if header => Some(
-            w.extract::<String>()
-                .map_err(|_| PyValueError::new_err("header=True 时 weight 必须是列名字符串"))?,
-        ),
+        Some(w) if header => Some(w.extract::<String>().map_err(|_| {
+            PyValueError::new_err("with header=True, weight must be a column name string")
+        })?),
         Some(w) => {
             let index = w.extract::<isize>().map_err(|_| {
-                PyValueError::new_err("header=False 时 weight 必须是从 0 开始的列下标")
+                PyValueError::new_err("with header=False, weight must be a zero-based column index")
             })?;
             if index < 0 {
                 return Err(PyValueError::new_err(format!(
-                    "weight 列下标不能是负数,给的是 {index}"
+                    "weight column index cannot be negative, got {index}"
                 )));
             }
             Some(
@@ -3945,17 +3959,16 @@ fn train_file(
     // header, a column index for a headerless CSV).
     let qid_owned: Option<String> = match qid {
         None => None,
-        Some(q) if header => Some(
-            q.extract::<String>()
-                .map_err(|_| PyValueError::new_err("header=True 时 qid 必须是列名字符串"))?,
-        ),
+        Some(q) if header => Some(q.extract::<String>().map_err(|_| {
+            PyValueError::new_err("with header=True, qid must be a column name string")
+        })?),
         Some(q) => {
             let index = q.extract::<isize>().map_err(|_| {
-                PyValueError::new_err("header=False 时 qid 必须是从 0 开始的列下标")
+                PyValueError::new_err("with header=False, qid must be a zero-based column index")
             })?;
             if index < 0 {
                 return Err(PyValueError::new_err(format!(
-                    "qid 列下标不能是负数,给的是 {index}"
+                    "qid column index cannot be negative, got {index}"
                 )));
             }
             Some(
@@ -4030,14 +4043,14 @@ fn train_file(
             csv_preflight.as_deref().expect("CSV preflight exists"),
             targets,
         ),
-        other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
+        other => Err(anyhow::anyhow!("unknown format {other:?}")),
     }
-    .map_err(|e| PyValueError::new_err(format!("读 {path} 的 schema 失败:{e}")))?;
+    .map_err(|e| PyValueError::new_err(format!("failed to read the schema of {path}: {e}")))?;
     // Declared feature types are positional over the resolved features (label
     // and weight excluded), like XGBoost's `feature_types`.
     if !cfg.categorical.is_empty() && cfg.categorical.len() != n_features {
         return Err(PyValueError::new_err(format!(
-            "feature_types 有 {} 项,文件有 {n_features} 个特征列(不含标签/权重列)",
+            "feature_types has {} entries, the file has {n_features} feature columns (excluding label/weight columns)",
             cfg.categorical.len()
         )));
     }
@@ -4054,7 +4067,10 @@ fn train_file(
             let mut total = 0u64;
             for p in &paths {
                 total += parquet_source::peek_n_rows(p).map_err(|e| {
-                    PyValueError::new_err(format!("读 {} 的行数失败:{e}", p.display()))
+                    PyValueError::new_err(format!(
+                        "failed to read the row count of {}: {e}",
+                        p.display()
+                    ))
                 })?;
             }
             Some(total)
@@ -4075,7 +4091,7 @@ fn train_file(
         (None, Some(_)) => {
             let c = cfg.requested_cols_per_block.filter(|c| *c > 0).ok_or_else(|| {
                 PyValueError::new_err(
-                    "GPU 输入在 open 前拿不到行数时需要显式 cols_per_block；open 后会用真实行数完成显存、stream 和 residency 规划",
+                    "GPU input needs an explicit cols_per_block when the row count is unavailable before open; memory, stream and residency planning finish with the real row count after open",
                 )
             })?;
             (
@@ -4143,7 +4159,7 @@ fn train_file(
                     ingest_threads,
                 ),
             },
-            other => Err(anyhow::anyhow!("不认识的格式 {other:?}")),
+            other => Err(anyhow::anyhow!("unknown format {other:?}")),
         }
     };
     // 验证集同样接受多文件规格。
@@ -4156,7 +4172,7 @@ fn train_file(
         let r = crate::source::input::resolve(&[spec.to_string()])?;
         anyhow::ensure!(
             r.format == resolved.format,
-            "验证集格式({})和训练集({})不一致",
+            "validation set format ({}) differs from the training set ({})",
             r.format.label(),
             resolved.format.label()
         );
@@ -4338,7 +4354,7 @@ fn train_file(
                     &Local,
                 ),
                 #[cfg(not(feature = "cuda"))]
-                Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
+                Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
                 None => train_weighted(
                     &src,
                     &labels,
@@ -4512,7 +4528,7 @@ fn train_file(
                 &Local,
             ),
             #[cfg(not(feature = "cuda"))]
-            Some(_) => Err(anyhow::anyhow!("这个构建没有 CUDA 支持")),
+            Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
             None => train_weighted(
                 &ds.source,
                 &ds.labels,

@@ -48,7 +48,7 @@ impl<'a> Targets<'a> {
     pub fn new(label: &'a str, weight: Option<&'a str>) -> anyhow::Result<Self> {
         crate::ensure_input!(
             weight != Some(label),
-            "weight 列和 label 列不能是同一列 {label:?}"
+            "weight and label cannot be the same column {label:?}"
         );
         Ok(Self {
             label,
@@ -106,7 +106,9 @@ impl<'a> Targets<'a> {
     ) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
         let mut seen = std::collections::HashSet::new();
         if let Some(dup) = columns.iter().find(|n| !seen.insert(**n)) {
-            crate::bail_input!("文件里有重复的列名 {dup:?};列名必须唯一");
+            crate::bail_input!(
+                "duplicate column name {dup:?} in the file; column names must be unique"
+            );
         }
         let mut idx = Vec::new();
         let mut names = Vec::new();
@@ -118,7 +120,7 @@ impl<'a> Targets<'a> {
         }
         crate::ensure_input!(
             !idx.is_empty(),
-            "除了标签列 {:?} 之外没有别的列了",
+            "no columns besides the label column {:?}",
             self.label
         );
         let Some(want) = self.features else {
@@ -136,7 +138,7 @@ impl<'a> Targets<'a> {
             .collect();
         crate::ensure_input!(
             missing.is_empty() && extra.is_empty(),
-            "特征列和训练集对不上(按列名绑定):缺少 {missing:?},多出 {extra:?}"
+            "feature columns do not match the training set (bound by name): missing {missing:?}, extra {extra:?}"
         );
         let idx = want
             .iter()
@@ -233,11 +235,13 @@ pub fn mask_missing_in_place(data: &mut [f32], missing: f32) {
 /// 校验从文件读出的权重列:不能有缺失、不能是负数(XGBoost 同样拒绝)。
 pub(crate) fn check_weight_column(weights: &[f32], name: &str) -> anyhow::Result<()> {
     if let Some(i) = weights.iter().position(|w| w.is_nan()) {
-        crate::bail_input!("权重列 {name:?} 第 {i} 行是缺失值;样本权重不能缺失");
+        crate::bail_input!(
+            "weight column {name:?} is missing at row {i}; sample weights cannot be missing"
+        );
     }
     if let Some(i) = weights.iter().position(|w| !w.is_finite() || *w < 0.0) {
         crate::bail_input!(
-            "权重列 {name:?} 第 {i} 行是 {};样本权重必须是有限的非负数",
+            "weight column {name:?} is {} at row {i}; sample weights must be finite and non-negative",
             weights[i]
         );
     }
@@ -407,7 +411,7 @@ mod targets_tests {
             .select_features(&["label", "a", "a"])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("重复"), "{err}");
+        assert!(err.contains("duplicate"), "{err}");
     }
 }
 

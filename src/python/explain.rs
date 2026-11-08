@@ -148,21 +148,21 @@ impl PyModel {
             )
         })?;
         if mode == SchemaMode::Named && self.inner.feature_names.is_empty() {
-            return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
+            return Err(PyValueError::new_err(
+                "model is marked as named but has no feature names",
+            ));
         }
         if resolved.format == InputFormat::Parquet && !header {
-            return Err(PyValueError::new_err("header=False 只适用于 CSV"));
+            return Err(PyValueError::new_err("header=False only applies to CSV"));
         }
         if resolved.format == InputFormat::Csv {
             match (mode, header) {
-                (SchemaMode::Named, false) => {
-                    return Err(PyValueError::new_err(
-                        "命名模式模型不能用 header=False 的位置 CSV 预测",
-                    ))
-                }
+                (SchemaMode::Named, false) => return Err(PyValueError::new_err(
+                    "a model with named features cannot predict on a positional header=False CSV",
+                )),
                 (SchemaMode::Positional, true) => {
                     return Err(PyValueError::new_err(
-                        "位置模式模型预测 CSV 时必须显式传 header=False",
+                        "a positional model must pass header=False explicitly to predict on CSV",
                     ))
                 }
                 _ => {}
@@ -377,7 +377,7 @@ impl PyModel {
             let (n_rows, cols) = (shape[0], shape[1]);
             if cols != n_features {
                 return Err(PyValueError::new_err(format!(
-                    "模型是按 {n_features} 个特征训的,传进来的是 {cols} 列"
+                    "model was trained on {n_features} features, got {cols} columns"
                 )));
             }
             let view = x.as_array();
@@ -387,7 +387,7 @@ impl PyModel {
                 .map(|(ix, _)| ix)
             {
                 return Err(PyValueError::new_err(format!(
-                    "预测数据第 {r} 行第 {c} 列是 f32::MAX:这个值保留给缺失值分裂边界,训练和预测都拒绝它;请先缩放这个特征"
+                    "prediction data at row {r}, column {c} is f32::MAX: this value is reserved for the missing-value split boundary and is rejected in training and prediction; rescale this feature first"
                 )));
             }
             let gathered;

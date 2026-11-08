@@ -13,6 +13,12 @@ pub(super) struct ResidentSplitBuffers {
     next: CudaSlice<i64>,
     candidates: CudaSlice<u8>,
     packets: CudaSlice<u8>,
+    /// Pinned host mirror of `packets`: the last window of a level is copied
+    /// asynchronously right after its kernels are queued, so collecting it
+    /// costs a stream wait instead of a synchronous pageable D2H.
+    packets_host: PinnedHostSlice<u8>,
+    /// Bytes of `packets` already queued into `packets_host`.
+    packets_in_flight: Option<usize>,
     sums: CudaSlice<i64>,
     metadata: CudaSlice<u32>,
     feats: CudaSlice<u32>,
@@ -55,11 +61,17 @@ impl ResidentSplitBuffers {
         node_masks: bool,
     ) -> Result<Self> {
         let packet_stride = SPLIT_PACKET_BYTES + if categorical { CAT_SET_WORDS * 4 } else { 0 };
+        let packet_bytes = cap * packet_stride * SPLIT_PACKET_WINDOW_BATCHES;
+        // SAFETY: the pinned bytes are only read after a D2H has written them
+        // (`collect_split_packets` waits for the copy's event first).
+        let packets_host = unsafe { stream.context().alloc_pinned::<u8>(packet_bytes.max(1)) }?;
         Ok(Self {
             previous: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             next: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             candidates: stream.alloc_zeros::<u8>((feats * cap * 64).max(1))?,
-            packets: stream.alloc_zeros::<u8>(cap * packet_stride * SPLIT_PACKET_WINDOW_BATCHES)?,
+            packets: stream.alloc_zeros::<u8>(packet_bytes)?,
+            packets_host,
+            packets_in_flight: None,
             sums: stream.alloc_zeros::<i64>(cap * 2)?,
             metadata: stream.alloc_zeros::<u32>(cap * 4)?,
             feats: stream.alloc_zeros::<u32>(feats.max(1))?,
@@ -103,6 +115,15 @@ pub(crate) struct GpuSplitGroup {
 }
 pub(crate) type GpuSplitResult = (usize, Option<SplitCandidate>, Option<Vec<GradPairFixed>>);
 
+/// A level whose last packet window is queued but not yet collected
+/// ([`GpuBlockSession::split_cached_submit`]).
+pub(crate) struct GpuSplitLevel {
+    pending: Vec<PendingSplitBatch>,
+    packet_nodes: usize,
+    results: Vec<GpuSplitResult>,
+    keep_next: bool,
+}
+
 struct PendingSplitBatch {
     indices: Vec<usize>,
     working_slots: Vec<usize>,
@@ -138,6 +159,8 @@ impl GpuBlockSession<'_> {
             );
         }
         cache.next_ids.clear();
+        // A copy queued by an abandoned level must never stand in for a new one.
+        cache.packets_in_flight = None;
         Ok(true)
     }
 
@@ -174,6 +197,7 @@ impl GpuBlockSession<'_> {
     /// Build only small children, subtract cached parents on device, and return
     /// compact winners. Uncached histograms are downloaded only if another
     /// level can consume them; this is the exact bounded-capacity fallback.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_cached_batch(
         &mut self,
         groups: &[GpuSplitGroup],
@@ -185,6 +209,36 @@ impl GpuBlockSession<'_> {
         p: &TrainParams,
         keep_next: bool,
     ) -> Result<Vec<GpuSplitResult>> {
+        let level = self.split_cached_submit(
+            groups,
+            feats,
+            sampled,
+            categorical,
+            node_enabled,
+            q,
+            p,
+            keep_next,
+        )?;
+        self.split_cached_finish(level)
+    }
+
+    /// First half of [`Self::split_cached_batch`]: queue every batch of the
+    /// level, collecting only packet windows that must be drained before the
+    /// next producer (full window or an uncached spill). The last window stays
+    /// queued, so the caller can submit other blocks' levels before waiting in
+    /// [`Self::split_cached_finish`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_cached_submit(
+        &mut self,
+        groups: &[GpuSplitGroup],
+        feats: &[FeatId],
+        sampled: Option<&[FeatId]>,
+        categorical: Option<&[bool]>,
+        node_enabled: Option<&dyn Fn(usize, FeatId) -> bool>,
+        q: &GradQuantizer,
+        p: &TrainParams,
+        keep_next: bool,
+    ) -> Result<GpuSplitLevel> {
         let cap = self.ctx.hist_nodes_per_batch;
         let mut pending = Vec::with_capacity(SPLIT_PACKET_WINDOW_BATCHES);
         let mut packet_nodes = 0;
@@ -202,7 +256,10 @@ impl GpuBlockSession<'_> {
             let spills = keep_next && cache.next_ids.len() + nodes > cache.capacity;
             // An uncached histogram lives in reusable hist_out: collect before
             // another producer can overwrite it. Cached winners need only packets.
-            if spills && !pending.is_empty() {
+            // A full packet window is drained only when another batch needs
+            // its slots, so a level that exactly fills the window stays queued
+            // for `split_cached_finish`.
+            if !pending.is_empty() && (spills || pending.len() == SPLIT_PACKET_WINDOW_BATCHES) {
                 results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
                 pending.clear();
                 packet_nodes = 0;
@@ -219,12 +276,62 @@ impl GpuBlockSession<'_> {
                 packet_nodes,
             )?);
             packet_nodes += nodes;
-            if spills || pending.len() == SPLIT_PACKET_WINDOW_BATCHES {
+            if spills {
                 results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
                 pending.clear();
                 packet_nodes = 0;
             }
         }
+        if !pending.is_empty() {
+            self.enqueue_split_packets(packet_nodes)?;
+        }
+        Ok(GpuSplitLevel {
+            pending,
+            packet_nodes,
+            results,
+            keep_next,
+        })
+    }
+
+    /// Queue the async copy of the first `nodes` packets into the pinned
+    /// mirror on the slot's stream (no host wait).
+    fn enqueue_split_packets(&mut self, nodes: usize) -> Result<()> {
+        let slot = self.slot.as_mut().expect("histogram slot lease missing");
+        let stream = slot.stream.clone();
+        let cache = slot
+            .split_cache
+            .as_mut()
+            .context("resident split cache unavailable")?;
+        let bytes = nodes * cache.packet_stride;
+        anyhow::ensure!(
+            bytes <= cache.packets_host.len(),
+            "GPU split packet window exceeds its pinned mirror"
+        );
+        let mut dst = super::PinnedPrefix {
+            inner: &mut cache.packets_host,
+            len: bytes,
+        };
+        stream.memcpy_dtoh(&cache.packets.slice(..bytes), &mut dst)?;
+        cache.packets_in_flight = Some(bytes);
+        self.timing.d2h_calls += 1;
+        self.timing.d2h_bytes += bytes as u64;
+        self.timing.split_d2h_calls += 1;
+        self.timing.split_d2h_bytes += bytes as u64;
+        Ok(())
+    }
+
+    /// Second half of [`Self::split_cached_batch`]: drain the last packet
+    /// window and return all of the level's winners in submission order.
+    pub(crate) fn split_cached_finish(
+        &mut self,
+        level: GpuSplitLevel,
+    ) -> Result<Vec<GpuSplitResult>> {
+        let GpuSplitLevel {
+            pending,
+            packet_nodes,
+            mut results,
+            keep_next,
+        } = level;
         if !pending.is_empty() {
             results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
         }
@@ -536,7 +643,7 @@ impl GpuBlockSession<'_> {
             ..
         } = &mut **slot;
         let cache = split_cache
-            .as_ref()
+            .as_mut()
             .context("resident split cache unavailable")?;
         anyhow::ensure!(
             pending.len() <= SPLIT_PACKET_WINDOW_BATCHES
@@ -554,17 +661,23 @@ impl GpuBlockSession<'_> {
         let start = std::time::Instant::now();
         let packet_ready_phase = crate::diagnostic::Phase::new(b"fb.host.packet_ready\0");
         let stride = cache.packet_stride;
-        let mut packets = vec![0u8; nodes * stride];
-        stream.memcpy_dtoh(
-            &cache.packets.slice(..packets.len()),
-            packets.as_mut_slice(),
-        )?;
+        let bytes = nodes * stride;
+        if cache.packets_in_flight.take() != Some(bytes) {
+            // Mid-level window (drained before the next batch): copy now.
+            let mut dst = super::PinnedPrefix {
+                inner: &mut cache.packets_host,
+                len: bytes,
+            };
+            stream.memcpy_dtoh(&cache.packets.slice(..bytes), &mut dst)?;
+            self.timing.d2h_calls += 1;
+            self.timing.d2h_bytes += bytes as u64;
+            self.timing.split_d2h_calls += 1;
+            self.timing.split_d2h_bytes += bytes as u64;
+        }
         stream.synchronize()?;
+        // `as_slice` also waits for the copy's own event.
+        let packets: Vec<u8> = cache.packets_host.as_slice()?[..bytes].to_vec();
         drop(packet_ready_phase);
-        self.timing.d2h_calls += 1;
-        self.timing.d2h_bytes += packets.len() as u64;
-        self.timing.split_d2h_calls += 1;
-        self.timing.split_d2h_bytes += packets.len() as u64;
         if self.ctx.timing {
             let ms = start.elapsed().as_secs_f32() * 1e3;
             self.timing.d2h_ms += ms;

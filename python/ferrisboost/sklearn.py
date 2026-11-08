@@ -1,6 +1,6 @@
-"""scikit-learn 风格的估计器:`FerrisBoostClassifier` / `FerrisBoostRegressor`。
+"""scikit-learn 风格的估计器:`FerrisBoostClassifier` / `FerrisBoostRegressor` / `FerrisBoostRanker`。
 
-和 XGBoost 的 `XGBClassifier` / `XGBRegressor` 同一套用法,但**不占用 xgboost
+和 XGBoost 的 `XGBClassifier` / `XGBRegressor` / `XGBRanker` 同一套用法,但**不占用 xgboost
 的名字**(两个库可以同时 import):
 
 =====================  ==============================
@@ -8,6 +8,7 @@ XGBoost                FerrisBoost
 =====================  ==============================
 ``XGBClassifier``      ``FerrisBoostClassifier``
 ``XGBRegressor``       ``FerrisBoostRegressor``
+``XGBRanker``          ``FerrisBoostRanker``
 =====================  ==============================
 
     from ferrisboost.sklearn import FerrisBoostClassifier

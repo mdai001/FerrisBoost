@@ -60,7 +60,9 @@ def train(
     passed to callbacks start at 0, and early stopping's best_iteration is the
     absolute round in the whole model (as in XGBoost). A stale best_iteration
     of the continued model is kept if early stopping is not used. File inputs
-    need a model that records its feature schema (saved by FerrisBoost).
+    are bound to the model by feature name (any column order), so the model
+    needs feature names; an XGBoost model has them when it was trained with
+    feature_names. A model without them raises ValueError for file input.
 
     weight gives per-row sample weights (XGBoost's DMatrix weight): a 1-D array
     for array input, or a column name (column index for headerless CSV) for

@@ -230,7 +230,10 @@ mod tests {
         for round in 0..8 {
             let s = sample_features(300, 0.1, 42, round);
             assert_eq!(s.len(), 30);
-            assert!(s.windows(2).all(|w| w[0] < w[1]), "必须升序且无重复");
+            assert!(
+                s.windows(2).all(|w| w[0] < w[1]),
+                "must be ascending with no duplicates"
+            );
             assert!(s.iter().all(|&f| f < 300));
         }
     }
@@ -246,8 +249,16 @@ mod tests {
     #[test]
     fn different_seed_or_round_changes_the_set() {
         let a = sample_features(300, 0.3, 11, 5);
-        assert_ne!(a, sample_features(300, 0.3, 12, 5), "换 seed 应该换集合");
-        assert_ne!(a, sample_features(300, 0.3, 11, 6), "换轮次应该换集合");
+        assert_ne!(
+            a,
+            sample_features(300, 0.3, 12, 5),
+            "a different seed should change the set"
+        );
+        assert_ne!(
+            a,
+            sample_features(300, 0.3, 11, 6),
+            "a different round should change the set"
+        );
     }
 
     #[test]
@@ -260,7 +271,11 @@ mod tests {
             assert_eq!(level.len(), 40);
             assert!(level.windows(2).all(|w| w[0] < w[1]));
             assert!(level.iter().all(|f| tree.binary_search(f).is_ok()));
-            assert_eq!(level, ns.level_set(&tree, depth), "同层同种子必须复现");
+            assert_eq!(
+                level,
+                ns.level_set(&tree, depth),
+                "same level and seed must reproduce"
+            );
             for node in 0..6 {
                 let set = ns.node_set(&level, node);
                 assert_eq!(set.len(), 20);

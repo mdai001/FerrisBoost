@@ -16,7 +16,7 @@ affiliated with or endorsed by the XGBoost project or its maintainers.
 In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not by GPU compute kernels, but by host-memory overhead, data ingest, and rigid memory limits. FerrisBoost focuses on reducing ingest, memory, and execution overhead in large tabular workflows:
 
 - **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–4× faster** while cutting peak host RAM by **2–3×** (`0.29–0.47× XGBoost`).
-- **Adaptive VRAM Management**: FerrisBoost's GPU memory planner selects a stable full-residency, hybrid-residency, or streaming plan from the dataset shape and available memory budget. The plan stays fixed during training rather than continuously migrating data between modes.
+- **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the rest from the quantized cache every level (hybrid), down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans. On the host, the quantized Parquet cache spills to local disk beyond `cache_budget_bytes`.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
@@ -201,7 +201,7 @@ model = fb.train(
 )
 ```
 
-For scikit-learn pipelines, use `FerrisBoostClassifier` and `FerrisBoostRegressor`, which follow the `XGBClassifier` / `XGBRegressor` interface. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) work on any model, including models loaded from XGBoost.
+For scikit-learn pipelines, use `FerrisBoostClassifier`, `FerrisBoostRegressor` and `FerrisBoostRanker`, which follow the `XGBClassifier` / `XGBRegressor` / `XGBRanker` interface. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) work on any model, including models loaded from XGBoost.
 
 ### XGBoost Interchange
 
@@ -215,11 +215,11 @@ Because FerrisBoost models are serialized to standard XGBoost-compatible JSON:
   preds = booster.predict(xgb.DMatrix(X))
   ```
 
-- Similarly, FerrisBoost can load models originally trained by XGBoost (`fb.Model.load_model("xgb_model.json")`) and predict using FerrisBoost's CPU engine.
+- Similarly, FerrisBoost can load models originally trained by XGBoost (`fb.Model.load_model("xgb_model.json")`), predict with them on CPU or GPU, and continue training them (`init_model=`).
 
 FerrisBoost prediction is independent of the training backend. CPU prediction parallelizes deterministic row ranges with `predict_threads=0` by default. CUDA-enabled builds can opt into single-GPU prediction with `use_gpu=True`; repeated calls reuse a lazy compact device model. File prediction validates the complete model schema, then materializes only features used by the trees. The canonical model feature IDs are never rewritten: compact IDs exist only in the cached inference representation, preserving save/load and XGBoost compatibility. A transfer-aware selector keeps small or transfer-heavy batches on CPU. CPU single-thread, CPU multi-thread, and GPU outputs preserve the same row order and prediction bits for the same model.
 
-File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes one `float32` prediction column without collecting the complete result in Python memory.
+File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes `float32` prediction columns (one per class or quantile for multi-output models) without collecting the complete result in Python memory.
 
 ### Objectives and metrics
 
@@ -249,19 +249,20 @@ logging, and the complete parameter reference.
 ### 0.0.7 (unreleased)
 
 - Added `base_margin`.
-- Added training continuation (`init_model`).
+- Added training continuation (`init_model`; `xgb_model` also accepted).
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`) and `FerrisBoostRanker`.
 - Added unbiased learning to rank.
 - Added ranking `auc` and `aucpr`.
 - Added multiple quantiles in one model (`quantile_alpha` list).
-- GPU prediction for categorical models and with `base_margin`.
-- Multiclass `predict_to_parquet` now streams.
 - Added `strict_shape`.
+- GPU prediction for categorical models and with `base_margin`.
 - SHAP values on GPU.
 - Continue training from XGBoost models with file input.
+- Multiclass and multi-quantile `predict_to_parquet` now stream.
 - Faster file prediction for wide data.
 - Changed: input validation errors that surfaced as `RuntimeError` are now `ValueError`.
-- GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
+- Faster CPU training.
+- GPU speed optimizations.
 
 ### 0.0.6
 

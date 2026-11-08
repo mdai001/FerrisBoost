@@ -141,10 +141,10 @@ def test_softmax_parquet_writes_class_index(tmp_path):
 @pytest.mark.parametrize("params, labels, match", [
     ({"objective": "multi:softprob"}, None, "num_class"),
     ({"objective": "multi:softprob", "num_class": 1}, None, "num_class"),
-    ({"objective": "multi:softprob", "num_class": 3}, [0, 1, 3], "整数"),
-    ({"objective": "multi:softprob", "num_class": 3}, [0, 1.5, 2], "整数"),
+    ({"objective": "multi:softprob", "num_class": 3}, [0, 1, 3], "integers"),
+    ({"objective": "multi:softprob", "num_class": 3}, [0, 1.5, 2], "integers"),
     ({"objective": "multi:softprob", "num_class": 3, "eval_metric": "auc"}, None, "mlogloss"),
-    ({"objective": "binary:logistic", "eval_metric": "mlogloss"}, [0, 1, 1], "多分类"),
+    ({"objective": "binary:logistic", "eval_metric": "mlogloss"}, [0, 1, 1], "multiclass metric"),
 ])
 def test_invalid_configurations_are_rejected(params, labels, match):
     x, y = make(n=300, k=3)
@@ -289,7 +289,7 @@ def test_multiclass_parquet_output_follows_single_output_rules(tmp_path):
     pq.write_table(pa.table({f"f{i}": x[:, i] for i in range(x.shape[1])}), src)
     m = fb.train({"objective": "multi:softprob", "num_class": 3}, x, label=y,
                  num_boost_round=2, quiet=True)
-    with pytest.raises(ValueError, match="扩展名"):
+    with pytest.raises(ValueError, match="extension"):
         m.predict_to_parquet(src, str(tmp_path / "out.csv"))
     with pytest.raises(ValueError, match="prediction_column"):
         m.predict_to_parquet(src, str(tmp_path / "a.parquet"), prediction_column=" ")

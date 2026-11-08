@@ -1114,8 +1114,14 @@ extern "C" __global__ void quantile_gradient_rows(
     float* gpair_out,
     unsigned long long subsample_threshold,
     unsigned long long subsample_seed,
-    unsigned long long subsample_tree) {
+    unsigned long long subsample_tree,
+    // 每个 block 一对 (max|g|, max|h|),和 `apply_delta_and_gradient` 一样融合进来,
+    // 省掉单独的 `gpair_max_abs` 一趟和它的 host 往返。launch 几何因此就是归约几何
+    // (grid-stride,block 数 = max 槽位数)。
+    double* max_out) {
     const float scale = (float)scratch[(uint64_t)n_partials * 2];
+    double mg = 0.0;
+    double mh = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
         float g = 0.0f;
@@ -1148,7 +1154,11 @@ extern "C" __global__ void quantile_gradient_rows(
         }
         gpair_out[(uint64_t)i * 2] = g;
         gpair_out[(uint64_t)i * 2 + 1] = h;
+        // 采样置零之后的值进 max(和单独的 gpair_max_abs 看到的一样)。
+        mg = fmax(mg, fb_bound(g));
+        mh = fmax(mh, fb_bound(h));
     }
+    fb_block_max_pair(mg, mh, max_out);
 }
 
 extern "C" __global__ void gpair_max_abs(
@@ -2114,9 +2124,17 @@ extern "C" __global__ void partition_scan_blocks(
 
 // One fixed-size AoS descriptor per node:
 // input offset, length, original-local feature, split bin, missing-left,
-// count base, offset base, output offset, level-total slot, cumulative block end.
-// All pointers are ordinary tracked allocations; no per-node pointer table.
-enum { PART_DESC_WORDS = 10 };
+// count base, offset base, output offset, level-total slot, cumulative block end,
+// resident-block table index.
+// The resident blocks a batch reads (one level's nodes may split on features of
+// several blocks) travel as a small by-value table of base pointers and widths,
+// so one launch triple partitions a whole level instead of one per block.
+enum { PART_DESC_WORDS = 11 };
+#define PART_MAX_BLOCKS 32u
+struct PartBlocks {
+    unsigned long long base[PART_MAX_BLOCKS];
+    uint32_t n_feats[PART_MAX_BLOCKS];
+};
 
 __device__ __forceinline__ uint32_t partition_batch_node(
     const uint32_t* descriptors, uint32_t nodes, uint32_t block) {
@@ -2130,8 +2148,8 @@ __device__ __forceinline__ uint32_t partition_batch_node(
 }
 
 extern "C" __global__ void partition_count_batched(
-    const uint8_t* bins, const uint32_t* rows, const uint32_t* descriptors,
-    uint32_t nodes, uint32_t n_rows, uint32_t n_feats, uint32_t row_major,
+    const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
+    uint32_t nodes, uint32_t n_rows, uint32_t row_major,
     uint8_t* flags, uint32_t* counts) {
     const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
     const uint32_t* d = descriptors + node * PART_DESC_WORDS;
@@ -2139,6 +2157,8 @@ extern "C" __global__ void partition_count_batched(
     const uint32_t idx = local_block * blockDim.x + threadIdx.x;
     uint32_t left = 0;
     if (idx < d[1]) {
+        const uint8_t* bins = (const uint8_t*)blocks.base[d[10]];
+        const uint32_t n_feats = blocks.n_feats[d[10]];
         const uint32_t arena = d[0] + idx;
         const uint32_t row = rows[arena];
         const uint64_t address = row_major ? (uint64_t)row * n_feats + d[2]
@@ -2337,6 +2357,41 @@ extern "C" __global__ void assign_leaf_value(
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n_selected) {
         prediction_delta[rows[idx]] = value;
+    }
+}
+
+// Up to `FB_LEAF_BATCH` terminal nodes in one launch. The table travels as a
+// kernel parameter (well under the 4 KB parameter limit), so a level's leaves
+// cost one launch and no H2D. `blk_ptr` is the exclusive prefix of per-leaf CTA
+// counts; leaf `i` owns CTAs [blk_ptr[i], blk_ptr[i+1]). Every row belongs to
+// exactly one terminal node, so the stores are disjoint and order free.
+#define FB_LEAF_BATCH 64u
+struct LeafBatch {
+    uint32_t n;
+    uint32_t blk_ptr[FB_LEAF_BATCH + 1];
+    uint32_t offset[FB_LEAF_BATCH];
+    uint32_t len[FB_LEAF_BATCH];
+    float value[FB_LEAF_BATCH];
+};
+
+extern "C" __global__ void assign_leaf_values_batched(
+    const uint32_t* rows,
+    float* prediction_delta,
+    const LeafBatch batch) {
+    // Largest i with blk_ptr[i] <= blockIdx.x (empty leaves own no CTA).
+    uint32_t lo = 0;
+    uint32_t hi = batch.n;
+    while (hi - lo > 1) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (batch.blk_ptr[mid] <= blockIdx.x) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const uint32_t j = (blockIdx.x - batch.blk_ptr[lo]) * blockDim.x + threadIdx.x;
+    if (j < batch.len[lo]) {
+        prediction_delta[rows[batch.offset[lo] + j]] = batch.value[lo];
     }
 }
 

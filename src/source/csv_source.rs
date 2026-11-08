@@ -36,7 +36,8 @@ const BATCH_SIZE: usize = 8192;
 /// own reader, so gzip never needs to be made seekable by inflating the entire
 /// file into a `Vec`.
 fn readable(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
-    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
+    let file =
+        File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
     if crate::source::input::is_gzipped(path) {
         Ok(Box::new(flate2::read::GzDecoder::new(BufReader::new(file))))
     } else {
@@ -49,7 +50,7 @@ pub(crate) fn infer_schema(path: &Path, has_header: bool) -> anyhow::Result<Sche
     let format = Format::default().with_header(has_header);
     let (schema, _) = format
         .infer_schema(&mut file, Some(INFER_ROWS))
-        .map_err(|e| anyhow::anyhow!("{} 的 schema 推断失败:{e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("schema inference failed for {}: {e}", path.display()))?;
     Ok(Arc::new(schema))
 }
 
@@ -88,9 +89,12 @@ pub(crate) fn positional_label_name_from_schema(
     let n_columns = schema.fields().len();
     crate::ensure_input!(
         label_index < n_columns,
-        "label 列下标 {label_index} 越界:无表头 CSV 只有 {n_columns} 列"
+        "label column index {label_index} is out of range: the headerless CSV has only {n_columns} columns"
     );
-    crate::ensure_input!(n_columns > 1, "无表头 CSV 除了标签列之外没有特征列");
+    crate::ensure_input!(
+        n_columns > 1,
+        "headerless CSV has no feature columns besides the label column"
+    );
     Ok(schema.field(label_index).name().clone())
 }
 
@@ -106,9 +110,9 @@ fn check_numeric(schema: &Schema, skip: &str) -> anyhow::Result<()> {
         match f.data_type() {
             DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 => {}
             other => crate::bail_input!(
-                "列 {:?} 推断成了 {other:?},只支持数值列。\
-                 类别特征要先在上游编码成数值;如果它其实是数字,\
-                 检查一下是不是有非法字符或者千分位逗号",
+                "column {:?} was inferred as {other:?}; only numeric columns are supported; \
+                 encode categorical features as numbers upstream; if it is actually numeric, \
+                 check for invalid characters or thousands separators",
                 f.name()
             ),
         }
@@ -154,7 +158,7 @@ pub(crate) fn read_u64_column(
             .fields()
             .iter()
             .position(|f| f.name() == name)
-            .ok_or_else(|| crate::input_err!("{} 里没有列 {name:?}", path.display()))?;
+            .ok_or_else(|| crate::input_err!("{} has no column {name:?}", path.display()))?;
         for batch in batch_reader(path, schema, has_header, vec![col])? {
             out.extend(crate::source::arrow_source::column_as_u64(
                 &batch?, 0, name,
@@ -167,10 +171,9 @@ pub(crate) fn read_u64_column(
 fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let find = |want: &str| {
-        names
-            .iter()
-            .position(|n| *n == want)
-            .ok_or_else(|| crate::input_err!("文件里没有列 {want:?},只有 {names:?}"))
+        names.iter().position(|n| *n == want).ok_or_else(|| {
+            crate::input_err!("file has no column {want:?}; available columns: {names:?}")
+        })
     };
     if let Some(q) = targets.qid {
         find(q)?;
@@ -302,10 +305,10 @@ fn open_many_impl(
     nthread: usize,
     first_schema: Option<SchemaRef>,
 ) -> anyhow::Result<Dataset> {
-    anyhow::ensure!(!paths.is_empty(), "没有输入文件");
+    anyhow::ensure!(!paths.is_empty(), "no input files");
     let label = targets.label;
     let schema_pool = crate::threading::build_pool(nthread)
-        .map_err(|e| anyhow::anyhow!("CSV schema ingest 线程池创建失败:{e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create the CSV schema ingest thread pool: {e}"))?;
     let schema_profile = crate::source::openprof::start("schema");
     let schemas = schema_pool.install(|| {
         paths
@@ -338,7 +341,7 @@ fn open_many_impl(
             Some(canon) if has_header => {
                 crate::ensure_input!(
                     names.len() == canon.len(),
-                    "多文件 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
+                    "schemas differ across files: {} has {} feature columns, {} has {}",
                     paths[0].display(),
                     canon.len(),
                     p.display(),
@@ -347,7 +350,10 @@ fn open_many_impl(
                 let mut mapped = Vec::with_capacity(canon.len());
                 for want in canon {
                     let at = names.iter().position(|n| n == want).ok_or_else(|| {
-                        crate::input_err!("多文件 schema 不一致:{} 里没有列 {want:?}", p.display())
+                        crate::input_err!(
+                            "schemas differ across files: {} has no column {want:?}",
+                            p.display()
+                        )
                     })?;
                     mapped.push(cols[at]);
                 }
@@ -356,7 +362,7 @@ fn open_many_impl(
             Some(canon) => {
                 crate::ensure_input!(
                     names.len() == canon.len(),
-                    "多文件位置 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
+                    "positional schemas differ across files: {} has {} feature columns, {} has {}",
                     paths[0].display(),
                     canon.len(),
                     p.display(),
@@ -367,7 +373,7 @@ fn open_many_impl(
         }
         label_proj.push(label_col);
     }
-    let feature_names = feature_names.expect("非空");
+    let feature_names = feature_names.expect("non-empty");
 
     let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
     let owned = paths.to_vec();
@@ -563,7 +569,7 @@ impl Iterator for FeatureLabelBatches<'_> {
         let extra = 1 + usize::from(self.weights.is_some());
         if batch.num_columns() != self.n_features + extra {
             return Some(Err(anyhow::anyhow!(
-                "CSV combined batch 有 {} 列,预期 {} 个特征 + {extra} 个标签/权重列",
+                "CSV combined batch has {} columns, expected {} features + {extra} label/weight columns",
                 batch.num_columns(),
                 self.n_features,
             )));
@@ -726,7 +732,7 @@ fn parallel_csv_chunks(
             let mut reader = BufReader::new(input);
             let mut record = Vec::new();
             if has_header && read_csv_record(&mut reader, &mut record)? == 0 {
-                crate::bail_input!("{} 没有 CSV 表头", path.display());
+                crate::bail_input!("{} has no CSV header", path.display());
             }
             loop {
                 let mut bytes = Vec::with_capacity(CSV_CHUNK_BYTES);
@@ -893,7 +899,11 @@ mod tests {
         let ds = open(&path, "target", 16, 2).unwrap();
 
         assert_eq!(ds.source.n_rows(), 6);
-        assert_eq!(ds.source.n_features(), 3, "标签列不算特征");
+        assert_eq!(
+            ds.source.n_features(),
+            3,
+            "the label column is not a feature"
+        );
         assert_eq!(ds.feature_names, vec!["f0", "f1", "f2"]);
         assert_eq!(ds.labels, vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
 
@@ -908,7 +918,7 @@ mod tests {
                 assert_eq!(
                     ds.source.bin_at(row, f),
                     dense.bin_at(row, f),
-                    "行 {row} 特征 {f}"
+                    "row {row} feature {f}"
                 );
             }
         }
@@ -936,11 +946,11 @@ mod tests {
             "f0,target,city\n1.0,0,beijing\n2.0,1,shanghai\n",
         );
         let Err(e) = open(&path, "target", 16, 2) else {
-            panic!("字符串列应该被拒绝")
+            panic!("string column should be rejected")
         };
         let msg = e.to_string();
-        assert!(msg.contains("city"), "报错要点名是哪一列:{msg}");
-        assert!(msg.contains("只支持数值列"), "{msg}");
+        assert!(msg.contains("city"), "error should name the column: {msg}");
+        assert!(msg.contains("only numeric columns are supported"), "{msg}");
         std::fs::remove_file(&path).ok();
     }
 
@@ -948,7 +958,7 @@ mod tests {
     fn missing_label_column_lists_what_is_there() {
         let path = write("no_label", BODY);
         let Err(e) = open(&path, "nope", 16, 2) else {
-            panic!("应该报错")
+            panic!("should fail")
         };
         assert!(e.to_string().contains("f0"), "{e}");
         std::fs::remove_file(&path).ok();
@@ -977,10 +987,17 @@ mod tests {
         let label = positional_label_name(&path, 2).unwrap();
         let ds =
             open_many_with_header(std::slice::from_ref(&path), &label, None, 16, 2, false).unwrap();
-        assert_eq!(ds.source.n_rows(), 4, "第一行不能被当成表头吃掉");
+        assert_eq!(
+            ds.source.n_rows(),
+            4,
+            "the first row must not be consumed as a header"
+        );
         assert_eq!(ds.source.n_features(), 3);
         assert_eq!(ds.labels, vec![0.0, 1.0, 0.0, 1.0]);
-        assert!(ds.feature_names.is_empty(), "无表头模型必须是位置模式");
+        assert!(
+            ds.feature_names.is_empty(),
+            "a headerless model must be positional"
+        );
         assert!(positional_label_name(&path, 4).is_err());
         std::fs::remove_file(&path).ok();
     }
