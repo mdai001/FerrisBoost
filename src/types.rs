@@ -586,8 +586,8 @@ pub struct QuantileAlphas {
 
 impl QuantileAlphas {
     pub fn new(alphas: &[f32]) -> anyhow::Result<Self> {
-        anyhow::ensure!(!alphas.is_empty(), "quantile_alpha 不能是空列表");
-        anyhow::ensure!(
+        crate::ensure_input!(!alphas.is_empty(), "quantile_alpha 不能是空列表");
+        crate::ensure_input!(
             alphas.len() <= MAX_QUANTILE_ALPHAS,
             "quantile_alpha 最多 {MAX_QUANTILE_ALPHAS} 个分位数,给了 {}",
             alphas.len()

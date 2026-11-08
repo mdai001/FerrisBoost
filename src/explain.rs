@@ -443,13 +443,15 @@ fn check_covers(tree: &Tree, index: usize) -> Result<()> {
             || tree.nodes[node.left as usize].sum_hess < 0.0
             || tree.nodes[node.right as usize].sum_hess < 0.0
         {
-            bail!("tree {index} has a negative cover (sum_hessian) at a split: SHAP is undefined");
+            crate::bail_input!(
+                "tree {index} has a negative cover (sum_hessian) at a split: SHAP is undefined"
+            );
         }
         if node.sum_hess.is_nan()
             || tree.nodes[node.left as usize].sum_hess.is_nan()
             || tree.nodes[node.right as usize].sum_hess.is_nan()
         {
-            bail!("tree {index} has a NaN cover (sum_hessian): SHAP is undefined");
+            crate::bail_input!("tree {index} has a NaN cover (sum_hessian): SHAP is undefined");
         }
     }
     Ok(())

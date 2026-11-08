@@ -88,8 +88,7 @@ fn explain_batch(
 const EXPLAIN_WORK_FACTOR: usize = 32;
 
 impl PyModel {
-    /// `Model.get_score`: feature index -> name (`f{i}` when the model has no
-    /// names, as XGBoost does) and the importance of every used feature.
+    /// The device engine when `use_gpu` asks for it (an error without CUDA).
     pub(super) fn explain_engine(&self, use_gpu: bool) -> PyResult<GpuEngine> {
         ensure_gpu_prediction_available(use_gpu)?;
         #[cfg(feature = "cuda")]
@@ -99,6 +98,8 @@ impl PyModel {
         Ok(None)
     }
 
+    /// `Model.get_score`: feature index -> name (`f{i}` when the model has no
+    /// names, as XGBoost does) and the importance of every used feature.
     pub(super) fn feature_score_dict<'py>(
         &self,
         py: Python<'py>,
@@ -121,20 +122,29 @@ impl PyModel {
         Ok(out)
     }
 
-    /// File inputs need the same schema contract as `predict_files`; this
-    /// mirrors its checks (the explain path reads full canonical rows).
-    pub(super) fn check_explain_file_schema(
+    /// The schema contract of every file input (predict, `predict_to_parquet`,
+    /// explanations, file `base_margin`, file continuation): which column
+    /// binding the model uses and whether `header` agrees with it.
+    pub(super) fn check_file_schema(
         &self,
         resolved: &crate::source::input::ResolvedInput,
         header: bool,
     ) -> PyResult<()> {
         use crate::source::input::InputFormat;
         use crate::tree::SchemaMode;
-        let mode = self.inner.schema_mode.ok_or_else(|| {
+        // A model without a recorded schema is bound by name when it has
+        // complete feature names (XGBoost models usually do) and refused
+        // otherwise: an empty name list is either a positional model or a
+        // named one that lost its names, and guessing wrong mis-scores
+        // silently.
+        let mode = self.inner.file_schema_mode().ok_or_else(|| {
             PyValueError::new_err(
-                "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
-                 空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
-                 二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
+                "this model does not record how its features map to file columns, so a file \
+                 cannot be bound to it safely: it has no feature names, and binding by position \
+                 would silently mis-score a file whose columns are in another order. Give the \
+                 model feature names (for an XGBoost model: set `feature_names` on the Booster \
+                 before saving it), train it with this version of FerrisBoost, or use an array / \
+                 DataFrame instead of a file",
             )
         })?;
         if mode == SchemaMode::Named && self.inner.feature_names.is_empty() {
@@ -180,7 +190,8 @@ impl PyModel {
             let (rows, trees) = (shape[0], shape[1]);
             if trees % groups != 0 {
                 return Err(PyValueError::new_err(format!(
-                    "strict_shape with pred_leaf needs whole boosting rounds, but {trees} trees                      were used and every round has {groups} (n_trees must be a multiple of {groups})"
+                    "strict_shape with pred_leaf needs whole boosting rounds, but {trees} trees \
+                     were used and every round has {groups} (n_trees must be a multiple of {groups})"
                 )));
             }
             vec![rows, trees / groups, groups, 1]
@@ -266,14 +277,18 @@ impl PyModel {
             if let Some(specs) = path_specs_of(data)? {
                 let resolved = crate::source::input::resolve(&specs)
                     .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-                self.check_explain_file_schema(&resolved, header)?;
-                let projected: Vec<usize> = (0..n_features).collect();
+                self.check_file_schema(&resolved, header)?;
+                // Explanations are exactly zero for a feature no tree splits on, so
+                // only the used columns are read; they are scattered into a
+                // full-width, zero-filled row block (the output keeps every feature).
+                let projected = self.inner.used_split_features(upto);
+                let full_width = projected.len() == n_features;
                 let initially_resolved_ingest = resolved_ingest_workers(
                     self.ingest_threads,
                     resolved.format.label(),
                     &resolved.paths,
-                    n_features,
-                    n_features.max(1),
+                    projected.len(),
+                    projected.len().max(1),
                 );
                 let (ingest_workers, predict_worker_cap, _) = prediction_pipeline_workers(
                     self.ingest_threads,
@@ -284,6 +299,7 @@ impl PyModel {
                 let mut out: Vec<f32> = Vec::new();
                 let k = self.inner.num_outputs();
                 let mut row_offset = 0usize;
+                let mut full: Vec<f32> = Vec::new();
                 let rows = py
                     .detach(|| {
                         crate::source::predict_input::for_each_projected_contiguous_batch(
@@ -312,6 +328,23 @@ impl PyModel {
                                     None => None,
                                 };
                                 row_offset += n_rows;
+                                let batch = if full_width {
+                                    batch
+                                } else {
+                                    if full.len() != n_rows * n_features {
+                                        full.clear();
+                                        full.resize(n_rows * n_features, 0.0);
+                                    }
+                                    for (row, src) in full
+                                        .chunks_exact_mut(n_features)
+                                        .zip(batch.chunks_exact(projected.len()))
+                                    {
+                                        for (&feature, &value) in projected.iter().zip(src) {
+                                            row[feature] = value;
+                                        }
+                                    }
+                                    &full[..]
+                                };
                                 out.extend(explain_batch(
                                     &explainer,
                                     &gpu,

@@ -46,7 +46,7 @@ pub struct Targets<'a> {
 
 impl<'a> Targets<'a> {
     pub fn new(label: &'a str, weight: Option<&'a str>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
+        crate::ensure_input!(
             weight != Some(label),
             "weight 列和 label 列不能是同一列 {label:?}"
         );
@@ -106,7 +106,7 @@ impl<'a> Targets<'a> {
     ) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
         let mut seen = std::collections::HashSet::new();
         if let Some(dup) = columns.iter().find(|n| !seen.insert(**n)) {
-            anyhow::bail!("文件里有重复的列名 {dup:?};列名必须唯一");
+            crate::bail_input!("文件里有重复的列名 {dup:?};列名必须唯一");
         }
         let mut idx = Vec::new();
         let mut names = Vec::new();
@@ -116,7 +116,7 @@ impl<'a> Targets<'a> {
                 names.push(n.to_string());
             }
         }
-        anyhow::ensure!(
+        crate::ensure_input!(
             !idx.is_empty(),
             "除了标签列 {:?} 之外没有别的列了",
             self.label
@@ -134,7 +134,7 @@ impl<'a> Targets<'a> {
             .filter(|n| !want.contains(n))
             .map(String::as_str)
             .collect();
-        anyhow::ensure!(
+        crate::ensure_input!(
             missing.is_empty() && extra.is_empty(),
             "特征列和训练集对不上(按列名绑定):缺少 {missing:?},多出 {extra:?}"
         );
@@ -193,7 +193,7 @@ pub fn validate_missing(missing: f64) -> anyhow::Result<f32> {
         return Ok(f32::NAN);
     }
     let narrowed = missing as f32;
-    anyhow::ensure!(
+    crate::ensure_input!(
         narrowed.is_finite() && narrowed != f32::MAX,
         "missing={missing} is not allowed: it must be NaN or a finite float32 value \
          (+/-inf and f32::MAX are reserved and rejected in features, so they cannot be \
@@ -233,10 +233,10 @@ pub fn mask_missing_in_place(data: &mut [f32], missing: f32) {
 /// 校验从文件读出的权重列:不能有缺失、不能是负数(XGBoost 同样拒绝)。
 pub(crate) fn check_weight_column(weights: &[f32], name: &str) -> anyhow::Result<()> {
     if let Some(i) = weights.iter().position(|w| w.is_nan()) {
-        anyhow::bail!("权重列 {name:?} 第 {i} 行是缺失值;样本权重不能缺失");
+        crate::bail_input!("权重列 {name:?} 第 {i} 行是缺失值;样本权重不能缺失");
     }
     if let Some(i) = weights.iter().position(|w| !w.is_finite() || *w < 0.0) {
-        anyhow::bail!(
+        crate::bail_input!(
             "权重列 {name:?} 第 {i} 行是 {};样本权重必须是有限的非负数",
             weights[i]
         );

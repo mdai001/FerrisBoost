@@ -42,7 +42,8 @@ use crate::types::{Objective, TrainParams};
 /// anyhow 的错误转 Python 异常。
 ///
 /// 尽量给具体的异常类型:文件找不到就是 FileNotFoundError,参数不对
-/// 就是 ValueError。全都甩成 RuntimeError 的话,调用方没法按类型处理,
+/// (带 `crate::error::InputError` 标记的校验错误)就是 ValueError,
+/// 其余(I/O、CUDA、内部错误)才是 RuntimeError。全都甩成 RuntimeError 的话,调用方没法按类型处理,
 /// 而且 traceback 里只剩一句没头没尾的话。
 fn to_py_err(e: anyhow::Error) -> PyErr {
     let msg = format!("{e:#}");
@@ -51,7 +52,9 @@ fn to_py_err(e: anyhow::Error) -> PyErr {
             return pyo3::exceptions::PyFileNotFoundError::new_err(msg);
         }
     }
-    if msg.contains("打不开") || msg.contains("没有列") {
+    // Rejected input is tagged where it is validated (`crate::error`); the two
+    // message checks cover file-open and missing-column errors that predate it.
+    if crate::error::is_input_error(&e) || msg.contains("打不开") || msg.contains("没有列") {
         return PyValueError::new_err(msg);
     }
     PyRuntimeError::new_err(msg)
@@ -1132,8 +1135,6 @@ fn predict_files_to_parquet(
     missing: f32,
     init: Option<&[f32]>,
 ) -> PyResult<usize> {
-    use crate::tree::SchemaMode;
-
     if prediction_column.trim().is_empty() {
         return Err(PyValueError::new_err(
             "prediction_column 不能为空或只包含空白",
@@ -1154,34 +1155,7 @@ fn predict_files_to_parquet(
 
     let resolved = crate::source::input::resolve(&path_specs)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    let mode = model.inner.schema_mode.ok_or_else(|| {
-        PyValueError::new_err(
-            "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
-             空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
-             二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
-        )
-    })?;
-    if mode == SchemaMode::Named && model.inner.feature_names.is_empty() {
-        return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
-    }
-    if resolved.format == crate::source::input::InputFormat::Parquet && !header {
-        return Err(PyValueError::new_err("header=False 只适用于 CSV"));
-    }
-    if resolved.format == crate::source::input::InputFormat::Csv {
-        match (mode, header) {
-            (SchemaMode::Named, false) => {
-                return Err(PyValueError::new_err(
-                    "命名模式模型不能用 header=False 的位置 CSV 预测",
-                ))
-            }
-            (SchemaMode::Positional, true) => {
-                return Err(PyValueError::new_err(
-                    "位置模式模型预测 CSV 时必须显式传 header=False",
-                ))
-            }
-            _ => {}
-        }
-    }
+    model.check_file_schema(&resolved, header)?;
 
     let names = model.inner.feature_names.clone();
     let canonical_n_features = model.inner.n_features;
@@ -1205,9 +1179,10 @@ fn predict_files_to_parquet(
     } else {
         None
     };
-    let projected_features: Vec<usize> = match &single {
-        Some(inference) => inference.canonical_features().to_vec(),
-        None => (0..canonical_n_features).collect(),
+    let projected_features: Vec<usize> = match (&single, &multi) {
+        (Some(inference), _) => inference.canonical_features().to_vec(),
+        (None, Some((_, infs))) => union_features(infs),
+        (None, None) => unreachable!("either a single or a multi-output predictor"),
     };
     let n_features = projected_features.len();
     // `multi:softmax` writes one class-index column; every other multi-output result
@@ -1379,7 +1354,7 @@ fn predict_files_to_parquet(
                             upto,
                             data,
                             n_rows,
-                            canonical_n_features,
+                            &projected_features,
                             false,
                             workers,
                             &mut predict_pool,
@@ -1502,7 +1477,9 @@ fn score_multi_output_batch(
     upto: usize,
     data: &[f32],
     n_rows: usize,
-    canonical_n_features: usize,
+    // Canonical feature ids held by the columns of `data` (ascending): the union
+    // of every view's features, so a file is read for those columns only.
+    layout: &[usize],
     gpu_batch: bool,
     workers: usize,
     pool: &mut Option<rayon::ThreadPool>,
@@ -1514,15 +1491,19 @@ fn score_multi_output_batch(
     for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
         let nt = model.class_tree_count(upto, c);
         let gathered;
-        let vdata: &[f32] = if vinf.is_identity(canonical_n_features) {
+        let vdata: &[f32] = if vinf.canonical_features() == layout {
             data
         } else {
-            gathered = project_canonical_rows(
-                data,
-                n_rows,
-                canonical_n_features,
-                vinf.canonical_features(),
-            )?;
+            let positions = vinf
+                .canonical_features()
+                .iter()
+                .map(|feature| {
+                    layout
+                        .binary_search(feature)
+                        .map_err(|_| anyhow::anyhow!("prediction layout lacks feature {feature}"))
+                })
+                .collect::<anyhow::Result<Vec<usize>>>()?;
+            gathered = project_canonical_rows(data, n_rows, layout.len(), &positions)?;
             &gathered
         };
         let col_init: Option<Vec<f32>> =
@@ -1561,6 +1542,18 @@ fn score_multi_output_batch(
         }
     }
     Ok(margins)
+}
+
+/// Ascending union of the canonical features the output views of a
+/// multi-output model read.
+fn union_features(infs: &[Arc<crate::inference::CompactInferenceModel>]) -> Vec<usize> {
+    let mut union: Vec<usize> = infs
+        .iter()
+        .flat_map(|inf| inf.canonical_features().iter().copied())
+        .collect();
+    union.sort_unstable();
+    union.dedup();
+    union
 }
 
 fn project_canonical_rows(
@@ -2126,7 +2119,6 @@ impl PyModel {
         missing: f32,
         init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use crate::tree::SchemaMode;
         if init.is_some() && use_gpu {
             return Err(PyValueError::new_err(
                 "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
@@ -2139,43 +2131,13 @@ impl PyModel {
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
-        // ⚠️ 老模型没记过绑定模式,而空名单既可能是"真·位置模式",也可能是
-        // "命名模式但当时没存名字" —— 从 JSON 里分不出来。**猜错会静默算错**,
-        // 所以这里直接拒,并说清楚怎么办。
-        let mode = self.inner.schema_mode.ok_or_else(|| {
-            PyValueError::new_err(
-                "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
-                 空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
-                 二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
-            )
-        })?;
-        if mode == SchemaMode::Named && self.inner.feature_names.is_empty() {
-            return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
-        }
-        if resolved.format == crate::source::input::InputFormat::Parquet && !header {
-            return Err(PyValueError::new_err("header=False 只适用于 CSV"));
-        }
-        if resolved.format == crate::source::input::InputFormat::Csv {
-            match (mode, header) {
-                (SchemaMode::Named, false) => {
-                    return Err(PyValueError::new_err(
-                        "命名模式模型不能用 header=False 的位置 CSV 预测",
-                    ))
-                }
-                (SchemaMode::Positional, true) => {
-                    return Err(PyValueError::new_err(
-                        "位置模式模型预测 CSV 时必须显式传 header=False",
-                    ))
-                }
-                _ => {}
-            }
-        }
+        self.check_file_schema(&resolved, header)?;
 
         let names = self.inner.feature_names.clone();
         let canonical_n_features = self.inner.n_features;
         let upto = n_trees.unwrap_or(self.inner.trees.len());
         let k_out = self.inner.num_outputs();
-        // 多分类:文件只读一遍。每个 batch 按**完整**规范特征投影一次,
+        // 多分类:文件只读一遍。每个 batch 只读各类别视图用到的特征的**并集**,
         // 然后每个类别视图在内存里 gather 自己(压缩过)的特征子集、用自己的
         // 单输出预测器打分,按行交错后做 softmax / argmax。
         let multiclass: Option<MulticlassPredictors> = if k_out > 1 {
@@ -2194,9 +2156,10 @@ impl PyModel {
         } else {
             None
         };
-        let projected_features: Vec<usize> = match &single {
-            Some(inference) => inference.canonical_features().to_vec(),
-            None => (0..canonical_n_features).collect(),
+        let projected_features: Vec<usize> = match (&single, &multiclass) {
+            (Some(inference), _) => inference.canonical_features().to_vec(),
+            (None, Some((_, infs))) => union_features(infs),
+            (None, None) => unreachable!("either a single or a multi-output predictor"),
         };
         let n_features = projected_features.len();
         let mut out: Vec<f32> = Vec::new();
@@ -2306,7 +2269,7 @@ impl PyModel {
                                 upto,
                                 data,
                                 n_rows,
-                                canonical_n_features,
+                                &projected_features,
                                 gpu_batch,
                                 workers,
                                 &mut predict_pool,
@@ -4054,10 +4017,20 @@ fn train_file(
             )));
         }
     }
-    let targets = crate::source::Targets::new(label, weight_owned.as_deref())
+    // A continued model with feature names indexes its features by those names:
+    // bind the training (and eval) files' columns by name, in the model's order
+    // (file column order is free; a missing or surplus column is an error).
+    let prior_names: Vec<String> = match (&prior_model, header) {
+        (Some(prior), true) => prior.inner.feature_names.clone(),
+        _ => Vec::new(),
+    };
+    let mut targets = crate::source::Targets::new(label, weight_owned.as_deref())
         .map_err(|e| PyValueError::new_err(format!("{e}")))?
         .with_qid(qid_owned.as_deref())
         .with_base_margin(&margin_names);
+    if !prior_names.is_empty() {
+        targets = targets.with_features(&prior_names);
+    }
     // **peek schema → 定 blocking → 才真正 open**。Parquet / CSV 在 open
     // 之前不知道特征数,而自动选块宽需要它;单独 peek 一次(只读 footer /
     // 只推断 schema,不解压数据)就能把策略决定留在这一层,

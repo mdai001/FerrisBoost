@@ -86,11 +86,11 @@ pub(crate) fn positional_label_name_from_schema(
     label_index: usize,
 ) -> anyhow::Result<String> {
     let n_columns = schema.fields().len();
-    anyhow::ensure!(
+    crate::ensure_input!(
         label_index < n_columns,
         "label 列下标 {label_index} 越界:无表头 CSV 只有 {n_columns} 列"
     );
-    anyhow::ensure!(n_columns > 1, "无表头 CSV 除了标签列之外没有特征列");
+    crate::ensure_input!(n_columns > 1, "无表头 CSV 除了标签列之外没有特征列");
     Ok(schema.field(label_index).name().clone())
 }
 
@@ -105,7 +105,7 @@ fn check_numeric(schema: &Schema, skip: &str) -> anyhow::Result<()> {
         }
         match f.data_type() {
             DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 => {}
-            other => anyhow::bail!(
+            other => crate::bail_input!(
                 "列 {:?} 推断成了 {other:?},只支持数值列。\
                  类别特征要先在上游编码成数值;如果它其实是数字,\
                  检查一下是不是有非法字符或者千分位逗号",
@@ -154,7 +154,7 @@ pub(crate) fn read_u64_column(
             .fields()
             .iter()
             .position(|f| f.name() == name)
-            .ok_or_else(|| anyhow::anyhow!("{} 里没有列 {name:?}", path.display()))?;
+            .ok_or_else(|| crate::input_err!("{} 里没有列 {name:?}", path.display()))?;
         for batch in batch_reader(path, schema, has_header, vec![col])? {
             out.extend(crate::source::arrow_source::column_as_u64(
                 &batch?, 0, name,
@@ -170,7 +170,7 @@ fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles>
         names
             .iter()
             .position(|n| *n == want)
-            .ok_or_else(|| anyhow::anyhow!("文件里没有列 {want:?},只有 {names:?}"))
+            .ok_or_else(|| crate::input_err!("文件里没有列 {want:?},只有 {names:?}"))
     };
     if let Some(q) = targets.qid {
         find(q)?;
@@ -336,7 +336,7 @@ fn open_many_impl(
                 feat_proj.push(cols);
             }
             Some(canon) if has_header => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     names.len() == canon.len(),
                     "多文件 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
                     paths[0].display(),
@@ -347,14 +347,14 @@ fn open_many_impl(
                 let mut mapped = Vec::with_capacity(canon.len());
                 for want in canon {
                     let at = names.iter().position(|n| n == want).ok_or_else(|| {
-                        anyhow::anyhow!("多文件 schema 不一致:{} 里没有列 {want:?}", p.display())
+                        crate::input_err!("多文件 schema 不一致:{} 里没有列 {want:?}", p.display())
                     })?;
                     mapped.push(cols[at]);
                 }
                 feat_proj.push(mapped);
             }
             Some(canon) => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     names.len() == canon.len(),
                     "多文件位置 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
                     paths[0].display(),
@@ -726,7 +726,7 @@ fn parallel_csv_chunks(
             let mut reader = BufReader::new(input);
             let mut record = Vec::new();
             if has_header && read_csv_record(&mut reader, &mut record)? == 0 {
-                anyhow::bail!("{} 没有 CSV 表头", path.display());
+                crate::bail_input!("{} 没有 CSV 表头", path.display());
             }
             loop {
                 let mut bytes = Vec::with_capacity(CSV_CHUNK_BYTES);

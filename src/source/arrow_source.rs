@@ -28,7 +28,7 @@ pub(crate) fn column_as_u64(
     use arrow::datatypes::{Float64Type, UInt64Type};
 
     let array: &ArrayRef = batch.column(col);
-    anyhow::ensure!(
+    crate::ensure_input!(
         array.null_count() == 0,
         "query-id column {name:?} has missing values"
     );
@@ -38,7 +38,7 @@ pub(crate) fn column_as_u64(
         let values = as_f64.as_primitive::<Float64Type>();
         let mut out = Vec::with_capacity(values.len());
         for &v in values.values().iter() {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 v.is_finite() && v >= 0.0 && v.fract() == 0.0,
                 "query-id column {name:?} must hold non-negative integers, found {v}"
             );
@@ -46,12 +46,12 @@ pub(crate) fn column_as_u64(
         }
         return Ok(out);
     }
-    anyhow::ensure!(
+    crate::ensure_input!(
         ty.is_integer(),
         "query-id column {name:?} must be an integer column, found {ty:?}"
     );
     let as_u64 = cast(array, &DataType::UInt64)?;
-    anyhow::ensure!(
+    crate::ensure_input!(
         as_u64.null_count() == 0,
         "query-id column {name:?} must hold non-negative integers"
     );
@@ -129,7 +129,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Dictionary(_, value) => {
             if !(value.is_numeric()) {
                 let name = batch.schema().field(col).name().clone();
-                anyhow::bail!(
+                crate::bail_input!(
                     "column {name:?} is a dictionary of {value:?} values: categorical \
                      file columns must hold integer category codes (the codes of a string \
                      dictionary differ between row groups). Encode the categories as integers \
@@ -166,13 +166,13 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
             if REJECT_MAX && any_max {
                 // 报列名:`col` 是这一批里的列号,文件只读了部分列时它不是文件里的列号。
                 let name = batch.schema().field(col).name().clone();
-                anyhow::bail!("feature column {name:?} contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
+                crate::bail_input!("feature column {name:?} contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
             }
             if REJECT_INF && any_inf {
                 let i = (0..n)
                     .find(|&i| !values.is_null(i) && (values.value(i) as f32).is_infinite())
                     .expect("any_inf");
-                anyhow::bail!(
+                crate::bail_input!(
                     "第 {col} 列第 {i} 行是 {}(换成 f32 是 {}):不支持 ±inf \
                      或超出 f32 范围的值(XGBoost 同样拒绝);缺失值请用 null / NaN",
                     values.value(i),
@@ -187,7 +187,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Float64 => visit_values!(Float64Array),
         DataType::Int32 => visit_values!(Int32Array),
         DataType::Int64 => visit_values!(Int64Array),
-        other => anyhow::bail!(
+        other => crate::bail_input!(
             "第 {col} 列是 {other:?},只支持数值列。\\
              类别特征要先在上游编码成整数类别码(0..=253),再用 feature_types=\"c\" 声明"
         ),
@@ -291,7 +291,7 @@ pub(crate) fn build_cuts_and_count_typed(
             let mut w = Vec::with_capacity(batch.num_rows());
             for_each_column_f32(&batch, n_feats, |v| w.push(v))?;
             if let Some(i) = w.iter().position(|v| !v.is_finite() || *v < 0.0) {
-                anyhow::bail!(
+                crate::bail_input!(
                     "样本权重第 {} 行是 {};权重必须是有限的非负数",
                     row_offset + i,
                     w[i]
@@ -312,7 +312,7 @@ pub(crate) fn build_cuts_and_count_typed(
             }
         };
         if sketches.is_none() {
-            anyhow::ensure!(
+            crate::ensure_input!(
                 categorical.is_empty() || categorical.len() == n_feats,
                 "feature_types has {} entries but the data has {n_feats} feature columns",
                 categorical.len()
@@ -361,7 +361,7 @@ pub(crate) fn build_cuts_and_count_typed(
     drop(scan_profile);
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
     let cuts = sketches
-        .ok_or_else(|| anyhow::anyhow!("一个 batch 都没有,建不了分箱边界"))?
+        .ok_or_else(|| crate::input_err!("一个 batch 都没有,建不了分箱边界(数据没有行)"))?
         .finalize_checked(&feature_names)?;
     Ok((cuts, n_rows))
 }

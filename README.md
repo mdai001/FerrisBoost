@@ -257,6 +257,9 @@ logging, and the complete parameter reference.
 - Multiclass `predict_to_parquet` now streams.
 - Added `strict_shape`.
 - SHAP values on GPU.
+- Continue training from XGBoost models with file input.
+- Faster file prediction for wide data.
+- Changed: input validation errors that surfaced as `RuntimeError` are now `ValueError`.
 - GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6

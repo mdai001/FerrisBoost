@@ -876,7 +876,7 @@ def test_cache_rejects_a_different_max_bin(tmp_path):
     cache = tmp_path / "mb"
     fb.train({**BASE, "max_bin": 64, "cache_path": cache}, str(path),
              label="target", num_boost_round=2)
-    with pytest.raises((ValueError, RuntimeError), match="max_bin|缓存"):
+    with pytest.raises(ValueError, match="max_bin|缓存"):
         fb.train({**BASE, "max_bin": 32, "cache_path": cache}, str(path),
                  label="target", num_boost_round=2)
 

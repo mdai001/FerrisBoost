@@ -56,13 +56,13 @@ impl Dataset {
         weights: Option<(Vec<f32>, &str)>,
     ) -> anyhow::Result<Self> {
         use crate::train::BlockSource as _;
-        anyhow::ensure!(
+        crate::ensure_input!(
             labels.len() == source.n_rows(),
             "标签有 {} 行,特征有 {} 行",
             labels.len(),
             source.n_rows()
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             !labels.iter().any(|v| v.is_nan()),
             "标签列 {label_name:?} 里有缺失值。缺失的标签得在上游处理掉 —— \
              填 0 会被当成一个真实标签学进去"
@@ -70,7 +70,7 @@ impl Dataset {
         let weights = match weights {
             None => None,
             Some((w, name)) => {
-                anyhow::ensure!(
+                crate::ensure_input!(
                     w.len() == source.n_rows(),
                     "权重有 {} 行,特征有 {} 行",
                     w.len(),
@@ -341,7 +341,7 @@ fn column_index(path: &Path, name: &str) -> anyhow::Result<usize> {
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect();
-            anyhow::anyhow!("文件里没有列 {name:?},只有 {have:?}")
+            crate::input_err!("文件里没有列 {name:?},只有 {have:?}")
         })
 }
 
@@ -465,7 +465,7 @@ fn resolve_categorical_flags(
     declared: Option<&[bool]>,
 ) -> anyhow::Result<Vec<bool>> {
     let declared = declared.unwrap_or(&[]);
-    anyhow::ensure!(
+    crate::ensure_input!(
         declared.is_empty() || declared.len() == feat_cols.len(),
         "feature_types has {} entries but the data has {} feature columns",
         declared.len(),
@@ -690,7 +690,7 @@ pub(crate) fn open_many_observed<'a>(
     let mut label_proj: Vec<usize> = vec![label_col_first];
     for p in &paths[1..] {
         let (cols, names) = feature_columns(p, targets)?;
-        anyhow::ensure!(
+        crate::ensure_input!(
             names.len() == feature_names.len(),
             "多文件 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
             paths[0].display(),
@@ -702,7 +702,7 @@ pub(crate) fn open_many_observed<'a>(
         let mut mapped = Vec::with_capacity(feature_names.len());
         for want in &feature_names {
             let at = names.iter().position(|n| n == want).ok_or_else(|| {
-                anyhow::anyhow!("多文件 schema 不一致:{} 里没有特征列 {want:?}", p.display())
+                crate::input_err!("多文件 schema 不一致:{} 里没有特征列 {want:?}", p.display())
             })?;
             mapped.push(cols[at]);
         }
@@ -1138,7 +1138,7 @@ impl ParquetBlockSource {
                     cache_path,
                 );
             }
-            anyhow::ensure!(
+            crate::ensure_input!(
                 !cache_path.exists() || std::fs::read_dir(cache_path)?.next().is_none(),
                 "缓存路径 {} 已存在且不是有效的 ferrisboost 缓存",
                 cache_path.display()
@@ -1238,7 +1238,7 @@ impl ParquetBlockSource {
                 // 逐值比,不只比哈希:manifest 里存着完整的 cuts,
                 // 直接比是免费的,而且比任何哈希都强。哈希只用来发现
                 // manifest 自身被改坏。
-                anyhow::ensure!(
+                crate::ensure_input!(
                     cuts.values == src.cuts().values && cuts.offsets == src.cuts().offsets,
                     "给定的 cuts 和缓存里的不一致:拒绝使用旧量化数据。\
                      验证集要用训练集的 cuts,但**不能和训练集共用 cache_path** —— \
@@ -1276,7 +1276,7 @@ impl ParquetBlockSource {
     ) -> anyhow::Result<(Self, Vec<f32>)> {
         let label = targets.label;
         let n_features = feat_cols.len();
-        anyhow::ensure!(
+        crate::ensure_input!(
             cuts.n_feats() == n_features,
             "cuts 是按 {} 个特征建的,文件里有 {n_features} 个",
             cuts.n_feats()
@@ -1293,7 +1293,7 @@ impl ParquetBlockSource {
                 labels.extend(crate::source::arrow_source::column_as_f32(&batch, 0)?);
             }
         }
-        anyhow::ensure!(
+        crate::ensure_input!(
             !labels.iter().any(|v| v.is_nan()),
             "标签列 {label:?} 里有缺失值"
         );
@@ -1442,13 +1442,13 @@ impl ParquetBlockSource {
         let label = targets.label;
         let raw = std::fs::read(cache_path.join("manifest.json"))?;
         let manifest: CacheManifest = serde_json::from_slice(&raw)?;
-        anyhow::ensure!(
+        crate::ensure_input!(
             manifest.version == 2,
             "不支持的量化缓存版本 {}（payload checksum 从版本 2 开始；请重建旧缓存）",
             manifest.version
         );
         let identity = source_identity(&path)?;
-        anyhow::ensure!(
+        crate::ensure_input!(
             (
                 manifest.source_path.as_str(),
                 manifest.source_len,
@@ -1456,33 +1456,33 @@ impl ParquetBlockSource {
             ) == (identity.0.as_str(), identity.1, identity.2),
             "缓存对应的 Parquet 文件已经变化或不是当前文件"
         );
-        anyhow::ensure!(manifest.label == label, "缓存标签列不一致");
-        anyhow::ensure!(
+        crate::ensure_input!(manifest.label == label, "缓存标签列不一致");
+        crate::ensure_input!(
             manifest.weight.as_deref() == targets.weight,
             "缓存权重列不一致(缓存 {:?},本次 {:?})",
             manifest.weight,
             targets.weight
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             manifest.base_margin.as_slice() == targets.base_margin.unwrap_or(&[]),
             "缓存 base_margin 列不一致(缓存 {:?},本次 {:?})",
             manifest.base_margin,
             targets.base_margin
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             manifest.qid.as_deref() == targets.qid,
             "cache query-id column differs (cache {:?}, this run {:?})",
             manifest.qid,
             targets.qid
         );
-        anyhow::ensure!(
+        crate::ensure_input!(
             manifest.cols_per_block == cols_per_block,
             "缓存列块宽度不一致"
         );
         if max_bins != 0 {
-            anyhow::ensure!(manifest.max_bins == max_bins, "缓存 max_bin 不一致");
+            crate::ensure_input!(manifest.max_bins == max_bins, "缓存 max_bin 不一致");
         }
-        anyhow::ensure!(manifest.n_features == feat_cols.len(), "缓存特征数不一致");
+        crate::ensure_input!(manifest.n_features == feat_cols.len(), "缓存特征数不一致");
         let expected_groups =
             crate::columns::partition_features(manifest.n_features, cols_per_block);
         anyhow::ensure!(
@@ -1504,7 +1504,7 @@ impl ParquetBlockSource {
         // The sentinel decides which values are missing, so cached bins are only
         // valid for the same `missing` (a stale cache would silently bin
         // sentinel values as ordinary numbers or vice versa).
-        anyhow::ensure!(
+        crate::ensure_input!(
             manifest.missing_bits == missing_bits(targets.missing),
             "缓存是用不同的 missing 参数建的(缓存 {},本次 {});请换一个 cache_path 或重建缓存",
             describe_missing(manifest.missing_bits),
@@ -1518,7 +1518,7 @@ impl ParquetBlockSource {
         // declaration must always reuse the cache it built.
         let resolved = resolve_categorical_flags(&path, &feat_cols, targets.categorical)?;
         let cached = |f: usize| manifest.categorical.get(f).copied().unwrap_or(false);
-        anyhow::ensure!(
+        crate::ensure_input!(
             (0..manifest.n_features).all(|f| resolved[f] == cached(f)),
             "缓存的特征类型(categorical)和本次解析出的特征类型不一致\
              (feature_types 参数或文件里的字典列变了);请换一个 cache_path 或重建缓存"

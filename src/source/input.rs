@@ -12,7 +12,7 @@
 //!    比报错糟糕得多。
 //! 3. **格式必须一致。** 一次训练里混 parquet 和 csv 没有合理语义,直接拒。
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -63,14 +63,14 @@ pub struct ResolvedInput {
 /// 把一组 spec 展开成确定顺序的文件列表。
 pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
     if specs.is_empty() {
-        bail!("没有给任何输入路径");
+        crate::bail_input!("没有给任何输入路径");
     }
     // BTreeSet 同时负责去重和排序 —— 顺序确定这条不能靠调用方自觉。
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
     for spec in specs {
         let expanded = expand_one(spec)?;
         if expanded.is_empty() {
-            bail!("{spec:?} 没有匹配到任何 .parquet / .csv / .csv.gz 文件");
+            crate::bail_input!("{spec:?} 没有匹配到任何 .parquet / .csv / .csv.gz 文件");
         }
         found.extend(expanded);
     }
@@ -87,7 +87,7 @@ pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
         })?;
         match format {
             None => format = Some(f),
-            Some(prev) if prev != f => bail!(
+            Some(prev) if prev != f => crate::bail_input!(
                 "一次训练不能混用不同格式:同时出现了 {} 和 {}",
                 prev.label(),
                 f.label()
@@ -111,7 +111,7 @@ fn expand_one(spec: &str) -> Result<Vec<PathBuf>> {
         return list_dir(path);
     }
     if !path.exists() {
-        bail!("输入文件不存在:{spec}");
+        crate::bail_input!("输入文件不存在:{spec}");
     }
     // 显式给出的单文件必须是认识的格式 —— 这里不静默跳过。
     InputFormat::of(path)
@@ -148,10 +148,10 @@ fn expand_glob(spec: &str) -> Result<Vec<PathBuf>> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     if dir.to_string_lossy().contains('*') || dir.to_string_lossy().contains('?') {
-        bail!("只支持文件名部分带 glob(如 data/*.parquet),目录部分不支持:{spec}");
+        crate::bail_input!("只支持文件名部分带 glob(如 data/*.parquet),目录部分不支持:{spec}");
     }
     if !dir.is_dir() {
-        bail!("glob 的目录部分不存在:{}", dir.display());
+        crate::bail_input!("glob 的目录部分不存在:{}", dir.display());
     }
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))?

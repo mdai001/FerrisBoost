@@ -524,7 +524,9 @@ impl SketchSet {
                 let label = names
                     .get(f)
                     .map_or_else(|| format!("#{f}"), |n| format!("{n:?}"));
-                anyhow::bail!(crate::categorical::invalid_code_message(&label, bad));
+                return Err(crate::error::input_error(
+                    crate::categorical::invalid_code_message(&label, bad),
+                ));
             }
             categorical.push(sk.cat.is_some());
             values.extend_from_slice(&sk.cuts(max_bins));

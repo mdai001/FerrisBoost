@@ -226,7 +226,7 @@ def test_incompatible_models_are_rejected():
     with pytest.raises(ValueError, match="features"):
         fb.train(params("binary:logistic"), x[:, :3], label=y, num_boost_round=1, xgb_model=m,
                  quiet=True)
-    with pytest.raises((ValueError, RuntimeError), match="base_score"):
+    with pytest.raises(ValueError, match="base_score"):
         fb.train(params("binary:logistic", base_score=0.123), x, label=y, num_boost_round=1,
                  xgb_model=m, quiet=True)
     with pytest.raises(TypeError, match="xgb_model"):
@@ -273,7 +273,7 @@ def test_categorical_features_continue_and_mismatched_types_are_rejected(tmp_pat
     joined = fb.train(p, df, label=y, num_boost_round=3, xgb_model=part, quiet=True)
     assert saved(full, tmp_path, "f").read_bytes() == saved(joined, tmp_path, "j").read_bytes()
     # Declaring the feature as numeric is an error, not a silent re-interpretation.
-    with pytest.raises((ValueError, RuntimeError), match="feature_types"):
+    with pytest.raises(ValueError, match="feature_types"):
         fb.train(params("binary:logistic"), df[["cat", "num"]].astype(np.float32).to_numpy(),
                  label=y, num_boost_round=1, xgb_model=part, quiet=True)
     # Validation frames are re-coded onto the training categories as usual.
