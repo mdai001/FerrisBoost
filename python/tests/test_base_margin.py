@@ -204,8 +204,6 @@ def test_invalid_margins_are_rejected():
     model = fb.train(p, x, label=y, num_boost_round=1, quiet=True)
     with pytest.raises(ValueError, match="base_margin has 99 rows"):
         model.predict(x, base_margin=margin[:99])
-    with pytest.raises(ValueError, match="use_gpu"):
-        model.predict(x, base_margin=margin, use_gpu=True)
 
 
 def test_iteration_range_applies_on_top_of_the_margin():

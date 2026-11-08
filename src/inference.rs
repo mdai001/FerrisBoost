@@ -364,7 +364,7 @@ pub(crate) struct CompactInferenceModel {
 }
 
 impl CompactInferenceModel {
-    /// Whether any split is categorical (the device predictor cannot score it).
+    /// Whether any split is categorical (selects the device categorical kernel).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn has_categorical_splits(&self) -> bool {
         self.model.has_categorical_splits()
