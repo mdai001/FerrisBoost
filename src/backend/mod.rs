@@ -297,6 +297,9 @@ pub mod cuda {
         pub fn assign_leaf_value(&self, _span: GpuRowSpan, _value: f32) -> Result<()> {
             match self.0 {}
         }
+        pub fn assign_leaf_values(&self, _leaves: &[(GpuRowSpan, f32)]) -> Result<()> {
+            match self.0 {}
+        }
         pub fn download_prediction_delta(&self) -> Result<f32> {
             match self.0 {}
         }
@@ -331,6 +334,12 @@ pub mod cuda {
             &self,
             _block: usize,
             _local_feat: usize,
+        ) -> Result<Option<GpuPartitionSession<'_>>> {
+            match self.0 {}
+        }
+        pub fn partition_session_resident_blocks(
+            &self,
+            _blocks: &[usize],
         ) -> Result<Option<GpuPartitionSession<'_>>> {
             match self.0 {}
         }
@@ -387,6 +396,12 @@ pub mod cuda {
         pub fn partition_resident_batch(
             &mut self,
             _requests: &[(GpuRowSpan, usize, u32, bool)],
+        ) -> Result<Vec<usize>> {
+            match self.0 {}
+        }
+        pub fn partition_resident_multi(
+            &mut self,
+            _requests: &[(GpuRowSpan, usize, usize, u32, bool)],
         ) -> Result<Vec<usize>> {
             match self.0 {}
         }

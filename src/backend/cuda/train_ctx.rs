@@ -33,6 +33,37 @@ use super::{device_state, DeviceState, SharedHistogramConfig};
 /// `gpair_max_abs` / `gpair_quantize` 的 launch 几何。两个 kernel 都是
 /// grid-stride,所以 block 数只要够填满卡,不随行数线性增长。
 const GPAIR_THREADS: usize = 256;
+
+/// Kernel-parameter layout of `PartBlocks` in histogram.cu: base pointer and
+/// width of each resident block a batched partition launch reads.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PartBlocks {
+    base: [u64; crate::gpu_mem_plan::PARTITION_MAX_BLOCKS],
+    n_feats: [u32; crate::gpu_mem_plan::PARTITION_MAX_BLOCKS],
+}
+
+// SAFETY: plain `repr(C)` integers matching the CUDA struct, passed by value.
+unsafe impl cudarc::driver::DeviceRepr for PartBlocks {}
+
+/// Terminal nodes per `assign_leaf_values_batched` launch; must equal
+/// `FB_LEAF_BATCH` in histogram.cu. The table is a kernel parameter.
+const LEAF_BATCH: usize = 64;
+
+/// Kernel-parameter layout of `LeafBatch` in histogram.cu.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LeafBatch {
+    n: u32,
+    blk_ptr: [u32; LEAF_BATCH + 1],
+    offset: [u32; LEAF_BATCH],
+    len: [u32; LEAF_BATCH],
+    value: [f32; LEAF_BATCH],
+}
+
+// SAFETY: plain `repr(C)` integers and floats with the same layout as the
+// CUDA struct, passed by value as a kernel parameter.
+unsafe impl cudarc::driver::DeviceRepr for LeafBatch {}
 const GPAIR_BLOCKS: usize = 1024;
 /// fast 的 device scale 结果:`[grad_scale, hess_scale, max_grad, max_hess]`。
 const GPAIR_SCALE_WORDS: usize = 4;
@@ -121,21 +152,24 @@ pub struct GpuHostMemoryBudget {
     pub rm_stage_bytes: usize,
     /// 一轮定点梯度的 pinned staging buffer。
     pub gpair_bytes: usize,
+    /// Pinned mirrors of the resident split caches' packet windows.
+    pub split_packets_bytes: usize,
 }
 
 impl GpuHostMemoryBudget {
     pub fn total(&self) -> usize {
-        self.block_bins_bytes + self.rm_stage_bytes + self.gpair_bytes
+        self.block_bins_bytes + self.rm_stage_bytes + self.gpair_bytes + self.split_packets_bytes
     }
 
     pub fn report(&self) -> String {
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         format!(
-            "pinned host {:.1} MB = column-block staging {:.1} + row-major staging {:.1} + gpair staging {:.1}",
+            "pinned host {:.1} MB = column-block staging {:.1} + row-major staging {:.1} + gpair staging {:.1} + split packets {:.3}",
             mb(self.total()),
             mb(self.block_bins_bytes),
             mb(self.rm_stage_bytes),
             mb(self.gpair_bytes),
+            mb(self.split_packets_bytes),
         )
     }
 }
@@ -431,7 +465,7 @@ mod rank_ctx;
 pub use rank_ctx::RankDeviceInputs;
 #[path = "split_ctx.rs"]
 mod split_ctx;
-pub(crate) use split_ctx::GpuSplitGroup;
+pub(crate) use split_ctx::{GpuSplitGroup, GpuSplitResult};
 
 struct GpuHistBuffers {
     split_cache: Option<split_ctx::ResidentSplitBuffers>,
@@ -606,6 +640,7 @@ pub struct GpuTrainCtx {
     partition_batch_scan_fn: CudaFunction,
     partition_batch_scatter_fn: CudaFunction,
     assign_leaf_fn: CudaFunction,
+    assign_leaves_fn: CudaFunction,
     init_tree_fn: CudaFunction,
     start_event: CudaEvent,
     end_event: CudaEvent,
@@ -953,6 +988,10 @@ impl GpuTrainCtx {
             .module
             .load_function("assign_leaf_value")
             .context("assign_leaf_value not found in PTX")?;
+        let assign_leaves_fn = state
+            .module
+            .load_function("assign_leaf_values_batched")
+            .context("assign_leaf_values_batched not found in PTX")?;
         let init_tree_fn = state
             .module
             .load_function("init_tree_rows")
@@ -1594,6 +1633,20 @@ impl GpuTrainCtx {
                 0
             },
             gpair_bytes: usize::from(use_pinned) * n_rows * 2 * 8,
+            split_packets_bytes: if split_cache_enabled {
+                resident_block_count
+                    * (hist_nodes_per_batch
+                        * (crate::gpu_mem_plan::SPLIT_PACKET_BYTES
+                            + if split_cat_enabled {
+                                crate::gpu_mem_plan::CAT_SET_WORDS * 4
+                            } else {
+                                0
+                            })
+                        * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES)
+                        .max(1)
+            } else {
+                0
+            },
         };
 
         let start_event = state
@@ -1640,6 +1693,7 @@ impl GpuTrainCtx {
             partition_batch_scan_fn,
             partition_batch_scatter_fn,
             assign_leaf_fn,
+            assign_leaves_fn,
             init_tree_fn,
             start_event,
             end_event,
@@ -2007,6 +2061,54 @@ impl GpuTrainCtx {
         Ok(())
     }
 
+    /// Assign several terminal nodes' values in one launch per
+    /// [`LEAF_BATCH`] nodes (instead of one launch per node). The rows of all
+    /// spans must be disjoint, which holds for the terminal nodes of one tree.
+    pub fn assign_leaf_values(&self, leaves: &[(GpuRowSpan, f32)]) -> Result<()> {
+        for (span, _) in leaves {
+            if span.offset.saturating_add(span.len) > self.n_rows {
+                bail!("leaf row span out of range: {span:?}");
+            }
+        }
+        const THREADS: u32 = 256;
+        let mut buf = self.lock()?;
+        let GpuBuffers {
+            rows,
+            prediction_delta,
+            ..
+        } = &mut *buf;
+        let nonempty: Vec<_> = leaves.iter().filter(|(span, _)| span.len > 0).collect();
+        for chunk in nonempty.chunks(LEAF_BATCH) {
+            let mut batch = LeafBatch {
+                n: chunk.len() as u32,
+                blk_ptr: [0; LEAF_BATCH + 1],
+                offset: [0; LEAF_BATCH],
+                len: [0; LEAF_BATCH],
+                value: [0.0; LEAF_BATCH],
+            };
+            let mut blocks = 0u32;
+            for (i, (span, value)) in chunk.iter().enumerate() {
+                batch.blk_ptr[i] = blocks;
+                batch.offset[i] = span.offset as u32;
+                batch.len[i] = span.len as u32;
+                batch.value[i] = *value;
+                blocks = blocks
+                    .checked_add((span.len as u32).div_ceil(THREADS))
+                    .context("leaf batch grid exceeds u32")?;
+            }
+            batch.blk_ptr[chunk.len()] = blocks;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut launch = self.stream.launch_builder(&self.assign_leaves_fn);
+            launch.arg(&*rows).arg(&mut *prediction_delta).arg(&batch);
+            unsafe { launch.launch(cfg) }.context("launch assign_leaf_values_batched")?;
+        }
+        Ok(())
+    }
+
     /// One prediction D2H per tree, then host gradients can start the next round.
     /// 只把 delta 取回 host,**不施加**。融合路径用它:施加和求梯度合成
     /// 下一轮开头的一次遍历。
@@ -2228,8 +2330,8 @@ impl GpuTrainCtx {
                 subsample_seed,
                 subsample_tree,
             )?;
-            // The quantile gradient kernel already masked this pair.
-            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false);
+            // The quantile gradient kernel already masked this pair and reduced its max.
+            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true);
         }
         {
             // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
@@ -2325,6 +2427,8 @@ impl GpuTrainCtx {
             weight_resident,
             prediction_delta,
             gpair_f32,
+            gpair_max,
+            gpair_max_host,
             qt_scratch,
             ..
         } = &mut *buf;
@@ -2340,6 +2444,13 @@ impl GpuTrainCtx {
         let scratch = qt_scratch
             .as_mut()
             .context("fast quantile reduction scratch not allocated")?;
+        let max_out = gpair_max
+            .as_mut()
+            .context("gpair max buffer not allocated")?;
+        // 梯度 kernel 顺带出每 block 的 max|g| / max|h|,所以它的 launch 几何就是
+        // 归约几何(和 `apply_delta_and_gradient` 一样)。
+        let max_blocks = u32::try_from(gpair_max_host.len() / 2)
+            .context("gpair max reduction block count exceeds u32")?;
         let has_weight: u32 = weight_resident.is_some().into();
         let weight = weight_resident.as_ref().unwrap_or(label);
         {
@@ -2395,8 +2506,8 @@ impl GpuTrainCtx {
         }
         {
             let cfg = LaunchConfig {
-                grid_dim: (n_rows_u32.div_ceil(THREADS).min(65535), 1, 1),
-                block_dim: (THREADS, 1, 1),
+                grid_dim: (max_blocks, 1, 1),
+                block_dim: (GPAIR_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut launch = self.stream.launch_builder(grad_fn);
@@ -2416,7 +2527,8 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch quantile_gradient_rows")?;
         }
         Ok(())
@@ -2615,8 +2727,8 @@ impl GpuTrainCtx {
             subsample_seed,
             subsample_tree,
         )?;
-        // 梯度 kernel 已经采样置零;和单 alpha 一样重扫 max。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false)
+        // 梯度 kernel 已经采样置零并归约出每 block 的 max;和单 alpha 一样不再重扫。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
     /// 多个 `quantile_alpha`:刚建完的第 `target` 棵树的叶子增量立刻并进它那一列。
@@ -3645,6 +3757,56 @@ impl GpuTrainCtx {
             ctx: self,
             buf,
             resident: Some((slot, local_feat)),
+            more_resident: Vec::new(),
+            timing: GpuSegmentTiming::default(),
+        }))
+    }
+
+    /// A partition session over several resident blocks (ascending, distinct,
+    /// at most [`crate::gpu_mem_plan::PARTITION_MAX_BLOCKS`]), so one batch can
+    /// partition every numeric node of a level whatever block its split
+    /// feature lives in ([`GpuPartitionSession::partition_resident_multi`]).
+    /// `None` when any of them is not resident.
+    pub fn partition_session_resident_blocks(
+        &self,
+        blocks: &[usize],
+    ) -> Result<Option<GpuPartitionSession<'_>>> {
+        ensure!(
+            !blocks.is_empty()
+                && blocks.len() <= crate::gpu_mem_plan::PARTITION_MAX_BLOCKS
+                && blocks.windows(2).all(|w| w[0] < w[1]),
+            "resident partition blocks must be 1..={} ascending distinct blocks",
+            crate::gpu_mem_plan::PARTITION_MAX_BLOCKS
+        );
+        if blocks.iter().any(|&b| b >= self.resident_block_count) {
+            return Ok(None);
+        }
+        let mut guards = Vec::with_capacity(blocks.len());
+        // Slots before the core buffers, in ascending order (same order as
+        // every other path that holds both).
+        for &block in blocks {
+            let slot_index = self.hist_stream_count + block;
+            let slot = self.hist_slots[slot_index]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("GPU histogram slot {slot_index} poisoned"))?;
+            if slot.resident_block != Some(block) {
+                return Ok(None);
+            }
+            let feats = slot.resident_feats;
+            if feats == 0 || feats > slot.bins.len() / self.n_rows.max(1) {
+                bail!("resident block {block} width {feats} does not match its buffer");
+            }
+            guards.push(slot);
+        }
+        self.echo_part_col_source(true);
+        let buf = self.lock()?;
+        let mut guards = guards.into_iter();
+        let first = guards.next().expect("at least one block");
+        Ok(Some(GpuPartitionSession {
+            ctx: self,
+            buf,
+            resident: Some((first, 0)),
+            more_resident: guards.collect(),
             timing: GpuSegmentTiming::default(),
         }))
     }
@@ -3705,6 +3867,7 @@ impl GpuTrainCtx {
             ctx: self,
             buf,
             resident: None,
+            more_resident: Vec::new(),
             timing,
         })
     }
@@ -4498,6 +4661,9 @@ pub struct GpuPartitionSession<'a> {
     /// resident 命中时借住那个 slot,直接拿它 bins 里的那一列;
     /// `usize` 是该特征在块内的局部下标。None 表示走老的 `part_col` 上传。
     resident: Option<(MutexGuard<'a, GpuHistBuffers>, usize)>,
+    /// Further resident blocks a level-wide batch may read
+    /// ([`GpuTrainCtx::partition_session_resident_blocks`]).
+    more_resident: Vec<MutexGuard<'a, GpuHistBuffers>>,
     timing: GpuSegmentTiming,
 }
 
@@ -4509,7 +4675,35 @@ impl GpuPartitionSession<'_> {
         &mut self,
         requests: &[(GpuRowSpan, usize, u32, bool)],
     ) -> Result<Vec<PartitionToken>> {
-        use crate::gpu_mem_plan::{PARTITION_BATCH_CAPACITY, PARTITION_DESCRIPTOR_WORDS};
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let block = self
+            .resident
+            .as_ref()
+            .context("partition batch requires a resident block")?
+            .0
+            .resident_block
+            .context("partition batch requires a resident block")?;
+        let requests: Vec<_> = requests
+            .iter()
+            .map(|&(span, feat, split, missing)| (span, block, feat, split, missing))
+            .collect();
+        self.partition_resident_multi(&requests)
+    }
+
+    /// Like [`Self::partition_resident_batch`], but each request names its
+    /// resident physical block, which must be one of this session's blocks.
+    /// One descriptor upload and one count/scan/scatter launch triple cover
+    /// all of them; rows land exactly where per-block batches in the same
+    /// request order would put them.
+    pub fn partition_resident_multi(
+        &mut self,
+        requests: &[(GpuRowSpan, usize, usize, u32, bool)],
+    ) -> Result<Vec<PartitionToken>> {
+        use crate::gpu_mem_plan::{
+            PARTITION_BATCH_CAPACITY, PARTITION_DESCRIPTOR_WORDS, PARTITION_MAX_BLOCKS,
+        };
         ensure!(
             requests.len() <= PARTITION_BATCH_CAPACITY,
             "partition batch exceeds {PARTITION_BATCH_CAPACITY}"
@@ -4517,32 +4711,49 @@ impl GpuPartitionSession<'_> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let feats = self
+        let primary = &self
             .resident
             .as_ref()
             .context("partition batch requires a resident block")?
-            .0
-            .resident_feats;
-        let n_feats = u32::try_from(feats).context("resident partition block width exceeds u32")?;
+            .0;
+        // Table position of each session block: primary first, then the rest.
+        let table: Vec<(usize, usize)> = std::iter::once(&**primary)
+            .chain(self.more_resident.iter().map(|g| &**g))
+            .map(|slot| {
+                slot.resident_block
+                    .map(|b| (b, slot.resident_feats))
+                    .context("partition session block is not resident")
+            })
+            .collect::<Result<_>>()?;
+        debug_assert!(table.len() <= PARTITION_MAX_BLOCKS);
+        let mut table_index = Vec::with_capacity(requests.len());
+        for &(_, block, feat, _, _) in requests {
+            let (index, &(_, feats)) = table
+                .iter()
+                .enumerate()
+                .find(|(_, (b, _))| *b == block)
+                .with_context(|| format!("block {block} is not part of this partition session"))?;
+            ensure!(
+                feat < feats,
+                "resident feature {feat} exceeds block width {feats}"
+            );
+            table_index.push(index);
+        }
         let first_slot = self.buf.part_pending.len();
         ensure!(
             first_slot + requests.len() <= MAX_LEVEL_NODES,
             "partition level exceeds {MAX_LEVEL_NODES}"
         );
         let mut selected = 0usize;
-        for (i, &(span, feat, _, _)) in requests.iter().enumerate() {
+        for (i, &(span, _, _, _, _)) in requests.iter().enumerate() {
             ensure!(
                 span.offset <= self.ctx.n_rows && span.len <= self.ctx.n_rows - span.offset,
                 "partition device row span out of bounds: {span:?}"
             );
-            ensure!(
-                feat < feats,
-                "resident feature {feat} exceeds block width {feats}"
-            );
             selected = selected
                 .checked_add(span.len)
                 .context("partition row sum overflow")?;
-            for &(prior, _, _, _) in &requests[..i] {
+            for &(prior, _, _, _, _) in &requests[..i] {
                 ensure!(
                     span.len == 0
                         || prior.len == 0
@@ -4557,11 +4768,26 @@ impl GpuPartitionSession<'_> {
             "next partition row arena overflow"
         );
         if requests.len() == 1 {
-            let (span, feat, split, missing) = requests[0];
+            let (span, _, feat, split, missing) = requests[0];
+            // The single-node kernels read the primary block: make the
+            // request's block primary for this call.
+            let k = table_index[0];
+            if k > 0 {
+                std::mem::swap(
+                    &mut self.resident.as_mut().expect("validated resident").0,
+                    &mut self.more_resident[k - 1],
+                );
+            }
             let previous_feat = self.resident.as_ref().expect("validated resident").1;
             self.resident.as_mut().expect("validated resident").1 = feat;
             let result = self.partition(span, split, missing);
             self.resident.as_mut().expect("validated resident").1 = previous_feat;
+            if k > 0 {
+                std::mem::swap(
+                    &mut self.resident.as_mut().expect("validated resident").0,
+                    &mut self.more_resident[k - 1],
+                );
+            }
             return result.map(|token| vec![token]);
         }
         let threads = self.ctx.partition_threads;
@@ -4569,7 +4795,7 @@ impl GpuPartitionSession<'_> {
         let mut blocks = 0usize;
         let mut offsets = 0usize;
         let mut out = self.buf.next_rows_cursor;
-        for (i, &(span, feat, split, missing)) in requests.iter().enumerate() {
+        for (i, &(span, _, feat, split, missing)) in requests.iter().enumerate() {
             let nb = span.len.div_ceil(threads as usize);
             descriptors[i * PARTITION_DESCRIPTOR_WORDS..(i + 1) * PARTITION_DESCRIPTOR_WORDS]
                 .copy_from_slice(&[
@@ -4583,6 +4809,7 @@ impl GpuPartitionSession<'_> {
                     out as u32,
                     (first_slot + i) as u32,
                     (blocks + nb) as u32,
+                    table_index[i] as u32,
                 ]);
             blocks += nb;
             offsets += nb + 1;
@@ -4615,7 +4842,6 @@ impl GpuPartitionSession<'_> {
             let n_nodes = requests.len() as u32;
             let n_rows = self.ctx.n_rows as u32;
             let row_major = u32::from(self.ctx.rm_count_fn.is_some());
-            let slot = &self.resident.as_ref().expect("validated resident").0;
             {
                 let GpuBuffers {
                     rows,
@@ -4624,18 +4850,38 @@ impl GpuPartitionSession<'_> {
                     part_block_counts,
                     ..
                 } = &mut *self.buf;
-                let bins = slot.bins.slice(..self.ctx.n_rows * feats);
-                let mut launch = self
-                    .ctx
-                    .stream
-                    .launch_builder(&self.ctx.partition_batch_count_fn);
+                let stream = &self.ctx.stream;
+                let primary = &self.resident.as_ref().expect("validated resident").0;
+                let mut part_blocks = PartBlocks {
+                    base: [0; crate::gpu_mem_plan::PARTITION_MAX_BLOCKS],
+                    n_feats: [0; crate::gpu_mem_plan::PARTITION_MAX_BLOCKS],
+                };
+                // The guards wait for the blocks' pending writes and record
+                // this stream's read once the launch is queued (cudarc events).
+                let mut reads = Vec::with_capacity(table.len());
+                for (k, slot) in std::iter::once(primary)
+                    .chain(self.more_resident.iter())
+                    .enumerate()
+                {
+                    let feats = slot.resident_feats;
+                    ensure!(
+                        self.ctx.n_rows * feats <= slot.bins.len(),
+                        "resident block width does not match its buffer"
+                    );
+                    // The prefix view would have the same base pointer.
+                    let (ptr, read) = cudarc::driver::DevicePtr::device_ptr(&slot.bins, stream);
+                    part_blocks.base[k] = ptr;
+                    part_blocks.n_feats[k] = u32::try_from(feats)
+                        .context("resident partition block width exceeds u32")?;
+                    reads.push(read);
+                }
+                let mut launch = stream.launch_builder(&self.ctx.partition_batch_count_fn);
                 launch
-                    .arg(&bins)
+                    .arg(&part_blocks)
                     .arg(&*rows)
                     .arg(&*part_descriptors)
                     .arg(&n_nodes)
                     .arg(&n_rows)
-                    .arg(&n_feats)
                     .arg(&row_major)
                     .arg(part_flags)
                     .arg(part_block_counts);
@@ -4647,6 +4893,7 @@ impl GpuPartitionSession<'_> {
                     })
                 }
                 .context("launch partition_count_batched")?;
+                drop(reads);
             }
             {
                 let GpuBuffers {
@@ -4723,7 +4970,7 @@ impl GpuPartitionSession<'_> {
             }
         }
         let mut tokens = Vec::with_capacity(requests.len());
-        for (i, &(span, _, _, _)) in requests.iter().enumerate() {
+        for (i, &(span, _, _, _, _)) in requests.iter().enumerate() {
             tokens.push(first_slot + i);
             self.buf.part_pending.push(PendingPartition {
                 out_offset: descriptors[i * PARTITION_DESCRIPTOR_WORDS + 7] as usize,
