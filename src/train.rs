@@ -990,16 +990,18 @@ fn train_with_backend(
             "{} needs query groups: pass qid= or group= with the training data",
             cfg.objective.name()
         ),
-        (false, Some(_)) => anyhow::bail!(
-            "query groups (qid / group) are only used by the rank:* objectives, not {}",
-            cfg.objective.name()
-        ),
-        (true, Some(g)) => crate::rank::validate_group_ptr(g, n, "训练集")?,
+        // Without a ranking objective the groups do not change training (the
+        // training set only keeps them if it is also evaluated); they are checked all
+        // the same.
+        (_, Some(g)) => crate::rank::validate_group_ptr(g, n, "训练集")?,
         (false, None) => {}
     }
     // Ranking weights are per query group (XGBoost): they never reach the per-row
     // machinery (gradient weights, base score, device labels).
-    let n_weights = cfg.group_ptr.as_ref().map_or(n, |g| g.len() - 1);
+    let n_weights = match (&cfg.group_ptr, ranking.is_some()) {
+        (Some(g), true) => g.len() - 1,
+        _ => n,
+    };
     if let Some(w) = weights {
         validate_weights(w, n_weights, "训练集")?;
     }
@@ -1011,6 +1013,14 @@ fn train_with_backend(
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
     let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
+    if let Some((_, rp)) = ranking {
+        anyhow::ensure!(
+            !(rp.unbiased && fast_requested && gpu_device.is_some()),
+            "lambdarank_unbiased is not supported with gpu_math=\"fast\" (the position-bias \
+             estimation has no deterministic device implementation yet); use gpu_math=\"exact\" \
+             (byte-identical to the CPU) or the CPU"
+        );
+    }
     let rank_grad = match (ranking, cfg.group_ptr.as_deref()) {
         (Some((kind, params)), Some(groups)) => Some(crate::rank::RankGradient::new(
             kind,
@@ -1173,12 +1183,7 @@ fn train_with_backend(
                 ev.name,
                 cfg.objective.name()
             ),
-            (false, Some(_)) => anyhow::bail!(
-                "validation set {:?} has query groups, but {} is not a ranking objective",
-                ev.name,
-                cfg.objective.name()
-            ),
-            (true, Some(g)) => crate::rank::validate_group_ptr(
+            (_, Some(g)) => crate::rank::validate_group_ptr(
                 g,
                 ev.source.n_rows(),
                 &format!("validation set {:?}", ev.name),
@@ -1187,9 +1192,35 @@ fn train_with_backend(
         }
         for m in &cfg.eval_metrics {
             m.check_labels(ev.labels, &format!("validation set {:?}", ev.name))?;
+            // `aucpr` over query groups needs binary relevance (XGBoost `InvalidLabels`).
+            if ev.group_ptr.is_some() && m.name() == "aucpr" {
+                crate::rank::GroupAuc::new(crate::rank::GroupAucKind::Pr, false)
+                    .check_labels(ev.labels, &format!("validation set {:?}", ev.name))?;
+            }
         }
         if let Some(w) = ev.weights {
-            let n_ev_weights = ev.group_ptr.map_or(ev.source.n_rows(), |g| g.len() - 1);
+            let n_ev_weights = match (ev.group_ptr, ranking.is_some()) {
+                (Some(g), true) => g.len() - 1,
+                _ => ev.source.n_rows(),
+            };
+            // XGBoost scores `auc` / `aucpr` of data with query groups per group, with
+            // one weight per group, which a per-row weight vector cannot be.
+            if ev.group_ptr.is_some() && ranking.is_none() {
+                if let Some(m) = cfg
+                    .eval_metrics
+                    .iter()
+                    .find(|m| matches!(m.name(), "auc" | "aucpr"))
+                {
+                    anyhow::bail!(
+                        "validation set {:?}: {} with query groups is scored per group and needs \
+                         one weight per group, but {} uses per-row weights; drop the weights or \
+                         the groups of this set",
+                        ev.name,
+                        m.name(),
+                        cfg.objective.name()
+                    );
+                }
+            }
             validate_weights(w, n_ev_weights, &format!("验证集 {:?} ", ev.name))?;
             for m in &cfg.eval_metrics {
                 anyhow::ensure!(
@@ -1226,6 +1257,7 @@ fn train_with_backend(
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: source.cuts().categorical_flags().to_vec(),
+        rank_bias: None,
         best_iteration: None,
         best_score: None,
     };
@@ -1763,6 +1795,11 @@ fn train_with_backend(
         model.best_iteration = Some(iter);
         model.best_score = Some(score);
     }
+    // Unbiased LambdaMART: the position biases as of the last round, saved with the
+    // objective config like XGBoost does.
+    if let Some((ti_plus, tj_minus)) = rank_grad.as_ref().and_then(|rg| rg.position_bias()) {
+        model.rank_bias = Some(crate::tree::RankBias { ti_plus, tj_minus });
+    }
 
     if !cfg.quiet {
         if let (Some(before), Some(after)) = (source_bytes_start, source.source_bytes_read()) {
@@ -1853,6 +1890,7 @@ pub fn train_gpu_one_tree(
             class_base_margins: Vec::new(),
             scale_pos_weight: cfg.params.scale_pos_weight,
             feature_types: Vec::new(),
+            rank_bias: None,
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -1901,6 +1939,7 @@ pub fn train_gpu_one_tree(
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: Vec::new(),
+        rank_bias: None,
         trees: vec![tree],
         base_score,
         objective: cfg.objective,

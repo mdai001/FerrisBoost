@@ -249,6 +249,8 @@ logging, and the complete parameter reference.
 ### 0.0.7 (unreleased)
 
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
+- Added unbiased learning to rank.
+- Added ranking `auc` and `aucpr`.
 
 ### 0.0.6 (unreleased)
 

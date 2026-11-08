@@ -18,6 +18,8 @@
 //! Query groups are a flat `group_ptr` (`n_groups + 1` offsets) that lives
 //! beside the labels; nothing here touches feature storage.
 
+use std::sync::Mutex;
+
 use rayon::prelude::*;
 
 use crate::types::GradPair;
@@ -71,9 +73,11 @@ pub struct RankParams {
     pub normalization: bool,
     pub score_normalization: bool,
     pub ndcg_exp_gain: bool,
-    /// Unbiased LambdaMART (position bias). Not supported yet: rejected by
-    /// [`RankParams::validate`].
+    /// Unbiased LambdaMART (`lambdarank_unbiased`): the position bias of the click
+    /// data is estimated every round and divided out of the pair gradients.
     pub unbiased: bool,
+    /// `lambdarank_bias_norm`: the position-bias ratios are raised to
+    /// `1 / (1 + bias_norm)`.
     pub bias_norm: f64,
 }
 
@@ -127,12 +131,22 @@ impl RankParams {
             self.bias_norm.is_finite() && self.bias_norm >= 0.0,
             "lambdarank_bias_norm must be a non-negative finite number"
         );
-        anyhow::ensure!(
-            !self.unbiased,
-            "lambdarank_unbiased (unbiased LambdaMART / position-bias estimation) is not \
-             supported yet; train with lambdarank_unbiased=false"
-        );
         Ok(())
+    }
+
+    /// `Regularizer()`: the exponent of the position-bias update.
+    pub fn regularizer(&self) -> f64 {
+        1.0 / (1.0 + self.bias_norm)
+    }
+
+    /// `RankingCache::MaxPositionSize()`: how many positions of the input list the
+    /// unbiased estimation tracks (the truncation level, or at most 32 for `mean`).
+    pub fn max_position_size(&self, max_group_size: usize) -> usize {
+        if self.has_truncation() {
+            self.num_pair() as usize
+        } else {
+            max_group_size.min(32)
+        }
     }
 }
 
@@ -346,6 +360,28 @@ pub struct RankGradient<'a> {
     weight_norm: f64,
     inv_idcg: Vec<f64>,
     discount: Vec<f64>,
+    /// Position-bias state of unbiased LambdaMART (`None` when it is off).
+    bias: Option<Mutex<BiasState>>,
+}
+
+/// The estimated position biases `ti+` / `tj-` (XGBoost `ti_plus_` / `tj_minus_`)
+/// and the per-row loss accumulators `li_full_` / `lj_full_` of the round in progress.
+struct BiasState {
+    ti_plus: Vec<f64>,
+    tj_minus: Vec<f64>,
+    li_full: Vec<f64>,
+    lj_full: Vec<f64>,
+}
+
+impl BiasState {
+    fn new(n_positions: usize, n_rows: usize) -> Self {
+        Self {
+            ti_plus: vec![1.0; n_positions],
+            tj_minus: vec![1.0; n_positions],
+            li_full: vec![0.0; n_rows],
+            lj_full: vec![0.0; n_rows],
+        }
+    }
 }
 
 #[derive(Default)]
@@ -399,6 +435,12 @@ impl<'a> RankGradient<'a> {
         if kind == RankKind::Map {
             check_binary_labels("rank:map", labels, "training set")?;
         }
+        let bias = params.unbiased.then(|| {
+            Mutex::new(BiasState::new(
+                params.max_position_size(max_group),
+                labels.len(),
+            ))
+        });
         Ok(Self {
             kind,
             params,
@@ -408,7 +450,18 @@ impl<'a> RankGradient<'a> {
             weight_norm,
             inv_idcg,
             discount,
+            bias,
         })
+    }
+
+    /// The position biases `(ti+, tj-)` as stored in the model JSON (f32, like
+    /// XGBoost's `F32Array`); `None` unless `lambdarank_unbiased` is on.
+    pub fn position_bias(&self) -> Option<(Vec<f32>, Vec<f32>)> {
+        let st = self.bias.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        Some((
+            st.ti_plus.iter().map(|&v| v as f32).collect(),
+            st.tj_minus.iter().map(|&v| v as f32).collect(),
+        ))
     }
 
     pub fn n_groups(&self) -> usize {
@@ -430,23 +483,70 @@ impl<'a> RankGradient<'a> {
 
     /// Gradients of every row for the scores `preds`. `seed` is the per-round draw of
     /// the training RNG (only used by `lambdarank_pair_method=mean`).
+    ///
+    /// With `lambdarank_unbiased` this is one XGBoost `GetGradient` call: the pair
+    /// gradients use the current position biases, then the biases are re-estimated
+    /// from the losses of this round (`UpdatePositionBias`). Call it once per round.
     pub fn gradients(&self, preds: &[f32], seed: u32, out: &mut Vec<GradPair>) {
+        match &self.bias {
+            None => self.gradients_with(preds, seed, out, None),
+            Some(state) => {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                self.gradients_with(preds, seed, out, Some(&mut st));
+                self.update_position_bias(&mut st);
+            }
+        }
+    }
+
+    /// The gradients the base-score estimation uses: XGBoost runs it on a throwaway
+    /// copy of the objective, so the position biases are all ones and nothing of the
+    /// training state is touched.
+    fn initial_gradients(&self, preds: &[f32], seed: u32, out: &mut Vec<GradPair>) {
+        match &self.bias {
+            None => self.gradients_with(preds, seed, out, None),
+            Some(state) => {
+                let n_pos = state.lock().unwrap_or_else(|e| e.into_inner()).ti_plus.len();
+                let mut fresh = BiasState::new(n_pos, self.labels.len());
+                self.gradients_with(preds, seed, out, Some(&mut fresh));
+            }
+        }
+    }
+
+    fn gradients_with(
+        &self,
+        preds: &[f32],
+        seed: u32,
+        out: &mut Vec<GradPair>,
+        bias: Option<&mut BiasState>,
+    ) {
         debug_assert_eq!(preds.len(), self.labels.len());
         out.clear();
         out.resize(preds.len(), GradPair::default());
         // Disjoint per-group output slices; groups are independent, and inside a
         // group everything is sequential, so the result does not depend on threads.
-        let mut tails: Vec<&mut [GradPair]> = Vec::with_capacity(self.n_groups());
-        let mut rest: &mut [GradPair] = out.as_mut_slice();
-        for w in self.group_ptr.windows(2) {
-            let (head, tail) = rest.split_at_mut((w[1] - w[0]) as usize);
-            tails.push(head);
-            rest = tail;
-        }
+        let n_groups = self.n_groups();
+        let tails = split_by_groups(out.as_mut_slice(), self.group_ptr);
+        let unbiased = bias.is_some();
+        let (ti, tj, li_tails, lj_tails): (&[f64], &[f64], _, _) = match bias {
+            Some(st) => (
+                &st.ti_plus,
+                &st.tj_minus,
+                split_by_groups(st.li_full.as_mut_slice(), self.group_ptr),
+                split_by_groups(st.lj_full.as_mut_slice(), self.group_ptr),
+            ),
+            None => (
+                &[],
+                &[],
+                (0..n_groups).map(|_| <&mut [f64]>::default()).collect(),
+                (0..n_groups).map(|_| <&mut [f64]>::default()).collect(),
+            ),
+        };
         tails
             .into_par_iter()
+            .zip(li_tails)
+            .zip(lj_tails)
             .enumerate()
-            .for_each_init(Scratch::default, |scratch, (g, out_g)| {
+            .for_each_init(Scratch::default, |scratch, (g, ((out_g, li_g), lj_g))| {
                 let (b, e) = (
                     self.group_ptr[g] as usize,
                     self.group_ptr[g + 1] as usize,
@@ -458,9 +558,43 @@ impl<'a> RankGradient<'a> {
                     self.group_weights.map_or(1.0f32, |w| w[g]),
                     seed,
                     out_g,
+                    unbiased.then_some(PositionBias {
+                        ti,
+                        tj,
+                        li: li_g,
+                        lj: lj_g,
+                    }),
                     scratch,
                 );
             });
+    }
+
+    /// `LambdaRankObj::UpdatePositionBias` (CPU): fold the per-row losses of every
+    /// group into per-position totals (groups in order, f64), then
+    /// `t(i) = (l(i) / l(0))^regularizer` (eq. 30 / 31) while `l(0)` is not tiny.
+    fn update_position_bias(&self, st: &mut BiasState) {
+        let n_pos = st.ti_plus.len();
+        let regularizer = self.params.regularizer();
+        let mut li = vec![0.0f64; n_pos];
+        let mut lj = vec![0.0f64; n_pos];
+        for w in self.group_ptr.windows(2) {
+            let (b, e) = (w[0] as usize, w[1] as usize);
+            let n = (e - b).min(n_pos);
+            for i in 0..n {
+                li[i] += st.li_full[b + i];
+                lj[i] += st.lj_full[b + i];
+            }
+        }
+        for i in 0..n_pos {
+            if li[0] >= EPS64 {
+                st.ti_plus[i] = (li[i] / li[0]).powf(regularizer);
+            }
+            if lj[0] >= EPS64 {
+                st.tj_minus[i] = (lj[i] / lj[0]).powf(regularizer);
+            }
+        }
+        st.li_full.fill(0.0);
+        st.lj_full.fill(0.0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -472,6 +606,7 @@ impl<'a> RankGradient<'a> {
         w: f32,
         seed: u32,
         out: &mut [GradPair],
+        mut bias: Option<PositionBias<'_>>,
         scratch: &mut Scratch,
     ) {
         let cnt = preds.len();
@@ -495,6 +630,13 @@ impl<'a> RankGradient<'a> {
         let kind = self.kind;
         // Normalization, first used by LightGBM.
         let mut sum_lambda = 0.0f64;
+        let (ti, tj): (&[f64], &[f64]) = match &bias {
+            Some(b) => (b.ti, b.tj),
+            None => (&[], &[]),
+        };
+        // positions tracked by the unbiased estimation
+        let n_tracked = ti.len();
+        let unbiased = bias.is_some();
 
         let mut op = |i: usize, j: usize| {
             let (mut rank_high, mut rank_low) = (i, j);
@@ -533,14 +675,39 @@ impl<'a> RankGradient<'a> {
             if norm_by_diff && best_score != worst_score {
                 delta_metric /= delta_score + 0.01;
             }
-            let lambda_ij = (sigmoid - 1.0) * delta_metric;
-            let hessian_ij = (sigmoid * (1.0 - sigmoid)).max(EPS64) * delta_metric * 2.0;
+            // `LambdaGrad`: the cost of the pair, used by the bias update (eq. 30 / 31).
+            let cost = if unbiased {
+                (1.0 / (1.0 - sigmoid)).ln() * delta_metric
+            } else {
+                0.0
+            };
+            let mut lambda_ij = (sigmoid - 1.0) * delta_metric;
+            let mut hessian_ij = (sigmoid * (1.0 - sigmoid)).max(EPS64) * delta_metric * 2.0;
+            // Positions beyond the tracked ones, and ratios so small that the
+            // division would be unstable, keep the unscaled gradient.
+            let tracked = unbiased && idx_high < n_tracked && idx_low < n_tracked;
+            if tracked && tj[idx_low] >= EPS64 && ti[idx_high] >= EPS64 {
+                lambda_ij /= ti[idx_high] * tj[idx_low];
+                hessian_ij /= ti[idx_high] * tj[idx_low];
+            }
             let pg_grad = lambda_ij as f32;
             let pg_hess = hessian_ij as f32;
             out[idx_high].grad += pg_grad;
             out[idx_high].hess += pg_hess;
             out[idx_low].grad += -pg_grad;
             out[idx_low].hess += pg_hess;
+            if tracked {
+                // `idx_high` / `idx_low` are positions in the input list (the rows of
+                // the group in file order), the click-position order.
+                if let Some(b) = bias.as_mut() {
+                    if tj[idx_low] >= EPS64 {
+                        b.li[idx_high] += cost / tj[idx_low];
+                    }
+                    if ti[idx_high] >= EPS64 {
+                        b.lj[idx_low] += cost / ti[idx_high];
+                    }
+                }
+            }
             sum_lambda += -2.0 * f64::from(pg_grad);
         };
 
@@ -583,6 +750,26 @@ impl<'a> RankGradient<'a> {
             p.hess = p.hess * w * wn;
         }
     }
+}
+
+/// Disjoint per-group slices of a per-row array.
+fn split_by_groups<'s, T>(mut rest: &'s mut [T], group_ptr: &[u32]) -> Vec<&'s mut [T]> {
+    let mut out = Vec::with_capacity(group_ptr.len().saturating_sub(1));
+    for w in group_ptr.windows(2) {
+        let (head, tail) = rest.split_at_mut((w[1] - w[0]) as usize);
+        out.push(head);
+        rest = tail;
+    }
+    out
+}
+
+/// What one group needs of the position-bias state: the current biases (read) and its
+/// slice of the per-row loss accumulators (written).
+struct PositionBias<'a> {
+    ti: &'a [f64],
+    tj: &'a [f64],
+    li: &'a mut [f64],
+    lj: &'a mut [f64],
 }
 
 #[inline]
@@ -765,7 +952,7 @@ impl RoundSeeds {
 pub fn estimate_base_score(grad: &RankGradient<'_>, seed: u32) -> f32 {
     let zeros = vec![0.0f32; grad.labels.len()];
     let mut out = Vec::new();
-    grad.gradients(&zeros, seed, &mut out);
+    grad.initial_gradients(&zeros, seed, &mut out);
     let (mut sg, mut sh) = (0.0f64, 0.0f64);
     for p in &out {
         sg += f64::from(p.grad);
@@ -1027,6 +1214,211 @@ impl crate::metrics::Metric for RankMetric {
     }
 }
 
+// ------------------------------------------------------------------ auc / aucpr per group
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupAucKind {
+    Roc,
+    Pr,
+}
+
+/// `auc` / `aucpr` for data with query groups (XGBoost `RankingAUC`,
+/// `src/metric/auc.cc`): every group is scored on its own, groups that cannot be
+/// scored are left out, and the score is the mean over the scorable groups.
+///
+/// * `auc` counts **all pairs** of a group, ordered by label: a pair scores 1 when
+///   the model keeps the label order, 0.5 for tied scores, 0 otherwise. Groups with
+///   fewer than 3 documents are not scorable. The group weight enters squared in
+///   both numerator and denominator, so it only matters through `0`.
+/// * `aucpr` is the binary PR-AUC of the group (labels must lie in `[0, 1]`) with
+///   the group weight on every document; groups without a positive or without a
+///   negative document are not scorable.
+///
+/// XGBoost uses this path whenever the data has query groups, whatever the
+/// objective. `sigmoid` applies the logistic transform first (`binary:logistic`
+/// metrics see probabilities); ranking objectives score the raw margin.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupAuc {
+    kind: GroupAucKind,
+    sigmoid: bool,
+}
+
+impl GroupAuc {
+    pub fn new(kind: GroupAucKind, sigmoid: bool) -> Self {
+        Self { kind, sigmoid }
+    }
+
+    fn name(&self) -> &'static str {
+        match self.kind {
+            GroupAucKind::Roc => "auc",
+            GroupAucKind::Pr => "aucpr",
+        }
+    }
+
+    /// `NaN` when no group is scorable (or there is no data).
+    pub fn score(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        group_ptr: &[u32],
+    ) -> f64 {
+        if label.is_empty() {
+            return f64::NAN;
+        }
+        let transformed: Vec<f32>;
+        let pred = if self.sigmoid {
+            transformed = pred.iter().map(|&r| crate::metrics::sigmoid_f32(r)).collect();
+            &transformed[..]
+        } else {
+            pred
+        };
+        let per_group: Vec<Option<f64>> = group_ptr
+            .par_windows(2)
+            .enumerate()
+            .map_init(Vec::new, |idx, (g, win)| {
+                let (b, e) = (win[0] as usize, win[1] as usize);
+                let w = weight.map_or(1.0f32, |w| w[g]);
+                let (p, y) = (&pred[b..e], &label[b..e]);
+                let auc = match self.kind {
+                    GroupAucKind::Roc => {
+                        if y.len() < 3 {
+                            return None;
+                        }
+                        roc_group(p, y, w, idx)
+                    }
+                    GroupAucKind::Pr => pr_group(p, y, w, idx),
+                };
+                (!auc.is_nan()).then_some(auc)
+            })
+            .collect();
+        let (mut sum, mut valid) = (0.0f64, 0u32);
+        for v in per_group.into_iter().flatten() {
+            sum += v;
+            valid += 1;
+        }
+        if valid == 0 {
+            f64::NAN
+        } else {
+            sum / f64::from(valid)
+        }
+    }
+}
+
+/// `GroupRankingROC`: all pairs in label order (stable, descending).
+fn roc_group(pred: &[f32], label: &[f32], w: f32, idx: &mut Vec<usize>) -> f64 {
+    rank_by_label(label, idx);
+    // f32 arithmetic where XGBoost has `float`: the squared weight, the score
+    // difference and the product that is added to the f64 sum.
+    let w2 = w * w;
+    let (mut auc, mut sum_w) = (0.0f64, 0.0f64);
+    for i in 0..idx.len() {
+        let pi = pred[idx[i]];
+        for &j in &idx[i + 1..] {
+            let d = pi - pred[j];
+            let v: f32 = if d > 0.0 {
+                1.0
+            } else if d == 0.0 {
+                0.5
+            } else {
+                0.0
+            };
+            auc += f64::from(v * w2);
+            sum_w += f64::from(w2);
+        }
+    }
+    if sum_w != 0.0 {
+        auc /= sum_w;
+    }
+    auc
+}
+
+/// `BinaryPRAUC` with a constant weight; `NaN` for a group with one class only.
+fn pr_group(pred: &[f32], label: &[f32], w: f32, idx: &mut Vec<usize>) -> f64 {
+    rank_by_score(pred, idx);
+    let (mut total_pos, mut total_neg) = (0.0f64, 0.0f64);
+    for &y in label {
+        total_pos += f64::from(w * y);
+        total_neg += f64::from(w * (1.0f32 - y));
+    }
+    if total_pos <= 0.0 || total_neg <= 0.0 {
+        return f64::NAN;
+    }
+    let first = idx[0];
+    let y = label[first];
+    let mut fp = (1.0 - f64::from(y)) * f64::from(w);
+    let mut tp = f64::from(y * w);
+    let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
+    let mut area = 0.0f64;
+    for k in 1..idx.len() {
+        let (i, prev) = (idx[k], idx[k - 1]);
+        if pred[i] != pred[prev] {
+            area += crate::metrics::delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+            fp_prev = fp;
+            tp_prev = tp;
+        }
+        let y = label[i];
+        fp += f64::from((1.0f32 - y) * w);
+        tp += f64::from(y * w);
+    }
+    area += crate::metrics::delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+    if fp <= 0.0 || tp <= 0.0 {
+        area = 0.0;
+    }
+    area
+}
+
+impl crate::metrics::Metric for GroupAuc {
+    fn name(&self) -> &str {
+        GroupAuc::name(self)
+    }
+
+    fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
+        self.score(pred, label, None, &[0, pred.len() as u32]) as f32
+    }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        assert!(
+            weight.is_none(),
+            "metric {:?} with weights needs query groups",
+            GroupAuc::name(self)
+        );
+        self.eval(pred, label)
+    }
+
+    fn eval_grouped(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        group_ptr: Option<&[u32]>,
+    ) -> f32 {
+        match group_ptr {
+            Some(g) => self.score(pred, label, weight, g) as f32,
+            None => self.eval_weighted(pred, label, weight),
+        }
+    }
+
+    fn check_labels(&self, labels: &[f32], what: &str) -> anyhow::Result<()> {
+        if self.kind == GroupAucKind::Pr {
+            anyhow::ensure!(
+                labels.iter().all(|&y| (0.0..=1.0).contains(&y)),
+                "{what}: aucpr supports only binary relevance for learning to rank \
+                 (labels in [0, 1])"
+            );
+        }
+        Ok(())
+    }
+
+    fn lower_is_better(&self) -> bool {
+        false
+    }
+}
+
 // ------------------------------------------------------------------ input helpers
 
 /// Group offsets from `qid` or `group=` sizes (exactly one may be given).
@@ -1221,5 +1613,186 @@ mod tests {
         };
         assert_eq!(RankMetric::default_for(RankKind::Map, &five).name(), "map@5");
         assert!(!d.lower_is_better());
+    }
+
+    // ---------------------------------------------------------------- unbiased
+
+    fn unbiased_fixture() -> (Vec<f32>, Vec<u32>, Vec<f32>) {
+        // two groups, clicks ordered by display position
+        let labels = vec![1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+        let ptr = vec![0u32, 4, 9];
+        let preds = vec![0.3f32, 0.1, 0.2, 0.4, 0.15, -0.1, 0.5, 0.0, 0.25];
+        (labels, ptr, preds)
+    }
+
+    #[test]
+    fn position_bias_sizes_follow_xgboost() {
+        let p = RankParams::default();
+        assert_eq!(p.max_position_size(5), 32);
+        assert_eq!(p.max_position_size(500), 32);
+        let k3 = RankParams {
+            num_pair_per_sample: Some(3),
+            ..p
+        };
+        assert_eq!(k3.max_position_size(500), 3);
+        let mean = RankParams {
+            pair_method: PairMethod::Mean,
+            ..p
+        };
+        assert_eq!(mean.max_position_size(5), 5);
+        assert_eq!(mean.max_position_size(500), 32);
+        assert_eq!(p.regularizer(), 0.5);
+        let q = RankParams {
+            bias_norm: 0.0,
+            ..p
+        };
+        assert_eq!(q.regularizer(), 1.0);
+    }
+
+    #[test]
+    fn unbiased_first_round_is_the_plain_gradient_and_the_bias_moves_afterwards() {
+        let (labels, ptr, preds) = unbiased_fixture();
+        let plain = RankGradient::new(RankKind::Pairwise, RankParams::default(), &labels, &ptr, None)
+            .unwrap();
+        assert!(plain.position_bias().is_none());
+        let params = RankParams {
+            unbiased: true,
+            ..RankParams::default()
+        };
+        let g = RankGradient::new(RankKind::Pairwise, params, &labels, &ptr, None).unwrap();
+        let (ti, tj) = g.position_bias().unwrap();
+        assert_eq!((ti.len(), tj.len()), (32, 32));
+        assert!(ti.iter().chain(&tj).all(|&v| v == 1.0));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        plain.gradients(&preds, 0, &mut a);
+        g.gradients(&preds, 0, &mut b);
+        // the biases are all ones, so the division is exact: the same gradients
+        assert!(a.iter().zip(&b).all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
+        // the update: position 0 is the reference, the others are ratios in (0, inf)
+        let (ti, tj) = g.position_bias().unwrap();
+        assert_eq!((ti[0], tj[0]), (1.0, 1.0));
+        assert!(ti[1..4].iter().chain(&tj[1..4]).any(|&v| v != 1.0), "{ti:?} {tj:?}");
+        // positions never seen in any group keep a zero loss -> bias 0
+        assert!(ti[4..].iter().all(|&v| v == 0.0), "{ti:?}");
+        // the next round uses them
+        g.gradients(&preds, 0, &mut b);
+        assert!(a.iter().zip(&b).any(|(x, y)| x.grad != y.grad));
+    }
+
+    #[test]
+    fn base_score_estimation_leaves_the_bias_state_alone() {
+        let (labels, ptr, _) = unbiased_fixture();
+        let params = RankParams {
+            unbiased: true,
+            ..RankParams::default()
+        };
+        let g = RankGradient::new(RankKind::Ndcg, params, &labels, &ptr, None).unwrap();
+        let plain = RankGradient::new(
+            RankKind::Ndcg,
+            RankParams::default(),
+            &labels,
+            &ptr,
+            None,
+        )
+        .unwrap();
+        // the estimate uses all-ones biases (a throwaway copy in XGBoost)
+        assert_eq!(estimate_base_score(&g, 0), estimate_base_score(&plain, 0));
+        let (ti, tj) = g.position_bias().unwrap();
+        assert!(ti.iter().chain(&tj).all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn unbiased_gradients_do_not_depend_on_threads() {
+        let sizes: Vec<u32> = (0..40).map(|i| 2 + (i * 7) % 23).collect();
+        let mut ptr = vec![0u32];
+        for s in &sizes {
+            ptr.push(ptr.last().unwrap() + s);
+        }
+        let n = *ptr.last().unwrap() as usize;
+        let labels: Vec<f32> = (0..n).map(|i| ((i * 5) % 3 == 0) as u8 as f32).collect();
+        let params = RankParams {
+            unbiased: true,
+            ..RankParams::default()
+        };
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let g = RankGradient::new(RankKind::Ndcg, params, &labels, &ptr, None).unwrap();
+                let mut out = Vec::new();
+                let mut last = Vec::new();
+                for r in 0..4 {
+                    let preds: Vec<f32> = (0..n).map(|i| ((i * 13 + r * 7) % 17) as f32 * 0.1).collect();
+                    g.gradients(&preds, r as u32, &mut out);
+                    last = out.clone();
+                }
+                (last, g.position_bias().unwrap())
+            })
+        };
+        let (a, ba) = run(1);
+        let (b, bb) = run(4);
+        assert!(a.iter().zip(&b).all(|(x, y)| x.grad == y.grad && x.hess == y.hess));
+        assert_eq!(ba, bb);
+    }
+
+    // ---------------------------------------------------------------- auc / aucpr per group
+
+    #[test]
+    fn group_roc_auc_counts_all_pairs_of_each_group() {
+        // group 0: labels 2 > 1 > 0, scores keep the order of two of the three pairs
+        // group 1: two documents, no ROC AUC
+        let label = [2.0f32, 1.0, 0.0, 1.0, 0.0];
+        let pred = [0.9f32, 0.1, 0.5, 0.3, 0.2];
+        let ptr = [0u32, 3, 5];
+        let m = GroupAuc::new(GroupAucKind::Roc, false);
+        assert!((m.score(&pred, &label, None, &ptr) - 2.0 / 3.0).abs() < 1e-15);
+        // equal scores count one half
+        let tied = [0.5f32; 5];
+        assert!((m.score(&tied, &label, None, &ptr) - 0.5).abs() < 1e-15);
+        // the weight is squared in both sums: it only matters through zero
+        let w = [3.0f32, 0.5];
+        assert!((m.score(&pred, &label, Some(&w), &ptr) - 2.0 / 3.0).abs() < 1e-15);
+        // a zero-weight group is scorable (and scores 0), so the mean is over both
+        let w0 = [0.0f32, 1.0];
+        assert_eq!(m.score(&pred, &label, Some(&w0), &ptr), 0.0);
+        // no data / only small groups -> NaN
+        assert!(m.score(&[], &[], None, &[0]).is_nan());
+        assert!(m.score(&pred[3..], &label[3..], None, &[0, 2]).is_nan());
+    }
+
+    #[test]
+    fn group_pr_auc_needs_both_classes_in_a_group() {
+        // group 0 has positives and negatives; group 1 only negatives; group 2 only positives
+        let label = [1.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0];
+        let pred = [0.9f32, 0.8, 0.7, 0.1, 0.5, 0.4, 0.3, 0.2];
+        let ptr = [0u32, 4, 6, 8];
+        let m = GroupAuc::new(GroupAucKind::Pr, false);
+        let all = m.score(&pred, &label, None, &ptr);
+        let first = m.score(&pred[..4], &label[..4], None, &[0, 4]);
+        assert!(first > 0.0 && first <= 1.0);
+        assert_eq!(all, first, "groups with one class are left out of the mean");
+        assert!(m.score(&pred[4..6], &label[4..6], None, &[0, 2]).is_nan());
+        // labels must be binary relevance
+        use crate::metrics::Metric;
+        assert!(m.check_labels(&[0.0, 2.0], "t").is_err());
+        assert!(m.check_labels(&[0.0, 1.0, 0.5], "t").is_ok());
+    }
+
+    #[test]
+    fn logistic_group_auc_scores_probabilities() {
+        use crate::metrics::{Auc, Metric};
+        let label = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
+        // margins far apart saturate the f32 sigmoid to the same probability
+        let raw = [40.0f32, 30.0, 0.2, -0.1, 0.0, 0.5];
+        let ptr = [0u32, 3, 6];
+        let grouped = Auc.eval_grouped(&raw, &label, None, Some(&ptr));
+        let prob: Vec<f32> = raw.iter().map(|&r| crate::metrics::sigmoid_f32(r)).collect();
+        let want = GroupAuc::new(GroupAucKind::Roc, false).score(&prob, &label, None, &ptr);
+        assert_eq!(f64::from(grouped), f64::from(want as f32));
+        // without groups the binary AUC is used
+        let flat = Auc.eval_grouped(&raw, &label, None, None);
+        assert_eq!(flat, Auc.eval(&raw, &label));
     }
 }

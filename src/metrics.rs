@@ -167,7 +167,7 @@ fn logloss_row(raw: f32, y: f32) -> f64 {
 
 /// XGBoost 的 sigmoid 在 f32 里算;阈值类指标(error)和排序类指标(auc)
 /// 都看变换后的 f32 概率,所以这里也用 f32,免得 0.5 附近判断不一致。
-fn sigmoid_f32(raw: f32) -> f32 {
+pub(crate) fn sigmoid_f32(raw: f32) -> f32 {
     1.0f32 / (1.0f32 + (-raw).exp())
 }
 
@@ -258,6 +258,22 @@ impl Metric for Auc {
         true
     }
 
+    /// With query groups XGBoost scores every group on its own
+    /// ([`crate::rank::GroupAuc`]); `weight` is then per group.
+    fn eval_grouped(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        group_ptr: Option<&[u32]>,
+    ) -> f32 {
+        match group_ptr {
+            Some(g) => crate::rank::GroupAuc::new(crate::rank::GroupAucKind::Roc, true)
+                .score(pred, label, weight, g) as f32,
+            None => self.eval_weighted(pred, label, weight),
+        }
+    }
+
     fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
         assert_eq!(pred.len(), label.len(), "auc 的预测和标签长度必须一致");
         if let Some(w) = weight {
@@ -311,7 +327,7 @@ impl Metric for Auc {
 pub struct AucPr;
 
 /// XGBoost `detail::CalcDeltaPRAUC`,全程 f64,运算顺序照抄。
-fn delta_pr_auc(fp_prev: f64, fp: f64, tp_prev: f64, tp: f64, total_pos: f64) -> f64 {
+pub(crate) fn delta_pr_auc(fp_prev: f64, fp: f64, tp_prev: f64, tp: f64, total_pos: f64) -> f64 {
     let pr_prev = tp_prev / total_pos;
     let pr = tp / total_pos;
     let (a, b) = if tp == tp_prev {
@@ -338,6 +354,21 @@ impl Metric for AucPr {
 
     fn supports_weights(&self) -> bool {
         true
+    }
+
+    /// With query groups: per-group PR-AUC ([`crate::rank::GroupAuc`]).
+    fn eval_grouped(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        group_ptr: Option<&[u32]>,
+    ) -> f32 {
+        match group_ptr {
+            Some(g) => crate::rank::GroupAuc::new(crate::rank::GroupAucKind::Pr, true)
+                .score(pred, label, weight, g) as f32,
+            None => self.eval_weighted(pred, label, weight),
+        }
     }
 
     fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
@@ -422,11 +453,27 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
     // Ranking metrics (`ndcg`, `map`, `pre`, with `@k` / `-`) need query groups,
     // so they pair with the ranking objectives and nothing else.
     if let Objective::Rank { params, .. } = obj {
+        // `auc` / `aucpr` of a ranking objective are scored per query group.
+        match name {
+            "auc" => {
+                return Ok(Box::new(crate::rank::GroupAuc::new(
+                    crate::rank::GroupAucKind::Roc,
+                    false,
+                )))
+            }
+            "aucpr" => {
+                return Ok(Box::new(crate::rank::GroupAuc::new(
+                    crate::rank::GroupAucKind::Pr,
+                    false,
+                )))
+            }
+            _ => {}
+        }
         return crate::rank::RankMetric::parse(name, params.ndcg_exp_gain)
             .map(|m| Box::new(m) as Box<dyn Metric>)
             .map_err(|e| {
                 format!(
-                    "{e}; {} supports the ranking metrics ndcg / ndcg@k / ndcg@k- / map / map@k / pre@k",
+                    "{e}; {} supports the ranking metrics ndcg / ndcg@k / ndcg@k- / map / map@k / pre@k / auc / aucpr",
                     obj.name()
                 )
             });

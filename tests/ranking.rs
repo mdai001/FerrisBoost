@@ -171,10 +171,16 @@ fn groups_are_required_and_validated() {
     short.group_ptr = Some(vec![0, 3, 5]);
     let err = train(&src, &d.y, &[], &short, &mut [], &Local).unwrap_err().to_string();
     assert!(err.contains("group sizes sum"), "{err}");
+    // other objectives accept groups (XGBoost does) and do not train differently
     let mut other = TrainConfig::new(params(1), Objective::SquaredError);
     other.group_ptr = Some(d.group_ptr.clone());
+    let grouped = train(&src, &d.y, &[], &other, &mut [], &Local).unwrap();
+    let plain = TrainConfig::new(params(1), Objective::SquaredError);
+    let ungrouped = train(&src, &d.y, &[], &plain, &mut [], &Local).unwrap();
+    assert_eq!(predictions(&grouped, &d), predictions(&ungrouped, &d));
+    other.group_ptr = Some(vec![0, 3, 5]);
     let err = train(&src, &d.y, &[], &other, &mut [], &Local).unwrap_err().to_string();
-    assert!(err.contains("only used by the rank"), "{err}");
+    assert!(err.contains("group sizes sum"), "{err}");
     // an evaluation set needs its own groups
     let cfg = config(RankKind::Ndcg, RankParams::default(), 1, &d.group_ptr);
     let eval = EvalSet {
@@ -249,12 +255,44 @@ fn ranking_metric_validation_follows_xgboost() {
     let cfg = config(RankKind::Map, RankParams::default(), 1, &d.group_ptr);
     let err = train(&src, &d.y, &[], &cfg, &mut [], &Local).unwrap_err().to_string();
     assert!(err.contains("binary"), "{err}");
-    // unbiased LambdaMART is rejected with a clear message
+}
+
+#[test]
+fn unbiased_lambdamart_keeps_its_position_bias_in_the_model() {
+    let d = data(8);
     let unbiased = RankParams {
         unbiased: true,
+        bias_norm: 0.5,
         ..RankParams::default()
     };
-    let cfg = config(RankKind::Ndcg, unbiased, 1, &d.group_ptr);
-    let err = train(&src, &d.y, &[], &cfg, &mut [], &Local).unwrap_err().to_string();
-    assert!(err.contains("unbiased"), "{err}");
+    let m = fit(&d, RankKind::Ndcg, unbiased, 1, None);
+    let bias = m.rank_bias.as_ref().expect("position bias is stored in the model");
+    // topk: one entry per tracked position, the first position is the reference
+    assert_eq!(bias.ti_plus.len(), 32);
+    assert_eq!(bias.tj_minus.len(), 32);
+    assert_eq!((bias.ti_plus[0], bias.tj_minus[0]), (1.0, 1.0));
+    assert!(bias.ti_plus.iter().any(|&v| v != 1.0));
+    // the plain model has none, and differs
+    let plain = fit(&d, RankKind::Ndcg, RankParams::default(), 1, None);
+    assert!(plain.rank_bias.is_none());
+    assert_ne!(predictions(&plain, &d), predictions(&m, &d));
+    // XGBoost's JSON: `ti+` / `tj-` next to `lambdarank_param`, read back exactly
+    let json = m.to_xgboost_json().unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let obj = &doc["learner"]["objective"];
+    assert_eq!(obj["lambdarank_param"]["lambdarank_unbiased"], "1");
+    assert_eq!(obj["ti+"].as_array().unwrap().len(), 32);
+    assert!(obj["tj-"].is_array());
+    let again = Model::from_xgboost_json(&json).unwrap();
+    assert_eq!(again.rank_bias, m.rank_bias);
+    assert_eq!(predictions(&again, &d), predictions(&m, &d));
+    // an iteration slice keeps the biases of the objective
+    assert_eq!(m.slice_rounds(0, 2).rank_bias, m.rank_bias);
+    // threads do not change anything
+    let m4 = fit(&d, RankKind::Ndcg, unbiased, 4, None);
+    assert_eq!(predictions(&m4, &d), predictions(&m, &d));
+    assert_eq!(m4.rank_bias, m.rank_bias);
+    // the plain objective writes neither array
+    let doc: serde_json::Value = serde_json::from_str(&plain.to_xgboost_json().unwrap()).unwrap();
+    assert!(doc["learner"]["objective"].get("ti+").is_none());
 }

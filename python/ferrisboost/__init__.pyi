@@ -64,9 +64,10 @@ def train(
     like label). Weights are per query group. Validation sets take eval_qid /
     eval_group, lists parallel to evals. XGBoost's lambdarank_pair_method
     ("topk" or "mean"), lambdarank_num_pair_per_sample, lambdarank_normalization,
-    lambdarank_score_normalization and ndcg_exp_gain are supported;
-    lambdarank_unbiased is not yet. The default metric is ndcg@32 (map@32 for
-    rank:map). gpu_math="fast" is not yet supported for ranking.
+    lambdarank_score_normalization, ndcg_exp_gain and lambdarank_unbiased /
+    lambdarank_bias_norm (unbiased LambdaMART; not with gpu_math="fast") are
+    supported. The default metric is ndcg@32 (map@32 for rank:map); auc and
+    aucpr are scored per query group.
 
     colsample_bytree, colsample_bylevel and colsample_bynode (each in (0, 1])
     nest as in XGBoost (tree set, then per-level subset, then per-node subset);
