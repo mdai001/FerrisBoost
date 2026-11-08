@@ -885,6 +885,7 @@ mod tests {
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
         }
     }
 

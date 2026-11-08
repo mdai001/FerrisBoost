@@ -620,7 +620,9 @@ JSON, or an `xgboost.Booster`. The model passed in is not modified.
   old trees, as in XGBoost). The old trees are scored on the raw feature values
   through their stored float thresholds, so they do not depend on bin boundaries.
 - The bin boundaries of the new trees are sketched afresh from the new data
-  (XGBoost does the same). Categorical features and multiclass models work.
+  (XGBoost does the same). Categorical features and multiclass models work; a
+  model with stored category names codes the new data with them (see
+  [Named categories](#named-categories)).
 - The objective follows the model: leave `params["objective"]` (and `num_class`) out
   to use the model's. A different objective, `num_class`, feature count, feature
   names (a DataFrame / table is bound to the model's names, in any column order;
@@ -804,12 +806,16 @@ How a feature is declared:
 - **pandas `category` columns and PyArrow dictionary columns** are detected
   automatically when `params["enable_categorical"]` is `True`; without it they
   are rejected so a categorical column is never trained as one by accident.
-  A category becomes its integer code (its position in the dictionary);
+  A category becomes its integer code (its position in the category list), and
+  the category list is **stored in the model** (see *Named categories* below);
   missing values stay missing. An explicit `feature_types` overrides detection.
-- **Parquet dictionary columns** are categorical automatically if their values
-  are integers, unless an explicit `feature_types` says otherwise. Dictionaries of strings are rejected in files, because the
-  codes of a string dictionary differ between row groups; encode the categories
-  as integers upstream, or train from an in-memory pandas or PyArrow table.
+  Categories must be strings or integers, as in XGBoost; other category types
+  (floats, booleans, ...) raise `ValueError`.
+- **Parquet dictionary columns** are categorical automatically, unless an
+  explicit `feature_types` says otherwise. A dictionary of **strings** is a
+  named categorical feature (below). A dictionary of **integers** keeps its
+  values as the category codes, as before. Other dictionary value types raise
+  `ValueError` when the feature is categorical.
 
 Category codes must be integers in `0..=65533`, with `NaN` / null for a missing
 value; negative, fractional, or larger values raise `ValueError`. One feature
@@ -823,10 +829,46 @@ error for a larger code. XGBoost allows codes up to 2^24.
 Codes need not be contiguous, but each code up to the feature's largest costs one
 histogram bin, so prefer compact codes.
 
-Validation sets use the training codes. A category that never appeared in
-training is "not in any set" and goes to the left child, as it does in XGBoost;
-for pandas and PyArrow validation data the categories are first re-coded onto
-the training categories.
+Validation sets use the training codes. For integer codes, a code that never
+appeared in training is "not in any set" and goes to the left child, as it does
+in XGBoost. Named validation data (pandas, PyArrow, Parquet string
+dictionaries) is first re-coded by value onto the training categories.
+
+### Named categories
+
+When the input names its categories (pandas `category` columns, PyArrow
+dictionary columns, Parquet string dictionaries), the model stores one category
+list per feature, in XGBoost 3.x's `cats` layout, and every later read re-codes
+by **value**:
+
+- **Files stay streaming.** For Parquet the Rust reader collects the
+  dictionaries while it streams the data (nothing is materialized in Python):
+  each feature's list holds the values in the order they first appear in the
+  rows (files in order, then rows), i.e. `pandas.unique` of the column;
+  dictionary order and unused dictionary entries play no part, so the list does
+  not depend on row groups, batching or thread count. Every file is coded onto
+  that one list, so files with differently ordered dictionaries train on
+  consistent codes. A plain string column declared `"c"` in
+  `feature_types` works the same way. At most 65,534 categories per feature.
+- **Validation sets and prediction** (`predict`, `pred_contribs`, `pred_leaf`,
+  `predict_to_parquet`, CPU or GPU) re-code DataFrames, Arrow tables and
+  Parquet files with the stored lists, so their categories may be listed in any
+  order or be a subset. A row holding a category the model does not know raises
+  `ValueError` (XGBoost rejects it too); dictionary entries no row uses are
+  ignored. String and integer categories do not mix: the category data type
+  must match the training data. NumPy input is taken as integer codes. A model
+  without stored lists (trained on integer codes) scores the codes of a
+  DataFrame or table as they are, as before.
+- **Model JSON**: XGBoost 3.4.1 loads a FerrisBoost model with categories and
+  re-codes DataFrames the same way; FerrisBoost loads an XGBoost model trained
+  on pandas categories with its lists. `Model.get_categories()` returns them.
+- **Continuation** (`init_model`) keeps the model's lists, as XGBoost does:
+  named training and validation data are coded with them, and a category
+  outside them raises `ValueError`. (When the new frame lists its categories in
+  another order, XGBoost 3.4.1 trains the new trees on the frame's own codes;
+  FerrisBoost re-codes by value, so old and new trees agree.)
+- **Quantized cache**: a Parquet cache records the category lists; reusing it
+  with other lists (for example a different `init_model`) is rejected.
 
 Split search follows XGBoost:
 
@@ -844,15 +886,15 @@ all apply. With lossless binning (numeric columns with fewer distinct values tha
 `tree_method="hist"` exactly, for regression, binary, and multiclass objectives.
 
 Prediction handles category sets on every path (arrays, pandas / PyArrow, files,
-`predict_to_parquet`, multiclass). A pandas DataFrame or PyArrow table passed to
-`Model.predict` is scored through its category codes, so it must carry the same
-categories in the same order as the training data (the scikit-learn estimators
-remember the training categories and re-code by value instead). With
-`use_gpu=True` categorical models are scored on the GPU as well, with the same
-category decisions and bit-identical results (see [Prediction](#prediction)).
+`predict_to_parquet`, multiclass). Named input is re-coded by value with the
+stored categories (see *Named categories*); the scikit-learn estimators do the
+same. With `use_gpu=True` categorical models are scored on the GPU as well,
+with the same category decisions and bit-identical results (see
+[Prediction](#prediction)).
 
-Saved models use XGBoost's JSON layout (`split_type`, `categories`, and the
-`feature_types` list) and load in XGBoost in both directions. A loaded XGBoost
+Saved models use XGBoost's JSON layout (`split_type`, `categories`, the
+`feature_types` list and, for named categories, `cats`) and load in XGBoost in
+both directions. A loaded XGBoost
 model may use category ids above 254; prediction follows its sets, with
 unknown or invalid values going left.
 
@@ -1133,10 +1175,10 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   go to `ferrisboost.train`. pandas `category` columns work in `fit`,
   `predict`, `predict_proba`, and `apply`, with `feature_names_in_` set as for
   any frame; with `enable_categorical=False` such a column raises
-  `ValueError`. The estimator remembers the training categories and re-codes
-  later frames by value, so a different category order is harmless and a
-  category unseen in training goes the way XGBoost sends it. A model restored
-  with `load_model` has no category table and scores a frame by its own codes.
+  `ValueError`. The training categories are stored in the booster and later
+  frames are re-coded by value, so a different category order is harmless; a
+  category unseen in training raises `ValueError`, as in XGBoost. A model
+  restored with `load_model` keeps its categories.
   For plain arrays, mark categorical columns with `feature_types=["c", "q", ...]`.
   `GridSearchCV`, `cross_val_score`, and `clone` work with categorical frames.
 - `apply(X, iteration_range=None)` returns the leaf node reached in every tree,

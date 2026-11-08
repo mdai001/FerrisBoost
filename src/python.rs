@@ -1482,6 +1482,7 @@ fn predict_files_to_parquet(
             header,
             ingest_workers,
             missing,
+            model.inner.categories.as_deref(),
             |data, n_rows| {
                 let workers = resolved_predict_workers(
                     predict_threads,
@@ -2389,6 +2390,7 @@ impl PyModel {
                     header,
                     ingest_workers,
                     missing,
+                    self.inner.categories.as_deref(),
                     |data, n_rows| {
                         // This batch's slice of the per-row start (row-major
                         // `n_rows x k_out`); batches arrive in file/row order.
@@ -2659,7 +2661,7 @@ impl PyModel {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         // A pandas DataFrame / pyarrow Table is bound to the model's feature
         // names (when it has them) before anything else, like evals in training.
-        let data = &bind_named_table(py, data, &self.inner.feature_names)?;
+        let data = &bind_named_table(py, data, self)?;
         let data = &normalize_array_input(py, data, missing)?;
         // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
         // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
@@ -3006,6 +3008,31 @@ impl PyModel {
     #[getter]
     fn num_class(&self) -> usize {
         self.inner.num_outputs()
+    }
+
+    /// Category names stored in the model, one entry per feature: a list of
+    /// the categories in code order (`str` or `int`), or `None` for a numeric
+    /// feature or a categorical feature trained on bare integer codes. `None`
+    /// instead of a list when no feature has names. Prediction from a
+    /// DataFrame, an Arrow table or a Parquet file re-codes categories by value
+    /// with these lists.
+    fn get_categories<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        let Some(table) = &self.inner.categories else {
+            return Ok(None);
+        };
+        let out = PyList::empty(py);
+        for c in table.features() {
+            match c.as_ref().map(|c| c.values()) {
+                None => out.append(py.None())?,
+                Some(crate::category_names::CategoryValues::Str(v)) => {
+                    out.append(PyList::new(py, v)?)?
+                }
+                Some(crate::category_names::CategoryValues::Int { values, .. }) => {
+                    out.append(PyList::new(py, values)?)?
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Feature importance with XGBoost's `Booster.get_score` semantics:
@@ -3601,9 +3628,10 @@ fn array_input<'py>(
 fn bind_named_table<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyAny>,
-    names: &[String],
+    model: &PyModel,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if names.is_empty()
+    let names = &model.inner.feature_names;
+    if (names.is_empty() && model.inner.categories.is_none())
         || path_specs_of(data)?.is_some()
         || data.extract::<PyReadonlyArray2<f32>>().is_ok()
     {
@@ -3614,8 +3642,9 @@ fn bind_named_table<'py>(
     if !is_table {
         return Ok(data.clone());
     }
+    // Categorical columns are re-coded by value onto the model's categories.
     fb.getattr("_as_predict_matrix")?
-        .call1((data, names.to_vec()))
+        .call1((data, names.to_vec(), model.get_categories(py)?))
 }
 
 /// Apply the XGBoost `missing` sentinel to array-like prediction input.
@@ -3653,6 +3682,46 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
             data[i]
         ))),
     }
+}
+
+/// Category names handed over by the Python layer (`params["_categories"]`):
+/// one entry per feature, `None` or `(kind, values)` with `kind` either
+/// `"str"` or an XGBoost integer type code (9..=16).
+fn parse_categories(
+    obj: Option<Bound<'_, PyAny>>,
+    n_features: usize,
+) -> PyResult<Option<crate::category_names::CategoryTable>> {
+    use crate::category_names::{CategoryTable, CategoryValues, FeatureCategories};
+    let Some(obj) = obj.filter(|o| !o.is_none()) else {
+        return Ok(None);
+    };
+    let entries: Vec<Option<(Bound<'_, PyAny>, Bound<'_, PyAny>)>> = obj.extract()?;
+    if entries.len() != n_features {
+        return Err(PyValueError::new_err(format!(
+            "category names cover {} features, the data has {n_features}",
+            entries.len()
+        )));
+    }
+    let mut features = Vec::with_capacity(n_features);
+    for (f, e) in entries.into_iter().enumerate() {
+        features.push(match e {
+            None => None,
+            Some((kind, values)) => {
+                let values = if kind.extract::<String>().is_ok_and(|k| k == "str") {
+                    CategoryValues::Str(values.extract()?)
+                } else {
+                    CategoryValues::Int {
+                        type_code: kind.extract()?,
+                        values: values.extract()?,
+                    }
+                };
+                Some(FeatureCategories::new(values).map_err(|e| {
+                    PyValueError::new_err(format!("categories of feature {f}: {e}"))
+                })?)
+            }
+        });
+    }
+    Ok(CategoryTable::new(features).non_empty())
 }
 
 /// Training categorical columns must hold integer codes `0..=65533` (NaN =
@@ -3793,6 +3862,11 @@ fn train_dense(
     let x_values = crate::source::missing_as_nan(x.as_slice()?, cfg.missing);
     reject_inf(&x_values, n_features, "training data")?;
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
+    let categories = parse_categories(params.get_item("_categories")?, n_features)?;
+    if let Some(t) = &categories {
+        t.check_against(n_features, &cfg.categorical)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     // Ranking: the group weight is repeated on the rows of its group.
     let unrolled_weights: Option<Vec<f32>> = match (&weights, &group_ptr, ranking) {
@@ -4005,6 +4079,25 @@ fn train_dense(
         }
     };
     let feature_names = margin::continued_feature_names(prior_model.as_deref(), feature_names)?;
+    // Category names of named input (pandas / Arrow) come from the Python
+    // layer, which has already coded the data with them (a continued model's
+    // lists for its features).
+    let mut model = model;
+    if let Some(table) = categories {
+        // A continued model's lists are kept exactly (integer type codes too).
+        let table = match prior_model
+            .as_ref()
+            .and_then(|p| p.inner.categories.clone())
+        {
+            None => table,
+            Some(prior) => crate::category_names::CategoryTable::new(
+                (0..n_features)
+                    .map(|f| prior.get(f).or(table.get(f)).cloned())
+                    .collect(),
+            ),
+        };
+        model.categories = Some(std::sync::Arc::new(table));
+    }
     Ok(finish(
         model,
         handle,
@@ -4217,9 +4310,15 @@ fn train_file(
         )));
     }
     let categorical_flags = cfg.categorical.clone();
+    // A continued model's category names code the named columns of the new
+    // files (XGBoost keeps the model's categories on continuation).
+    let prior_categories = prior_model
+        .as_ref()
+        .and_then(|p| p.inner.categories.clone());
     let targets = targets
         .with_categorical(&categorical_flags)
-        .with_missing(cfg.missing);
+        .with_missing(cfg.missing)
+        .with_categories(prior_categories.as_deref());
     // 行数同样要在 open 之前拿到 —— 显存模型的每一项都按它走。
     // parquet 从 footer 读,不解压任何数据;CSV 不扫全文件就是不知道。
     // ⚠️ **规划器要看到整个数据集的行数,不是第一个文件的。** 只报第一个

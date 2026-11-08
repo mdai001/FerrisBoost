@@ -69,6 +69,7 @@ where
         csv_has_header,
         ingest_threads,
         f32::NAN,
+        None,
         |data, _| {
             let rows = data
                 .chunks_exact(projected_features.len())
@@ -85,6 +86,11 @@ where
 /// `missing` is the XGBoost `missing` sentinel: feature values equal to it are
 /// handed to the callback as NaN (NaN = no sentinel), so scoring routes them
 /// down the missing direction exactly as it does for nulls.
+///
+/// `categories` (the model's category names, indexed by canonical feature id)
+/// re-codes named categorical columns (string dictionaries) by value; a row
+/// holding a category the model does not know is an error.
+#[allow(clippy::too_many_arguments)]
 pub fn for_each_projected_contiguous_batch<F>(
     resolved: &ResolvedInput,
     canonical_feature_names: &[String],
@@ -93,6 +99,7 @@ pub fn for_each_projected_contiguous_batch<F>(
     csv_has_header: bool,
     ingest_threads: usize,
     missing: f32,
+    categories: Option<&crate::category_names::CategoryTable>,
     mut on_rows: F,
 ) -> Result<usize>
 where
@@ -141,8 +148,9 @@ where
         ))
     };
     let mut rows = Vec::new();
+    let mut recoder = super::cat_recode::Recoder::fixed(categories);
     for batch in batches {
-        let batch = batch?;
+        let batch = recoder.recode(batch?, |c| projected_features.get(c).copied())?;
         batch_to_contiguous_rows(&batch, projected_features.len(), &mut rows)?;
         super::mask_missing_in_place(&mut rows, missing);
         total = total

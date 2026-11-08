@@ -428,11 +428,14 @@ def test_categorical_dataframe_end_to_end():
     shuffled["colour"] = shuffled["colour"].cat.reorder_categories(
         list(reversed(df["colour"].cat.categories)))
     np.testing.assert_array_equal(clf.predict_proba(shuffled), proba)
-    # a category never seen in training does not crash
+    # an unused extra category is fine; a row with a category never seen in
+    # training is rejected, as in XGBoost
     novel = df.copy()
     novel["colour"] = novel["colour"].cat.add_categories(["purple"])
+    np.testing.assert_array_equal(clf.predict_proba(novel), proba)
     novel.loc[novel.index[:5], "colour"] = "purple"
-    assert clf.predict_proba(novel).shape == (len(y), 2)
+    with pytest.raises(ValueError, match="purple"):
+        clf.predict_proba(novel)
     # apply, regressor, early stopping with a validation frame
     assert clf.apply(df).shape == (len(y), 20)
     reg = FerrisBoostRegressor(enable_categorical=True, **kw).fit(df, score)

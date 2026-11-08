@@ -246,6 +246,10 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.8 (unreleased)
+
+- Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost `cats` JSON) and DataFrames, tables and Parquet files are re-coded by category value at validation and prediction; categories unseen in training raise `ValueError`, as in XGBoost.
+
 ### 0.0.7 (unreleased)
 
 - Added `base_margin`.

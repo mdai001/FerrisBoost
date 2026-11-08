@@ -417,6 +417,7 @@ fn open_many_impl(
                 true,
                 targets.categorical.unwrap_or(&[]),
                 targets.missing,
+                targets.categories,
             )?;
             (cuts, Some(n_rows))
         }
@@ -429,6 +430,7 @@ fn open_many_impl(
                 false,
                 targets.categorical.unwrap_or(&[]),
                 targets.missing,
+                targets.categories,
             )?;
             (cuts, Some(n_rows))
         }

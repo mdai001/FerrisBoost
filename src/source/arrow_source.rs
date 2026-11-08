@@ -122,19 +122,20 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
     missing: f32,
     mut visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    // A dictionary column carries category codes: visit its decoded values.
-    // Only numeric dictionaries are stable codes; string dictionaries have a
-    // per-batch ordering that cannot be turned into consistent codes here.
+    // A numeric dictionary column carries category codes: visit its decoded
+    // values. String dictionaries of categorical features with category names
+    // were already re-coded to codes (`cat_recode`); one reaching this point
+    // belongs to a numeric feature or to a model without category names.
     let decoded;
     let array = match batch.column(col).data_type() {
         DataType::Dictionary(_, value) => {
             if !(value.is_numeric()) {
                 let name = batch.schema().field(col).name().clone();
                 crate::bail_input!(
-                    "column {name:?} is a dictionary of {value:?} values: categorical \
-                     file columns must hold integer category codes (the codes of a string \
-                     dictionary differ between row groups). Encode the categories as integers \
-                     upstream, or train from a pandas / PyArrow in-memory table"
+                    "column {name:?} is a dictionary of {value:?} values, which can only be a \
+                     categorical feature with category names: train it as categorical (do not \
+                     declare it \"q\" in feature_types); a model trained on integer codes for \
+                     this feature needs integer codes here"
                 );
             }
             decoded = arrow::compute::cast(batch.column(col), &DataType::Float64)?;
@@ -189,9 +190,9 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int32 => visit_values!(Int32Array),
         DataType::Int64 => visit_values!(Int64Array),
         other => crate::bail_input!(
-            "column {col} is {other:?}; only numeric columns are supported. Encode \
-             categorical features upstream as integer category codes (0..=65533) and \
-             declare them with feature_types=\"c\""
+            "column {col} is {other:?}; only numeric columns are supported. A string \
+             column can be a categorical feature: store it as a dictionary column or declare \
+             it with feature_types=\"c\" (integer category codes 0..=65533 work too)"
         ),
     }
     Ok(())
@@ -240,7 +241,7 @@ pub(crate) fn build_cuts_and_count_weighted(
     nthread: usize,
     weighted: bool,
 ) -> anyhow::Result<(BinCuts, usize)> {
-    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[], f32::NAN)
+    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[], f32::NAN, None)
 }
 
 /// `build_cuts_and_count_weighted` with categorical features.
@@ -260,6 +261,7 @@ pub(crate) fn build_cuts_and_count_typed(
     weighted: bool,
     categorical: &[bool],
     missing: f32,
+    seed: Option<&crate::category_names::CategoryTable>,
 ) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
@@ -274,6 +276,9 @@ pub(crate) fn build_cuts_and_count_typed(
     let profile_columns = pool.current_num_threads() == 1;
     let mut sketches: Option<SketchSet> = None;
     let mut feature_names: Vec<String> = Vec::new();
+    // Named categories (string dictionaries) are coded here, before any
+    // decoding; the list each feature learns is attached to the cuts.
+    let mut recoder: Option<crate::source::cat_recode::Recoder<'_>> = None;
     let mut n_rows = 0usize;
     // 手动迭代:`next()` 里才是 Parquet 解压,要和 sketch 分开计时。
     let mut batches = batches;
@@ -289,6 +294,35 @@ pub(crate) fn build_cuts_and_count_typed(
             .checked_add(batch.num_rows())
             .ok_or_else(|| anyhow::anyhow!("input row count overflows usize"))?;
         let n_feats = batch.num_columns() - usize::from(weighted);
+        if recoder.is_none() {
+            crate::ensure_input!(
+                categorical.is_empty() || categorical.len() == n_feats,
+                "feature_types has {} entries but the data has {n_feats} feature columns",
+                categorical.len()
+            );
+            let schema = batch.schema();
+            // An explicit feature_types list decides; otherwise dictionary-typed
+            // columns are detected as categorical (same rule as in-memory input).
+            // Resolved from the batch as read, before string columns become codes.
+            let flags: Vec<bool> = (0..n_feats)
+                .map(|f| match categorical.get(f) {
+                    Some(&declared) => declared,
+                    None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
+                })
+                .collect();
+            recoder = Some(crate::source::cat_recode::Recoder::learning(&flags, seed));
+            feature_names = schema
+                .fields()
+                .iter()
+                .take(n_feats)
+                .map(|f| f.name().clone())
+                .collect();
+            sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));
+        }
+        let batch = recoder
+            .as_mut()
+            .expect("created above")
+            .recode(batch, |c| (c < n_feats).then_some(c))?;
         let weights: Option<Vec<f32>> = if weighted {
             let mut w = Vec::with_capacity(batch.num_rows());
             for_each_column_f32(&batch, n_feats, |v| w.push(v))?;
@@ -313,29 +347,6 @@ pub(crate) fn build_cuts_and_count_typed(
                 })
             }
         };
-        if sketches.is_none() {
-            crate::ensure_input!(
-                categorical.is_empty() || categorical.len() == n_feats,
-                "feature_types has {} entries but the data has {n_feats} feature columns",
-                categorical.len()
-            );
-            let schema = batch.schema();
-            feature_names = schema
-                .fields()
-                .iter()
-                .take(n_feats)
-                .map(|f| f.name().clone())
-                .collect();
-            // An explicit feature_types list decides; otherwise dictionary-typed
-            // columns are detected as categorical (same rule as in-memory input).
-            let flags: Vec<bool> = (0..n_feats)
-                .map(|f| match categorical.get(f) {
-                    Some(&declared) => declared,
-                    None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
-                })
-                .collect();
-            sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));
-        }
         let sk = sketches.as_mut().expect("created above");
         anyhow::ensure!(
             n_feats == sk.n_feats(),
@@ -362,11 +373,16 @@ pub(crate) fn build_cuts_and_count_typed(
     }
     drop(scan_profile);
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
+    let sketches = sketches.ok_or_else(|| {
+        crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
+    })?;
+    let n_feats = sketches.n_feats();
+    let categories = recoder
+        .and_then(|r| r.into_table(n_feats))
+        .map(std::sync::Arc::new);
     let cuts = sketches
-        .ok_or_else(|| {
-            crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
-        })?
-        .finalize_checked(&feature_names)?;
+        .finalize_checked(&feature_names)?
+        .with_categories(categories);
     Ok((cuts, n_rows))
 }
 
@@ -417,8 +433,9 @@ pub fn quantize_with_nthread(
         anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
     })?;
 
+    let mut recoder = crate::source::cat_recode::Recoder::fixed(cuts.categories().map(|t| &**t));
     for batch in batches {
-        let batch = batch?;
+        let batch = recoder.recode(batch?, Some)?;
         anyhow::ensure!(
             batch.num_columns() == n_features,
             "batch has {} columns but cuts were built for {n_features} columns",
@@ -555,6 +572,7 @@ fn quantize_with_nthread_known_rows(
         anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
     })?;
     let mut row_offset = 0usize;
+    let mut recoder = crate::source::cat_recode::Recoder::fixed(cuts.categories().map(|t| &**t));
 
     let mut batches = batches;
     loop {
@@ -563,7 +581,7 @@ fn quantize_with_nthread_known_rows(
             batches.next()
         };
         let Some(batch) = next else { break };
-        let batch = batch?;
+        let batch = recoder.recode(batch?, Some)?;
         anyhow::ensure!(
             batch.num_columns() == cuts.n_feats(),
             "batch has {} columns but cuts were built for {} columns",
@@ -667,6 +685,7 @@ impl ArrowSource {
             quantize_threads,
             &[],
             f32::NAN,
+            None,
         )
     }
 
@@ -679,6 +698,7 @@ impl ArrowSource {
         quantize_threads: usize,
         categorical: &[bool],
         missing: f32,
+        seed: Option<&crate::category_names::CategoryTable>,
     ) -> anyhow::Result<Self>
     where
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
@@ -691,6 +711,7 @@ impl ArrowSource {
             false,
             categorical,
             missing,
+            seed,
         )?;
         let blocks = quantize_with_nthread_known_rows(
             batches(true)?,
@@ -1205,7 +1226,8 @@ mod tests {
         for sentinel in [-999.0f64, 0.0] {
             let bs = sentinel_batches(sentinel);
             let (with, rows) =
-                build_cuts_and_count_typed(feed(&bs), 16, 1, false, &[], sentinel as f32).unwrap();
+                build_cuts_and_count_typed(feed(&bs), 16, 1, false, &[], sentinel as f32, None)
+                    .unwrap();
             assert_eq!(rows, 6);
             // A sentinel is never a cut point or the observed minimum.
             let col_b = &with.values[with.offsets[1] as usize..with.offsets[2] as usize];
@@ -1213,7 +1235,8 @@ mod tests {
             // Equal to the sketch of the same data with nulls in those places.
             let nan_bs: Vec<RecordBatch> = batches();
             let (reference, _) =
-                build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+                build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN, None)
+                    .unwrap();
             let ref_b =
                 &reference.values[reference.offsets[1] as usize..reference.offsets[2] as usize];
             assert_eq!(col_b, ref_b);
@@ -1225,7 +1248,7 @@ mod tests {
         let bs = sentinel_batches(-999.0);
         let nan_bs = batches();
         let (cuts, _) =
-            build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+            build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN, None).unwrap();
         let (with, n) = quantize_with_nthread(feed(&bs), &cuts, 2, 1, -999.0).unwrap();
         let (without, _) = quantize_with_nthread(feed(&nan_bs), &cuts, 2, 1, f32::NAN).unwrap();
         assert_eq!(n, 6);
@@ -1252,9 +1275,17 @@ mod tests {
     fn two_pass_source_with_sentinel_equals_source_with_nulls() {
         let bs = sentinel_batches(-999.0);
         let nan_bs = batches();
-        let a =
-            ArrowSource::new_typed_with_phase_threads(|_| Ok(feed(&bs)), 16, 2, 1, 1, &[], -999.0)
-                .unwrap();
+        let a = ArrowSource::new_typed_with_phase_threads(
+            |_| Ok(feed(&bs)),
+            16,
+            2,
+            1,
+            1,
+            &[],
+            -999.0,
+            None,
+        )
+        .unwrap();
         let b = ArrowSource::new(|| Ok(feed(&nan_bs)), 16, 2).unwrap();
         // Column b matches in bins; columns a / c hold identical data.
         for row in 0..6 {
