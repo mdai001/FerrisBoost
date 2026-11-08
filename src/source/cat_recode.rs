@@ -18,10 +18,14 @@
 //!   holds a category outside the table is an error (XGBoost rejects such a
 //!   category too). Unused dictionary entries are ignored.
 //!
-//! With a fixed table, integer dictionaries are re-coded by value when the
-//! feature's categories are integers (a model trained from a pandas frame with
-//! integer categories). Without a category list a numeric dictionary keeps
-//! its values as the codes, as before named categories existed.
+//! With a fixed table, integer dictionaries and plain integer columns are
+//! re-coded by value when the feature's categories are integers (a model
+//! trained from a pandas frame with integer categories). Without a category
+//! list a numeric dictionary keeps its values as the codes, as before named
+//! categories existed.
+//!
+//! CSV has no dictionaries: a categorical CSV column read as text (see
+//! `csv_source::text_category_features`) is a plain string column here.
 
 use std::sync::Arc;
 
@@ -352,6 +356,29 @@ impl<'t> Recoder<'t> {
                     }
                     Some(out)
                 }
+                // Plain integers of a feature with integer categories are
+                // category values (a CSV column, a plain Parquet column), coded
+                // by value like an integer dictionary. Without an integer list
+                // they stay the codes.
+                t if t.is_integer() => match state.coder {
+                    Coder::Fixed(c) if matches!(c.values(), CategoryValues::Int { .. }) => {
+                        let mut out = Vec::with_capacity(column.len());
+                        for (i, v) in int_values(column)?.into_iter().enumerate() {
+                            out.push(match (v, v.flatten().and_then(|x| c.code_of_int(x))) {
+                                (None, _) => f32::NAN,
+                                (_, Some(code)) => code as f32,
+                                _ => {
+                                    let shown =
+                                        arrow::util::display::array_value_to_string(column, i)
+                                            .unwrap_or_else(|_| "?".into());
+                                    return Err(unseen_error(name, &shown));
+                                }
+                            });
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(codes) = codes {
@@ -484,6 +511,24 @@ mod tests {
             codes(&fixed.recode(batch(vec![("k", d)]), Some).unwrap(), 0),
             vec![2.0, 0.0, 1.0]
         );
+        // Plain integers (a CSV or plain Parquet column) are values too.
+        let plain: ArrayRef =
+            Arc::new(arrow::array::Int64Array::from(vec![Some(7), None, Some(3)]));
+        let out = fixed.recode(batch(vec![("k", plain)]), Some).unwrap();
+        assert_eq!(codes(&out, 0)[0], 1.0);
+        assert!(codes(&out, 0)[1].is_nan());
+        assert_eq!(codes(&out, 0)[2], 0.0);
+        let unseen: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![4i64]));
+        let err = fixed
+            .recode(batch(vec![("k", unseen)]), Some)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"k\"") && err.contains("category 4"), "{err}");
+        // Without a list they stay the codes.
+        let mut learn = Recoder::learning(&[true], None);
+        let plain: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![7i64]));
+        let out = learn.recode(batch(vec![("k", plain)]), Some).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
         let mut mismatch = Recoder::fixed(Some(&t));
         let err = mismatch
             .recode(batch(vec![("k", dict(&["a"], &[Some(0)]))]), Some)

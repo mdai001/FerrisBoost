@@ -101,23 +101,122 @@ pub(crate) fn positional_label_name_from_schema(
 /// 把推断出来的列类型收紧成训练能用的形状。
 ///
 /// 推断出 Utf8 的列直接报错,而不是留到量化时才炸 —— 那时候的错误
-/// 信息里只有列号,这里还能说出列名。
-fn check_numeric(schema: &Schema, skip: &str) -> anyhow::Result<()> {
-    for f in schema.fields() {
-        if f.name() == skip {
+/// 信息里只有列号,这里还能说出列名。Columns in `text` (categorical
+/// features read as category names, see [`text_category_features`]) are
+/// strings by design.
+fn check_numeric(schema: &Schema, skip: &str, text: &[usize]) -> anyhow::Result<()> {
+    for (c, f) in schema.fields().iter().enumerate() {
+        if f.name() == skip || text.contains(&c) {
             continue;
         }
         match f.data_type() {
             DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 => {}
             other => crate::bail_input!(
-                "column {:?} was inferred as {other:?}; only numeric columns are supported; \
-                 encode categorical features as numbers upstream; if it is actually numeric, \
-                 check for invalid characters or thousands separators",
+                "column {:?} was inferred as {other:?}; only numeric columns are supported, \
+                 except text columns declared categorical (\"c\" in feature_types), which are \
+                 read as category names; if it is actually numeric, check for invalid \
+                 characters or thousands separators",
                 f.name()
             ),
         }
     }
     Ok(())
+}
+
+/// A CSV column type the numeric readers decode. `Null` (a column whose
+/// sampled fields are all empty) is neither numbers nor text.
+fn is_number_type(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 | DataType::Null
+    )
+}
+
+/// Which canonical features are read as text, i.e. as category names.
+///
+/// * A feature with a `known` list of strings (the trained model's for a
+///   validation set; for training, a continued model's, when the feature is
+///   declared categorical) is text in every file, whatever the inferred type:
+///   a file holding only `"1"` and `"2"` of the categories `["1", "2", "x"]`
+///   must not be read as the codes 1 and 2.
+/// * Training (`learn`): a declared categorical feature without a known list
+///   is text when any file's inferred type for it is not a number (strings,
+///   booleans, dates, ...), and then in every file, so one feature never mixes
+///   codes and names. A categorical feature whose fields are all integers
+///   keeps them as the category codes (no names), as before.
+///
+/// `feat_proj[i][f]` = column of canonical feature `f` in file `i`.
+fn text_category_features(
+    schemas: &[SchemaRef],
+    feat_proj: &[Vec<usize>],
+    n_features: usize,
+    categorical: Option<&[bool]>,
+    known: Option<&crate::category_names::CategoryTable>,
+    learn: bool,
+) -> Vec<bool> {
+    use crate::category_names::CategoryValues;
+    let declared =
+        |f: usize| categorical.is_some_and(|flags| flags.get(f).copied().unwrap_or(false));
+    (0..n_features)
+        .map(|f| match known.and_then(|t| t.get(f)) {
+            // Training codes only declared features (a continued model's list
+            // included); validation codes every feature with a list.
+            Some(c) => matches!(c.values(), CategoryValues::Str(_)) && (!learn || declared(f)),
+            None => {
+                learn
+                    && declared(f)
+                    && schemas
+                        .iter()
+                        .zip(feat_proj)
+                        .any(|(s, cols)| !is_number_type(s.field(cols[f]).data_type()))
+            }
+        })
+        .collect()
+}
+
+/// `schema` with the given columns read as nullable UTF-8 text. An empty field
+/// stays null (a missing category), as for numbers.
+fn with_text_columns(schema: &SchemaRef, columns: &[usize]) -> SchemaRef {
+    if columns.is_empty() {
+        return Arc::clone(schema);
+    }
+    let fields: Vec<arrow::datatypes::Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(c, f)| {
+            if columns.contains(&c) {
+                arrow::datatypes::Field::new(f.name(), DataType::Utf8, true)
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// The schema a prediction reads `path` with: features with string categories
+/// in the model (`categories`, by canonical feature id; `canonical[f]` = its
+/// column) are text.
+pub(crate) fn prediction_schema(
+    schema: SchemaRef,
+    canonical: &[usize],
+    categories: Option<&crate::category_names::CategoryTable>,
+) -> SchemaRef {
+    let Some(table) = categories else {
+        return schema;
+    };
+    let text: Vec<usize> = canonical
+        .iter()
+        .enumerate()
+        .filter(|(f, _)| {
+            table.get(*f).is_some_and(|c| {
+                matches!(c.values(), crate::category_names::CategoryValues::Str(_))
+            })
+        })
+        .map(|(_, &c)| c)
+        .collect();
+    with_text_columns(&schema, &text)
 }
 
 fn batch_reader(
@@ -336,7 +435,6 @@ fn open_many_impl(
     let mut feature_names: Option<Vec<String>> = None;
 
     for (p, schema) in paths.iter().zip(&schemas) {
-        check_numeric(schema, label)?;
         let roles = columns(schema, targets)?;
         let (cols, label_col, names) = (roles.features, roles.label, roles.names);
         if let Some(w) = roles.weight {
@@ -383,6 +481,34 @@ fn open_many_impl(
         label_proj.push(label_col);
     }
     let feature_names = feature_names.expect("non-empty");
+
+    // Categorical features read as category names (text) are re-typed in
+    // every file before any read; the recoders then code them by value.
+    let known = match &cuts {
+        Some(c) => c.categories().map(|t| &**t),
+        None => targets.categories,
+    };
+    let text = text_category_features(
+        &schemas,
+        &feat_proj,
+        feature_names.len(),
+        targets.categorical,
+        known,
+        cuts.is_none(),
+    );
+    let schemas: Vec<SchemaRef> = schemas
+        .iter()
+        .zip(&feat_proj)
+        .map(|(schema, cols)| {
+            let text_cols: Vec<usize> = cols
+                .iter()
+                .zip(&text)
+                .filter_map(|(&c, &t)| t.then_some(c))
+                .collect();
+            check_numeric(schema, label, &text_cols)?;
+            Ok(with_text_columns(schema, &text_cols))
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
     let owned = paths.to_vec();
@@ -977,6 +1103,85 @@ mod tests {
         assert!(msg.contains("city"), "error should name the column: {msg}");
         assert!(msg.contains("only numeric columns are supported"), "{msg}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn declared_text_columns_learn_category_names_in_row_order() {
+        use crate::category_names::CategoryValues;
+        // File a's "city" fields are all integers, file b's are text: the
+        // column is text in both, and the list follows the rows.
+        let a = write("names_a", "city,target,x\n2,0,1\n1,1,2\n,0,3\n2,1,4\n");
+        let b = write("names_b", "x,city,target\n5,Oslo,0\n6,1,1\n7,Lima,0\n");
+        let flags = [true, false];
+        let targets = Targets::from("target").with_categorical(&flags);
+        let paths = vec![a.clone(), b.clone()];
+        for nthread in [1, 3] {
+            let ds = open_many_with_header_and_nthread(&paths, targets, None, 16, 2, true, nthread)
+                .unwrap();
+            let table = ds.source.cuts().categories().expect("names").clone();
+            let strs = |v: &[&str]| CategoryValues::Str(v.iter().map(|s| s.to_string()).collect());
+            assert_eq!(
+                table.get(0).unwrap().values(),
+                &strs(&["2", "1", "Oslo", "Lima"])
+            );
+            assert!(table.get(1).is_none());
+            let bins: Vec<u32> = (0..7).map(|r| ds.source.bin_at(r, 0)).collect();
+            let m = crate::types::MISSING_BIN as u32;
+            assert_eq!(bins, vec![0, 1, m, 0, 2, 1, 3]);
+
+            // A validation file of integers only is read as text and coded by value.
+            let v = write("names_v", "city,target,x\n1,0,1\nLima,1,2\n");
+            let valid = open_many_with_header_and_nthread(
+                std::slice::from_ref(&v),
+                targets.with_features(&ds.feature_names),
+                Some(ds.source.cuts().clone()),
+                0,
+                2,
+                true,
+                nthread,
+            )
+            .unwrap();
+            assert_eq!(valid.source.bin_at(0, 0), 1);
+            assert_eq!(valid.source.bin_at(1, 0), 3);
+            let unseen = write("names_u", "city,target,x\nRome,0,1\n");
+            let err = open_many_with_header_and_nthread(
+                std::slice::from_ref(&unseen),
+                targets.with_features(&ds.feature_names),
+                Some(ds.source.cuts().clone()),
+                0,
+                2,
+                true,
+                nthread,
+            )
+            .err()
+            .expect("unseen category")
+            .to_string();
+            assert!(
+                err.contains("\"city\"") && err.contains("\"Rome\""),
+                "{err}"
+            );
+        }
+        // Without names an all-integer categorical column keeps its codes.
+        let ds = open_many_with_header_and_nthread(
+            std::slice::from_ref(&a),
+            targets,
+            None,
+            16,
+            2,
+            true,
+            1,
+        )
+        .unwrap();
+        assert!(ds.source.cuts().categories().is_none());
+        // Undeclared text is rejected by name.
+        let err = open_many(&paths, "target", None, 16, 2)
+            .err()
+            .expect("undeclared text")
+            .to_string();
+        assert!(
+            err.contains("city") && err.contains("only numeric columns"),
+            "{err}"
+        );
     }
 
     #[test]
