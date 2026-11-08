@@ -797,6 +797,7 @@ mod tests {
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
         };
         let fused = CpuInferenceModel::new(&model).unwrap();
         let rows: Vec<f32> = (0..131 * 3)
