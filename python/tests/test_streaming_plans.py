@@ -331,6 +331,28 @@ def test_budget_driven_plans_without_override_train_the_cpu_model(tmp_path, capf
                  path, quiet=True, **kw)
 
 
+
+@cuda
+def test_override_over_a_set_budget_raises_before_training(tmp_path, capfd):
+    """A user-set gpu_memory_budget is a limit: an explicit resident_blocks that
+    needs more memory fails up front; the same override without a budget trains."""
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=2)
+    p = {**p, "hist_streams": 1}
+    estimate = {}
+    for resident in (total, 0):
+        _, info = _gpu(capfd, p, path, kw, resident_blocks=resident)
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    assert estimate[0] < estimate[total]
+    reserve = 512.0
+    budget = int((reserve + (estimate[0] + estimate[total]) / 2) * MB)  # fits streaming only
+    with pytest.raises(ValueError, match=r"resident_blocks=\d+ training needs about"):
+        fb.train({**p, "device": "cuda", "gpu_memory_budget": budget,
+                  "resident_blocks": total}, path, quiet=True, **kw)
+    # The budget alone plans a plan that fits.
+    _, info = _gpu(capfd, p, path, kw, gpu_memory_budget=budget)
+    assert info["residency"] != "full_resident"
+
 @cuda
 def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd):
     path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major",
@@ -437,6 +459,100 @@ def test_wide_bin_blocks_spill_and_stream_like_the_cpu(tmp_path, capfd):
             model, info = _wide_plan(capfd, spill, path, kw, **gpu)
             assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs)
 
+
+# ------------------------------------- CSV plans like Parquet (row count from the first pass)
+
+PLAN_RE = re.compile(r"resolved:\s+(\d+) cols/block.*?hist_streams:\s+(\d+)"
+                     r".*?physical_blocks:\s+(\d+).*?resident/stream:\s+(\d+) resident"
+                     r".*?estimated_peak:\s+([\d.]+) MB", re.S)
+
+
+def _planned(info):
+    """The pre-open plan report and the executed GPU_PATH plan, as one comparable tuple."""
+    m = PLAN_RE.search(info["log"])
+    assert m, info["log"][-2000:]
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5),
+            info["layout"], info["residency"], info["resident"], info["total"], info["streams"])
+
+
+def _equivalent_sources(tmp_path, path):
+    """The same rows as a single / multi-file Parquet and a single / multi-file / gzip CSV."""
+    table = pq.read_table(path)
+    step = table.num_rows // 3 + 1
+    pq_parts, csv_parts = tmp_path / "pq_parts", tmp_path / "csv_parts"
+    pq_parts.mkdir()
+    csv_parts.mkdir()
+    frame = table.to_pandas()
+    for i in range(3):
+        pq.write_table(table.slice(i * step, step), str(pq_parts / f"part{i}.parquet"))
+        frame.iloc[i * step:(i + 1) * step].to_csv(str(csv_parts / f"part{i}.csv"),
+                                                   index=False, na_rep="")
+    csv, gz = str(tmp_path / "data.csv"), str(tmp_path / "data.csv.gz")
+    frame.to_csv(csv, index=False, na_rep="")
+    frame.to_csv(gz, index=False, na_rep="", compression="gzip")
+    return {"parquet": path, "parquet_multi": str(pq_parts), "csv": csv,
+            "csv_multi": str(csv_parts), "csv_gz": gz}
+
+
+@cuda
+def test_csv_without_cols_per_block_plans_like_the_equivalent_parquet(tmp_path, capfd):
+    """CSV has no row count before open; the planner runs after the reader's first
+    pass with its exact aggregate count. Without cols_per_block, CSV / CSV.gz (single
+    and multi-file) then choose the block width, streams and residency of the same
+    rows as Parquet, under budget-driven full / hybrid / streaming plans, and train
+    the CPU model byte for byte."""
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=3,
+                            sampling={"subsample": 0.8, "colsample_bytree": 0.8}, n_cat=1)
+    p = {k: v for k, v in p.items() if k != "cols_per_block"}
+    sources = _equivalent_sources(tmp_path, path)
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    # Budgets from the planner's own estimates of each forced residency, so the
+    # case depends neither on the device nor on its free memory.
+    _, probe = _gpu(capfd, p, path, kw, resident_blocks=0)
+    total = probe["total"]
+    assert total >= 2, probe["log"][-2000:]
+    estimate = {}
+    for resident in (total, 1, 0):
+        _, info = _gpu(capfd, p, path, kw, resident_blocks=resident)
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    reserve = 512.0  # the planner's minimum safety reserve, below 3.4 GB budgets
+    residencies = set()
+    for resident in (total, 1, 0):
+        budget = int((reserve + estimate[resident] + 0.25) * MB)
+        plans = {}
+        for name, src in sources.items():
+            model, info = _gpu(capfd, p, src, kw, gpu_memory_budget=budget)
+            assert "GPU_BLOCKING" not in info["log"]
+            plans[name] = _planned(info)
+            assert _bytes(model, tmp_path, "gpu") == ref, (name, budget, plans[name])
+        assert len(set(plans.values())) == 1, plans
+        residencies.add(plans["parquet"][6])
+    assert residencies == {"full_resident", "hybrid_partial_resident", "pure_streaming"}
+
+
+@cuda
+def test_csv_plans_reject_overrides_over_a_set_budget_and_honor_explicit_widths(tmp_path, capfd):
+    """The budget-override rule holds for CSV planned after the first pass (the
+    planner's ValueError comes out unchanged), and an explicit cols_per_block is
+    still the CSV block width."""
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=2)
+    csv = _equivalent_sources(tmp_path, path)["csv"]
+    p = {**p, "hist_streams": 1}
+    estimate = {}
+    for resident in (total, 0):
+        _, info = _gpu(capfd, p, csv, kw, resident_blocks=resident)
+        _check_plan(info, "row_major", resident, total)
+        assert re.search(rf"resolved:\s+{LAYOUTS['row_major']['cols_per_block']} cols/block",
+                         info["log"]), info["log"][-2000:]
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    budget = int((512.0 + (estimate[0] + estimate[total]) / 2) * MB)  # fits streaming only
+    with pytest.raises(ValueError, match=r"resident_blocks=\d+ training needs about"):
+        fb.train({**p, "device": "cuda", "gpu_memory_budget": budget,
+                  "resident_blocks": total}, csv, quiet=True, **kw)
+    _, info = _gpu(capfd, p, csv, kw, gpu_memory_budget=budget)
+    assert info["residency"] != "full_resident"
 
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 

@@ -264,11 +264,20 @@ pub fn open_many_with_header_and_nthread<'a>(
         label.into(),
         cuts,
         max_bins,
-        cols_per_block,
+        BlockWidth::Fixed(cols_per_block),
         has_header,
         nthread,
         None,
     )
+}
+
+/// Block width of a CSV open: fixed up front, or chosen from the exact
+/// aggregate row count that the first (cut-building) pass counts, before the
+/// second pass builds the column blocks. The second form lets a caller plan
+/// memory from the real row count of input that has none before open.
+pub(crate) enum BlockWidth<'a> {
+    Fixed(usize),
+    FromRowCount(&'a mut dyn FnMut(u64) -> anyhow::Result<usize>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -277,20 +286,20 @@ pub(crate) fn open_many_with_header_and_nthread_prepared<'a>(
     label: impl Into<Targets<'a>>,
     cuts: Option<BinCuts>,
     max_bins: u32,
-    cols_per_block: usize,
+    width: BlockWidth<'_>,
     has_header: bool,
     nthread: usize,
-    first_schema: SchemaRef,
+    first_schema: Option<SchemaRef>,
 ) -> anyhow::Result<Dataset> {
     open_many_impl(
         paths,
         label.into(),
         cuts,
         max_bins,
-        cols_per_block,
+        width,
         has_header,
         nthread,
-        Some(first_schema),
+        first_schema,
     )
 }
 
@@ -300,7 +309,7 @@ fn open_many_impl(
     targets: Targets<'_>,
     cuts: Option<BinCuts>,
     max_bins: u32,
-    cols_per_block: usize,
+    width: BlockWidth<'_>,
     has_header: bool,
     nthread: usize,
     first_schema: Option<SchemaRef>,
@@ -422,6 +431,20 @@ fn open_many_impl(
                 targets.missing,
             )?;
             (cuts, Some(n_rows))
+        }
+    };
+
+    // The first pass has counted the exact rows of every file: the block width
+    // can be chosen now, before the second pass builds the blocks.
+    let cols_per_block = match width {
+        BlockWidth::Fixed(c) => c,
+        BlockWidth::FromRowCount(choose) => {
+            let n_rows = known_rows.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a CSV block width chosen from the row count needs the cut-building pass; it cannot be combined with given cuts"
+                )
+            })?;
+            choose(n_rows as u64)?
         }
     };
 
@@ -1011,10 +1034,10 @@ mod tests {
             "target",
             None,
             16,
-            2,
+            BlockWidth::Fixed(2),
             true,
             4,
-            schema,
+            Some(schema),
         )
         .unwrap();
         let regular = open(&path, "target", 16, 2).unwrap();
@@ -1035,5 +1058,71 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn block_width_from_the_aggregate_row_count_of_the_first_pass() {
+        let a = write("width_rows_a", BODY);
+        let b = write("width_rows_b", BODY);
+        let paths = vec![a.clone(), b.clone()];
+        let mut seen = Vec::new();
+        let mut choose = |rows: u64| -> anyhow::Result<usize> {
+            seen.push(rows);
+            Ok(2)
+        };
+        let planned = open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            None,
+            16,
+            BlockWidth::FromRowCount(&mut choose),
+            true,
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(seen, vec![12], "the width is chosen once, from all files");
+        let fixed = open_many(&paths, "target", None, 16, 2).unwrap();
+        assert_eq!(planned.source.n_blocks(), fixed.source.n_blocks());
+        assert_eq!(planned.labels, fixed.labels);
+        for feature in 0..fixed.source.n_features() as u32 {
+            for row in 0..fixed.source.n_rows() {
+                assert_eq!(
+                    planned.source.bin_at(row, feature),
+                    fixed.source.bin_at(row, feature)
+                );
+            }
+        }
+
+        // A failed choice fails the open; given cuts have no first pass to count.
+        let mut fail = |_: u64| -> anyhow::Result<usize> { anyhow::bail!("no plan fits") };
+        let err = match open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            None,
+            16,
+            BlockWidth::FromRowCount(&mut fail),
+            true,
+            2,
+            None,
+        ) {
+            Ok(_) => panic!("a failed width choice must fail the open"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("no plan fits"));
+        let mut never = |_: u64| -> anyhow::Result<usize> { unreachable!() };
+        assert!(open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            Some(fixed.source.cuts().clone()),
+            16,
+            BlockWidth::FromRowCount(&mut never),
+            true,
+            2,
+            None,
+        )
+        .is_err());
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 }
