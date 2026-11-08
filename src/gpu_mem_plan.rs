@@ -44,6 +44,36 @@ pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
     }
 }
 
+/// Shape of the device LambdaMART buffers (`gpu_math = "fast"` with a `rank:*`
+/// objective). Shared by the planner and `GpuTrainCtx::new`, which allocates exactly
+/// [`fast_rank_bytes`] for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FastRankShape {
+    /// Number of query groups (the planner uses the row count when the groups are
+    /// not known before the data is opened: an upper bound).
+    pub n_groups: u64,
+    /// `rank:map` keeps two f64 statistics per row.
+    pub map: bool,
+    /// `lambdarank_pair_method=mean` keeps the label-sorted order and the bucket
+    /// bounds (three u32 per row).
+    pub mean: bool,
+}
+
+/// Device bytes of the fast ranking path. Per row: rank list, scratch list and rank
+/// position (3 x u32) and two int64 fixed-point accumulators; `map` adds two f64,
+/// `mean` three u32. Per group: row offset, initiator offset, 1/IDCG (f64), group
+/// weight (f32) and an int64 normalization sum.
+pub fn fast_rank_bytes(n_rows: u64, shape: &FastRankShape) -> u64 {
+    let mut bytes = n_rows * (3 * 4 + 2 * 8);
+    if shape.map {
+        bytes += n_rows * 2 * 8;
+    }
+    if shape.mean {
+        bytes += n_rows * 3 * 4;
+    }
+    bytes + (shape.n_groups + 1) * 4 * 2 + shape.n_groups * (8 + 4 + 8)
+}
+
 /// `gpu_math = "fast"` 的 reg:quantileerror 归约形状。block 数是**固定常量**
 /// (不随行数/设备变化),这是逐次运行逐位确定的前提;必须和 `histogram.cu`
 /// 的 `QUANTILE_REDUCE_BLOCKS` 相同(有单测对拍源码)。
@@ -165,6 +195,13 @@ impl StreamingMemModel {
     /// host 加权,调用方不得在 exact 下调用它(memory model = 实际路径)。
     pub fn with_fast_weights(mut self, n_rows: u64) -> Self {
         self.fixed_bytes += n_rows * 4;
+        self
+    }
+
+    /// `gpu_math = "fast"` ranking: the device LambdaMART buffers. Matches the
+    /// `GpuTrainCtx` allocation exactly ([`fast_rank_bytes`]).
+    pub fn with_fast_rank(mut self, n_rows: u64, shape: &FastRankShape) -> Self {
+        self.fixed_bytes += fast_rank_bytes(n_rows, shape);
         self
     }
 
@@ -1122,6 +1159,33 @@ mod resolve_tests {
             cu.contains(&format!("#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u")),
             "histogram.cu 的 QUANTILE_REDUCE_BLOCKS 与 gpu_mem_plan 不一致"
         );
+    }
+
+    #[test]
+    fn fast_rank_charges_every_device_buffer() {
+        let rows = 1_000_000u64;
+        let shape = FastRankShape {
+            n_groups: 10_000,
+            map: false,
+            mean: false,
+        };
+        // 3 x u32 + 2 x i64 per row; two u32 offsets, f64 + f32 + i64 per group.
+        assert_eq!(
+            fast_rank_bytes(rows, &shape),
+            rows * 28 + 10_001 * 8 + 10_000 * 20
+        );
+        let map = FastRankShape { map: true, ..shape };
+        assert_eq!(fast_rank_bytes(rows, &map) - fast_rank_bytes(rows, &shape), rows * 16);
+        let mean = FastRankShape { mean: true, ..shape };
+        assert_eq!(fast_rank_bytes(rows, &mean) - fast_rank_bytes(rows, &shape), rows * 12);
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        assert_eq!(
+            base.with_fast_rank(rows, &shape).fixed_bytes,
+            base.fixed_bytes + fast_rank_bytes(rows, &shape)
+        );
+        // the CUDA constants the formula relies on
+        let cu = include_str!("backend/cuda/histogram.cu");
+        assert!(cu.contains("rank_sort_groups") && cu.contains("rank_pairs"));
     }
 
     #[test]

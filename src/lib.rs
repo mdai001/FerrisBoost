@@ -16,6 +16,7 @@ pub mod hist;
 mod inference;
 pub mod metrics;
 pub mod objective;
+pub mod rank;
 pub mod sketch;
 pub mod source;
 pub mod split;
