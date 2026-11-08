@@ -166,13 +166,13 @@ pub fn report() {
     }
     match *SHAPE.lock().unwrap() {
         Some((rows, feats, blocks)) => {
-            eprintln!("\n=== open 分段({rows} 行 × {feats} 列,{blocks} 块)===")
+            eprintln!("\n=== open phases ({rows} rows x {feats} cols, {blocks} blocks) ===")
         }
-        None => eprintln!("\n=== open 分段 ==="),
+        None => eprintln!("\n=== open phases ==="),
     }
     eprintln!(
         "{:<12}{:>9}{:>7}{:>10}{:>11}{:>12}{:>11}{:>6}",
-        "段", "wall", "占比", "cpu/wall", "逻辑读", "VmHWM@末", "VmRSS@末", "次数"
+        "phase", "wall", "share", "cpu/wall", "rchar", "VmHWM@end", "VmRSS@end", "calls"
     );
     for (name, b) in buckets.iter() {
         let wall_s = b.wall_ns as f64 / 1e9;
@@ -186,15 +186,15 @@ pub fn report() {
             b.calls,
         );
     }
-    eprintln!("{:<12}{:>8.1}s", "合计", total as f64 / 1e9);
+    eprintln!("{:<12}{:>8.1}s", "total", total as f64 / 1e9);
 
     let subs = SUB.lock().unwrap();
     if subs.is_empty() {
         return;
     }
     let sub_total: u128 = subs.iter().map(|(_, ns, _)| ns).sum();
-    eprintln!("\n--- 细分(只测墙钟)---");
-    eprintln!("{:<14}{:>9}{:>7}{:>14}", "段", "wall", "占比", "次数");
+    eprintln!("\n--- breakdown (wall clock only) ---");
+    eprintln!("{:<14}{:>9}{:>7}{:>14}", "phase", "wall", "share", "calls");
     for (name, ns, calls) in subs.iter() {
         eprintln!(
             "{name:<14}{:>8.1}s{:>6.0}%{:>14}",

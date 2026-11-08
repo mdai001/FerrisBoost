@@ -148,7 +148,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
             let values = array
                 .as_any()
                 .downcast_ref::<$ty>()
-                .expect("类型已经 match 过了");
+                .expect("type already matched");
             let mut any_inf = false;
             let mut any_max = false;
             for i in 0..n {
@@ -173,8 +173,8 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
                     .find(|&i| !values.is_null(i) && (values.value(i) as f32).is_infinite())
                     .expect("any_inf");
                 crate::bail_input!(
-                    "第 {col} 列第 {i} 行是 {}(换成 f32 是 {}):不支持 ±inf \
-                     或超出 f32 范围的值(XGBoost 同样拒绝);缺失值请用 null / NaN",
+                    "column {col} row {i} is {} ({} as f32): ±inf or values outside the f32 \
+                     range are not supported (XGBoost rejects them too); use null / NaN for missing values",
                     values.value(i),
                     values.value(i) as f32
                 );
@@ -188,8 +188,8 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int32 => visit_values!(Int32Array),
         DataType::Int64 => visit_values!(Int64Array),
         other => crate::bail_input!(
-            "第 {col} 列是 {other:?},只支持数值列。\\
-             类别特征要先在上游编码成整数类别码(0..=253),再用 feature_types=\"c\" 声明"
+            "column {col} is {other:?}; only numeric columns are supported; \
+             encode categorical features upstream as integer codes (0..=253) and declare them with feature_types=\"c\""
         ),
     }
     Ok(())
@@ -262,13 +262,13 @@ pub(crate) fn build_cuts_and_count_typed(
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
-        "max_bin 上限是 {MAX_BIN_LIMIT}(255 留给缺失哨兵),给的是 {max_bins}"
+        "max_bin must be at most {MAX_BIN_LIMIT} (255 is reserved for the missing sentinel), got {max_bins}"
     );
 
     // 整次扫描只建一个 pool。每 batch 重建一次在线程数较多、batch 很小
     // 时会让调度开销盖过 sketch 本身。
     let pool = crate::threading::build_pool(nthread)
-        .map_err(|e| anyhow::anyhow!("Parquet cuts 线程池创建失败:{e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create the Parquet cuts thread pool: {e}"))?;
     let profile_columns = pool.current_num_threads() == 1;
     let mut sketches: Option<SketchSet> = None;
     let mut feature_names: Vec<String> = Vec::new();
@@ -285,14 +285,14 @@ pub(crate) fn build_cuts_and_count_typed(
         let row_offset = n_rows;
         n_rows = n_rows
             .checked_add(batch.num_rows())
-            .ok_or_else(|| anyhow::anyhow!("输入行数溢出 usize"))?;
+            .ok_or_else(|| anyhow::anyhow!("input row count overflows usize"))?;
         let n_feats = batch.num_columns() - usize::from(weighted);
         let weights: Option<Vec<f32>> = if weighted {
             let mut w = Vec::with_capacity(batch.num_rows());
             for_each_column_f32(&batch, n_feats, |v| w.push(v))?;
             if let Some(i) = w.iter().position(|v| !v.is_finite() || *v < 0.0) {
                 crate::bail_input!(
-                    "样本权重第 {} 行是 {};权重必须是有限的非负数",
+                    "sample weight at row {} is {}; weights must be finite and non-negative",
                     row_offset + i,
                     w[i]
                 );
@@ -337,7 +337,7 @@ pub(crate) fn build_cuts_and_count_typed(
         let sk = sketches.as_mut().expect("created above");
         anyhow::ensure!(
             n_feats == sk.n_feats(),
-            "batch 之间的列数不一致:先前 {},这个 batch {n_feats}",
+            "column count differs between batches: previous {}, this batch {n_feats}",
             sk.n_feats()
         );
         if profile_columns {
@@ -361,7 +361,9 @@ pub(crate) fn build_cuts_and_count_typed(
     drop(scan_profile);
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
     let cuts = sketches
-        .ok_or_else(|| crate::input_err!("一个 batch 都没有,建不了分箱边界(数据没有行)"))?
+        .ok_or_else(|| {
+            crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
+        })?
         .finalize_checked(&feature_names)?;
     Ok((cuts, n_rows))
 }
@@ -394,7 +396,7 @@ pub fn quantize_with_nthread(
     nthread: usize,
     missing: f32,
 ) -> anyhow::Result<(Vec<ColumnBlock>, usize)> {
-    assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
+    assert!(cols_per_block > 0, "cols_per_block must be > 0");
     let n_features = cuts.n_feats();
     let groups = partition_features(n_features, cols_per_block);
 
@@ -403,14 +405,15 @@ pub fn quantize_with_nthread(
     let mut per_block: Vec<Vec<Vec<Bin>>> =
         groups.iter().map(|g| vec![Vec::new(); g.len()]).collect();
     let mut n_rows = 0usize;
-    let pool = crate::threading::build_pool(nthread)
-        .map_err(|e| anyhow::anyhow!("Arrow quantize ingest 线程池创建失败:{e}"))?;
+    let pool = crate::threading::build_pool(nthread).map_err(|e| {
+        anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
+    })?;
 
     for batch in batches {
         let batch = batch?;
         anyhow::ensure!(
             batch.num_columns() == n_features,
-            "batch 有 {} 列,cuts 是按 {n_features} 列建的",
+            "batch has {} columns but cuts were built for {n_features} columns",
             batch.num_columns()
         );
         n_rows += batch.num_rows();
@@ -443,7 +446,11 @@ pub fn quantize_with_nthread(
         .map(|(feat_ids, cols)| {
             let mut data = Vec::with_capacity(feat_ids.len() * n_rows);
             for col in cols {
-                debug_assert_eq!(col.len(), n_rows, "某一列的行数和别的列对不上");
+                debug_assert_eq!(
+                    col.len(),
+                    n_rows,
+                    "a column's row count does not match the other columns"
+                );
                 data.extend_from_slice(&col);
             }
             ColumnBlock {
@@ -469,7 +476,7 @@ fn quantize_with_nthread_known_rows(
     missing: f32,
 ) -> anyhow::Result<Vec<ColumnBlock>> {
     let allocation_profile = crate::source::openprof::start("bins allocate");
-    assert!(cols_per_block > 0, "cols_per_block 必须 > 0");
+    assert!(cols_per_block > 0, "cols_per_block must be > 0");
     let groups = partition_features(cuts.n_feats(), cols_per_block);
     let mut blocks = groups
         .iter()
@@ -477,7 +484,7 @@ fn quantize_with_nthread_known_rows(
             let len = features
                 .len()
                 .checked_mul(n_rows)
-                .ok_or_else(|| anyhow::anyhow!("量化块大小溢出 usize"))?;
+                .ok_or_else(|| anyhow::anyhow!("quantized block size overflows usize"))?;
             Ok(ColumnBlock {
                 feat_ids: features.clone(),
                 data: vec![MISSING_BIN; len],
@@ -487,8 +494,9 @@ fn quantize_with_nthread_known_rows(
         .collect::<anyhow::Result<Vec<_>>>()?;
     drop(allocation_profile);
     let _scan_profile = crate::source::openprof::start("bins scan");
-    let pool = crate::threading::build_pool(nthread)
-        .map_err(|e| anyhow::anyhow!("Arrow quantize ingest 线程池创建失败:{e}"))?;
+    let pool = crate::threading::build_pool(nthread).map_err(|e| {
+        anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
+    })?;
     let mut row_offset = 0usize;
 
     let mut batches = batches;
@@ -501,17 +509,17 @@ fn quantize_with_nthread_known_rows(
         let batch = batch?;
         anyhow::ensure!(
             batch.num_columns() == cuts.n_feats(),
-            "batch 有 {} 列,cuts 是按 {} 列建的",
+            "batch has {} columns but cuts were built for {} columns",
             batch.num_columns(),
             cuts.n_feats()
         );
         let batch_rows = batch.num_rows();
         let row_end = row_offset
             .checked_add(batch_rows)
-            .ok_or_else(|| anyhow::anyhow!("输入行数溢出 usize"))?;
+            .ok_or_else(|| anyhow::anyhow!("input row count overflows usize"))?;
         anyhow::ensure!(
             row_end <= n_rows,
-            "第二遍扫描行数超过第一遍:{row_end} > {n_rows}"
+            "second pass read more rows than the first: {row_end} > {n_rows}"
         );
 
         let _transform_profile = crate::source::openprof::sub("bins transform");
@@ -540,7 +548,7 @@ fn quantize_with_nthread_known_rows(
     }
     anyhow::ensure!(
         row_offset == n_rows,
-        "两遍扫描行数不一致:第一遍 {n_rows},第二遍 {row_offset}"
+        "row count differs between passes: first pass {n_rows}, second pass {row_offset}"
     );
     Ok(blocks)
 }
@@ -757,7 +765,7 @@ impl ArrowSource {
                 return b.column(local)[row];
             }
         }
-        panic!("特征 {feat} 不在任何列块里");
+        panic!("feature {feat} is not in any column block");
     }
 }
 
@@ -780,7 +788,12 @@ impl crate::train::BlockSource for ArrowSource {
         self.blocks
             .get(i)
             .map(|b| b.feat_ids.clone())
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,共 {} 个", self.blocks.len()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "column block {i} does not exist ({} blocks)",
+                    self.blocks.len()
+                )
+            })
     }
 
     /// 直接从常驻的块里切一列出来。
@@ -795,7 +808,10 @@ impl crate::train::BlockSource for ArrowSource {
                 return Ok(b.column(local).to_vec());
             }
         }
-        anyhow::bail!("特征 {feat} 不在任何列块里,共 {} 个特征", self.n_features)
+        anyhow::bail!(
+            "feature {feat} is not in any column block ({} features)",
+            self.n_features
+        )
     }
 
     /// 驻留的块直接借出列,零拷贝(见 trait 文档)。
@@ -816,10 +832,12 @@ impl crate::train::BlockSource for ArrowSource {
     /// "喂进来的 batch",没有回头再读的能力,所以做不了按需加载 ——
     /// 那是 `ParquetBlockSource` 的事(它能按 column chunk 重新读)。
     fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
-        let block = self
-            .blocks
-            .get(i)
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,一共 {} 个", self.blocks.len()))?;
+        let block = self.blocks.get(i).ok_or_else(|| {
+            anyhow::anyhow!(
+                "column block {i} does not exist ({} blocks)",
+                self.blocks.len()
+            )
+        })?;
         f(block);
         Ok(())
     }
@@ -922,7 +940,7 @@ mod tests {
                 assert_eq!(
                     src.bin_at(row, f),
                     dense.bin_at(row, f),
-                    "行 {row} 特征 {f}:Arrow 和 Dense 的 bin 不一致"
+                    "row {row} feature {f}: Arrow and Dense bins differ"
                 );
             }
         }
@@ -931,7 +949,7 @@ mod tests {
             assert_eq!(
                 src.cuts().cuts_for(f),
                 dense.cuts().cuts_for(f),
-                "特征 {f} 的 cuts"
+                "feature {f} cuts"
             );
         }
     }
@@ -946,7 +964,11 @@ mod tests {
         assert_eq!(src.bin_at(5, 1), MISSING_BIN);
         // 其余行不是缺失
         for row in [0usize, 2, 3, 4] {
-            assert_ne!(src.bin_at(row, 1), MISSING_BIN, "行 {row} 不该是缺失");
+            assert_ne!(
+                src.bin_at(row, 1),
+                MISSING_BIN,
+                "row {row} should not be missing"
+            );
         }
     }
 
@@ -966,7 +988,7 @@ mod tests {
                 assert_eq!(
                     split.bin_at(row, f),
                     whole.bin_at(row, f),
-                    "行 {row} 特征 {f}"
+                    "row {row} feature {f}"
                 );
             }
         }
@@ -989,7 +1011,7 @@ mod tests {
         }
         // 同一个值在两边落进同一个 bin
         for f in 0..3u32 {
-            assert_eq!(valid.bin_at(0, f), train.bin_at(3, f), "特征 {f}");
+            assert_eq!(valid.bin_at(0, f), train.bin_at(3, f), "feature {f}");
         }
     }
 
@@ -1000,10 +1022,13 @@ mod tests {
             .unwrap();
         let bs = vec![batch];
         let Err(err) = build_cuts_with_nthread(feed(&bs), 16, 8) else {
-            panic!("字符串列应该被拒绝");
+            panic!("string column should be rejected");
         };
         let msg = err.to_string();
-        assert!(msg.contains("只支持数值列"), "报错要说人话,实际是:{msg}");
+        assert!(
+            msg.contains("only numeric columns are supported"),
+            "error should be readable, got: {msg}"
+        );
     }
 
     #[test]
@@ -1014,18 +1039,18 @@ mod tests {
             .unwrap();
         let mixed = vec![bs[0].clone(), odd];
         let Err(err) = build_cuts_with_nthread(feed(&mixed), 16, 8) else {
-            panic!("列数不一致应该被拒绝");
+            panic!("mismatched column counts should be rejected");
         };
-        assert!(err.to_string().contains("列数不一致"), "{err}");
+        assert!(err.to_string().contains("column count differs"), "{err}");
     }
 
     #[test]
     fn empty_parallel_cut_input_is_rejected() {
         let empty = std::iter::empty::<anyhow::Result<RecordBatch>>();
         let Err(err) = build_cuts_with_nthread(empty, 16, 8) else {
-            panic!("空输入应该被拒绝");
+            panic!("empty input should be rejected");
         };
-        assert!(err.to_string().contains("一个 batch 都没有"), "{err}");
+        assert!(err.to_string().contains("no batches"), "{err}");
     }
 
     #[test]
@@ -1046,9 +1071,14 @@ mod tests {
             16,
             2,
         ) else {
-            panic!("两遍输入行数变化应该被拒绝");
+            panic!("a row count change between passes should be rejected");
         };
-        assert!(error.to_string().contains("两遍扫描行数不一致"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("row count differs between passes"),
+            "{error}"
+        );
     }
     /// The same 3 x 6 data as `batches()` but nulls spelled as a sentinel
     /// (-999 / 0 for the integer column), split over the same two batches.
