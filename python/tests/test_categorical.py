@@ -613,3 +613,20 @@ def test_unseen_validation_category_scores_like_predict_with_all_codes_used(miss
     pred = m.predict(xv)
     rmse = float(np.sqrt(np.mean((pred.astype(np.float64) - yv) ** 2)))
     assert hist["v"]["rmse"][-1] == pytest.approx(rmse, rel=1e-6)
+
+
+def test_fractional_validation_category_scores_like_predict():
+    # Validation values are binned like prediction reads them: a fractional
+    # code is truncated toward zero (XGBoost AsCat), so 1.5 is category 1.
+    x, y, ft = make_data(cat_levels=(5,), seed=24)
+    xv = x[:400].copy()
+    xv[::2, 2] += 0.5
+    yv = y[:400]
+    hist = {}
+    m = fb.train({"objective": "reg:squarederror", "max_depth": 3, "eval_metric": "rmse"}, x,
+                 label=y, feature_types=ft, evals=[(xv, yv, "v")], evals_result=hist,
+                 num_boost_round=4, quiet=True)
+    pred = m.predict(xv)
+    np.testing.assert_array_equal(pred, m.predict(np.trunc(xv).astype(np.float32)))
+    rmse = float(np.sqrt(np.mean((pred.astype(np.float64) - yv) ** 2)))
+    assert hist["v"]["rmse"][-1] == pytest.approx(rmse, rel=1e-6)

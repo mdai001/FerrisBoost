@@ -126,16 +126,19 @@ pub fn goes_left(words: &[u32], value: f32) -> bool {
 /// The bin of a categorical value under the training cuts of a feature with
 /// `n_bins` bins (`n_bins - 1` is the largest known code).
 ///
-/// Codes outside the trained range (or invalid values) are "unseen": they go
-/// left at every categorical node, so they map to `UNSEEN_CAT_BIN`, which no
-/// trained category set contains (training codes stop at `MAX_CAT_CODE`).
+/// A fractional value is truncated toward zero, as prediction does (XGBoost
+/// `AsCat`), so validation and prediction always pick the same category.
+/// Codes outside the trained range (negative, or at or above `n_bins`) are
+/// "unseen": they go left at every categorical node, so they map to
+/// `UNSEEN_CAT_BIN`, which no trained category set contains (training codes
+/// stop at `MAX_CAT_CODE`).
 /// Only validation sets quantized with the training cuts can reach this:
 /// training data is validated while the cuts are built.
 #[inline]
 pub fn code_to_bin(value: f32, n_bins: usize) -> u8 {
     debug_assert!(n_bins <= MAX_CAT_CODE as usize + 1);
-    if value >= 0.0 && value < n_bins as f32 && value == value.trunc() {
-        return value as u8;
+    if value >= 0.0 && value < n_bins as f32 {
+        return value as u8; // truncation toward zero, like `goes_left`
     }
     UNSEEN_CAT_BIN
 }
@@ -203,11 +206,21 @@ mod tests {
         assert_eq!(code_to_bin(3.0, 6), 3);
         assert_eq!(code_to_bin(6.0, 6), 254);
         assert_eq!(code_to_bin(-1.0, 6), 254);
-        assert_eq!(code_to_bin(2.5, 6), 254);
+        assert_eq!(code_to_bin(2.5, 6), 2);
+        assert_eq!(code_to_bin(5.9, 6), 5);
+        assert_eq!(code_to_bin(-0.5, 6), UNSEEN_CAT_BIN);
+        assert_eq!(code_to_bin(6.0, 6), UNSEEN_CAT_BIN);
         assert_eq!(code_to_bin(300.0, 254), UNSEEN_CAT_BIN);
         assert_eq!(code_to_bin(253.0, 254), 253);
         assert_eq!(code_to_bin(254.0, 254), UNSEEN_CAT_BIN);
         assert!(invalid_code(254.0));
+        // Validation binning and prediction agree on every value class.
+        let words = [0b0100u32]; // category 2 goes right
+        for v in [2.0f32, 2.5, 2.99, 1.5, -0.5, 7.0, 300.0] {
+            let bin = code_to_bin(v, 6);
+            let bin_left = bin == UNSEEN_CAT_BIN || words[0] >> bin & 1 == 0;
+            assert_eq!(bin_left, goes_left(&words, v), "value {v}");
+        }
         assert!(!invalid_code(253.0));
     }
 }
