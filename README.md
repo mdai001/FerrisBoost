@@ -249,6 +249,8 @@ logging, and the complete parameter reference.
 ### 0.0.7 (unreleased)
 
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
+- Added multiple quantiles in one model (`quantile_alpha` list).
+- Multiclass `predict_to_parquet` now streams.
 
 ### 0.0.6 (unreleased)
 

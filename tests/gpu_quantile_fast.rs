@@ -64,7 +64,7 @@ fn fast_quantile_is_deterministic_and_calibrated() {
     for alpha in [0.1f32, 0.5, 0.9] {
         for weighted in [false, true] {
             let what = format!("alpha={alpha} weighted={weighted}");
-            let obj = Objective::Quantile { alpha };
+            let obj = Objective::quantile(alpha);
             let weights = weighted.then_some(w.as_slice());
             let run = |math: GpuMath| {
                 let cfg = TrainConfig::new(quantile_params(math, 25), obj);
@@ -95,7 +95,7 @@ fn fast_quantile_with_row_sampling_is_deterministic() {
         let mut p = quantile_params(GpuMath::Fast, 6);
         p.subsample = 0.6;
         p.seed = 5;
-        let cfg = TrainConfig::new(p, Objective::Quantile { alpha: 0.7 });
+        let cfg = TrainConfig::new(p, Objective::quantile(0.7));
         let m = train_gpu(0, &source, &y, &[], &cfg, &mut [], &Local).unwrap();
         serde_json::to_vec(&m).unwrap()
     };
@@ -113,7 +113,7 @@ fn fast_quantile_first_round_matches_host_formulas() {
             let (_, y, w) = fixture(n_rows, 1, 3);
             let weights = weighted.then_some(w.as_slice());
             let alpha = 0.8f32;
-            let obj = Objective::Quantile { alpha };
+            let obj = Objective::quantile(alpha);
             let margin = obj.base_margin(obj.estimate_base_score(&y, weights));
             let config = SharedHistogramConfig {
                 runtime_log: false,

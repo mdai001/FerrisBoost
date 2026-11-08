@@ -572,6 +572,66 @@ impl Default for TrainParams {
     }
 }
 
+/// 一个模型里最多几个分位数(多输出 `reg:quantileerror`)。`Objective` 是 `Copy`,
+/// 所以 alpha 列表是定长数组 + 长度;这个上限只是数组容量,不是 XGBoost 的限制。
+pub const MAX_QUANTILE_ALPHAS: usize = 64;
+
+/// `quantile_alpha` 列表(升序)。构造时只检查个数;取值范围和升序由
+/// `Objective::validate_params` 检查(和 XGBoost `QuantileLossParam::Validate` 同一处)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantileAlphas {
+    len: u8,
+    values: [f32; MAX_QUANTILE_ALPHAS],
+}
+
+impl QuantileAlphas {
+    pub fn new(alphas: &[f32]) -> anyhow::Result<Self> {
+        anyhow::ensure!(!alphas.is_empty(), "quantile_alpha 不能是空列表");
+        anyhow::ensure!(
+            alphas.len() <= MAX_QUANTILE_ALPHAS,
+            "quantile_alpha 最多 {MAX_QUANTILE_ALPHAS} 个分位数,给了 {}",
+            alphas.len()
+        );
+        let mut values = [0.0f32; MAX_QUANTILE_ALPHAS];
+        values[..alphas.len()].copy_from_slice(alphas);
+        Ok(Self {
+            len: alphas.len() as u8,
+            values,
+        })
+    }
+
+    pub const fn single(alpha: f32) -> Self {
+        let mut values = [0.0f32; MAX_QUANTILE_ALPHAS];
+        values[0] = alpha;
+        Self { len: 1, values }
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &self.values[..self.len as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl serde::Serialize for QuantileAlphas {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for QuantileAlphas {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Vec::<f32>::deserialize(d)?;
+        Self::new(&v).map_err(serde::de::Error::custom)
+    }
+}
+
 /// 训练目标。带参数的变体存的是 XGBoost 同名参数的**解析后**的值;
 /// 行为(梯度、链接函数、校验、JSON)全部在 `crate::objective` 里。
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -602,12 +662,13 @@ pub enum Objective {
     Softmax {
         num_class: u32,
     },
-    /// `reg:quantileerror`,单个 `quantile_alpha` ∈ [0, 1]。XGBoost 3.4.1 的
-    /// 实现是**平滑 pinball 损失**,梯度依赖每轮由全体行的预测归约出的标量
-    /// scale,所以它是唯一一个梯度不是逐行纯函数的 objective(见
-    /// `Objective::quantile_scale`)。向量 alpha(多输出)不支持。
+    /// `reg:quantileerror`,`quantile_alpha` ∈ [0, 1](升序,XGBoost 同样要求)。
+    /// XGBoost 3.4.1 的实现是**平滑 pinball 损失**,梯度依赖每轮由全体行的预测
+    /// 归约出的标量 scale,所以它是唯一一个梯度不是逐行纯函数的 objective(见
+    /// `Objective::quantile_scale`)。多个 alpha = 多输出模型:`one_output_per_tree`,
+    /// 每轮每个 alpha 一棵树(和多分类同一套 `num_outputs()` 机制)。
     Quantile {
-        alpha: f32,
+        alphas: QuantileAlphas,
     },
     /// `rank:ndcg` / `rank:pairwise` / `rank:map` (LambdaMART). Gradients are per
     /// query group, not per row (see `crate::rank`); the scores are raw margins.

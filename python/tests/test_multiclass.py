@@ -322,3 +322,132 @@ def test_multiclass_parquet_output_inside_input_directory(tmp_path):
         np.testing.assert_array_equal(np.column_stack([got[c].to_numpy() for c in got.column_names]),
                                       m.predict(x))
         (out).unlink()
+
+
+# ---------------------------------------------------------------- streaming predict_to_parquet
+ROW_GROUP = 1024 * 1024
+
+
+def _big_input(tmp_path, x, copies, row_group_size=50_000):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    big = np.tile(x, (copies, 1))
+    src = str(tmp_path / "big.parquet")
+    pq.write_table(pa.table({f"f{i}": big[:, i] for i in range(big.shape[1])}), src,
+                   row_group_size=row_group_size)
+    return src, big
+
+
+def _columns(table):
+    return np.column_stack([table[c].to_numpy() for c in table.column_names])
+
+
+@pytest.mark.parametrize("kind", ["softprob", "margin", "softmax", "quantile", "quantile_margin"])
+def test_streaming_parquet_matches_in_memory_and_row_groups(tmp_path, kind):
+    # > 2 Parquet row groups of output: the batches of the input never line up with them.
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=600, k=3, seed=31)
+    if kind.startswith("quantile"):
+        m = fb.train({"objective": "reg:quantileerror", "quantile_alpha": [0.1, 0.5, 0.9],
+                      "max_depth": 3}, x, label=y, num_boost_round=3, quiet=True)
+    else:
+        obj = "multi:softmax" if kind == "softmax" else "multi:softprob"
+        m = fb.train({"objective": obj, "num_class": 3, "max_depth": 3}, x, label=y,
+                     num_boost_round=3, quiet=True)
+    src, big = _big_input(tmp_path, x, 3500)  # 2.1M rows
+    margin = kind in ("margin", "quantile_margin")
+    expected = m.predict(big, output_margin=margin)
+    out = str(tmp_path / "out.parquet")
+    n = m.predict_to_parquet(src, out, output_margin=margin, prediction_column="p")
+    assert n == len(big)
+    meta = pq.ParquetFile(out).metadata
+    assert [meta.row_group(i).num_rows for i in range(meta.num_row_groups)] == [
+        ROW_GROUP, ROW_GROUP, len(big) - 2 * ROW_GROUP]
+    table = pq.read_table(out)
+    if kind == "softmax":
+        assert table.column_names == ["p"]
+        np.testing.assert_array_equal(table["p"].to_numpy(), expected)
+    else:
+        assert table.column_names == ["p_0", "p_1", "p_2"]
+        np.testing.assert_array_equal(_columns(table), expected)
+    # the file does not depend on the worker split
+    out2 = str(tmp_path / "out2.parquet")
+    m.predict_to_parquet(src, out2, output_margin=margin, prediction_column="p",
+                         predict_threads=1)
+    assert open(out, "rb").read() == open(out2, "rb").read()
+
+
+def test_streaming_multi_output_parquet_equals_one_shot_write(tmp_path):
+    # Writing the whole output in one call (what 0.0.6 did for multi-output models) and
+    # streaming it in batches produce the same table and row groups.
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=500, k=4, seed=32)
+    m = fb.train({"objective": "multi:softprob", "num_class": 4, "max_depth": 3}, x, label=y,
+                 num_boost_round=3, quiet=True)
+    src, big = _big_input(tmp_path, x, 2200)  # 1.1M rows: two row groups
+    out = str(tmp_path / "stream.parquet")
+    m.predict_to_parquet(src, out)
+    pred = m.predict(big)
+    schema = pa.schema([pa.field(f"prediction_{c}", pa.float32(), nullable=False) for c in range(4)])
+    table = pa.table({f"prediction_{c}": pred[:, c] for c in range(4)}, schema=schema)
+    ref = str(tmp_path / "oneshot.parquet")
+    with pq.ParquetWriter(ref, schema, compression="snappy") as writer:
+        writer.write_table(table, row_group_size=ROW_GROUP)
+    got, want = pq.read_table(out), pq.read_table(ref)
+    assert got.equals(want)
+    assert pq.ParquetFile(out).metadata.num_row_groups == pq.ParquetFile(ref).metadata.num_row_groups
+
+
+def test_streaming_multi_output_parquet_single_row_and_headerless_csv(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=300, k=3, seed=33)
+    x = np.nan_to_num(x, nan=4.0)
+    m = fb.train({"objective": "multi:softprob", "num_class": 3}, x, label=y,
+                 num_boost_round=2, quiet=True)
+    one = str(tmp_path / "one.parquet")
+    pq.write_table(pa.table({f"f{i}": x[:1, i] for i in range(x.shape[1])}), one)
+    out = str(tmp_path / "o1.parquet")
+    assert m.predict_to_parquet(one, out) == 1
+    np.testing.assert_array_equal(_columns(pq.read_table(out)), m.predict(x[:1]))
+    csv = tmp_path / "x.csv"
+    np.savetxt(csv, x, delimiter=",", fmt="%.9g")
+    out = str(tmp_path / "o2.parquet")
+    assert m.predict_to_parquet(str(csv), out, header=False) == len(y)
+    np.testing.assert_array_equal(_columns(pq.read_table(out)), m.predict(x))
+
+
+def test_streaming_multi_output_parquet_memory_is_bounded(tmp_path):
+    # The output of 3M rows x 8 outputs is 96 MB per copy (the in-memory 0.0.6 path grew
+    # the peak RSS by about 60 MB here, streaming by about 0). Building it in memory needs
+    # several copies. The streaming path must stay far below that, whatever the row count.
+    import subprocess
+    import sys
+    import textwrap
+
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    x, y = make(n=1000, k=8, seed=41)
+    m = fb.train({"objective": "multi:softprob", "num_class": 8, "max_depth": 3}, x, label=y,
+                 num_boost_round=2, quiet=True)
+    model_path = str(tmp_path / "m.json")
+    m.save_model(model_path, quiet=True)
+    n_rows = 3_000_000
+    big = np.tile(x, (n_rows // len(x), 1))
+    src = str(tmp_path / "big.parquet")
+    pq.write_table(pa.table({f"f{i}": big[:, i] for i in range(big.shape[1])}), src,
+                   row_group_size=100_000)
+    del big
+    code = textwrap.dedent(f"""
+        import resource, ferrisboost as fb
+        m = fb.Model.load_model({model_path!r}, quiet=True)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        n = m.predict_to_parquet({src!r}, {str(tmp_path / "o.parquet")!r})
+        after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(n, (after - before) // 1024)
+    """)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    rows, growth_mb = map(int, out.stdout.split())
+    assert rows == n_rows
+    assert growth_mb < 30, f"peak RSS grew by {growth_mb} MB"

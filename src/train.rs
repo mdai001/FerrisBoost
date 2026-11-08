@@ -1032,6 +1032,10 @@ fn train_with_backend(
         cfg.objective.validate_labels(labels, "训练集")?;
         match cfg.base_score {
             Some(b) => vec![b; num_class],
+            // 多分位数:每个 alpha 一个标签分位数截距。
+            None if cfg.objective.is_multi_quantile() => {
+                cfg.objective.initial_quantile_margins(labels, weights)
+            }
             None => cfg.objective.initial_class_margins(labels, weights),
         }
     } else {
@@ -1283,6 +1287,7 @@ fn train_with_backend(
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
                     n_outputs: num_class,
+                    multi_quantile: cfg.objective.is_multi_quantile(),
                     // Device LambdaMART buffers (fast ranking only); the planner
                     // charges the same shape.
                     fast_rank: match (ranking, cfg.group_ptr.as_deref()) {
@@ -1972,18 +1977,32 @@ fn train_multiclass_rounds(
         .collect();
     let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
     let device_quant = gpu.is_some_and(|c| c.device_quantize_enabled());
+    let multi_quantile = cfg.objective.is_multi_quantile();
 
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
         if fast_math {
-            let _t = prof::Timer::new(&prof::GRAD);
-            gpu.expect("fast_math 蕴含 gpu 存在")
-                .fast_multiclass_begin_round()?;
+            // 多分位数没有每轮的行统计量:每个目标的 scale 在它自己的 kernel 里归约。
+            if !multi_quantile {
+                let _t = prof::Timer::new(&prof::GRAD);
+                gpu.expect("fast_math 蕴含 gpu 存在")
+                    .fast_multiclass_begin_round()?;
+            }
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
-                cfg.objective
-                    .softmax_gradients(&class_preds, labels, weights, &mut grads)
+                match cfg.objective.quantile_alphas() {
+                    Some(alphas) => quantile_multi_gradients(
+                        alphas.as_slice(),
+                        &class_preds,
+                        labels,
+                        weights,
+                        &mut grads,
+                    ),
+                    None => cfg
+                        .objective
+                        .softmax_gradients(&class_preds, labels, weights, &mut grads),
+                }
             });
         }
         for class in 0..k_count {
@@ -2016,12 +2035,22 @@ fn train_multiclass_rounds(
                 // kernel、无条件执行 —— 采样掩码不是预测掩码。
                 let ctx = gpu.expect("fast_math 蕴含 gpu 存在");
                 let _t = prof::Timer::new(&prof::QUANTIZE);
-                let (q, root, _ms) = ctx.fast_multiclass_gradient_and_quantize(
-                    class,
-                    crate::subsample::threshold_for(cfg.params.subsample),
-                    cfg.params.seed,
-                    tree_index,
-                )?;
+                let (q, root, _ms) = if multi_quantile {
+                    ctx.fast_multiquantile_gradient_and_quantize(
+                        class,
+                        cfg.objective.quantile_alphas().expect("multi quantile").as_slice()[class],
+                        crate::subsample::threshold_for(cfg.params.subsample),
+                        cfg.params.seed,
+                        tree_index,
+                    )?
+                } else {
+                    ctx.fast_multiclass_gradient_and_quantize(
+                        class,
+                        crate::subsample::threshold_for(cfg.params.subsample),
+                        cfg.params.seed,
+                        tree_index,
+                    )?
+                };
                 (q, Vec::new(), Some(root))
             } else if device_quant {
                 let ctx = gpu.expect("device_quant 蕴含 gpu 存在");
@@ -2084,7 +2113,11 @@ fn train_multiclass_rounds(
                 )
             })?;
             // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
-            if fast_math {
+            if fast_math && multi_quantile {
+                // 下一棵树(下一个目标)会覆盖 delta buffer:立刻并进这个目标的列。
+                gpu.expect("fast_math 蕴含 gpu 存在")
+                    .fast_multiquantile_apply_delta(class)?;
+            } else if fast_math {
                 gpu.expect("fast_math 蕴含 gpu 存在")
                     .fast_multiclass_apply_delta(class)?;
             }
@@ -2140,6 +2173,34 @@ fn train_multiclass_rounds(
         model.best_score = Some(score);
     }
     Ok(model)
+}
+
+/// 多分位数一轮的梯度:每个 alpha(= 目标)各自的 scale 和逐行梯度,
+/// `out[k]` 是第 k 个 alpha 的梯度列(已乘样本权重)。
+///
+/// XGBoost `QuantileRegression::GetGradient`:每个目标独立求
+/// `S_j = (Σ w·sqrt|p_j − y| / Σ w)²`(f32 逐行乘积、f64 串行累加),所以和单 alpha
+/// 路径逐位相同,而且目标之间互不影响 —— 第 k 棵树只改第 k 列预测,
+/// 一轮开头一次算完和每棵树前各算一次结果一样。
+fn quantile_multi_gradients(
+    alphas: &[f32],
+    class_preds: &[Vec<f32>],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &mut [Vec<GradPair>],
+) {
+    debug_assert_eq!(alphas.len(), class_preds.len());
+    out.par_iter_mut()
+        .zip(class_preds.par_iter())
+        .zip(alphas.par_iter())
+        .for_each(|((col, preds), &alpha)| {
+            let qs = Objective::quantile_scale(preds, labels, weights);
+            let obj = Objective::quantile(alpha);
+            *col = match weights {
+                None => compute_gradients(preds, labels, obj, qs),
+                Some(w) => compute_gradients_weighted(preds, labels, w, obj, qs),
+            };
+        });
 }
 
 /// K 份按类排的预测 → 按行排的 `n × K`。
@@ -3735,8 +3796,9 @@ pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
 #[inline]
 fn gradient_of(pred: f32, label: f32, obj: Objective, quantile_scale: f32) -> GradPair {
     match obj {
-        Objective::Quantile { alpha } => {
-            Objective::quantile_gradient(alpha, quantile_scale, pred, label)
+        // 单目标路径(多个 alpha 时按目标拆成单 alpha 的 objective 再调用)。
+        Objective::Quantile { alphas } => {
+            Objective::quantile_gradient(alphas.as_slice()[0], quantile_scale, pred, label)
         }
         _ => obj.gradient(pred, label),
     }
@@ -5052,8 +5114,8 @@ mod tests {
             (Objective::SquaredError, 0.5f32, false),
             (Objective::SquaredError, 0.7, true),
             (Objective::Logistic, 0.6, true),
-            (Objective::Quantile { alpha: 0.7 }, 0.5, false),
-            (Objective::Quantile { alpha: 0.3 }, 0.8, true),
+            (Objective::quantile(0.7), 0.5, false),
+            (Objective::quantile(0.3), 0.8, true),
         ] {
             let mut p = params(5, 5);
             p.subsample = subsample;
@@ -5291,7 +5353,7 @@ mod tests {
     fn quantile_objective_trains_reproducibly_and_tracks_the_quantile() {
         let (x, y, nf) = wiggly_data(2000, 4);
         for alpha in [0.1f32, 0.5, 0.9] {
-            let obj = Objective::Quantile { alpha };
+            let obj = Objective::quantile(alpha);
             let mut p = params(4, 30);
             p.nthread = 1;
             let (a, src) = train_on(&x, &y, nf, p.clone(), obj);
@@ -5303,6 +5365,47 @@ mod tests {
             let frac = below as f32 / y.len() as f32;
             assert!((frac - alpha).abs() < 0.12, "alpha={alpha} frac={frac}");
         }
+    }
+
+    #[test]
+    fn multi_quantile_trains_one_tree_per_alpha_and_equals_single_alpha_models() {
+        let (x, y, nf) = wiggly_data(2000, 5);
+        let alphas = [0.1f32, 0.5, 0.9];
+        let multi_obj = Objective::quantile(0.5).with_quantile_alphas(&alphas).unwrap();
+        let mut p = params(4, 6);
+        p.nthread = 1;
+        let (multi, src) = train_on(&x, &y, nf, p.clone(), multi_obj);
+        assert_eq!(multi.trees.len(), 6 * alphas.len());
+        assert_eq!(multi.num_outputs(), alphas.len());
+        // The thread count never changes the model.
+        let mut p4 = p.clone();
+        p4.nthread = 4;
+        let (multi4, _) = train_on(&x, &y, nf, p4, multi_obj);
+        assert_eq!(json(&multi), json(&multi4));
+        // Column j is the single-alpha model trained alone (no sampling): same trees, same
+        // per-alpha intercept.
+        for (j, &alpha) in alphas.iter().enumerate() {
+            let (single, _) = train_on(&x, &y, nf, p.clone(), Objective::quantile(alpha));
+            let view = multi.class_view(j);
+            assert_eq!(view.base_score, single.base_score, "alpha={alpha}");
+            assert_eq!(view.trees.len(), single.trees.len());
+            let a = predict_on(&view, &src).unwrap();
+            let b = predict_on(&single, &src).unwrap();
+            assert_eq!(a, b, "alpha={alpha}");
+        }
+        // JSON: num_target = K, vector base_score, lossless round trip.
+        let doc: serde_json::Value = serde_json::from_str(&json(&multi)).unwrap();
+        let mp = &doc["learner"]["learner_model_param"];
+        assert_eq!(mp["num_target"], "3");
+        assert_eq!(mp["num_class"], "0");
+        let back = Model::from_xgboost_json(&json(&multi)).unwrap();
+        assert_eq!(back.objective, multi_obj);
+        assert_eq!(back.class_base_margins, multi.class_base_margins);
+        assert_eq!(json(&back), json(&multi));
+        // Row predictions are sorted per row (non-crossing quantiles).
+        let row: Vec<f32> = x[..nf].to_vec();
+        let pred = back.predict_row(&row);
+        assert!(pred.windows(2).all(|w| w[0] <= w[1]), "{pred:?}");
     }
 
     #[test]

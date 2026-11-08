@@ -37,10 +37,17 @@ pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usiz
 /// 规划器和 `GpuTrainCtx::new` **都调用这一个函数**,所以两边不可能漂移。
 /// 单输出(`K <= 1`)恒为 0。
 pub(crate) fn fast_multiclass_extra_bytes(n_rows: u64, n_outputs: u64) -> u64 {
+    fast_multi_output_extra_bytes(n_rows, n_outputs, true)
+}
+
+/// 同上,但 `softmax_stats = false` 时不含每行 softmax 统计量:多个 `quantile_alpha`
+/// 的 fast 训练只多出 `(K-1) × n` 的 prediction 列(每个目标的 scale 复用同一块
+/// 固定大小的归约暂存,逐个目标串行用完)。
+pub(crate) fn fast_multi_output_extra_bytes(n_rows: u64, n_outputs: u64, softmax_stats: bool) -> u64 {
     if n_outputs <= 1 {
         0
     } else {
-        n_rows * 4 * (n_outputs - 1) + n_rows * 8
+        n_rows * 4 * (n_outputs - 1) + if softmax_stats { n_rows * 8 } else { 0 }
     }
 }
 
@@ -210,6 +217,12 @@ impl StreamingMemModel {
     /// [`fast_multiclass_extra_bytes`]);单输出或 exact 下不得调用(等价于加 0)。
     pub fn with_fast_multiclass(mut self, n_rows: u64, n_outputs: u64) -> Self {
         self.fixed_bytes += fast_multiclass_extra_bytes(n_rows, n_outputs);
+        self
+    }
+
+    /// `gpu_math = "fast"` 多个 `quantile_alpha`:K 份常驻 prediction,没有 softmax 统计量。
+    pub fn with_fast_multi_quantile(mut self, n_rows: u64, n_outputs: u64) -> Self {
+        self.fixed_bytes += fast_multi_output_extra_bytes(n_rows, n_outputs, false);
         self
     }
 
@@ -1195,6 +1208,25 @@ mod resolve_tests {
         assert_eq!(weighted.fixed_bytes, base.fixed_bytes + 4_000_000);
         assert_eq!(weighted.per_col_bytes, base.per_col_bytes);
         assert_eq!(weighted.slot_col_bytes, base.slot_col_bytes);
+    }
+
+    #[test]
+    fn fast_multi_quantile_adds_only_the_extra_prediction_columns() {
+        let rows = 1_000_000u64;
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        assert_eq!(
+            base.with_fast_multi_quantile(rows, 1).fixed_bytes,
+            base.fixed_bytes
+        );
+        for k in [2u64, 3, 19] {
+            let q = base.with_fast_multi_quantile(rows, k);
+            // (K-1) x 4 B/row, no softmax statistics (the scale scratch is shared).
+            assert_eq!(q.fixed_bytes, base.fixed_bytes + rows * 4 * (k - 1));
+            assert_eq!(
+                q.fixed_bytes - base.fixed_bytes,
+                fast_multi_output_extra_bytes(rows, k, false)
+            );
+        }
     }
 
     #[test]

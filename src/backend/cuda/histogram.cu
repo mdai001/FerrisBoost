@@ -803,7 +803,7 @@ extern "C" __global__ void add_class_delta(
 //
 // `gpu_math = "fast"` 的 reg:quantileerror。梯度依赖每轮的全局 scale
 // `S = (Σ w·sqrt|p-y| / Σ w)^2`(XGBoost 3.4.1 quantile_obj.cu),所以一轮是三个 kernel:
-//   1. `quantile_apply_delta_partials` —— 施加叶子增量,同时对每个 block 归约
+//   1. `quantile_apply_delta_partials` —— 施加叶子增量(delta 为空则只读),同时对每个 block 归约
 //      `Σ w·sqrtf|p-y|` 与 `Σ w`(f64),写进 partials[2*block + {0,1}];
 //   2. `quantile_reduce_scale` —— 单 block 按固定顺序归约 partials,写出 S;
 //   3. `quantile_gradient_rows` —— 读 S,逐行出 grad/hess(含样本权重和行采样)。
@@ -832,9 +832,14 @@ extern "C" __global__ void quantile_apply_delta_partials(
     double sum_w = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
-        // 预测更新无条件执行(采样掩码不是预测掩码)。
-        const float p = __fadd_rn(pred[i], delta[i]);
-        pred[i] = p;
+        // 预测更新无条件执行(采样掩码不是预测掩码)。delta 为空指针 = 这一列的
+        // 叶子增量已经另行施加(多分位数:每个目标一列,`add_class_delta` 在每棵树之后
+        // 立即施加,因为 delta buffer 会被下一棵树覆盖),这里只读。
+        float p = pred[i];
+        if (delta != nullptr) {
+            p = __fadd_rn(p, delta[i]);
+            pred[i] = p;
+        }
         const float r = __fsqrt_rn(fabsf(__fsub_rn(p, label[i])));
         if (has_weight) {
             const float w = weight[i];

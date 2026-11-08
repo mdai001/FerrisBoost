@@ -22,7 +22,8 @@ class Model:
         ...
     @property
     def num_class(self) -> int:
-        """Number of classes for multiclass models; 1 otherwise."""
+        """Number of outputs: classes for multiclass models, quantiles for a
+        multi-quantile model (several quantile_alpha values); 1 otherwise."""
         ...
     def predict(
         self,
@@ -45,7 +46,9 @@ class Model:
         The result is 1-D with shape (n,), except for multiclass models:
         multi:softprob returns (n, num_class) probabilities, multi:softmax
         returns (n,) class indices (as float32), and output_margin=True returns
-        (n, num_class) raw margins for either multiclass objective.
+        (n, num_class) raw margins for either multiclass objective. A model with
+        several quantile_alpha values returns (n, n_quantiles), each row sorted
+        ascending (output_margin=True gives the unsorted per-quantile scores).
 
         File inputs accept PathLike, lists, directories, and globs. Pass
         header=False for headerless CSV. All trees are used unless n_trees is
@@ -121,11 +124,12 @@ class Model:
         """CPU-score file inputs and write ordered float32 predictions to Parquet.
 
         The target must not exist. Return the number of rows written. Multiclass
-        models write columns {prediction_column}_0, {prediction_column}_1, ...
-        (multi:softprob or output_margin=True) or one class-index column
-        (multi:softmax); in this version that path builds the output in memory
-        before writing (the input is still read once). missing has the same
-        meaning as in predict.
+        models and multi-quantile models write columns {prediction_column}_0,
+        {prediction_column}_1, ... (multi:softprob, output_margin=True, or one
+        column per quantile) or one class-index column (multi:softmax). Every
+        output streams in bounded batches (the input is read once; each batch is
+        scored for all outputs and written before the next is read). missing has
+        the same meaning as in predict.
         """
         ...
     def save_model(

@@ -403,7 +403,13 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
             Box::new(Elementwise::new(Ew::TweedieNll(variance_power), obj))
         }
         Objective::PseudoHuber { slope } => Box::new(Elementwise::new(Ew::Mphe(slope), obj)),
-        Objective::Quantile { alpha } => Box::new(Elementwise::new(Ew::Quantile(alpha), obj)),
+        Objective::Quantile { alphas } if alphas.len() > 1 => {
+            Box::new(MultiQuantile::new(alphas.as_slice()))
+        }
+        Objective::Quantile { alphas } => Box::new(Elementwise::new(
+            Ew::Quantile(alphas.as_slice()[0]),
+            obj,
+        )),
         Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
             Box::new(MultiClass::new(MultiKind::LogLoss, num_class as usize))
         }
@@ -436,6 +442,19 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
             "eval_metric {name:?} 不支持:它是排序指标,需要排序 objective \
              (rank:ndcg / rank:pairwise / rank:map)和 query groups"
         ));
+    }
+    // 多分位数(多目标)只接 quantile:XGBoost 的其它逐行指标要求预测和标签等长。
+    if let Objective::Quantile { alphas } = obj {
+        if alphas.len() > 1 {
+            return match name {
+                "quantile" => Ok(Box::new(MultiQuantile::new(alphas.as_slice()))),
+                _ => Err(format!(
+                    "eval_metric {name:?} 不能用于多个 quantile_alpha 的 reg:quantileerror:\
+                     预测是 n × {} 而标签是 n;多输出模型只支持 \"quantile\"",
+                    alphas.len()
+                )),
+            };
+        }
     }
     // 多分类只接 mlogloss / merror(XGBoost 对其它指标会因为预测长度不符报错)。
     if obj.is_multiclass() {
@@ -557,7 +576,7 @@ impl Ew {
                 _ => crate::objective::HUBER_DEFAULT_SLOPE,
             })),
             "quantile" => match obj {
-                Objective::Quantile { alpha } => no_param(Ew::Quantile(alpha)),
+                Objective::Quantile { alphas } => no_param(Ew::Quantile(alphas.as_slice()[0])),
                 _ => Err(
                     "eval_metric \"quantile\" 需要 objective=\"reg:quantileerror\"(它的 alpha \
                      来自 quantile_alpha)"
@@ -747,6 +766,68 @@ impl Metric for Elementwise {
         }
         let (esum, wsum) = self.sums(pred, label, weight);
         self.kind.finish(esum, wsum) as f32
+    }
+}
+
+// ---------------------------------------------------------------- 多分位数指标
+//
+// XGBoost `QuantileError`(`elementwise_metric.cu`),`quantile_alpha` 有多个值时:
+// 预测先按行升序排(`EvalTransform` = `PredTransform`,防交叉),然后对全部
+// (行, alpha) 对求和 —— 行主序 `i = row·K + a`,`loss·w` 在 f64 里累加,权重每个
+// 对各算一次,所以结果是各 alpha 加权平均损失的均值。
+
+pub struct MultiQuantile {
+    alphas: Vec<f32>,
+}
+
+impl MultiQuantile {
+    pub fn new(alphas: &[f32]) -> Self {
+        Self {
+            alphas: alphas.to_vec(),
+        }
+    }
+}
+
+impl Metric for MultiQuantile {
+    fn name(&self) -> &str {
+        "quantile"
+    }
+
+    fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
+        self.eval_weighted(pred, label, None)
+    }
+
+    fn supports_weights(&self) -> bool {
+        true
+    }
+
+    fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
+        let k = self.alphas.len();
+        assert_eq!(
+            pred.len(),
+            label.len() * k,
+            "quantile 的预测长度必须是 n × quantile_alpha 个数"
+        );
+        assert!(!label.is_empty(), "quantile 不能评估空数据");
+        let mut row = vec![0.0f32; k];
+        let (mut esum, mut wsum) = (0.0f64, 0.0f64);
+        for (i, &y) in label.iter().enumerate() {
+            let w = weight.map_or(1.0f32, |w| w[i]);
+            row.copy_from_slice(&pred[i * k..(i + 1) * k]);
+            crate::objective::sort_row_ascending(&mut row);
+            for (&a, &p) in self.alphas.iter().zip(&row) {
+                let d = y - p;
+                let sign = f32::from(d >= 0.0);
+                let loss = (a * sign * d) - (1.0 - a) * (1.0 - sign) * d;
+                esum += (loss * w) as f64;
+                wsum += w as f64;
+            }
+        }
+        if wsum == 0.0 {
+            esum as f32
+        } else {
+            (esum / wsum) as f32
+        }
     }
 }
 
@@ -943,6 +1024,35 @@ mod tests {
             LogLoss.eval_weighted(&[1.0, 2.0, 3.0], &[0.0; 3], Some(&z)),
             0.0
         );
+    }
+
+    #[test]
+    fn multi_quantile_metric_is_the_mean_of_per_alpha_losses_on_sorted_rows() {
+        let alphas = [0.2f32, 0.8];
+        let obj = Objective::quantile(0.5).with_quantile_alphas(&alphas).unwrap();
+        let m = for_objective("quantile", obj).unwrap();
+        assert_eq!(m.name(), "quantile");
+        assert_eq!(default_metric(obj).name(), "quantile");
+        // Row 1 has crossing margins (3 > 1): the metric sorts it to [1, 3] first.
+        let pred = [0.0f32, 2.0, 3.0, 1.0, 5.0, 6.0];
+        let label = [1.0f32, 2.0, 7.0];
+        let w = [1.0f32, 2.0, 0.5];
+        let sorted = [[0.0f32, 2.0], [1.0, 3.0], [5.0, 6.0]];
+        let (mut e, mut ws) = (0.0f64, 0.0f64);
+        for (i, row) in sorted.iter().enumerate() {
+            for (&a, &p) in alphas.iter().zip(row) {
+                let single = Elementwise::new(Ew::Quantile(a), Objective::quantile(a));
+                let loss = single.eval_weighted(&[p], &[label[i]], Some(&[1.0])) * w[i];
+                e += f64::from(loss);
+                ws += f64::from(w[i]);
+            }
+        }
+        let got = m.eval_weighted(&pred, &label, Some(&w));
+        assert!((f64::from(got) - e / ws).abs() < 1e-6, "{got} vs {}", e / ws);
+        // Other elementwise metrics need prediction and label of equal length.
+        let err = for_objective("mae", obj).err().unwrap();
+        assert!(err.contains("quantile"), "{err}");
+        assert!(m.supports_weights() && m.lower_is_better());
     }
 
     #[test]

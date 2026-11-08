@@ -57,8 +57,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_delta_step": None,
     "tweedie_variance_power": 1.5,
     "huber_slope": 1.0,
-    # reg:quantileerror 必须给:单个 [0, 1] 内的分位数(长度 1 的列表也收)。
-    # 向量(多分位数 = 多输出)不支持。
+    # reg:quantileerror 必须给:[0, 1] 内的分位数,标量或升序列表
+    # (多个值 = 多输出模型,每个分位数一棵树)。
     "quantile_alpha": None,
     # multi:softprob / multi:softmax 必须给;其它 objective 忽略。
     "num_class": None,
@@ -337,26 +337,28 @@ def _normalize_missing(value: Any) -> float:
         raise ValueError(f"missing 要是数字(默认 NaN),给的是 {value!r}") from None
 
 
-def _normalize_quantile_alpha(value: Any, objective: str) -> float | None:
-    """`quantile_alpha` -> float | None。长度 1 的序列等价于标量;多个值是多输出,不支持。"""
+def _normalize_quantile_alpha(value: Any, objective: str) -> list[float] | None:
+    """`quantile_alpha` -> list[float] | None. A scalar is a one-element list; several
+    values train one model with one output (and one tree per round) per quantile."""
     if value is None:
         if objective == "reg:quantileerror":
             raise ValueError(
-                "reg:quantileerror 需要 quantile_alpha(单个 [0, 1] 内的分位数,例如 0.9)"
+                "reg:quantileerror 需要 quantile_alpha(一个或多个 [0, 1] 内、升序的分位数,"
+                "例如 0.9 或 [0.1, 0.5, 0.9])"
             )
         return None
     if isinstance(value, (list, tuple, np.ndarray)):
-        flat = np.asarray(value, dtype=np.float64).ravel()
-        if flat.size != 1:
-            raise ValueError(
-                f"quantile_alpha 给了 {flat.size} 个值;多分位数(多输出)不支持,"
-                "请每个分位数训一个模型"
-            )
-        value = flat[0]
-    alpha = float(value)
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError(f"quantile_alpha 要在 [0, 1] 内,给的是 {alpha}")
-    return alpha
+        flat = np.asarray(value, dtype=np.float64).ravel().tolist()
+    else:
+        flat = [float(value)]
+    if not flat:
+        raise ValueError("quantile_alpha 不能是空列表")
+    for alpha in flat:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"quantile_alpha 要在 [0, 1] 内,给的是 {alpha}")
+    if any(a > b for a, b in zip(flat, flat[1:])):
+        raise ValueError(f"quantile_alpha 必须按升序排列(XGBoost 同样要求),给的是 {flat}")
+    return flat
 
 
 def _monotone_sign(value: Any, where: str) -> int:

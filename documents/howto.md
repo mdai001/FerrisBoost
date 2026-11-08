@@ -234,8 +234,10 @@ feature has fewer distinct values than `max_bin`.
 
 ### Quantile regression
 
-`reg:quantileerror` fits one conditional quantile and requires a scalar
-`quantile_alpha` in `[0, 1]` (XGBoost has no default either):
+`reg:quantileerror` fits conditional quantiles and requires `quantile_alpha`
+in `[0, 1]` (XGBoost has no default either): one value, or an ascending list
+for several quantiles in one model (see [Several quantiles in one
+model](#several-quantiles-in-one-model)):
 
 ```python
 upper = fb.train(
@@ -258,13 +260,46 @@ distinct values than `max_bin` and XGBoost runs with `nthread=1`. XGBoost sums
 the global scale in a thread-dependent order; FerrisBoost sums it serially, so
 its models do not depend on `nthread`.
 
-Limits: several `quantile_alpha` values (multi-output) are rejected, one model
-per quantile is the supported pattern. `gpu_math="fast"` is supported: the
-scale is reduced on the device in a fixed shape (fixed block count, per-block
-partial sums, one final single-block reduction in a fixed order, no float
-atomics), so a fast run is deterministic from run to run, but it is not
-byte-identical to the CPU (the summation order and the device `tanh` differ);
-`gpu_math="exact"` stays byte-identical to the CPU.
+`gpu_math="fast"` is supported: the scale is reduced on the device in a fixed
+shape (fixed block count, per-block partial sums, one final single-block
+reduction in a fixed order, no float atomics), so a fast run is deterministic
+from run to run, but it is not byte-identical to the CPU (the summation order
+and the device `tanh` differ); `gpu_math="exact"` stays byte-identical to the
+CPU.
+
+#### Several quantiles in one model
+
+Pass an ascending list to train one model with one output per quantile, as
+XGBoost does with `quantile_alpha=[0.1, 0.5, 0.9]`:
+
+```python
+model = fb.train(
+    {"objective": "reg:quantileerror", "quantile_alpha": [0.1, 0.5, 0.9], "max_depth": 4},
+    Xr, label=noisy, num_boost_round=100,
+    evals=[(Xr, noisy, "train")],              # one averaged "quantile" metric
+)
+q = model.predict(Xr)                          # shape (n, 3), one column per alpha
+```
+
+Each round builds one tree per quantile (`num_class`-style, XGBoost's
+`one_output_per_tree`), so `model.num_trees` is `3 * num_boost_round`. Every
+quantile has its own global scale and its own starting prediction: the
+`quantile_alpha_j` quantile of the labels (an explicit `base_score` is used for
+every quantile). `predict` sorts each row ascending so quantiles never cross,
+exactly as XGBoost does; `output_margin=True` returns the unsorted per-quantile
+scores. The `quantile` metric averages the pinball loss over all rows and
+quantiles (and the early-stopping rule uses it); other metrics are rejected for
+several quantiles because the prediction and the label have different shapes.
+`quantile_alpha` values must be in `[0, 1]` and ascending (repeats are allowed),
+and at most 64 are accepted. SHAP values, `pred_leaf`, `iteration_range`
+(rounds, `num_boost_round`-style) and `get_score` work as for multiclass models:
+`pred_contribs` returns `(n, n_quantiles, n_features + 1)`. The model JSON
+stores `num_target` and a vector `base_score`, and XGBoost loads it and
+FerrisBoost loads XGBoost's. On the CPU and with `gpu_math="exact"` the models
+match XGBoost exactly (same conditions as above); `gpu_math="fast"` keeps one
+prediction column per quantile on the device (the planner counts them) and
+reduces each quantile's scale in turn in the same fixed shape. `predict_to_parquet`
+writes one column per quantile, `prediction_0`, `prediction_1`, ...
 
 ## Regularization and class imbalance
 
@@ -414,7 +449,7 @@ model = fb.train(
 | `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
 | `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
 | `tweedie-nloglik@rho` | `reg:tweedie` | Negative Tweedie log-likelihood at variance power `rho` in `[1, 2)`, for example `tweedie-nloglik@1.5`. The `@rho` part is required |
-| `quantile` | `reg:quantileerror` | Pinball loss at `quantile_alpha`; the objective's default metric |
+| `quantile` | `reg:quantileerror` | Pinball loss at `quantile_alpha` (the mean over all quantiles of a multi-quantile model); the objective's default metric |
 | `mlogloss` | `multi:softprob`, `multi:softmax` | Multiclass negative log-likelihood |
 | `merror` | `multi:softprob`, `multi:softmax` | Multiclass error rate |
 | `ndcg`, `ndcg@k`, `ndcg@k-` | ranking objectives | Mean NDCG over the query groups (group weights if given); `@k` truncates, `-` scores a group without relevant documents as 0; see [Learning to rank](#learning-to-rank) |
@@ -868,13 +903,16 @@ model.predict_to_parquet("test.parquet", "proba.parquet")
 
 Limitations in this version:
 
-- `predict_to_parquet` for multiclass models builds the whole output in memory
-  before writing; it is not streamed in bounded batches like the single-output
-  path. Like the single-output path, it refuses to overwrite an existing file,
-  requires a `.parquet` or `.pq` extension, and removes a partial file if
-  prediction fails.
 - The lower-level `predict_array()` method rejects multiclass models; use
   `predict()`.
+
+`predict_to_parquet` streams multiclass output like the single-output path: the
+input is read once in bounded batches, each batch is scored for every class and
+written before the next one is read, so memory does not grow with the number of
+rows. Like the single-output path, it refuses to overwrite an existing file,
+requires a `.parquet` or `.pq` extension, and removes a partial file if
+prediction fails. The output file is the same whatever the thread counts or
+batch sizes were.
 
 File prediction reads the input once: each batch is scored for every class
 before the next batch is read.
@@ -1225,9 +1263,10 @@ memory budget, without manual chunk or batch tuning:
 - **Extra GPU memory in fast mode**: `gpu_math="fast"` keeps the running
   prediction and the labels on the device (4 bytes per row each) and, with
   sample weights, the weights (4 more bytes per row). Multiclass keeps one
-  prediction column per class plus two per-row softmax statistics.
+  prediction column per class plus two per-row softmax statistics; several
+  `quantile_alpha` values keep one prediction column per quantile.
   `reg:quantileerror` adds a small fixed scratch buffer that does not depend
-  on the row count. The memory planner accounts for all of these.
+  on the row count (it is reused by every quantile in turn). The memory planner accounts for all of these.
 - **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
 - **Categorical features**: supported with both `gpu_math` modes. Split search
   for them runs on the host (see [Categorical features](#categorical-features)).
@@ -1258,7 +1297,7 @@ CUDA, `max_depth` above 14 (on CPU too), `gpu_math="fast"` together with
 
 ## Prediction
 
-`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is a `float32` `numpy.ndarray`. It is one-dimensional, with shape `(n,)`, except for multiclass models, which return two-dimensional `(n, num_class)` probabilities or margins; `multi:softmax` returns a one-dimensional array of class indices unless `output_margin=True` (see [Multiclass prediction](#multiclass-prediction)). Predictions are in the objective's output space: probabilities for `binary:logistic`, `exp(margin)` for `count:poisson`, `reg:gamma`, and `reg:tweedie`, and the margin itself for the other regression objectives; `output_margin=True` returns the raw margin. Prediction has its own CPU thread control and does not inherit training `nthread`:
+`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is a `float32` `numpy.ndarray`. It is one-dimensional, with shape `(n,)`, except for multiclass models, which return two-dimensional `(n, num_class)` probabilities or margins, and models with several `quantile_alpha` values, which return `(n, n_quantiles)` (each row sorted ascending); `multi:softmax` returns a one-dimensional array of class indices unless `output_margin=True` (see [Multiclass prediction](#multiclass-prediction)). Predictions are in the objective's output space: probabilities for `binary:logistic`, `exp(margin)` for `count:poisson`, `reg:gamma`, and `reg:tweedie`, and the margin itself for the other regression objectives; `output_margin=True` returns the raw margin. Prediction has its own CPU thread control and does not inherit training `nthread`:
 
 ```python
 prediction = model.predict(data, predict_threads=0)  # process-aware auto
@@ -1305,7 +1344,7 @@ File readers validate the full canonical schema before projecting batches to the
 
 Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
 
-`predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. For multiclass models it writes one column per class instead (see [Multiclass prediction](#multiclass-prediction)). The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
+`predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. For multiclass models and for models with several `quantile_alpha` values it writes one column per class or quantile instead (see [Multiclass prediction](#multiclass-prediction)), streamed in the same bounded batches. The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
 
 The direct-output path keeps a bounded two-batch channel between scoring and one ordered Parquet writer thread. The writer can overlap encoding/output with the next input batch while preserving file order and row order. Auto mode shares one process-visible CPU budget across ingest, scoring, and the writer; explicit ingest or prediction thread counts are preserved and produce an oversubscription warning when their total plus the writer exceeds that budget.
 
@@ -1376,7 +1415,7 @@ leaves = model.predict(X_test, pred_leaf=True)                # (n, n_trees)
 
 Names are the model's feature names (the column names of a pandas DataFrame, PyArrow table, Parquet file, or headered CSV), or `f0`, `f1`, ... when the model was trained from a NumPy array. The scores come from the gain and Hessian sum that every tree node stores, so they also work on models loaded from XGBoost JSON.
 
-`predict(..., pred_contribs=True)` returns exact TreeSHAP values in margin space. Every row sums to the raw margin (`output_margin=True`), and the last column is the bias term: the model's `base_score` (as a margin) plus the cover-weighted mean of the trees. With `approx_contribs=True` it returns the faster Saabas attribution instead. Multiclass models return `(n, num_class, n_features + 1)`, one attribution matrix per class.
+`predict(..., pred_contribs=True)` returns exact TreeSHAP values in margin space. Every row sums to the raw margin (`output_margin=True`), and the last column is the bias term: the model's `base_score` (as a margin) plus the cover-weighted mean of the trees. With `approx_contribs=True` it returns the faster Saabas attribution instead. Multiclass models return `(n, num_class, n_features + 1)`, one attribution matrix per class; multi-quantile models return `(n, n_quantiles, n_features + 1)`.
 
 `pred_interactions=True` returns SHAP interaction values `(n, n_features + 1, n_features + 1)` (multiclass: `(n, num_class, n_features + 1, n_features + 1)`). The matrices are symmetric, each row sums to the matching `pred_contribs` row, and the whole matrix sums to the margin. Memory grows with `n * (n_features + 1)^2`, so score wide data in batches. Combining `pred_interactions=True` with `approx_contribs=True` raises an error: XGBoost 3.4.1 returns a diagonal-only matrix there.
 
@@ -1451,7 +1490,7 @@ empty `evals_result()`.
 |---|---:|---|
 | `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
 | `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank). `lambdarank_unbiased` and `lambdarank_bias_norm` are accepted but `lambdarank_unbiased=True` is rejected |
-| `quantile_alpha` | `None` | Required for `reg:quantileerror`: one quantile in `[0, 1]` (a length-1 list is accepted). Several quantiles (multi-output) are not supported and raise `ValueError` |
+| `quantile_alpha` | `None` | Required for `reg:quantileerror`: a quantile in `[0, 1]`, or an ascending list of up to 64 quantiles for one multi-output model (one tree per quantile per round; `predict` returns `(n, n_quantiles)`). Unsorted or out-of-range values raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
@@ -1587,11 +1626,12 @@ different sentinel such as `-999`. Setting a sentinel does not relax the other
 feature rules: a feature that is itself `+/-inf` or `float32` max is still an
 error.
 
-### `reg:quantileerror` needs a scalar `quantile_alpha`
+### `reg:quantileerror` needs a valid `quantile_alpha`
 
 `reg:quantileerror` raises `ValueError` without `quantile_alpha`, with a value
-outside `[0, 1]`, or with several values (multi-output). Pass one quantile, for
-example `0.9`, and train one model per quantile.
+outside `[0, 1]`, with a list that is not in ascending order (XGBoost has the
+same rule), or with more than 64 values. Pass one quantile, for example `0.9`,
+or a sorted list such as `[0.1, 0.5, 0.9]`.
 
 ### A categorical column is rejected
 

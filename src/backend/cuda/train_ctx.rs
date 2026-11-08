@@ -570,6 +570,8 @@ pub struct GpuTrainCtx {
     /// 每行输出数 K(多分类 = `num_class`,其余 1)。决定常驻 prediction 的
     /// 形状 `K × n`;规划器按同一个数计费。
     n_outputs: usize,
+    /// 多个 `quantile_alpha`:没有 softmax 统计量 buffer,每个目标走 quantile kernel。
+    multi_quantile: bool,
     /// GPU-local row-major 原型:转置、行主序 histogram、行主序取列。
     /// 三个要么都有要么都没有。
     rm_transpose_fn: Option<CudaFunction>,
@@ -760,6 +762,7 @@ impl GpuTrainCtx {
         // 多分类 fast 的三个 kernel。只有 Fast 且 K > 1 才加载;exact 的多分类
         // 在 host 算梯度,device 不需要知道 K。
         let n_outputs = config.n_outputs.max(1);
+        let multi_quantile = config.multi_quantile && n_outputs > 1;
         let multiclass_fast = fast_math && n_outputs > 1;
         let load_mc = |name: &str| -> Result<Option<CudaFunction>> {
             if !multiclass_fast {
@@ -1392,7 +1395,7 @@ impl GpuTrainCtx {
         } else {
             (None, None)
         };
-        let (mc_wmax, mc_wsum) = if multiclass_fast {
+        let (mc_wmax, mc_wsum) = if multiclass_fast && !multi_quantile {
             (
                 Some(
                     stream
@@ -1418,8 +1421,11 @@ impl GpuTrainCtx {
             None
         };
         let multiclass_bytes = if fast_math {
-            crate::gpu_mem_plan::fast_multiclass_extra_bytes(n_rows as u64, n_outputs as u64)
-                as usize
+            crate::gpu_mem_plan::fast_multi_output_extra_bytes(
+                n_rows as u64,
+                n_outputs as u64,
+                !multi_quantile,
+            ) as usize
         } else {
             0
         };
@@ -1560,6 +1566,7 @@ impl GpuTrainCtx {
             qt_reduce_fn,
             qt_grad_fn,
             n_outputs,
+            multi_quantile,
             gpu_math,
             state: state.clone(),
             stream,
@@ -2142,6 +2149,7 @@ impl GpuTrainCtx {
             self.launch_quantile_round(
                 &mut buf,
                 obj_param,
+                None,
                 subsample_threshold,
                 subsample_seed,
                 subsample_tree,
@@ -2208,6 +2216,9 @@ impl GpuTrainCtx {
         &self,
         buf: &mut GpuBuffers,
         alpha: f32,
+        // `Some(k)`:多个 quantile_alpha 的第 k 个目标 —— 只用 prediction 的第 k 列,
+        // 且叶子增量早已并进(`fast_multiquantile_apply_delta`),partials kernel 只读。
+        target: Option<usize>,
         subsample_threshold: u64,
         subsample_seed: u64,
         subsample_tree: u64,
@@ -2254,15 +2265,35 @@ impl GpuTrainCtx {
                 shared_mem_bytes: 0,
             };
             let mut launch = self.stream.launch_builder(partials_fn);
-            launch
-                .arg(&mut *pred)
-                .arg(&*prediction_delta)
-                .arg(label)
-                .arg(weight)
-                .arg(&has_weight)
-                .arg(&n_rows_u32)
-                .arg(&mut *scratch);
-            unsafe { launch.launch(cfg) }.context("launch quantile_apply_delta_partials")?;
+            match target {
+                None => {
+                    launch
+                        .arg(&mut *pred)
+                        .arg(&*prediction_delta)
+                        .arg(label)
+                        .arg(weight)
+                        .arg(&has_weight)
+                        .arg(&n_rows_u32)
+                        .arg(&mut *scratch);
+                    unsafe { launch.launch(cfg) }
+                        .context("launch quantile_apply_delta_partials")?;
+                }
+                Some(k) => {
+                    // 空 delta 指针:只读这一列(见 kernel 注释)。
+                    let no_delta = 0u64;
+                    let mut col = pred.slice_mut(k * self.n_rows..(k + 1) * self.n_rows);
+                    launch
+                        .arg(&mut col)
+                        .arg(&no_delta)
+                        .arg(label)
+                        .arg(weight)
+                        .arg(&has_weight)
+                        .arg(&n_rows_u32)
+                        .arg(&mut *scratch);
+                    unsafe { launch.launch(cfg) }
+                        .context("launch quantile_apply_delta_partials (target)")?;
+                }
+            }
         }
         {
             let cfg = LaunchConfig {
@@ -2285,8 +2316,12 @@ impl GpuTrainCtx {
                 shared_mem_bytes: 0,
             };
             let mut launch = self.stream.launch_builder(grad_fn);
+            let col = target.map(|k| pred.slice(k * self.n_rows..(k + 1) * self.n_rows));
+            match &col {
+                None => launch.arg(&*pred),
+                Some(col) => launch.arg(col),
+            };
             launch
-                .arg(&*pred)
                 .arg(label)
                 .arg(weight)
                 .arg(&has_weight)
@@ -2450,6 +2485,54 @@ impl GpuTrainCtx {
         }
         buf.mc_pending_class = Some(class);
         Ok(())
+    }
+
+    /// 多个 `quantile_alpha` 的 fast 训练:第 `target` 个 alpha 的梯度(带行采样,键 =
+    /// 树序号 `subsample_tree`)→ 通用的 device 量化尾巴。三个 quantile kernel 只读第
+    /// `target` 列 prediction(叶子增量已经由 [`Self::fast_multiquantile_apply_delta`]
+    /// 并进),scale 在同一块固定大小的暂存里逐目标归约,没有 host 往返、没有 per-round
+    /// 分配、没有浮点原子操作 —— 逐次运行逐位相同。语义同
+    /// [`Self::fast_gradient_and_quantize`]:**不保证与 CPU 逐字节相同**。
+    pub fn fast_multiquantile_gradient_and_quantize(
+        &self,
+        target: usize,
+        alpha: f32,
+        subsample_threshold: u64,
+        subsample_seed: u64,
+        subsample_tree: u64,
+    ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        ensure!(
+            self.multi_quantile && target < self.n_outputs,
+            "目标 {target} 超出 {} 个 quantile_alpha(或没有按多分位数配置)",
+            self.n_outputs
+        );
+        let mut buf = self.lock()?;
+        self.sync_if_timing()?;
+        let started = std::time::Instant::now();
+        self.launch_quantile_round(
+            &mut buf,
+            alpha,
+            Some(target),
+            subsample_threshold,
+            subsample_seed,
+            subsample_tree,
+        )?;
+        // 梯度 kernel 已经采样置零;和单 alpha 一样重扫 max。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false)
+    }
+
+    /// 多个 `quantile_alpha`:刚建完的第 `target` 棵树的叶子增量立刻并进它那一列。
+    /// 不能像多分类那样推迟:下一个目标的 quantile kernel 读的是自己的列,
+    /// 而 delta buffer 会被下一棵树覆盖。
+    pub fn fast_multiquantile_apply_delta(&self, target: usize) -> Result<()> {
+        ensure!(
+            self.multi_quantile && target < self.n_outputs,
+            "目标 {target} 超出 {} 个 quantile_alpha(或没有按多分位数配置)",
+            self.n_outputs
+        );
+        let mut buf = self.lock()?;
+        buf.mc_pending_class = Some(target);
+        self.flush_multiclass_delta_locked(&mut buf)
     }
 
     /// 把待施加的 delta 用独立 kernel 加到 prediction 上。只在训练结束读

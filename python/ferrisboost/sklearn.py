@@ -34,8 +34,10 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
 
 * 分类标签可以是任意可排序的类别(内部做 `LabelEncoder` 式编码,`classes_` 保存
   原始类别);XGBoost 要求标签恰好是 `0..K-1`。标签已经是 `0..K-1` 时两者行为一致。
-* 不支持 `booster=` / `tree_method=` 等 FerrisBoost 没有的选项;多分位数
-  `quantile_alpha`(多输出)不支持。
+* 不支持 `booster=` / `tree_method=` 等 FerrisBoost 没有的选项。
+
+`quantile_alpha` 可以是一个分位数,也可以是升序列表(多输出模型,和 XGBoost 一样:
+每轮每个分位数一棵树,`predict` 返回 `(n_samples, n_quantiles)`)。
 
 `missing`、类别特征和 `apply` 与 XGBoost 一致:
 
@@ -60,6 +62,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -187,7 +190,7 @@ class _FerrisBoostBase(BaseEstimator):
         device: str | None = None,
         gpu_math: str | None = None,
         cols_per_block: int | None = None,
-        quantile_alpha: float | None = None,
+        quantile_alpha: float | Sequence[float] | None = None,
         tweedie_variance_power: float | None = None,
         huber_slope: float | None = None,
         importance_type: str | None = None,
@@ -513,7 +516,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
     """回归估计器(对应 `xgboost.XGBRegressor`),默认 `reg:squarederror`。
 
     支持 `reg:squarederror`、`count:poisson`、`reg:gamma`、`reg:tweedie`、
-    `reg:pseudohubererror`、`reg:quantileerror`(需要标量 `quantile_alpha`)。
+    `reg:pseudohubererror`、`reg:quantileerror`(需要 `quantile_alpha`:标量,或升序列表得到多输出模型)。
     """
 
     def _default_objective(self) -> str:
@@ -564,7 +567,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
     def load_model(self, fname: str | os.PathLike) -> FerrisBoostRegressor:
         """读 XGBoost 兼容的 JSON(也能读 XGBoost 训的单输出回归模型)。"""
         self._Booster = self._load_booster(fname)
-        if self._Booster.num_class > 1:
+        if self._Booster.num_class > 1 and self._Booster.objective != "reg:quantileerror":
             raise ValueError("This is a multiclass model; use FerrisBoostClassifier.load_model")
         self.n_features_in_ = self._Booster.n_features
         self.evals_result_ = {}

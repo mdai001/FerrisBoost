@@ -538,13 +538,19 @@ impl Model {
                         )
                     },
                     boost_from_average: "1".into(),
-                    num_class: if self.class_base_margins.is_empty() {
-                        "0".into()
-                    } else {
+                    // 多分类写 num_class;多分位数是多目标:num_class = 0、
+                    // num_target = alpha 个数(XGBoost 的写法)。
+                    num_class: if self.objective.is_multiclass() {
                         self.class_base_margins.len().to_string()
+                    } else {
+                        "0".into()
                     },
                     num_feature: self.n_features.to_string(),
-                    num_target: "1".into(),
+                    num_target: if self.objective.is_multi_quantile() {
+                        self.class_base_margins.len().to_string()
+                    } else {
+                        "1".into()
+                    },
                 },
                 objective: xgb::ObjectiveJson {
                     name: self.objective.name().into(),
@@ -579,16 +585,33 @@ impl Model {
             )));
         }
         let mp = &learner.learner_model_param;
-        let num_class = parse_param::<i32>("num_class", &mp.num_class)?.max(1) as usize;
-        // ⚠️ 多目标模型(XGBoost 2.x 可能只存一个标量 base_score)必须拒绝:
-        // 当成单目标读会把所有目标的树加在一起,静默给出错的预测。
-        if !mp.num_target.trim().is_empty() && parse_param::<i32>("num_target", &mp.num_target)? > 1
+        let objective = match Objective::from_json(&learner.objective.name, &learner.objective.rest)
+        {
+            Some(o) => o,
+            None => {
+                return Err(unsupported(format_args!(
+                    "objective {} 不支持;支持的有 {}",
+                    learner.objective.name,
+                    Objective::supported_names()
+                )))
+            }
+        };
+        let num_class_param = parse_param::<i32>("num_class", &mp.num_class)?.max(1) as usize;
+        let num_target = if mp.num_target.trim().is_empty() {
+            1
+        } else {
+            parse_param::<i32>("num_target", &mp.num_target)?.max(1) as usize
+        };
+        // ⚠️ 多目标模型必须拒绝,除非是多分位数的 `reg:quantileerror`(每个 alpha 一个目标,
+        // `one_output_per_tree`):当成单目标读会把所有目标的树加在一起,静默给出错的预测。
+        if num_target > 1 && !(objective.is_multi_quantile() && num_target == objective.num_outputs())
         {
             return Err(unsupported(format_args!(
-                "多目标模型不支持(num_target = {})",
-                mp.num_target
+                "多目标模型不支持(num_target = {num_target});只支持多个 quantile_alpha 的 \
+                 reg:quantileerror"
             )));
         }
+        let num_class = num_class_param.max(num_target);
         // 多分类(one_output_per_tree)要求第 i 棵树属于第 i % K 类 —— XGBoost
         // 训练出来的就是这个排法;别的排法(比如手工拼接的模型)直接拒绝,
         // 不猜。
@@ -622,18 +645,6 @@ impl Model {
                 booster.model.gbtree_model_param.num_parallel_tree
             )));
         }
-
-        let objective = match Objective::from_json(&learner.objective.name, &learner.objective.rest)
-        {
-            Some(o) => o,
-            None => {
-                return Err(unsupported(format_args!(
-                    "objective {} 不支持;支持的有 {}",
-                    learner.objective.name,
-                    Objective::supported_names()
-                )))
-            }
-        };
 
         anyhow_like_check(
             num_class == objective.num_outputs(),

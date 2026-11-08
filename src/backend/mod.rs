@@ -33,6 +33,7 @@ pub mod cuda {
         pub gpu_math: crate::types::GpuMath,
         pub fast_weights: bool,
         pub n_outputs: usize,
+        pub multi_quantile: bool,
         pub fast_rank: Option<crate::gpu_mem_plan::FastRankShape>,
     }
     /// Static inputs of the device ranking path (uninhabited without CUDA).
@@ -58,6 +59,7 @@ pub mod cuda {
                 gpu_math: crate::types::GpuMath::Exact,
                 fast_weights: false,
                 n_outputs: 1,
+                multi_quantile: false,
                 fast_rank: None,
             }
         }
@@ -181,6 +183,19 @@ pub mod cuda {
             match self.0 {}
         }
         pub fn fast_multiclass_apply_delta(&self, _class: usize) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn fast_multiquantile_gradient_and_quantize(
+            &self,
+            _target: usize,
+            _alpha: f32,
+            _threshold: u64,
+            _seed: u64,
+            _tree: u64,
+        ) -> Result<(crate::types::GradQuantizer, GradPairFixed, f32)> {
+            match self.0 {}
+        }
+        pub fn fast_multiquantile_apply_delta(&self, _target: usize) -> Result<()> {
             match self.0 {}
         }
         pub fn fast_gradient_and_quantize(

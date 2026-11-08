@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::rank::{PairMethod, RankKind, RankParams, NOT_SET};
-use crate::types::{GradPair, Objective};
+use crate::types::{GradPair, Objective, QuantileAlphas};
 
 /// XGBoost `kRtEps`。
 const K_RT_EPS: f32 = 1e-6;
@@ -95,7 +95,9 @@ impl Objective {
             slope: HUBER_DEFAULT_SLOPE,
         },
         // alpha 在 `ALL` 里只是占位(XGBoost 没有默认值,必须由用户给)。
-        Objective::Quantile { alpha: 0.5 },
+        Objective::Quantile {
+            alphas: QuantileAlphas::single(0.5),
+        },
     ];
 
     /// XGBoost 的 objective 名字(写进模型 JSON、出现在报错里)。
@@ -160,6 +162,8 @@ impl Objective {
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
                 num_class as usize
             }
+            // 多个 alpha = 多目标:每个 alpha 一棵树(XGBoost `num_target`)。
+            Objective::Quantile { alphas } => alphas.len(),
             _ => 1,
         }
     }
@@ -172,6 +176,26 @@ impl Objective {
     /// `reg:quantileerror`:梯度依赖每轮全体行预测归约出的标量 scale。
     pub fn is_quantile(self) -> bool {
         matches!(self, Objective::Quantile { .. })
+    }
+
+    /// 多个分位数(多目标 `reg:quantileerror`)。
+    pub fn is_multi_quantile(self) -> bool {
+        matches!(self, Objective::Quantile { alphas } if alphas.len() > 1)
+    }
+
+    /// `quantile_alpha` 列表(只有 `reg:quantileerror` 有)。
+    pub fn quantile_alphas(self) -> Option<QuantileAlphas> {
+        match self {
+            Objective::Quantile { alphas } => Some(alphas),
+            _ => None,
+        }
+    }
+
+    /// 单个分位数的 `reg:quantileerror`(梯度 / metric 的逐目标 objective)。
+    pub fn quantile(alpha: f32) -> Objective {
+        Objective::Quantile {
+            alphas: QuantileAlphas::single(alpha),
+        }
     }
 
     /// `rank:*`: gradients are computed per query group (`crate::rank`).
@@ -187,12 +211,14 @@ impl Objective {
         }
     }
 
-    /// 带上 `quantile_alpha`(只对 `reg:quantileerror` 生效)。
-    pub fn with_quantile_alpha(self, alpha: f32) -> Objective {
-        match self {
-            Objective::Quantile { .. } => Objective::Quantile { alpha },
+    /// 带上 `quantile_alpha` 列表(只对 `reg:quantileerror` 生效)。
+    pub fn with_quantile_alphas(self, alphas: &[f32]) -> anyhow::Result<Objective> {
+        Ok(match self {
+            Objective::Quantile { .. } => Objective::Quantile {
+                alphas: QuantileAlphas::new(alphas)?,
+            },
             other => other,
-        }
+        })
     }
 
     /// 带上用户参数。`max_delta_step` 是用户**显式**给的值(`None` = 没给):
@@ -248,10 +274,20 @@ impl Objective {
                 slope.is_finite() && slope != 0.0,
                 "huber_slope 必须是非 0 的有限值"
             ),
-            Objective::Quantile { alpha } => anyhow::ensure!(
-                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
-                "quantile_alpha 必须在 [0, 1] 内,给的是 {alpha}"
-            ),
+            // XGBoost `QuantileLossParam::Validate`:每个值在 [0, 1],且升序(可相等)。
+            Objective::Quantile { alphas } => {
+                let a = alphas.as_slice();
+                for &alpha in a {
+                    anyhow::ensure!(
+                        alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                        "quantile_alpha 必须在 [0, 1] 内,给的是 {alpha}"
+                    );
+                }
+                anyhow::ensure!(
+                    a.windows(2).all(|w| w[0] <= w[1]),
+                    "quantile_alpha 必须按升序排列(XGBoost 同样要求),给的是 {a:?}"
+                );
+            }
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
                 anyhow::ensure!(
                     num_class >= 2,
@@ -324,10 +360,10 @@ impl Objective {
                 "ranking base score needs the query groups: use crate::rank::estimate_base_score"
             );
         }
-        if let Objective::Quantile { alpha } = self {
+        if let Objective::Quantile { alphas } = self {
             // XGBoost `QuantileRegression::InitEstimation`:标签的 alpha 分位数
             // (无权重:线性插值;有权重:阶梯函数)。权重是样本权重本身。
-            return quantile_intercept(alpha, labels, weights);
+            return quantile_intercepts(&alphas.as_slice()[..1], labels, weights)[0];
         }
         let newton = match self {
             Objective::PseudoHuber { .. } => true,
@@ -557,7 +593,9 @@ impl Objective {
             Objective::Poisson { max_delta_step } => max_delta_step,
             Objective::Tweedie { variance_power } => variance_power,
             Objective::PseudoHuber { slope } => slope,
-            Objective::Quantile { alpha } => alpha,
+            // 单输出 fast kernel 的 alpha;多个 alpha 每个目标单独传(见
+            // `Objective::quantile_alphas`)。
+            Objective::Quantile { alphas } => alphas.as_slice()[0],
             _ => 0.0,
         }
     }
@@ -588,10 +626,18 @@ impl Objective {
                 json_block("pseudo_huber_param", "huber_slope", slope.to_string())
             }
             // XGBoost 存的是 ParamArray<float> 的 JSON 数组字符串。
-            Objective::Quantile { alpha } => json_block(
+            Objective::Quantile { alphas } => json_block(
                 "quantile_loss_param",
                 "quantile_alpha",
-                format!("[{alpha}]"),
+                format!(
+                    "[{}]",
+                    alphas
+                        .as_slice()
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
             ),
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => json_block(
                 "softmax_multiclass_param",
@@ -626,7 +672,7 @@ impl Objective {
                 slope: json_param(rest, "pseudo_huber_param", "huber_slope").unwrap_or(slope),
             },
             Objective::Quantile { .. } => Objective::Quantile {
-                alpha: quantile_alpha_from_json(rest)?,
+                alphas: quantile_alphas_from_json(rest)?,
             },
             Objective::Softprob { .. } => Objective::Softprob {
                 num_class: json_param(rest, "softmax_multiclass_param", "num_class")? as u32,
@@ -736,68 +782,92 @@ fn rank_params_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<R
 //
 // S ≤ 0 或 w == 0 时 (g, h) = (0, 0)。
 
-/// 解析 `quantile_loss_param.quantile_alpha`("[0.9]"、"0.9"、"(0.9)")。
-/// 向量(多输出)返回 `None`:不支持。
-fn quantile_alpha_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<f32> {
+/// 解析 `quantile_loss_param.quantile_alpha`("[0.9]"、"0.9"、"(0.9)"、
+/// "[1E-1,5E-1,9E-1]"、JSON 数组)。
+fn quantile_alphas_from_json(
+    rest: &BTreeMap<String, serde_json::Value>,
+) -> Option<QuantileAlphas> {
     let raw = rest.get("quantile_loss_param")?.get("quantile_alpha")?;
-    let text = match raw {
-        serde_json::Value::String(s) => s.trim().to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Array(a) if a.len() == 1 => return a[0].as_f64().map(|v| v as f32),
+    let values: Vec<f32> = match raw {
+        serde_json::Value::String(s) => s
+            .trim()
+            .trim_start_matches(['[', '('])
+            .trim_end_matches([']', ')'])
+            .split(',')
+            .map(|t| t.trim().parse::<f32>().ok())
+            .collect::<Option<Vec<_>>>()?,
+        serde_json::Value::Number(n) => vec![n.as_f64()? as f32],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|v| v.as_f64().map(|v| v as f32))
+            .collect::<Option<Vec<_>>>()?,
         _ => return None,
     };
-    let inner = text
-        .trim_start_matches(['[', '('])
-        .trim_end_matches([']', ')']);
-    if inner.contains(',') {
-        return None;
-    }
-    inner.trim().parse().ok()
+    QuantileAlphas::new(&values).ok()
 }
 
-/// XGBoost `common::Quantile` / `WeightedQuantile`(CPU 路径,`InitEstimation`)。
-fn quantile_intercept(alpha: f32, labels: &[f32], weights: Option<&[f32]>) -> f32 {
+/// XGBoost `common::Quantile` / `WeightedQuantile`(CPU 路径,`InitEstimation`),
+/// 每个 alpha 一个截距。标签只排一次。
+fn quantile_intercepts(alphas: &[f32], labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
     let n = labels.len();
     if n == 0 {
-        return DEFAULT_BASE_SCORE;
+        return vec![DEFAULT_BASE_SCORE; alphas.len()];
     }
     // 稳定排序(并列保持原顺序),和 XGBoost `StableSort` 一致。
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&l, &r| labels[l].total_cmp(&labels[r]));
     let val = |i: usize| labels[idx[i]];
-    let alpha = f64::from(alpha);
-    match weights {
-        None => {
-            let nf = n as f64;
-            if alpha <= 1.0 / (nf + 1.0) {
-                return val(0);
-            }
-            if alpha >= nf / (nf + 1.0) {
-                return val(n - 1);
-            }
-            let x = alpha * (nf + 1.0);
-            let k = x.floor() - 1.0;
-            let d = (x - 1.0) - k;
-            let v0 = val(k as usize);
-            let v1 = val(k as usize + 1);
-            // `v0 + d * (v1 - v0)`:f32 差,f64 乘加,最后收成 f32。
-            (f64::from(v0) + d * f64::from(v1 - v0)) as f32
+    // 加权:累计权重只算一次。
+    let cdf: Option<Vec<f32>> = weights.map(|w| {
+        let mut cdf = vec![0.0f32; n];
+        cdf[0] = w[idx[0]];
+        for i in 1..n {
+            cdf[i] = cdf[i - 1] + w[idx[i]];
         }
-        Some(w) => {
-            let mut cdf = vec![0.0f32; n];
-            cdf[0] = w[idx[0]];
-            for i in 1..n {
-                cdf[i] = cdf[i - 1] + w[idx[i]];
+        cdf
+    });
+    alphas
+        .iter()
+        .map(|&alpha| {
+            let alpha = f64::from(alpha);
+            match &cdf {
+                None => {
+                    let nf = n as f64;
+                    if alpha <= 1.0 / (nf + 1.0) {
+                        return val(0);
+                    }
+                    if alpha >= nf / (nf + 1.0) {
+                        return val(n - 1);
+                    }
+                    let x = alpha * (nf + 1.0);
+                    let k = x.floor() - 1.0;
+                    let d = (x - 1.0) - k;
+                    let v0 = val(k as usize);
+                    let v1 = val(k as usize + 1);
+                    // `v0 + d * (v1 - v0)`:f32 差,f64 乘加,最后收成 f32。
+                    (f64::from(v0) + d * f64::from(v1 - v0)) as f32
+                }
+                Some(cdf) => {
+                    let thresh = (f64::from(cdf[n - 1]) * alpha) as f32;
+                    // lower_bound:第一个 cdf >= thresh。
+                    let at = cdf.partition_point(|&c| c < thresh).min(n - 1);
+                    val(at)
+                }
             }
-            let thresh = (f64::from(cdf[n - 1]) * alpha) as f32;
-            // lower_bound:第一个 cdf >= thresh。
-            let at = cdf.partition_point(|&c| c < thresh).min(n - 1);
-            val(at)
-        }
-    }
+        })
+        .collect()
 }
 
 impl Objective {
+    /// 多目标 `reg:quantileerror` 的每目标截距(XGBoost `InitEstimation` 里
+    /// `quantiles(t)`:第 t 个 alpha 的标签分位数;单个 alpha 就是标量截距)。
+    pub fn initial_quantile_margins(self, labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
+        match self {
+            Objective::Quantile { alphas } => quantile_intercepts(alphas.as_slice(), labels, weights),
+            _ => unreachable!("initial_quantile_margins 只用于 reg:quantileerror"),
+        }
+    }
+
     /// 每轮的全局 scale `S`(`reg:quantileerror` 专用)。`preds` 是 raw margin
     /// (恒等链接,即预测值)。串行 f64 累加:结果与线程数无关,并与 XGBoost
     /// `nthread=1` 逐位相同。
@@ -946,8 +1016,50 @@ impl Objective {
                 None
             }
             Objective::Softmax { .. } => Some(argmax(row) as f32),
+            // 多分位数:每行升序排列,防止分位数交叉(XGBoost
+            // `QuantileRegression::PredTransform` / `EvalTransform`)。
+            Objective::Quantile { .. } => {
+                sort_row_ascending(row);
+                None
+            }
             _ => None,
         }
+    }
+
+    /// `n × K` 行主序的 raw margin → 预测值(`transform_row` 的批量版)。
+    /// `softmax` 返回每行的类别下标(`n` 个值);其它原地变换并返回 `None`。
+    pub fn transform_rows(self, margins: &mut [f32], k: usize) -> Option<Vec<f32>> {
+        use rayon::prelude::*;
+        match self {
+            Objective::Softmax { .. } => Some(
+                margins
+                    .par_chunks_exact(k)
+                    .map(|row| argmax(row) as f32)
+                    .collect(),
+            ),
+            Objective::Softprob { .. } => {
+                margins.par_chunks_exact_mut(k).for_each(softmax_in_place);
+                None
+            }
+            Objective::Quantile { .. } if k > 1 => {
+                margins.par_chunks_exact_mut(k).for_each(sort_row_ascending);
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+/// XGBoost 的逐行插入排序(`>` 比较,NaN 的相对位置与它一致)。
+pub fn sort_row_ascending(row: &mut [f32]) {
+    for i in 1..row.len() {
+        let value = row[i];
+        let mut pos = i;
+        while pos > 0 && row[pos - 1] > value {
+            row[pos] = row[pos - 1];
+            pos -= 1;
+        }
+        row[pos] = value;
     }
 }
 
@@ -1020,7 +1132,7 @@ mod tests {
             .collect();
         assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            Objective::Quantile { alpha: 0.3 }.device_param(),
+            Objective::quantile(0.3).device_param(),
             0.3,
             "quantile 的 alpha 经 device_param 传给 fast kernel"
         );
@@ -1028,15 +1140,65 @@ mod tests {
 
     #[test]
     fn quantile_intercept_matches_xgboost_rules() {
+        let one = |a: f32, y: &[f32], w: Option<&[f32]>| quantile_intercepts(&[a], y, w)[0];
         // n = 4:alpha <= 1/5 取最小值,>= 4/5 取最大值,否则线性插值。
         let y = [4.0f32, 1.0, 3.0, 2.0];
-        assert_eq!(quantile_intercept(0.1, &y, None), 1.0);
-        assert_eq!(quantile_intercept(0.9, &y, None), 4.0);
+        assert_eq!(one(0.1, &y, None), 1.0);
+        assert_eq!(one(0.9, &y, None), 4.0);
         // x = 0.5 * 5 = 2.5,k = 1,d = 0.5:2 + 0.5 * (3 - 2)
-        assert_eq!(quantile_intercept(0.5, &y, None), 2.5);
+        assert_eq!(one(0.5, &y, None), 2.5);
         // 加权:阶梯函数,cdf = [1, 2, 3, 4],thresh = 2 → 第二个。
         let w = [1.0f32; 4];
-        assert_eq!(quantile_intercept(0.5, &y, Some(&w)), 2.0);
+        assert_eq!(one(0.5, &y, Some(&w)), 2.0);
+        // 多个 alpha:每个等于单独算,标签只排一次。
+        let alphas = [0.1f32, 0.5, 0.9];
+        assert_eq!(quantile_intercepts(&alphas, &y, None), [1.0, 2.5, 4.0]);
+        assert_eq!(quantile_intercepts(&alphas, &y, Some(&w)), [1.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn quantile_alphas_validate_parse_and_round_trip_json() {
+        let o = Objective::from_name("reg:quantileerror")
+            .unwrap()
+            .with_quantile_alphas(&[0.1, 0.5, 0.9])
+            .unwrap();
+        assert_eq!(o.num_outputs(), 3);
+        assert!(o.is_multi_quantile());
+        o.validate_params().unwrap();
+        // JSON 往返:写成 "[0.1,0.5,0.9]",读回同一个列表。
+        assert_eq!(Objective::from_json(o.name(), &o.json_params(1.0)), Some(o));
+        // XGBoost 的写法 "[1E-1,5E-1,9E-1]" 也读得懂。
+        let mut rest = o.json_params(1.0);
+        rest.insert(
+            "quantile_loss_param".into(),
+            serde_json::json!({"quantile_alpha": "[1E-1,5E-1,9E-1]"}),
+        );
+        assert_eq!(Objective::from_json(o.name(), &rest), Some(o));
+        // 升序、范围、个数。
+        let bad = |a: &[f32]| {
+            Objective::quantile(0.5)
+                .with_quantile_alphas(a)
+                .and_then(|o| o.validate_params())
+        };
+        assert!(bad(&[0.9, 0.1]).is_err());
+        assert!(bad(&[0.1, 1.5]).is_err());
+        assert!(bad(&[]).is_err());
+        assert!(bad(&[f32::NAN]).is_err());
+        assert!(bad(&[0.5, 0.5]).is_ok(), "XGBoost 允许重复(只要求非降)");
+        assert!(bad(&vec![0.5; crate::types::MAX_QUANTILE_ALPHAS + 1]).is_err());
+    }
+
+    #[test]
+    fn multi_quantile_rows_are_sorted_like_xgboost_pred_transform() {
+        let o = Objective::quantile(0.5)
+            .with_quantile_alphas(&[0.1, 0.5, 0.9])
+            .unwrap();
+        let mut m = vec![3.0f32, 1.0, 2.0, 0.0, 5.0, 4.0];
+        assert!(o.transform_rows(&mut m, 3).is_none());
+        assert_eq!(m, [1.0, 2.0, 3.0, 0.0, 4.0, 5.0]);
+        let mut row = [2.0f32, 1.0, 3.0];
+        assert!(o.transform_row(&mut row).is_none());
+        assert_eq!(row, [1.0, 2.0, 3.0]);
     }
 
     #[test]

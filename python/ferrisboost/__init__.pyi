@@ -41,8 +41,9 @@ def train(
     params["num_class"] (>= 2) and integer labels in [0, num_class); each
     round builds num_class trees. Objective-specific parameters:
     tweedie_variance_power (default 1.5, in [1, 2)), huber_slope (default 1,
-    non-zero) and quantile_alpha (required for reg:quantileerror: one quantile
-    in [0, 1]; several quantiles are rejected; gpu_math="fast" is supported).
+    non-zero) and quantile_alpha (required for reg:quantileerror: a quantile in
+    [0, 1], or an ascending list of quantiles for one multi-output model with
+    one tree per quantile per round; gpu_math="fast" is supported).
     Other regularization parameters follow XGBoost: alpha (alias
     reg_alpha), max_delta_step (count:poisson defaults to 0.7 when unset) and
     scale_pos_weight (binary:logistic, reg:squarederror, reg:gamma only).

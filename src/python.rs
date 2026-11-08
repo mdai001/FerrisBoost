@@ -280,7 +280,10 @@ fn resolve_blocking(
                     };
                     // fast 多分类:K 份常驻 prediction + softmax 统计量。
                     // exact 的多分类在 host 算梯度,device 上不多占。
-                    let model = if fast {
+                    let model = if fast && cfg.objective.is_multi_quantile() {
+                        // 多个 quantile_alpha:K 份 prediction,没有 softmax 统计量。
+                        model.with_fast_multi_quantile(rows, cfg.objective.num_outputs() as u64)
+                    } else if fast {
                         model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
                     } else {
                         model
@@ -981,8 +984,9 @@ fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool
 const PREDICTION_PARQUET_ROW_GROUP_ROWS: usize = 1024 * 1024;
 const PREDICTION_PARQUET_CHANNEL_BATCHES: usize = 2;
 
+/// One batch of output columns (one `Vec` per Parquet column, equal lengths).
 enum PredictionParquetMessage {
-    Batch(Vec<f32>),
+    Batch(Vec<Vec<f32>>),
     Finish,
 }
 
@@ -999,10 +1003,15 @@ impl Drop for IncompletePredictionOutput {
     }
 }
 
+/// Ordered Parquet writer thread. Incoming batches (whose sizes follow the ingest
+/// batches) are regrouped into exact row groups of `PREDICTION_PARQUET_ROW_GROUP_ROWS`
+/// rows before they reach the Arrow writer, so the file is byte-identical whatever the
+/// ingest batch sizes or worker counts were, and identical to writing the whole
+/// output in one call. Memory is bounded by one row group per column.
 fn prediction_parquet_writer(
     file: std::fs::File,
     output_path: std::path::PathBuf,
-    prediction_column: String,
+    column_names: Vec<String>,
     receiver: std::sync::mpsc::Receiver<PredictionParquetMessage>,
 ) -> anyhow::Result<usize> {
     use arrow::array::{ArrayRef, Float32Array};
@@ -1016,11 +1025,13 @@ fn prediction_parquet_writer(
         path: output_path,
         complete: false,
     };
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        prediction_column,
-        DataType::Float32,
-        false,
-    )]));
+    let n_columns = column_names.len();
+    let schema = Arc::new(Schema::new(
+        column_names
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Float32, false))
+            .collect::<Vec<_>>(),
+    ));
     let properties = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
@@ -1028,22 +1039,60 @@ fn prediction_parquet_writer(
     let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
         .context("创建 prediction Parquet writer 失败")?;
     let mut rows_written = 0usize;
+    let mut pending: Vec<Vec<f32>> = vec![Vec::new(); n_columns];
+    let write_group = |writer: &mut ArrowWriter<std::fs::File>,
+                       columns: Vec<Vec<f32>>|
+     -> anyhow::Result<()> {
+        let arrays: Vec<ArrayRef> = columns
+            .into_iter()
+            .map(|values| Arc::new(Float32Array::from(values)) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .context("创建 prediction Arrow batch 失败")?;
+        writer
+            .write(&batch)
+            .context("写 prediction Parquet batch 失败")
+    };
     loop {
         match receiver.recv() {
-            Ok(PredictionParquetMessage::Batch(values)) => {
+            Ok(PredictionParquetMessage::Batch(columns)) => {
+                anyhow::ensure!(
+                    columns.len() == n_columns,
+                    "prediction batch 有 {} 列,schema 有 {n_columns} 列",
+                    columns.len()
+                );
+                let rows = columns.first().map_or(0, Vec::len);
+                anyhow::ensure!(
+                    columns.iter().all(|c| c.len() == rows),
+                    "prediction batch 各列长度不一致"
+                );
                 rows_written = rows_written
-                    .checked_add(values.len())
+                    .checked_add(rows)
                     .context("prediction 输出行数溢出")?;
-                let values: ArrayRef = Arc::new(Float32Array::from(values));
-                let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values])
-                    .context("创建 prediction Arrow batch 失败")?;
-                writer
-                    .write(&batch)
-                    .context("写 prediction Parquet batch 失败")?;
+                if pending[0].is_empty() && rows == PREDICTION_PARQUET_ROW_GROUP_ROWS {
+                    write_group(&mut writer, columns)?;
+                    continue;
+                }
+                for (buffer, column) in pending.iter_mut().zip(columns) {
+                    buffer.extend_from_slice(&column);
+                }
+                while pending[0].len() >= PREDICTION_PARQUET_ROW_GROUP_ROWS {
+                    let group: Vec<Vec<f32>> = pending
+                        .iter_mut()
+                        .map(|buffer| {
+                            let rest = buffer.split_off(PREDICTION_PARQUET_ROW_GROUP_ROWS);
+                            std::mem::replace(buffer, rest)
+                        })
+                        .collect();
+                    write_group(&mut writer, group)?;
+                }
             }
             Ok(PredictionParquetMessage::Finish) => break,
             Err(_) => anyhow::bail!("prediction Parquet pipeline 在完成前被取消"),
         }
+    }
+    if !pending[0].is_empty() {
+        write_group(&mut writer, std::mem::take(&mut pending))?;
     }
     writer
         .finish()
@@ -1122,11 +1171,45 @@ fn predict_files_to_parquet(
 
     let names = model.inner.feature_names.clone();
     let canonical_n_features = model.inner.n_features;
-    let inference = model.inference_model().map_err(to_py_err)?;
-    let projected_features = inference.canonical_features().to_vec();
-    let n_features = inference.n_features();
     let upto = n_trees.unwrap_or(model.inner.trees.len());
-    let inner = inference.model();
+    // Multi-output models (multiclass, several quantiles): the file is read once, every
+    // batch is scored for all outputs and written before the next one is read.
+    let k_out = model.inner.num_outputs();
+    let multi: Option<MulticlassPredictors> = if k_out > 1 {
+        let views = model.class_views().map_err(to_py_err)?;
+        let infs = views
+            .iter()
+            .map(|v| v.inference_model())
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(to_py_err)?;
+        Some((views, infs))
+    } else {
+        None
+    };
+    let single = if multi.is_none() {
+        Some(model.inference_model().map_err(to_py_err)?)
+    } else {
+        None
+    };
+    let projected_features: Vec<usize> = match &single {
+        Some(inference) => inference.canonical_features().to_vec(),
+        None => (0..canonical_n_features).collect(),
+    };
+    let n_features = projected_features.len();
+    // `multi:softmax` writes one class-index column; every other multi-output result
+    // (probabilities, margins, quantiles) writes `{column}_{k}`.
+    let label_column = !output_margin
+        && matches!(
+            model.inner.objective,
+            crate::types::Objective::Softmax { .. }
+        );
+    let column_names: Vec<String> = if multi.is_none() || label_column {
+        vec![prediction_column.to_string()]
+    } else {
+        (0..k_out)
+            .map(|c| format!("{prediction_column}_{c}"))
+            .collect()
+    };
     let rows_total = if resolved.format == crate::source::input::InputFormat::Parquet {
         resolved
             .paths
@@ -1145,7 +1228,15 @@ fn predict_files_to_parquet(
         n_features,
         n_features.max(1),
     );
-    let work_per_row = prediction_work_per_row(inner, upto);
+    let work_per_row = match (&single, &multi) {
+        (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
+        (None, Some((views, _))) => views
+            .iter()
+            .enumerate()
+            .map(|(c, v)| prediction_work_per_row(&v.inner, model.inner.class_tree_count(upto, c)))
+            .sum(),
+        (None, None) => unreachable!("either a single or a multi-output predictor"),
+    };
     let (ingest_workers, predict_worker_cap, oversubscribed) = prediction_output_pipeline_workers(
         model.ingest_threads,
         predict_threads,
@@ -1183,10 +1274,10 @@ fn predict_files_to_parquet(
 
     let (sender, receiver) = std::sync::mpsc::sync_channel(PREDICTION_PARQUET_CHANNEL_BATCHES);
     let writer_path = output_path.clone();
-    let writer_column = prediction_column.to_string();
+    let writer_columns = column_names.clone();
     let writer_handle = match std::thread::Builder::new()
         .name("fb-predict-parquet".to_string())
-        .spawn(move || prediction_parquet_writer(file, writer_path, writer_column, receiver))
+        .spawn(move || prediction_parquet_writer(file, writer_path, writer_columns, receiver))
     {
         Ok(handle) => handle,
         Err(error) => {
@@ -1199,10 +1290,11 @@ fn predict_files_to_parquet(
 
     if !model.quiet {
         eprintln!(
-            "PREDICT_OUTPUT start format=parquet output={} column={} \
+            "PREDICT_OUTPUT start format=parquet output={} column={} outputs={} \
              ingest_workers={} predict_workers={} writer_workers=1 queue_batches={}",
             output_path.display(),
             prediction_column,
+            column_names.len(),
             ingest_workers,
             predict_worker_cap,
             PREDICTION_PARQUET_CHANNEL_BATCHES,
@@ -1219,7 +1311,10 @@ fn predict_files_to_parquet(
     );
     let mut predict_pool = None;
     let input_result = py.detach(|| {
-        let predictor = inference.cpu_predictor()?;
+        let predictor = match &single {
+            Some(inference) => Some(inference.cpu_predictor()?),
+            None => None,
+        };
         crate::source::predict_input::for_each_projected_contiguous_batch(
             &resolved,
             &names,
@@ -1235,18 +1330,47 @@ fn predict_files_to_parquet(
                     n_rows,
                     work_per_row,
                 );
-                let mut batch = score_contiguous_rows(
-                    &predictor,
-                    data,
-                    n_rows,
-                    n_features,
-                    upto,
-                    workers,
-                    &mut predict_pool,
-                )?;
-                transform_prediction_margins(inner, &mut batch, output_margin);
+                let columns: Vec<Vec<f32>> = match (&single, &multi, &predictor) {
+                    (Some(inference), _, Some(predictor)) => {
+                        let mut batch = score_contiguous_rows(
+                            predictor,
+                            data,
+                            n_rows,
+                            n_features,
+                            upto,
+                            workers,
+                            &mut predict_pool,
+                        )?;
+                        transform_prediction_margins(inference.model(), &mut batch, output_margin);
+                        vec![batch]
+                    }
+                    (_, Some((views, infs)), _) => {
+                        let mut margins = score_multi_output_batch(
+                            &model.inner,
+                            views,
+                            infs,
+                            upto,
+                            data,
+                            n_rows,
+                            canonical_n_features,
+                            false,
+                            workers,
+                            &mut predict_pool,
+                        )?;
+                        if output_margin {
+                            deinterleave_columns(&margins, k_out)
+                        } else if let Some(labels) =
+                            model.inner.objective.transform_rows(&mut margins, k_out)
+                        {
+                            vec![labels]
+                        } else {
+                            deinterleave_columns(&margins, k_out)
+                        }
+                    }
+                    _ => unreachable!("either a single or a multi-output predictor"),
+                };
                 sender
-                    .send(PredictionParquetMessage::Batch(batch))
+                    .send(PredictionParquetMessage::Batch(columns))
                     .map_err(|_| {
                         anyhow::anyhow!("prediction Parquet writer stopped before batch commit")
                     })
@@ -1317,6 +1441,81 @@ fn predict_files_to_parquet(
         );
     }
     Ok(rows_written)
+}
+
+/// Row-major `n × k` values → `k` columns of `n` values.
+fn deinterleave_columns(values: &[f32], k: usize) -> Vec<Vec<f32>> {
+    let n = values.len() / k;
+    (0..k)
+        .map(|c| (0..n).map(|i| values[i * k + c]).collect())
+        .collect()
+}
+
+/// Score one batch of canonical-width rows for every output of a multi-output model
+/// (multiclass classes, or one quantile per alpha): each output view scores its own
+/// compressed feature subset with the single-output predictor. Returns the `n × K`
+/// raw margins, row-major.
+#[allow(clippy::too_many_arguments)]
+fn score_multi_output_batch(
+    model: &Model,
+    views: &[PyModel],
+    infs: &[Arc<crate::inference::CompactInferenceModel>],
+    upto: usize,
+    data: &[f32],
+    n_rows: usize,
+    canonical_n_features: usize,
+    gpu_batch: bool,
+    workers: usize,
+    pool: &mut Option<rayon::ThreadPool>,
+) -> anyhow::Result<Vec<f32>> {
+    let k_out = views.len();
+    let mut margins = vec![0.0f32; n_rows * k_out];
+    for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
+        let nt = model.class_tree_count(upto, c);
+        let gathered;
+        let vdata: &[f32] = if vinf.is_identity(canonical_n_features) {
+            data
+        } else {
+            gathered = project_canonical_rows(
+                data,
+                n_rows,
+                canonical_n_features,
+                vinf.canonical_features(),
+            )?;
+            &gathered
+        };
+        #[cfg(feature = "cuda")]
+        let col = if gpu_batch {
+            view.gpu_predictor(0)?.predict_margins(vdata, n_rows, nt)?
+        } else {
+            score_contiguous_rows(
+                &*vinf.cpu_predictor()?,
+                vdata,
+                n_rows,
+                vinf.n_features(),
+                nt,
+                workers,
+                pool,
+            )?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let col = {
+            let _ = (gpu_batch, view);
+            score_contiguous_rows(
+                &*vinf.cpu_predictor()?,
+                vdata,
+                n_rows,
+                vinf.n_features(),
+                nt,
+                workers,
+                pool,
+            )?
+        };
+        for (i, v) in col.into_iter().enumerate() {
+            margins[i * k_out + c] = v;
+        }
+    }
+    Ok(margins)
 }
 
 fn project_canonical_rows(
@@ -1560,10 +1759,9 @@ impl PyModel {
         Ok(views)
     }
 
-    /// 多分类预测:每类视图各跑一遍单输出路径(CPU / GPU / 文件都复用),
-    /// 再按行组合。返回按行排的 `n × K` margin。
-    ///
-    /// ⚠️ 文件输入会被读 K 遍(每类一遍);0.0.6 再做单遍多输出。
+    /// 多输出(多分类、多分位数)预测:每个输出的视图各跑一遍单输出路径(CPU / GPU 都复用),
+    /// 再按行组合。返回按行排的 `n × K` margin。文件输入走 `predict_files`:
+    /// 只读一遍,每个 batch 对所有输出打分(见 `score_multi_output_batch`)。
     #[allow(clippy::too_many_arguments)]
     fn multiclass_margins<'py>(
         &self,
@@ -1667,166 +1865,16 @@ impl PyModel {
         )?;
         let k = self.inner.num_outputs();
         if !output_margin {
-            if let crate::types::Objective::Softmax { .. } = self.inner.objective {
-                let labels: Vec<f32> = margins
-                    .chunks_exact(k)
-                    .map(|row| crate::objective::argmax(row) as f32)
-                    .collect();
+            // softprob → 概率,softmax → 类别下标(此时返回一维),
+            // 多分位数 → 每行升序(防交叉)。
+            if let Some(labels) = self.inner.objective.transform_rows(&mut margins, k) {
                 return Ok(PyArray1::from_vec(py, labels).into_any());
             }
-            margins
-                .par_chunks_exact_mut(k)
-                .for_each(crate::objective::softmax_in_place);
         }
         let arr = PyArray1::from_vec(py, margins)
             .reshape([n, k])
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(arr.into_any())
-    }
-
-    /// 多分类写 Parquet:`softprob` / margin 写 K 列 `{column}_{k}`,
-    /// `softmax` 写一列类别下标。
-    ///
-    /// ⚠️ 0.0.5 先在内存里算完再写(不是单输出那条有界流式管线);
-    /// 输入文件每类读一遍。0.0.6 做单遍、流式的多输出写出。
-    #[allow(clippy::too_many_arguments)]
-    fn multiclass_to_parquet(
-        &self,
-        py: Python<'_>,
-        data: &Bound<'_, PyAny>,
-        output_path: &str,
-        output_margin: bool,
-        n_trees: Option<usize>,
-        header: bool,
-        predict_threads: usize,
-        prediction_column: &str,
-        missing: f32,
-    ) -> PyResult<usize> {
-        use arrow::array::{ArrayRef, Float32Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use parquet::arrow::ArrowWriter;
-        use parquet::basic::Compression;
-        use parquet::file::properties::WriterProperties;
-
-        // 和单输出路径同样的输出规则:列名非空、扩展名、不覆盖已有文件、
-        // 失败时删掉半成品。全部在预测之前检查,不白算一遍。
-        if prediction_column.trim().is_empty() {
-            return Err(PyValueError::new_err(
-                "prediction_column 不能为空或只包含空白",
-            ));
-        }
-        let out_path = std::path::PathBuf::from(output_path);
-        let valid_extension = out_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("parquet") || e.eq_ignore_ascii_case("pq"));
-        if !valid_extension {
-            return Err(PyValueError::new_err(
-                "prediction 输出路径必须使用 .parquet 或 .pq 扩展名",
-            ));
-        }
-        // 先拒绝已存在的目标(不白算一遍),但**不在这里创建文件**:
-        // 输出若落在输入目录 / glob 里,先建出来的空文件会被当成输入读进去。
-        // 输入全部读完、预测算完之后才 create_new(仍然原子地拒绝覆盖)。
-        if out_path.exists() {
-            return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
-                "prediction 输出已存在,不会覆盖: {}",
-                out_path.display()
-            )));
-        }
-        let (n, mut margins) = self.multiclass_margins(
-            py,
-            data,
-            n_trees,
-            header,
-            predict_threads,
-            false,
-            missing,
-        )?;
-        let file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&out_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(pyo3::exceptions::PyFileExistsError::new_err(format!(
-                    "prediction 输出已存在,不会覆盖: {}",
-                    out_path.display()
-                )))
-            }
-            Err(error) => {
-                return Err(PyValueError::new_err(format!(
-                    "无法创建 prediction 输出 {}: {error}",
-                    out_path.display()
-                )))
-            }
-        };
-        let mut cleanup = IncompletePredictionOutput {
-            path: out_path,
-            complete: false,
-        };
-
-        let k = self.inner.num_outputs();
-        let softmax_labels = !output_margin
-            && matches!(
-                self.inner.objective,
-                crate::types::Objective::Softmax { .. }
-            );
-        let columns: Vec<(String, Vec<f32>)> = if softmax_labels {
-            vec![(
-                prediction_column.to_string(),
-                margins
-                    .chunks_exact(k)
-                    .map(|r| crate::objective::argmax(r) as f32)
-                    .collect(),
-            )]
-        } else {
-            if !output_margin {
-                margins
-                    .par_chunks_exact_mut(k)
-                    .for_each(crate::objective::softmax_in_place);
-            }
-            (0..k)
-                .map(|c| {
-                    (
-                        format!("{prediction_column}_{c}"),
-                        (0..n).map(|i| margins[i * k + c]).collect(),
-                    )
-                })
-                .collect()
-        };
-        let write = || -> anyhow::Result<usize> {
-            let schema = Arc::new(Schema::new(
-                columns
-                    .iter()
-                    .map(|(name, _)| Field::new(name, DataType::Float32, false))
-                    .collect::<Vec<_>>(),
-            ));
-            let arrays: Vec<ArrayRef> = columns
-                .iter()
-                .map(|(_, v)| Arc::new(Float32Array::from(v.clone())) as ArrayRef)
-                .collect();
-            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-                .context("创建 prediction Arrow batch 失败")?;
-            let props = WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
-                .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
-                .build();
-            let mut writer = ArrowWriter::try_new(file, schema, Some(props))
-                .context("创建 prediction Parquet writer 失败")?;
-            writer.write(&batch).context("写 prediction Parquet 失败")?;
-            writer.finish().context("完成 prediction Parquet 失败")?;
-            writer
-                .inner()
-                .sync_all()
-                .context("同步 prediction Parquet 文件失败")?;
-            Ok(n)
-        };
-        let n = py.detach(write).map_err(to_py_err)?;
-        cleanup.complete = true;
-        Ok(n)
     }
 
     fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
@@ -2301,66 +2349,25 @@ impl PyModel {
                                 n_rows,
                                 work_per_row,
                             );
-                            let mut margins = vec![0.0f32; n_rows * k_out];
-                            for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
-                                let nt = self.inner.class_tree_count(upto, c);
-                                let gathered;
-                                let vdata: &[f32] = if vinf.is_identity(canonical_n_features) {
-                                    data
-                                } else {
-                                    gathered = project_canonical_rows(
-                                        data,
-                                        n_rows,
-                                        canonical_n_features,
-                                        vinf.canonical_features(),
-                                    )?;
-                                    &gathered
-                                };
-                                #[cfg(feature = "cuda")]
-                                let col = if gpu_batch {
-                                    view.gpu_predictor(0)?.predict_margins(vdata, n_rows, nt)?
-                                } else {
-                                    score_contiguous_rows(
-                                        &*vinf.cpu_predictor()?,
-                                        vdata,
-                                        n_rows,
-                                        vinf.n_features(),
-                                        nt,
-                                        workers,
-                                        &mut predict_pool,
-                                    )?
-                                };
-                                #[cfg(not(feature = "cuda"))]
-                                let col = {
-                                    let _ = (gpu_batch, view);
-                                    score_contiguous_rows(
-                                        &*vinf.cpu_predictor()?,
-                                        vdata,
-                                        n_rows,
-                                        vinf.n_features(),
-                                        nt,
-                                        workers,
-                                        &mut predict_pool,
-                                    )?
-                                };
-                                for (i, v) in col.into_iter().enumerate() {
-                                    margins[i * k_out + c] = v;
-                                }
-                            }
+                            let mut margins = score_multi_output_batch(
+                                &self.inner,
+                                views,
+                                infs,
+                                upto,
+                                data,
+                                n_rows,
+                                canonical_n_features,
+                                gpu_batch,
+                                workers,
+                                &mut predict_pool,
+                            )?;
                             if output_margin {
                                 out.extend(margins);
-                            } else if let crate::types::Objective::Softmax { .. } =
-                                self.inner.objective
+                            } else if let Some(labels) =
+                                self.inner.objective.transform_rows(&mut margins, k_out)
                             {
-                                out.extend(
-                                    margins
-                                        .chunks_exact(k_out)
-                                        .map(|r| crate::objective::argmax(r) as f32),
-                                );
+                                out.extend(labels);
                             } else {
-                                margins
-                                    .par_chunks_exact_mut(k_out)
-                                    .for_each(crate::objective::softmax_in_place);
                                 out.extend(margins);
                             }
                             return Ok(());
@@ -2481,19 +2488,6 @@ impl PyModel {
                     "predict_to_parquet 只接受文件路径、路径列表、目录或 glob 输入",
                 )
             })?;
-            if self.inner.num_outputs() > 1 {
-                return self.multiclass_to_parquet(
-                    py,
-                    data,
-                    output_path,
-                    output_margin,
-                    n_trees,
-                    header,
-                    predict_threads,
-                    prediction_column,
-                    missing,
-                );
-            }
             predict_files_to_parquet(
                 self,
                 py,
@@ -2866,11 +2860,12 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
     // 没给时 XGBoost 的 learner 对 count:poisson 把它设成 0.7(两边都是),
     // 其它 objective 树上是 0。
     let max_delta_step: Option<f32> = get!("max_delta_step");
-    let quantile_alpha: Option<f32> = get!("quantile_alpha");
+    // Python 层已经把标量 / 序列统一成 `list[float]`(或 None)。
+    let quantile_alpha: Option<Vec<f32>> = get!("quantile_alpha");
     if objective == "reg:quantileerror" && quantile_alpha.is_none() {
         return Err(PyValueError::new_err(
-            "reg:quantileerror 需要 quantile_alpha(单个 [0, 1] 内的分位数,例如 0.9);\
-             XGBoost 没有默认值",
+            "reg:quantileerror 需要 quantile_alpha(一个或多个 [0, 1] 内、升序的分位数,\
+             例如 0.9 或 [0.1, 0.5, 0.9]);XGBoost 没有默认值",
         ));
     }
     let objective = Objective::from_name(&objective)
@@ -2890,7 +2885,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                 k.unwrap_or(0)
             },
        )
-        .with_quantile_alpha(quantile_alpha.unwrap_or(0.5));
+        .with_quantile_alphas(quantile_alpha.as_deref().unwrap_or(&[0.5]))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let objective = match objective {
         Objective::Rank { kind, .. } => Objective::Rank {
             kind,

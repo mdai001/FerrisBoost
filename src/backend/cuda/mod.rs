@@ -156,6 +156,11 @@ pub struct SharedHistogramConfig {
     /// `K > 1` 才有内存代价:常驻 prediction 变成 `K × n`,外加每行 softmax 统计量。
     /// 规划器必须用同一个 K(`gpu_mem_plan::fast_multiclass_extra_bytes`)。
     pub n_outputs: usize,
+    /// 多个 `quantile_alpha`(`n_outputs` 个目标的 `reg:quantileerror`)。
+    /// 没有 softmax 行统计量:fast 的每个目标在自己的 kernel 里归约 scale,
+    /// 所以只有 `K × n` 的 prediction 有常驻代价(规划器见
+    /// `gpu_mem_plan::fast_multi_output_extra_bytes`)。
+    pub multi_quantile: bool,
     /// `gpu_math = Fast` with a ranking objective: the shape of the device LambdaMART
     /// buffers (allocated once, charged by the planner with the same
     /// `gpu_mem_plan::fast_rank_bytes`). `None` for every other training.
@@ -180,6 +185,7 @@ impl Default for SharedHistogramConfig {
             gpu_math: crate::types::GpuMath::Exact,
             fast_weights: false,
             n_outputs: 1,
+            multi_quantile: false,
             fast_rank: None,
         }
     }
