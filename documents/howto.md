@@ -1493,7 +1493,7 @@ prediction = model.predict(["test_part_0.parquet", "test_part_1.parquet"])
 prediction = model.predict("data/test_partitions/")
 prediction = model.predict("data/test_*.parquet")
 
-# Headerless CSV (positional mode):
+# Headerless CSV (positional mode; for a model trained without feature names):
 prediction = model.predict("test.csv", header=False)
 ```
 
