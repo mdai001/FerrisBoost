@@ -397,3 +397,49 @@ def test_gpu_fast_continuation_is_deterministic(tmp_path):
     two = fb.train(gp, x, label=y, num_boost_round=3, xgb_model=first, quiet=True)
     assert saved(one, tmp_path, "one").read_bytes() == saved(two, tmp_path, "two").read_bytes()
     assert one.num_trees == 6
+
+
+# ---------------------------------------------------------------------- ranking
+def make_rank(seed=0, sizes=(3, 5, 8, 13, 21, 34, 40, 7, 9, 30)):
+    rng = np.random.default_rng(seed)
+    n = int(sum(sizes))
+    x = rng.integers(0, 12, size=(n, 6)).astype(np.float32)
+    s = x[:, 0] * 0.5 + x[:, 1] * 0.3 - x[:, 2] * 0.2 + rng.normal(0, 1.5, n)
+    y = np.clip(np.round((s - s.min()) / (s.max() - s.min()) * 4), 0, 4).astype(np.float32)
+    return x, y, np.repeat(np.arange(len(sizes)), sizes)
+
+
+@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise", "rank:map"])
+def test_ranking_model_continuation_matches_xgboost(objective, tmp_path):
+    x, y, qid = make_rank()
+    if objective == "rank:map":
+        y = (y > 1).astype(np.float32)
+    d = xgb.DMatrix(x, y, qid=qid)
+    xp = {"objective": objective, "tree_method": "hist", "nthread": 1, "max_depth": 3, "max_bin": 16}
+    first = xgb.train(xp, d, 3)
+    cont = xgb.train(xp, d, 3, xgb_model=first)
+    p = {"objective": objective, "nthread": 1, "max_depth": 3, "max_bin": 16}
+    m1 = fb.train(p, x, label=y, qid=qid, num_boost_round=3, quiet=True)
+    m2 = fb.train(p, x, label=y, qid=qid, num_boost_round=3, xgb_model=m1, quiet=True)
+    np.testing.assert_array_equal(raw(m2, x), xraw(cont, x))
+    # Same data: 3 + 3 rounds are the 6 uninterrupted rounds, byte for byte.
+    full = fb.train(p, x, label=y, qid=qid, num_boost_round=6, quiet=True)
+    assert saved(full, tmp_path, "f").read_bytes() == saved(m2, tmp_path, "j").read_bytes()
+
+
+def test_ranking_continuation_with_validation_sets_and_margins():
+    x, y, qid = make_rank()
+    vx, vy, vq = make_rank(seed=4, sizes=(6, 11, 17, 25))
+    margin = np.random.default_rng(2).normal(0, 0.4, len(y)).astype(np.float32)
+    p = {"objective": "rank:ndcg", "nthread": 1, "max_depth": 3, "max_bin": 16}
+    m1 = fb.train(p, x, label=y, qid=qid, base_margin=margin, num_boost_round=3, quiet=True)
+    res = {}
+    m2 = fb.train(p, x, label=y, qid=qid, base_margin=margin, num_boost_round=3, xgb_model=m1,
+                  evals=[(vx, vy, "v")], eval_qid=[vq], evals_result=res, quiet=True)
+    assert m2.num_trees == 6
+    assert all(len(v) == 3 for v in res["v"].values())
+    d = xgb.DMatrix(x, y, qid=qid, base_margin=margin)
+    xp = {"objective": "rank:ndcg", "tree_method": "hist", "nthread": 1, "max_depth": 3,
+          "max_bin": 16}
+    cont = xgb.train(xp, d, 3, xgb_model=xgb.train(xp, d, 3))
+    np.testing.assert_array_equal(raw(m2, x, base_margin=margin), xraw(cont, x, margin))

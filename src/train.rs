@@ -655,6 +655,11 @@ pub struct TrainConfig {
     /// itself is never evaluated here, because the data arrives binned with
     /// freshly sketched cuts while its splits are float thresholds.
     pub prior_model: Option<Model>,
+    /// Query-group row offsets (`n_groups + 1` values, first 0, last = rows) of the
+    /// training set. Required by the `rank:*` objectives and rejected by every
+    /// other objective. With ranking, the `weights` argument of the train entry
+    /// points holds one weight per query group instead of one per row.
+    pub group_ptr: Option<Vec<u32>>,
 }
 
 impl TrainConfig {
@@ -669,6 +674,7 @@ impl TrainConfig {
             base_margin: None,
             eval_base_margins: Vec::new(),
             prior_model: None,
+            group_ptr: None,
         }
     }
 
@@ -699,6 +705,9 @@ pub struct EvalSet<'a> {
     /// 每行样本权重,`None` 等价于全 1(XGBoost 的 DMatrix `weight`)。
     /// 加权 metric 是 `sum(w·loss) / sum(w)`。
     pub weights: Option<&'a [f32]>,
+    /// Query-group row offsets of this validation set (required by ranking
+    /// objectives; with ranking, `weights` is one value per group).
+    pub group_ptr: Option<&'a [u32]>,
 }
 
 /// 让 `with_block` 能带返回值。
@@ -1136,11 +1145,56 @@ fn train_with_backend(
         labels.len()
     );
     anyhow::ensure!(labels.iter().all(|v| v.is_finite()), "标签必须全部是有限值");
-    if let Some(w) = weights {
-        validate_weights(w, n, "训练集")?;
+    let ranking = cfg.objective.rank();
+    match (ranking.is_some(), cfg.group_ptr.as_deref()) {
+        (true, None) => anyhow::bail!(
+            "{} needs query groups: pass qid= or group= with the training data",
+            cfg.objective.name()
+        ),
+        (false, Some(_)) => anyhow::bail!(
+            "query groups (qid / group) are only used by the rank:* objectives, not {}",
+            cfg.objective.name()
+        ),
+        (true, Some(g)) => crate::rank::validate_group_ptr(g, n, "训练集")?,
+        (false, None) => {}
     }
+    // Ranking weights are per query group (XGBoost): they never reach the per-row
+    // machinery (gradient weights, base score, device labels).
+    let n_weights = cfg.group_ptr.as_ref().map_or(n, |g| g.len() - 1);
+    if let Some(w) = weights {
+        validate_weights(w, n_weights, "训练集")?;
+    }
+    let (group_weights, weights) = if ranking.is_some() {
+        (weights, None)
+    } else {
+        (None, weights)
+    };
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
+    let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
+    let rank_grad = match (ranking, cfg.group_ptr.as_deref()) {
+        (Some((kind, params)), Some(groups)) => Some(crate::rank::RankGradient::new(
+            kind,
+            params,
+            labels,
+            groups,
+            group_weights,
+        )?),
+        _ => None,
+    };
+    // One draw of the training RNG per round (XGBoost seeds the sampled pairs of
+    // `lambdarank_pair_method=mean` from it); the base-score estimation takes the
+    // first one when the base score is not given.
+    let mut round_seeds = ranking.map(|(_, params)| crate::rank::RoundSeeds::new(&params, cfg.params.seed));
+    // Continuation: skip the draws the earlier rounds (and the base-score
+    // estimation) would have consumed, so the pair sampling of N+M rounds equals
+    // N continued by M. A first run with an explicit `base_score` drew one less;
+    // for it the continued stream is shifted by one draw (still deterministic).
+    if let (Some(seeds), Some(prior)) = (round_seeds.as_mut(), cfg.prior_model.as_ref()) {
+        for _ in 0..=prior.trees.len() {
+            seeds.draw();
+        }
+    }
     let num_class = cfg.objective.num_outputs();
     validate_start_margins(cfg, source, evals)?;
     // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
@@ -1160,6 +1214,14 @@ fn train_with_backend(
         prior.base_score
     } else if num_class > 1 {
         class_margins[0]
+    } else if let Some(rg) = rank_grad.as_ref() {
+        match cfg.base_score {
+            Some(b) => b,
+            None => {
+                let seed = round_seeds.as_mut().map_or(0, |r| r.draw());
+                crate::rank::estimate_base_score(rg, seed)
+            }
+        }
     } else {
         cfg.resolve_base_score(labels, weights)
     };
@@ -1280,8 +1342,30 @@ fn train_with_backend(
         );
         cfg.objective
             .validate_labels(ev.labels, &format!("验证集 {:?} ", ev.name))?;
+        match (ranking.is_some(), ev.group_ptr) {
+            (true, None) => anyhow::bail!(
+                "validation set {:?} needs query groups (eval qid / group) for {}",
+                ev.name,
+                cfg.objective.name()
+            ),
+            (false, Some(_)) => anyhow::bail!(
+                "validation set {:?} has query groups, but {} is not a ranking objective",
+                ev.name,
+                cfg.objective.name()
+            ),
+            (true, Some(g)) => crate::rank::validate_group_ptr(
+                g,
+                ev.source.n_rows(),
+                &format!("validation set {:?}", ev.name),
+            )?,
+            (false, None) => {}
+        }
+        for m in &cfg.eval_metrics {
+            m.check_labels(ev.labels, &format!("validation set {:?}", ev.name))?;
+        }
         if let Some(w) = ev.weights {
-            validate_weights(w, ev.source.n_rows(), &format!("验证集 {:?} ", ev.name))?;
+            let n_ev_weights = ev.group_ptr.map_or(ev.source.n_rows(), |g| g.len() - 1);
+            validate_weights(w, n_ev_weights, &format!("验证集 {:?} ", ev.name))?;
             for m in &cfg.eval_metrics {
                 anyhow::ensure!(
                     m.supports_weights(),
@@ -1389,6 +1473,18 @@ fn train_with_backend(
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
                     n_outputs: num_class,
+                    // Device LambdaMART buffers (fast ranking only); the planner
+                    // charges the same shape.
+                    fast_rank: match (ranking, cfg.group_ptr.as_deref()) {
+                        (Some((kind, params)), Some(g)) if fast_requested => {
+                            Some(crate::gpu_mem_plan::FastRankShape {
+                                n_groups: (g.len() - 1) as u64,
+                                map: kind == crate::rank::RankKind::Map,
+                                mean: params.pair_method == crate::rank::PairMethod::Mean,
+                            })
+                        }
+                        _ => None,
+                    },
                     device_quantize: cfg.params.device_quantize,
                     ..Default::default()
                 },
@@ -1455,6 +1551,13 @@ fn train_with_backend(
         }
     }
 
+    // fast ranking: static per-group inputs go to the device once
+    if let (true, Some(rg)) = (fast_math, rank_grad.as_ref()) {
+        gpu.as_ref()
+            .expect("fast_math 蕴含 gpu 存在")
+            .init_fast_rank(&rg.device_inputs())?;
+    }
+
     if num_class > 1 {
         model.class_base_margins = class_margins;
         return train_multiclass_rounds(
@@ -1512,6 +1615,7 @@ fn train_with_backend(
         // 回调和 metric 也只看 eval),所以把施加推迟到这里是安全的;
         // 训练结束时若还欠一次施加,循环外会补上,不留下过期状态。
         let fuse = pending_delta;
+        let round_seed = round_seeds.as_mut().map_or(0, |r| r.draw());
         // fast 模式下 host 侧完全不产生 gpair:prediction apply、objective
         // gradient 和量化在 device 上一次做完。
         let exact_gradient_phase =
@@ -1525,6 +1629,16 @@ fn train_with_backend(
             pool.install(|| -> anyhow::Result<()> {
                 let _t = prof::Timer::new(&prof::GRAD);
                 ctx.with_prediction_delta(&mut |delta| {
+                    if let Some(rg) = rank_grad.as_ref() {
+                        // Group gradients need every updated score: apply the
+                        // delta first, then compute them.
+                        predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .for_each(|(p, d)| *p += *d);
+                        rg.gradients(&predictions, round_seed, &mut out);
+                        return;
+                    }
                     if obj.is_quantile() {
                         // 梯度依赖全体行的更新后预测(全局 scale):先施加 delta
                         // 再整体求梯度,不能边施加边算。
@@ -1566,6 +1680,11 @@ fn train_with_backend(
         } else {
             pool.install(|| {
                 let _t = prof::Timer::new(&prof::GRAD);
+                if let Some(rg) = rank_grad.as_ref() {
+                    let mut out = Vec::new();
+                    rg.gradients(&predictions, round_seed, &mut out);
+                    return out;
+                }
                 // quantile 的 scale 是对全体行预测的串行 f64 归约(其它
                 // objective 不用,传 0)。
                 let qs = if cfg.objective.is_quantile() {
@@ -1644,12 +1763,21 @@ fn train_with_backend(
             // 行采样在 device 上完成:阈值 host 折算,device 只比整数。
             // ⚠️ kernel 里 prediction 更新是**无条件**的,只有 gpair 被置零 ——
             // 采样掩码不是预测掩码。
-            let (q, root, _ms) = ctx.fast_gradient_and_quantize(
-                cfg.objective,
-                crate::subsample::threshold_for(cfg.params.subsample),
-                cfg.params.seed,
-                key_round as u64,
-            )?;
+            let (q, root, _ms) = if rank_grad.is_some() {
+                ctx.fast_rank_round(
+                    round_seed,
+                    crate::subsample::threshold_for(cfg.params.subsample),
+                    cfg.params.seed,
+                    key_round as u64,
+                )?
+            } else {
+                ctx.fast_gradient_and_quantize(
+                    cfg.objective,
+                    crate::subsample::threshold_for(cfg.params.subsample),
+                    cfg.params.seed,
+                    key_round as u64,
+                )?
+            };
             // delta 已经被 device kernel 吃掉,不再欠 host 一次施加。
             pending_delta = false;
             (q, Vec::new(), Some(root))
@@ -2257,7 +2385,7 @@ fn evaluate(
             entries.push((
                 ev.name.clone(),
                 m.name().to_string(),
-                m.eval_weighted(pred, ev.labels, ev.weights),
+                m.eval_grouped(pred, ev.labels, ev.weights, ev.group_ptr),
             ));
         }
     }
@@ -4401,6 +4529,7 @@ mod tests {
             source: &src,
             labels: &y[..18],
             weights: None,
+            group_ptr: None,
         };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local)
             .expect_err("验证标签长度不一致必须报错");
@@ -4540,6 +4669,7 @@ mod tests {
             source: &valid_src,
             labels: &flipped,
             weights: None,
+            group_ptr: None,
         }];
 
         let mut cbs: Vec<Box<dyn Callback>> = vec![
@@ -4610,6 +4740,7 @@ mod tests {
             source: &valid_src,
             labels: &y,
             weights: None,
+            group_ptr: None,
         }];
 
         let recorder = RecordHistory::new();
@@ -4675,6 +4806,7 @@ mod tests {
             source: &valid,
             labels: &y,
             weights: None,
+            group_ptr: None,
         }];
         let recorder = RecordHistory::new();
         let history = recorder.handle();
@@ -4727,6 +4859,7 @@ mod tests {
             source: &valid,
             labels: &y,
             weights: None,
+            group_ptr: None,
         }];
         let recorder = RecordHistory::new();
         let history = recorder.handle();
@@ -4892,6 +5025,7 @@ mod tests {
             source: &valid_src,
             labels: &y,
             weights: None,
+            group_ptr: None,
         }];
         let model = train(&train_src, &y, &evals, &cfg, &mut [], &Local).unwrap();
 
@@ -5317,6 +5451,7 @@ mod tests {
             source: &src,
             labels: &y,
             weights: Some(&bad),
+            group_ptr: None,
         };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).expect_err("验证集权重也要校验");
         assert!(err.to_string().contains("验证集 \"valid\""), "{err:#}");
@@ -5885,6 +6020,7 @@ mod tests {
             source: &src,
             labels: &y,
             weights: None,
+            group_ptr: None,
         };
         let cfg = TrainConfig {
             eval_base_margins: vec![Some(vec![0.0; 3])],
@@ -6117,6 +6253,7 @@ mod tests {
             source: &src,
             labels: &y,
             weights: None,
+            group_ptr: None,
         };
         let cfg = TrainConfig {
             base_margin: Some(margins.clone()),

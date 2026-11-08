@@ -33,6 +33,17 @@ pub mod cuda {
         pub gpu_math: crate::types::GpuMath,
         pub fast_weights: bool,
         pub n_outputs: usize,
+        pub fast_rank: Option<crate::gpu_mem_plan::FastRankShape>,
+    }
+    /// Static inputs of the device ranking path (uninhabited without CUDA).
+    pub struct RankDeviceInputs<'a> {
+        pub kind: crate::rank::RankKind,
+        pub params: crate::rank::RankParams,
+        pub labels: &'a [f32],
+        pub group_ptr: &'a [u32],
+        pub group_weights: Option<&'a [f32]>,
+        pub weight_norm: f64,
+        pub inv_idcg: &'a [f64],
     }
     impl Default for SharedHistogramConfig {
         fn default() -> Self {
@@ -47,6 +58,7 @@ pub mod cuda {
                 gpu_math: crate::types::GpuMath::Exact,
                 fast_weights: false,
                 n_outputs: 1,
+                fast_rank: None,
             }
         }
     }
@@ -150,6 +162,18 @@ pub mod cuda {
             _weights: Option<&[f32]>,
             _row_margins: &[f32],
         ) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn init_fast_rank(&self, _inputs: &RankDeviceInputs<'_>) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn fast_rank_round(
+            &self,
+            _round_seed: u32,
+            _t: u64,
+            _s: u64,
+            _tree: u64,
+        ) -> Result<(crate::types::GradQuantizer, GradPairFixed, f32)> {
             match self.0 {}
         }
         pub fn fast_multiclass_begin_round(&self) -> Result<()> {

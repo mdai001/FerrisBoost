@@ -223,12 +223,12 @@ File-to-file CPU scoring is also available through `Model.predict_to_parquet()`;
 
 ### Objectives and metrics
 
-Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, and `multi:softmax`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, and `merror`. See the Python API How-To for which metrics apply to which objective.
+Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, and the ranking objectives `rank:ndcg`, `rank:pairwise` and `rank:map`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, `merror`, and, for ranking, `ndcg`, `map` and `pre` (with `@k`). See the Python API How-To for which metrics apply to which objective.
 
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** categories are integer codes `0..=254` (at most 255 per feature). GPU training runs the split search for categorical features on the host, and prediction from a categorical model runs on the CPU.
+* **Categorical features:** categories are integer codes `0..=253` (at most 254 per feature in this version; a larger limit is planned). GPU training runs the split search for categorical features on the host, and prediction from a categorical model runs on the CPU.
 * **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -250,6 +250,7 @@ logging, and the complete parameter reference.
 
 - Added `base_margin`.
 - Added training continuation (`xgb_model`).
+- Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
 
 ### 0.0.6 (unreleased)
 

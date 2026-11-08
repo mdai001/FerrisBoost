@@ -413,3 +413,43 @@ def test_gpu_fast_starts_from_the_margins_and_is_deterministic(objective, tmp_pa
     np.testing.assert_allclose(
         one.predict(x, output_margin=True, base_margin=margin),
         exact.predict(x, output_margin=True, base_margin=margin), rtol=1e-4, atol=1e-4)
+
+
+# ---------------------------------------------------------------------- ranking
+def make_rank(seed=0, sizes=(3, 5, 8, 13, 21, 34, 40, 7, 9, 30)):
+    rng = np.random.default_rng(seed)
+    n = int(sum(sizes))
+    x = rng.integers(0, 12, size=(n, 6)).astype(np.float32)
+    s = x[:, 0] * 0.5 + x[:, 1] * 0.3 - x[:, 2] * 0.2 + rng.normal(0, 1.5, n)
+    y = np.clip(np.round((s - s.min()) / (s.max() - s.min()) * 4), 0, 4).astype(np.float32)
+    qid = np.repeat(np.arange(len(sizes)), sizes)
+    margin = rng.normal(0, 0.5, n).astype(np.float32)
+    return x, y, qid, margin
+
+
+@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise"])
+@pytest.mark.parametrize("pair_method", ["topk", "mean"])
+def test_base_margin_with_ranking_objectives_matches_xgboost(objective, pair_method):
+    x, y, qid, margin = make_rank()
+    extra = {"lambdarank_pair_method": pair_method}
+    d = xgb.DMatrix(x, y, qid=qid, base_margin=margin)
+    bst = xgb.train({"objective": objective, "tree_method": "hist", "nthread": 1,
+                     "max_depth": 3, "max_bin": 16, **extra}, d, 5)
+    model = fb.train({"objective": objective, "nthread": 1, "max_depth": 3, "max_bin": 16, **extra},
+                     x, label=y, qid=qid, base_margin=margin, num_boost_round=5, quiet=True)
+    np.testing.assert_array_equal(
+        model.predict(x, output_margin=True, base_margin=margin),
+        bst.predict(xgb.DMatrix(x, base_margin=margin), output_margin=True))
+    # The margin matters (a plain model starts from the intercept instead).
+    assert not np.array_equal(model.predict(x), model.predict(x, base_margin=margin))
+
+
+def test_ranker_estimator_passes_base_margin_through():
+    x, y, qid, margin = make_rank()
+    kw = dict(n_estimators=4, max_depth=3, max_bin=16, n_jobs=1, objective="rank:ndcg")
+    xr = xgb.XGBRanker(tree_method="hist", **kw)
+    xr.fit(x, y, qid=qid, base_margin=margin)
+    fr = fb.FerrisBoostRanker(**kw)
+    fr.fit(x, y, qid=qid, base_margin=margin)
+    np.testing.assert_array_equal(fr.predict(x, base_margin=margin),
+                                  xr.predict(x, base_margin=margin))

@@ -286,6 +286,23 @@ fn resolve_blocking(
                     } else {
                         model
                     };
+                    // fast ranking: the device LambdaMART buffers. The group count is
+                    // known up front for arrays; file inputs plan with the row count
+                    // (an upper bound) and allocate for the real groups.
+                    let model = match (fast, cfg.objective.rank()) {
+                        (true, Some((kind, params))) => model.with_fast_rank(
+                            rows,
+                            &crate::gpu_mem_plan::FastRankShape {
+                                n_groups: cfg
+                                    .group_ptr
+                                    .as_ref()
+                                    .map_or(rows, |g| (g.len() - 1) as u64),
+                                map: kind == crate::rank::RankKind::Map,
+                                mean: params.pair_method == crate::rank::PairMethod::Mean,
+                            },
+                        ),
+                        _ => model,
+                    };
                     if cfg.params.gpu_split_cache
                         && !matches!(
                             std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
@@ -2872,6 +2889,9 @@ struct Parsed {
     /// XGBoost `missing`: feature values equal to it are treated as NaN in the
     /// training data and every validation set. NaN = no sentinel.
     missing: f32,
+    /// Query-group row offsets of the training set (ranking). Set by the entry
+    /// point once the groups are known, before `train_config`.
+    group_ptr: Option<Vec<u32>>,
 }
 
 /// Python 层归一后的单调约束:按位置,或按列名(要等拿到列名才能解析)。
@@ -2927,6 +2947,7 @@ impl Parsed {
         let mut cfg = TrainConfig {
             base_score: self.base_score,
             quiet: self.quiet,
+            group_ptr: self.group_ptr.clone(),
             ..TrainConfig::new(self.params.clone(), self.objective)
         };
         if !self.eval_metrics.is_empty() {
@@ -2940,6 +2961,64 @@ impl Parsed {
         let lower_is_better = cfg.eval_metrics.last().is_none_or(|m| m.lower_is_better());
         Ok((cfg, lower_is_better))
     }
+}
+
+/// The XGBoost `lambdarank_*` / `ndcg_exp_gain` parameters of a ranking objective.
+fn parse_rank_params(d: &Bound<'_, PyDict>) -> PyResult<crate::rank::RankParams> {
+    use crate::rank::{PairMethod, RankParams};
+    fn get<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        d.get_item(key)?.ok_or_else(|| {
+            PyValueError::new_err(format!("参数 {key} 没给(Python 层应该补上默认值)"))
+        })
+    }
+    let get = |key: &str| get(d, key);
+    let pair_method: String = get("lambdarank_pair_method")?.extract()?;
+    let pair_method = match pair_method.as_str() {
+        "topk" => PairMethod::TopK,
+        "mean" => PairMethod::Mean,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "lambdarank_pair_method must be \"topk\" or \"mean\", got {other:?}"
+            )))
+        }
+    };
+    let num_pair: Option<u32> = get("lambdarank_num_pair_per_sample")?.extract()?;
+    Ok(RankParams {
+        pair_method,
+        num_pair_per_sample: num_pair,
+        normalization: get("lambdarank_normalization")?.extract()?,
+        score_normalization: get("lambdarank_score_normalization")?.extract()?,
+        ndcg_exp_gain: get("ndcg_exp_gain")?.extract()?,
+        unbiased: get("lambdarank_unbiased")?.extract()?,
+        bias_norm: get("lambdarank_bias_norm")?.extract()?,
+    })
+}
+
+/// Group offsets and per-group weights of a file dataset from its query-id column
+/// and (optional) per-row weight column.
+fn file_groups(
+    ids: &[u64],
+    row_weights: Option<&[f32]>,
+    weight_column: Option<&str>,
+) -> anyhow::Result<(Vec<u32>, Option<Vec<f32>>)> {
+    let ptr = crate::rank::group_ptr_from_qid(ids)?;
+    let weights = match row_weights {
+        None => None,
+        Some(w) => {
+            anyhow::ensure!(
+                w.len() == ids.len(),
+                "weight column has {} rows, the query-id column {}",
+                w.len(),
+                ids.len()
+            );
+            Some(crate::rank::group_weights_from_rows(
+                w,
+                &ptr,
+                weight_column.unwrap_or("weight"),
+            )?)
+        }
+    };
+    Ok((ptr, weights))
 }
 
 fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
@@ -3008,6 +3087,13 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             },
        )
         .with_quantile_alpha(quantile_alpha.unwrap_or(0.5));
+    let objective = match objective {
+        Objective::Rank { kind, .. } => Objective::Rank {
+            kind,
+            params: parse_rank_params(d)?,
+        },
+        other => other,
+    };
     objective
         .validate_params()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -3093,6 +3179,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             names
         },
         weighted: false,
+        group_ptr: None,
         missing: {
             let raw: f64 = get!("missing");
             crate::source::validate_missing(raw)
@@ -3362,7 +3449,7 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     }
 }
 
-/// Training categorical columns must hold integer codes `0..=254` (NaN =
+/// Training categorical columns must hold integer codes `0..=253` (NaN =
 /// missing). Report the first offender by feature index before binning.
 fn check_categorical_codes(
     data: &[f32],
@@ -3397,7 +3484,8 @@ fn check_categorical_codes(
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
                     verbose_eval=None, callbacks=None, weight=None, feature_names=None,
-                    base_margin=None, eval_base_margins=None, prior_model=None))]
+                    qid=None, group=None, base_margin=None, eval_base_margins=None,
+                    prior_model=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_dense(
     py: Python<'_>,
@@ -3410,6 +3498,8 @@ fn train_dense(
     callbacks: Option<&Bound<'_, PyList>>,
     weight: Option<PyReadonlyArray1<'_, f32>>,
     feature_names: Option<Vec<String>>,
+    qid: Option<PyReadonlyArray1<'_, u64>>,
+    group: Option<PyReadonlyArray1<'_, u64>>,
     // Per-row starting margin `(rows, num_outputs)` (for continuation: the
     // prior model's margin on this data); one entry per eval set in
     // `eval_base_margins`, `None` for a set that starts from the intercept.
@@ -3423,7 +3513,8 @@ fn train_dense(
     let weights: Option<Vec<f32>> = weight
         .map(|w| w.as_slice().map(<[f32]>::to_vec))
         .transpose()?;
-    cfg.weighted = weights.is_some();
+    let ranking = cfg.objective.is_ranking();
+    cfg.weighted = weights.is_some() && !ranking;
     let shape = x.shape();
     let (n_rows, n_features) = (shape[0], shape[1]);
     let labels = y.as_slice()?.to_vec();
@@ -3433,6 +3524,29 @@ fn train_dense(
             labels.len()
         )));
     }
+    // Query groups (ranking): flat row offsets next to the labels.
+    let group_ptr = crate::rank::group_ptr_from_inputs(
+        qid.as_ref().map(|q| q.as_slice()).transpose()?,
+        group.as_ref().map(|g| g.as_slice()).transpose()?,
+        n_rows,
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    match (ranking, group_ptr.is_some()) {
+        (true, false) => {
+            return Err(PyValueError::new_err(format!(
+                "{} needs query groups: pass qid= or group=",
+                cfg.objective.name()
+            )))
+        }
+        (false, true) => {
+            return Err(PyValueError::new_err(format!(
+                "qid / group are only used by the rank:* objectives, not {}",
+                cfg.objective.name()
+            )))
+        }
+        _ => {}
+    }
+    cfg.group_ptr = group_ptr.clone();
 
     // 量化在 GIL 里做:它要读 numpy 的内存。之后训练不再碰 Python 对象,
     // 就可以放掉 GIL 了。
@@ -3446,11 +3560,17 @@ fn train_dense(
     // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
     apply_resolved_geometry(&mut cfg, &plan);
     if let Some(w) = &weights {
-        if w.len() != n_rows {
-            return Err(PyValueError::new_err(format!(
-                "weight 有 {} 个,特征矩阵有 {n_rows} 行",
-                w.len()
-            )));
+        // Ranking weights are one per query group.
+        let expected = group_ptr.as_ref().map_or(n_rows, |g| g.len() - 1);
+        if w.len() != expected {
+            return Err(PyValueError::new_err(if ranking {
+                format!(
+                    "ranking weights are per query group: weight has {} entries for {expected} groups",
+                    w.len()
+                )
+            } else {
+                format!("weight 有 {} 个,特征矩阵有 {n_rows} 行", w.len())
+            }));
         }
         if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
             return Err(PyValueError::new_err("样本权重必须是有限的非负数"));
@@ -3463,6 +3583,12 @@ fn train_dense(
     reject_inf(&x_values, n_features, "训练集")?;
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
+    // Ranking: the group weight is repeated on the rows of its group.
+    let unrolled_weights: Option<Vec<f32>> = match (&weights, &group_ptr) {
+        (Some(w), Some(g)) => Some(crate::rank::unroll_group_weights(w, g)),
+        _ => None,
+    };
+    let sketch_weights: Option<&[f32]> = unrolled_weights.as_deref().or(weights.as_deref());
     let train_src = DenseSource::new_weighted_with_nthread(
         &x_values,
         n_rows,
@@ -3479,21 +3605,29 @@ fn train_dense(
         },
         plan.effective,
         cfg.params.nthread,
-        weights.as_deref(),
+        sketch_weights,
     );
 
     // 验证集必须复用训练集的 cuts,否则同一个值会落进不同的 bin
     #[allow(clippy::type_complexity)]
-    let mut eval_data: Vec<(String, DenseSource, Vec<f32>, Option<Vec<f32>>)> = Vec::new();
+    let mut eval_data: Vec<(
+        String,
+        DenseSource,
+        Vec<f32>,
+        Option<Vec<f32>>,
+        Option<Vec<u32>>,
+    )> = Vec::new();
     if let Some(list) = evals {
         for item in list.iter() {
-            // Python 层统一成 (data, label, weight-or-None, name)。
+            // Python 层统一成 (data, label, weight-or-None, name, qid-or-None, group-or-None)。
             #[allow(clippy::type_complexity)]
-            let (ex, ey, ew, name): (
+            let (ex, ey, ew, name, eq, eg): (
                 PyReadonlyArray2<f32>,
                 PyReadonlyArray1<f32>,
                 Option<PyReadonlyArray1<f32>>,
                 String,
+                Option<PyReadonlyArray1<u64>>,
+                Option<PyReadonlyArray1<u64>>,
             ) = item.extract()?;
             let eshape = ex.shape();
             if eshape[1] != n_features {
@@ -3512,7 +3646,13 @@ fn train_dense(
                 cfg.params.cols_per_block,
             );
             let ew = ew.map(|w| w.as_slice().map(<[f32]>::to_vec)).transpose()?;
-            eval_data.push((name, src, ey.as_slice()?.to_vec(), ew));
+            let egp = crate::rank::group_ptr_from_inputs(
+                eq.as_ref().map(|q| q.as_slice()).transpose()?,
+                eg.as_ref().map(|g| g.as_slice()).transpose()?,
+                eshape[0],
+            )
+            .map_err(|e| PyValueError::new_err(format!("validation set {name}: {e}")))?;
+            eval_data.push((name, src, ey.as_slice()?.to_vec(), ew, egp));
         }
     }
 
@@ -3570,11 +3710,12 @@ fn train_dense(
 
     let evals_ref: Vec<EvalSet> = eval_data
         .iter()
-        .map(|(name, src, labels, w)| EvalSet {
+        .map(|(name, src, labels, w, gp)| EvalSet {
             name: name.clone(),
             source: src,
             labels,
             weights: w.as_deref(),
+            group_ptr: gp.as_deref(),
         })
         .collect();
 
@@ -3654,7 +3795,7 @@ fn train_dense(
 /// 文件入口。**格式由 Rust 从解析出的文件判定**,不再由 Python 按后缀猜。
 #[pyfunction]
 #[pyo3(signature = (path_specs, label, params, header=true, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None, weight=None, base_margin=None,
+                    verbose_eval=None, callbacks=None, weight=None, qid=None, base_margin=None,
                     start_margin=None, eval_start_margins=None, prior_model=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_file(
@@ -3671,6 +3812,7 @@ fn train_file(
     verbose_eval: Option<usize>,
     callbacks: Option<&Bound<'_, PyList>>,
     weight: Option<&Bound<'_, PyAny>>,
+    qid: Option<&Bound<'_, PyAny>>,
     // `base_margin`: file column name(s) holding the per-row starting margin
     // (one per output), excluded from the features like the label / weight.
     // `start_margin` / `eval_start_margins`: explicit `(rows, outputs)` arrays
@@ -3682,7 +3824,8 @@ fn train_file(
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
-    cfg.weighted = weight.is_some();
+    let ranking = cfg.objective.is_ranking();
+    cfg.weighted = weight.is_some() && !ranking;
     // 先把输入规格解成确定顺序的文件列表。格式也由它判定 ——
     // Python 那边不再靠后缀猜。
     // ⚠️ 输入规格的问题是**用户输入错误**,不是运行时故障 —— 映射成
@@ -3753,6 +3896,53 @@ fn train_file(
             )
         }
     };
+    // The query-id column: same convention as label / weight (a name with a
+    // header, a column index for a headerless CSV).
+    let qid_owned: Option<String> = match qid {
+        None => None,
+        Some(q) if header => Some(
+            q.extract::<String>()
+                .map_err(|_| PyValueError::new_err("header=True 时 qid 必须是列名字符串"))?,
+        ),
+        Some(q) => {
+            let index = q.extract::<isize>().map_err(|_| {
+                PyValueError::new_err("header=False 时 qid 必须是从 0 开始的列下标")
+            })?;
+            if index < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "qid 列下标不能是负数,给的是 {index}"
+                )));
+            }
+            Some(
+                csv_source::positional_label_name_from_schema(
+                    csv_preflight.as_deref().expect("CSV preflight exists"),
+                    index as usize,
+                )
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?,
+            )
+        }
+    };
+    match (ranking, qid_owned.is_some()) {
+        (true, false) => {
+            return Err(PyValueError::new_err(format!(
+                "{} needs query groups: pass qid=<query-id column>",
+                cfg.objective.name()
+            )))
+        }
+        (false, true) => {
+            return Err(PyValueError::new_err(format!(
+                "qid is only used by the rank:* objectives, not {}",
+                cfg.objective.name()
+            )))
+        }
+        _ => {}
+    }
+    if qid_owned.is_some() && qid_owned.as_deref() == Some(label) {
+        return Err(PyValueError::new_err("qid column must differ from the label column"));
+    }
+    if qid_owned.is_some() && qid_owned == weight_owned {
+        return Err(PyValueError::new_err("qid column must differ from the weight column"));
+    }
     let k_out = cfg.objective.num_outputs();
     let margin_names: Vec<String> = match base_margin {
         Some(v) if !v.is_none() => {
@@ -3769,6 +3959,7 @@ fn train_file(
     }
     let targets = crate::source::Targets::new(label, weight_owned.as_deref())
         .map_err(|e| PyValueError::new_err(format!("{e}")))?
+        .with_qid(qid_owned.as_deref())
         .with_base_margin(&margin_names);
     // **peek schema → 定 blocking → 才真正 open**。Parquet / CSV 在 open
     // 之前不知道特征数,而自动选块宽需要它;单独 peek 一次(只读 footer /
@@ -3980,6 +4171,31 @@ fn train_file(
             Ok(Some(values))
         };
         let weights = read_weights(path)?;
+        // Ranking: the query-id column gives the groups; the weight column must hold
+        // one weight per group (repeated on its rows).
+        let read_qid = |p: &str| -> PyResult<Option<Vec<u64>>> {
+            let Some(q) = targets.qid else {
+                return Ok(None);
+            };
+            parquet_source::read_u64_columns(&[std::path::PathBuf::from(p)], q)
+                .map(Some)
+                .map_err(to_py_err)
+        };
+        let group_inputs = |ids: Option<Vec<u64>>,
+                            w: Option<Vec<f32>>|
+         -> PyResult<(Option<Vec<f32>>, Option<Vec<u32>>)> {
+            match ids {
+                None => Ok((w, None)),
+                Some(ids) => {
+                    let (gp, gw) =
+                        file_groups(&ids, w.as_deref(), targets.weight).map_err(to_py_err)?;
+                    Ok((gw, Some(gp)))
+                }
+            }
+        };
+        let (weights, train_group_ptr) = group_inputs(read_qid(path)?, weights)?;
+        let mut train_cfg = train_cfg;
+        train_cfg.group_ptr = train_group_ptr;
         ingest_reporter.complete(src.n_rows());
         let mut eval_data = Vec::new();
         let mut eval_paths: Vec<String> = Vec::new();
@@ -4003,7 +4219,8 @@ fn train_file(
                 )
                 .map_err(to_py_err)?;
                 let ew = read_weights(&p)?;
-                eval_data.push((name, d, ew));
+                let (ew, egp) = group_inputs(read_qid(&p)?, ew)?;
+                eval_data.push((name, d, ew, egp));
             }
         }
         // Starting margins (see `margin::dataset_margin`): train, then each eval.
@@ -4016,7 +4233,7 @@ fn train_file(
             k_out,
             "training set",
         )?;
-        for (i, (name, (_, l), _)) in eval_data.iter().enumerate() {
+        for (i, (name, (_, l), _, _)) in eval_data.iter().enumerate() {
             let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             train_cfg.eval_base_margins.push(margin::dataset_margin(
@@ -4031,11 +4248,12 @@ fn train_file(
         }
         let evals_ref: Vec<EvalSet> = eval_data
             .iter()
-            .map(|(name, (s, l), w)| EvalSet {
+            .map(|(name, (s, l), w, gp)| EvalSet {
                 name: name.clone(),
                 source: s,
                 labels: l,
                 weights: w.as_deref(),
+                group_ptr: gp.as_deref(),
             })
             .collect();
         if !cfg.quiet {
@@ -4119,6 +4337,32 @@ fn train_file(
     margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
     let (mut train_cfg, lower_is_better) = cfg.train_config()?;
     train_cfg.prior_model = prior_model.as_ref().map(|p| p.inner.clone());
+    // Ranking: query ids come from the qid column of every file, in dataset order.
+    let read_qid_paths = |ps: &[std::path::PathBuf]| -> PyResult<Option<Vec<u64>>> {
+        let Some(q) = targets.qid else {
+            return Ok(None);
+        };
+        match fmt {
+            "parquet" => parquet_source::read_u64_columns(ps, q),
+            _ => csv_source::read_u64_column(ps, header, q),
+        }
+        .map(Some)
+        .map_err(to_py_err)
+    };
+    let group_inputs = |ids: Option<Vec<u64>>,
+                        w: Option<&[f32]>|
+     -> PyResult<(Option<Vec<f32>>, Option<Vec<u32>>)> {
+        match ids {
+            None => Ok((w.map(<[f32]>::to_vec), None)),
+            Some(ids) => {
+                let (gp, gw) = file_groups(&ids, w, targets.weight).map_err(to_py_err)?;
+                Ok((gw, Some(gp)))
+            }
+        }
+    };
+    let (ds_weights, train_group_ptr) =
+        group_inputs(read_qid_paths(&paths)?, ds.weights.as_deref())?;
+    train_cfg.group_ptr = train_group_ptr;
     let Callbacks {
         list: mut cbs,
         history: handle,
@@ -4143,8 +4387,12 @@ fn train_file(
             let (p, name): (String, String) = item.extract()?;
             let d = open_spec(&p, &ds.feature_names, Some(ds.source.cuts().clone()))
                 .map_err(to_py_err)?;
-            eval_paths.push(p);
-            eval_data.push((name, d));
+            eval_paths.push(p.clone());
+            let eval_paths = crate::source::input::resolve(&[p.clone()])
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?
+                .paths;
+            let (ew, egp) = group_inputs(read_qid_paths(&eval_paths)?, d.weights.as_deref())?;
+            eval_data.push((name, d, ew, egp));
         }
     }
     train_cfg.base_margin = margin::dataset_margin(
@@ -4156,7 +4404,7 @@ fn train_file(
         k_out,
         "training set",
     )?;
-    for (i, (name, d)) in eval_data.iter().enumerate() {
+    for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
         let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
         train_cfg.eval_base_margins.push(margin::dataset_margin(
@@ -4171,11 +4419,12 @@ fn train_file(
     }
     let evals_ref: Vec<EvalSet> = eval_data
         .iter()
-        .map(|(name, d)| EvalSet {
+        .map(|(name, d, w, gp)| EvalSet {
             name: name.clone(),
             source: &d.source,
             labels: &d.labels,
-            weights: d.weights.as_deref(),
+            weights: w.as_deref(),
+            group_ptr: gp.as_deref(),
         })
         .collect();
 
@@ -4197,7 +4446,7 @@ fn train_file(
                 ord,
                 &ds.source,
                 &ds.labels,
-                ds.weights.as_deref(),
+                ds_weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
@@ -4208,7 +4457,7 @@ fn train_file(
             None => train_weighted(
                 &ds.source,
                 &ds.labels,
-                ds.weights.as_deref(),
+                ds_weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
@@ -4240,9 +4489,49 @@ fn train_file(
     ))
 }
 
+/// A ranking metric (`ndcg`, `ndcg@k`, `ndcg@k-`, `map`, `map@k`, `pre@k`) of scores
+/// against labels, with XGBoost's semantics. `qid` gives the query groups and
+/// `weight` is one value per group. Used by `FerrisBoostRanker.score`.
+#[pyfunction]
+#[pyo3(signature = (metric, pred, label, qid, weight=None, ndcg_exp_gain=true))]
+fn rank_score(
+    metric: &str,
+    pred: PyReadonlyArray1<'_, f32>,
+    label: PyReadonlyArray1<'_, f32>,
+    qid: PyReadonlyArray1<'_, u64>,
+    weight: Option<PyReadonlyArray1<'_, f32>>,
+    ndcg_exp_gain: bool,
+) -> PyResult<f64> {
+    let value_err = |e: anyhow::Error| PyValueError::new_err(e.to_string());
+    let (pred, label) = (pred.as_slice()?, label.as_slice()?);
+    if pred.len() != label.len() {
+        return Err(PyValueError::new_err(format!(
+            "pred has {} entries, label {}",
+            pred.len(),
+            label.len()
+        )));
+    }
+    let group_ptr = crate::rank::group_ptr_from_qid(qid.as_slice()?).map_err(value_err)?;
+    crate::rank::validate_group_ptr(&group_ptr, pred.len(), "qid").map_err(value_err)?;
+    let weight = weight.map(|w| w.as_slice().map(<[f32]>::to_vec)).transpose()?;
+    if let Some(w) = &weight {
+        if w.len() != group_ptr.len() - 1 {
+            return Err(PyValueError::new_err(format!(
+                "ranking weights are per query group: {} weights for {} groups",
+                w.len(),
+                group_ptr.len() - 1
+            )));
+        }
+    }
+    let m = crate::rank::RankMetric::parse(metric, ndcg_exp_gain).map_err(value_err)?;
+    m.validate_labels(label, "labels").map_err(value_err)?;
+    Ok(m.score(pred, label, weight.as_deref(), Some(&group_ptr)))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
+    m.add_function(wrap_pyfunction!(rank_score, m)?)?;
     m.add_function(wrap_pyfunction!(train_dense, m)?)?;
     m.add_function(wrap_pyfunction!(train_file, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
