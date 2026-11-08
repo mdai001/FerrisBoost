@@ -356,6 +356,35 @@ fn resolve_blocking(
             if !cfg.quiet {
                 eprintln!("{}", p.report());
             }
+            // A user-set gpu_memory_budget is a limit: explicit layout overrides
+            // that push the planned peak past it fail up front instead of
+            // training over budget. Without a budget the overrides win as before.
+            if let Some(budget) = cfg.params.gpu_memory_budget {
+                let usable = p.free_vram.saturating_sub(p.reserve);
+                if p.estimated_peak > usable {
+                    let mut set = Vec::new();
+                    if let Some(c) = cfg.requested_cols_per_block.filter(|c| *c > 0) {
+                        set.push(format!("cols_per_block={c}"));
+                    }
+                    if let Some(n) = cfg.params.hist_streams {
+                        set.push(format!("hist_streams={n}"));
+                    }
+                    if let Some(r) = cfg.params.resident_blocks {
+                        set.push(format!("resident_blocks={r}"));
+                    }
+                    if !set.is_empty() {
+                        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+                        return Err(PyValueError::new_err(format!(
+                            "with {} training needs about {:.1} MB of GPU memory, but gpu_memory_budget={:.1} MB allows {:.1} MB after the {:.1} MB safety reserve; raise the budget or remove the override(s)",
+                            set.join(", "),
+                            mb(p.estimated_peak),
+                            mb(budget as u64),
+                            mb(usable),
+                            mb(p.reserve),
+                        )));
+                    }
+                }
+            }
             Ok(BlockingPlan::from_plan(&p, n_features, cfg.params.nthread))
         }
         #[cfg(not(feature = "cuda"))]
