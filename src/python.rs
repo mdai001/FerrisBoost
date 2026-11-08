@@ -9,9 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use numpy::{
-    PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, ToPyArray,
-};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 #[cfg(not(feature = "cuda"))]
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -1054,7 +1052,7 @@ fn resolved_predict_workers(
 fn score_rows<F>(
     n_rows: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     score_row: F,
 ) -> anyhow::Result<Vec<f32>>
 where
@@ -1071,7 +1069,7 @@ where
         return Ok(out);
     }
     if pool.is_none() {
-        *pool = Some(crate::threading::build_pool(workers)?);
+        *pool = Some(crate::threading::prediction_pool(workers)?);
     }
     let chunks = workers.saturating_mul(4).max(1);
     let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
@@ -1103,7 +1101,7 @@ fn score_contiguous_rows_from(
     n_features: usize,
     n_trees: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     init: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
     let mut out = vec![0.0f32; n_rows];
@@ -1115,7 +1113,7 @@ fn score_contiguous_rows_from(
         return Ok(out);
     }
     if pool.is_none() {
-        *pool = Some(crate::threading::build_pool(workers)?);
+        *pool = Some(crate::threading::prediction_pool(workers)?);
     }
     let chunks = workers.saturating_mul(4).max(1);
     let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
@@ -1633,7 +1631,7 @@ fn score_multi_output_batch(
     layout: &[usize],
     gpu_batch: bool,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     // Per-row start margins of this batch, row-major `n_rows x K` (replaces the intercepts).
     init: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
@@ -2197,7 +2195,7 @@ impl PyModel {
                     }
                     .map_err(to_py_err)?;
                     transform_prediction_margins(&self.inner, &mut out, output_margin);
-                    return Ok(out.to_pyarray(py));
+                    return Ok(PyArray1::from_vec(py, out));
                 }
             }
             let worker_cap = effective_nthread(predict_threads);
@@ -2241,7 +2239,7 @@ impl PyModel {
                 })
             }
             .map_err(to_py_err)?;
-            Ok(out.to_pyarray(py))
+            Ok(PyArray1::from_vec(py, out))
         })
     }
 
