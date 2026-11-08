@@ -820,7 +820,7 @@ mod tests {
                         assert_eq!(
                             g.gain.to_bits(),
                             w.gain.to_bits(),
-                            "seed {seed} miss {missing_pct}%: 增益 {} vs 暴力 {}",
+                            "seed {seed} miss {missing_pct}%: gain {} vs brute force {}",
                             g.gain,
                             w.gain
                         );
@@ -847,16 +847,16 @@ mod tests {
                 lambda: 1.0,
                 ..Default::default()
             };
-            let c = case.best(&p).expect("随机数据总能分出来");
+            let c = case.best(&p).expect("random data should always split");
 
             let (l, r) = case.partition(&c);
             // 定点:逐位相等,不是"差在 1e-4 以内"
-            assert_eq!(c.left, l, "seed {seed} 左侧");
-            assert_eq!(c.right, r, "seed {seed} 右侧");
+            assert_eq!(c.left, l, "seed {seed} left");
+            assert_eq!(c.right, r, "seed {seed} right");
             // 两边加起来必须是节点总和,缺失行一个都不能漏
             let mut sum = c.left;
             sum += c.right;
-            assert_eq!(sum, case.node_sum(), "seed {seed} 左 + 右 != 总和");
+            assert_eq!(sum, case.node_sum(), "seed {seed} left + right != total");
         }
     }
 
@@ -911,7 +911,10 @@ mod tests {
         let case = missing_direction_case(-1.0);
         let c = case.best(&p).unwrap();
         assert_eq!(c.bin, 1);
-        assert!(c.missing_left, "缺失和左侧同号,应该走左");
+        assert!(
+            c.missing_left,
+            "missing has the same sign as the left side, should go left"
+        );
         assert_eq!(case.f(c.left).0, -4.0);
         assert_eq!(case.f(c.right).0, 2.0);
 
@@ -919,7 +922,10 @@ mod tests {
         let case = missing_direction_case(1.0);
         let c = case.best(&p).unwrap();
         assert_eq!(c.bin, 1);
-        assert!(!c.missing_left, "缺失和右侧同号,应该走右");
+        assert!(
+            !c.missing_left,
+            "missing has the same sign as the right side, should go right"
+        );
         assert_eq!(case.f(c.left).0, -2.0);
         assert_eq!(case.f(c.right).0, 4.0);
     }
@@ -939,7 +945,10 @@ mod tests {
         for seed in 0..10u64 {
             let case = random_case(seed, 32, 3, 0);
             let c = case.best(&p).unwrap();
-            assert!(!c.missing_left, "seed {seed}: 无缺失时默认方向应该是右");
+            assert!(
+                !c.missing_left,
+                "seed {seed}: default direction should be right when nothing is missing"
+            );
         }
     }
 
@@ -989,10 +998,13 @@ mod tests {
         };
         let c = case.best(&p).unwrap();
 
-        assert_eq!(c.bin, 2, "所有非缺失行走左边,右边界就是 bin 数");
-        assert!(!c.missing_left, "缺失独自留在右边");
-        assert_eq!(case.f(c.left).0, 4.0, "两个真实 bin 的和");
-        assert_eq!(case.f(c.right).0, -6.0, "两行缺失");
+        assert_eq!(
+            c.bin, 2,
+            "all non-missing rows go left, so the right boundary is the bin count"
+        );
+        assert!(!c.missing_left, "missing stays alone on the right");
+        assert_eq!(case.f(c.left).0, 4.0, "sum of the two real bins");
+        assert_eq!(case.f(c.right).0, -6.0, "two missing rows");
     }
 
     #[test]
@@ -1079,7 +1091,7 @@ mod tests {
         assert_eq!(
             case.best(&loose).unwrap().feat,
             0,
-            "不剪枝时特征 0 增益最高"
+            "without pruning feature 0 has the highest gain"
         );
 
         let strict = TrainParams {
@@ -1087,7 +1099,10 @@ mod tests {
             ..loose.clone()
         };
         let c = case.best(&strict).unwrap();
-        assert_eq!(c.feat, 1, "min_child_weight 该在比增益之前就把特征 0 挡掉");
+        assert_eq!(
+            c.feat, 1,
+            "min_child_weight should reject feature 0 before gains are compared"
+        );
         // hess 恒等于 1 时反量化必须精确还原成整数,不然 mcw 的比较
         // 会在 2.9999999 上翻边。scale 取 2 的幂就是为了这个。
         assert_eq!(case.f(c.left).1, 3.0);
@@ -1133,7 +1148,10 @@ mod tests {
         // 手算:GL = -2, GR = 2, HL = HR = 2, G = 0, λ = 1
         // 增益 = 4/3 + 4/3 - 0 = 8/3(不是 4/3)
         let g0 = case.best(&base).unwrap().gain;
-        assert!((g0 - 8.0 / 3.0).abs() < 1e-6, "增益应为 8/3,实际 {g0}");
+        assert!(
+            (g0 - 8.0 / 3.0).abs() < 1e-6,
+            "gain should be 8/3, got {g0}"
+        );
 
         // γ 略小于 8/3:还留得住;略大于:该被剪掉。
         // 要是哪天有人"顺手"把 0.5 补回去,这两条会一起挂。
@@ -1147,7 +1165,10 @@ mod tests {
             gamma: 8.0 / 3.0 + 0.01,
             ..base.clone()
         };
-        assert!(case.best(&prune).is_none(), "γ 超过增益就该剪掉");
+        assert!(
+            case.best(&prune).is_none(),
+            "should prune when gamma exceeds the gain"
+        );
     }
 
     #[test]
@@ -1185,7 +1206,10 @@ mod tests {
         };
         let c = case.best(&p).unwrap();
 
-        assert_eq!(c.bin, 2, "bin 0/1 归左、bin 2/3 归右,右边界就是 2");
+        assert_eq!(
+            c.bin, 2,
+            "bins 0/1 go left and bins 2/3 go right, so the right boundary is 2"
+        );
         assert_eq!(case.f(c.left).0, -2.0);
         assert_eq!(case.f(c.right).0, 2.0);
     }

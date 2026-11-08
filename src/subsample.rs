@@ -115,7 +115,7 @@ mod tests {
             .collect();
         let orig = g.clone();
         assert_eq!(zero_unselected(&mut g, 1.0, 9, 5), 64);
-        assert_eq!(g, orig, "subsample=1.0 必须完全不动数据");
+        assert_eq!(g, orig, "subsample=1.0 must leave the data untouched");
     }
 
     #[test]
@@ -168,11 +168,14 @@ mod tests {
             .collect();
         assert!(
             counts.windows(2).any(|w| w[0] != w[1]),
-            "选中条数应当随树波动,而不是固定值:{counts:?}"
+            "the selected count should vary per tree, not stay fixed: {counts:?}"
         );
         // 但要在合理范围内。
         for c in counts {
-            assert!((4700..5300).contains(&c), "选中条数 {c} 偏离 50% 太远");
+            assert!(
+                (4700..5300).contains(&c),
+                "selected count {c} is too far from 50%"
+            );
         }
     }
 
@@ -185,7 +188,7 @@ mod tests {
             let frac = kept / n as f64;
             assert!(
                 (frac - f64::from(rate)).abs() < 0.01,
-                "rate={rate} 实际 {frac:.4}"
+                "rate={rate} actual {frac:.4}"
             );
         }
     }
@@ -204,9 +207,13 @@ mod tests {
         assert!(kept > 0 && kept < 200);
         for i in 0..200 {
             if row_selected(i as u64, t, 4, 0) {
-                assert_eq!(g[i], orig[i], "选中的行不能被改动");
+                assert_eq!(g[i], orig[i], "selected rows must not be modified");
             } else {
-                assert_eq!(g[i], GradPairFixed::default(), "未选中的行必须置零");
+                assert_eq!(
+                    g[i],
+                    GradPairFixed::default(),
+                    "unselected rows must be zeroed"
+                );
             }
         }
     }

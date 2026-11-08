@@ -264,15 +264,15 @@ impl Objective {
         match self {
             Objective::Poisson { max_delta_step } => crate::ensure_input!(
                 max_delta_step.is_finite() && max_delta_step >= 0.0,
-                "count:poisson 的 max_delta_step 必须是非负有限值"
+                "count:poisson max_delta_step must be finite and non-negative"
             ),
             Objective::Tweedie { variance_power } => crate::ensure_input!(
                 (1.0..2.0).contains(&variance_power),
-                "tweedie_variance_power 必须在 [1, 2),给的是 {variance_power}"
+                "tweedie_variance_power must be in [1, 2), got {variance_power}"
             ),
             Objective::PseudoHuber { slope } => crate::ensure_input!(
                 slope.is_finite() && slope != 0.0,
-                "huber_slope 必须是非 0 的有限值"
+                "huber_slope must be finite and non-zero"
             ),
             // XGBoost `QuantileLossParam::Validate`:每个值在 [0, 1],且升序(可相等)。
             Objective::Quantile { alphas } => {
@@ -280,18 +280,18 @@ impl Objective {
                 for &alpha in a {
                     crate::ensure_input!(
                         alpha.is_finite() && (0.0..=1.0).contains(&alpha),
-                        "quantile_alpha 必须在 [0, 1] 内,给的是 {alpha}"
+                        "quantile_alpha must be in [0, 1], got {alpha}"
                     );
                 }
                 crate::ensure_input!(
                     a.windows(2).all(|w| w[0] <= w[1]),
-                    "quantile_alpha 必须按升序排列(XGBoost 同样要求),给的是 {a:?}"
+                    "quantile_alpha must be in ascending order (as XGBoost requires), got {a:?}"
                 );
             }
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
                 crate::ensure_input!(
                     num_class >= 2,
-                    "{} 需要 num_class ≥ 2,给的是 {num_class}",
+                    "{} requires num_class >= 2, got {num_class}",
                     self.name()
                 )
             }
@@ -329,7 +329,7 @@ impl Objective {
             Objective::Logistic => {
                 assert!(
                     (0.0..=1.0).contains(&base_score),
-                    "binary:logistic 的 base_score 是概率,必须在 [0, 1] 里,给的是 {base_score}"
+                    "binary:logistic base_score is a probability and must be in [0, 1], got {base_score}"
                 );
                 let x = base_score.clamp(K_RT_EPS, 1.0 - K_RT_EPS);
                 -(1.0f32 / x - 1.0).ln()
@@ -445,10 +445,12 @@ impl Objective {
                 }
             }
             Objective::Softprob { .. } | Objective::Softmax { .. } => {
-                unreachable!("多分类梯度按行算,走 Objective::softmax_gradients")
+                unreachable!(
+                    "multiclass gradients are computed per row via Objective::softmax_gradients"
+                )
             }
             Objective::Quantile { .. } => {
-                unreachable!("quantile 梯度依赖每轮的全局 scale,走 Objective::quantile_gradient")
+                unreachable!("quantile gradients depend on the per-round global scale; use Objective::quantile_gradient")
             }
             Objective::Rank { .. } => {
                 unreachable!("ranking gradients are per query group: use crate::rank::RankGradient")
@@ -515,22 +517,22 @@ impl Objective {
             },
             Objective::Logistic => crate::ensure_input!(
                 labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
-                "{what}的 {name} 标签必须在 [0, 1]"
+                "{what}: {name} labels must be in [0, 1]"
             ),
             Objective::Poisson { .. } | Objective::Tweedie { .. } => crate::ensure_input!(
                 labels.iter().all(|&v| v >= 0.0),
-                "{what}的 {name} 标签必须非负"
+                "{what}: {name} labels must be non-negative"
             ),
             Objective::Gamma => crate::ensure_input!(
                 labels.iter().all(|&v| v > 0.0),
-                "{what}的 {name} 标签必须为正"
+                "{what}: {name} labels must be positive"
             ),
             Objective::Softprob { num_class } | Objective::Softmax { num_class } => {
                 crate::ensure_input!(
                     labels
                         .iter()
                         .all(|&v| v >= 0.0 && v < num_class as f32 && v.fract() == 0.0),
-                    "{what}的 {name} 标签必须是 [0, num_class={num_class}) 里的整数"
+                    "{what}: {name} labels must be integers in [0, num_class={num_class})"
                 )
             }
         }
@@ -546,18 +548,18 @@ impl Objective {
             | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => {
-                crate::ensure_input!(base_score.is_finite(), "{name} 的 base_score 必须是有限值")
+                crate::ensure_input!(base_score.is_finite(), "{name} base_score must be finite")
             }
             // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
             Objective::Logistic => crate::ensure_input!(
                 base_score.is_finite() && (0.0..=1.0).contains(&base_score),
-                "{name} 的 base_score 必须是 [0, 1] 内的有限概率"
+                "{name} base_score must be a finite probability in [0, 1]"
             ),
             // log 链接:0 会变成 −inf margin。
             Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
                 crate::ensure_input!(
                     base_score.is_finite() && base_score > 0.0,
-                    "{name} 的 base_score 必须为正(标签全为 0 时请显式给一个正的 base_score)"
+                    "{name} base_score must be positive (pass a positive base_score explicitly when all labels are 0)"
                 )
             }
         }
@@ -864,7 +866,7 @@ impl Objective {
             Objective::Quantile { alphas } => {
                 quantile_intercepts(alphas.as_slice(), labels, weights)
             }
-            _ => unreachable!("initial_quantile_margins 只用于 reg:quantileerror"),
+            _ => unreachable!("initial_quantile_margins is only for reg:quantileerror"),
         }
     }
 
@@ -1134,7 +1136,7 @@ mod tests {
         assert_eq!(
             Objective::quantile(0.3).device_param(),
             0.3,
-            "quantile 的 alpha 经 device_param 传给 fast kernel"
+            "quantile alpha is passed to the fast kernel via device_param"
         );
     }
 
@@ -1184,7 +1186,10 @@ mod tests {
         assert!(bad(&[0.1, 1.5]).is_err());
         assert!(bad(&[]).is_err());
         assert!(bad(&[f32::NAN]).is_err());
-        assert!(bad(&[0.5, 0.5]).is_ok(), "XGBoost 允许重复(只要求非降)");
+        assert!(
+            bad(&[0.5, 0.5]).is_ok(),
+            "XGBoost allows duplicates (it only requires non-decreasing)"
+        );
         assert!(bad(&vec![0.5; crate::types::MAX_QUANTILE_ALPHAS + 1]).is_err());
     }
 

@@ -155,7 +155,7 @@ impl Callback for RecordHistory {
     fn after_iteration(&mut self, m: &RoundMetrics) -> bool {
         self.history
             .lock()
-            .expect("evals_result 的锁被毒化了")
+            .expect("evals_result lock is poisoned")
             .push(m.clone());
         true
     }

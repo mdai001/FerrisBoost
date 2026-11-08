@@ -102,7 +102,7 @@ pub fn build_cols(
     // 所以在 debug 里直接断言,不留给"结果看起来怪怪的"去发现。
     debug_assert!(
         out.iter().all(|g| *g == GradPairFixed::default()),
-        "hist::build 要求 out 进来就是清零的(见函数文档)"
+        "hist::build requires out to be zeroed on entry (see the function docs)"
     );
 
     // 每「行 × 特征」一次累加。一次性加,不进内层循环。
@@ -229,7 +229,7 @@ fn build_nodes_with_span(
         nodes
             .iter()
             .all(|(rows, _)| rows.windows(2).all(|w| w[0] <= w[1])),
-        "build_nodes 要求每个节点的行下标升序"
+        "build_nodes requires ascending row indices for each node"
     );
     if crate::train::prof::enabled() {
         let rows: usize = nodes.iter().map(|(r, _)| r.len()).sum();
@@ -384,7 +384,11 @@ pub fn subtract(parent: &Histogram, child: &Histogram, out: &mut Histogram) {
 ///
 /// 定点加减按模 `2^64` 精确且顺序无关,所以原地做和三方相减**逐位相同**。
 pub fn subtract_in_place(parent: &mut Histogram, child: &Histogram) {
-    debug_assert_eq!(parent.bins.len(), child.bins.len(), "相减两边宽度必须一致");
+    debug_assert_eq!(
+        parent.bins.len(),
+        child.bins.len(),
+        "both sides of the subtraction must have the same width"
+    );
     for i in 0..parent.bins.len() {
         parent.bins[i] = parent.bins[i] - child.bins[i];
     }
@@ -449,7 +453,10 @@ mod tests {
             bins: parent.bins.clone(),
         };
         subtract_in_place(&mut moved, &child);
-        assert_eq!(moved.bins, three_way.bins, "原地相减必须逐位等于三方相减");
+        assert_eq!(
+            moved.bins, three_way.bins,
+            "in-place subtraction must be bit-identical to three-way subtraction"
+        );
     }
 
     use crate::types::{GradPair, GradQuantizer};
@@ -624,7 +631,7 @@ mod tests {
                     Some(rows),
                     &mut single,
                 );
-                assert_eq!(out, &single, "span {span}: 与逐节点 build 不一致");
+                assert_eq!(out, &single, "span {span}: differs from per-node build");
                 assert_same(
                     out,
                     &reference(&block, n_rows, n_feats, &offs, &gpair, rows),
@@ -713,7 +720,10 @@ mod tests {
             Some(&shuffled),
             &mut b,
         );
-        assert_eq!(a, b, "换行顺序结果就变了,定点累加白做了");
+        assert_eq!(
+            a, b,
+            "result changed with row order; fixed-point accumulation is not order-independent"
+        );
 
         // 反着来也一样
         shuffled.reverse();
@@ -812,7 +822,11 @@ mod tests {
         for &g in &gpair {
             want += g;
         }
-        assert_eq!(node_sum(&gpair, None), want, "并行全量求和必须逐位等于串行");
+        assert_eq!(
+            node_sum(&gpair, None),
+            want,
+            "parallel full sum must be bit-identical to serial"
+        );
 
         // 行子集那条分支同样要过阈值才并行。
         let rows: Vec<RowId> = (0..n as RowId).filter(|r| r % 2 == 0).collect();
@@ -823,7 +837,7 @@ mod tests {
         assert_eq!(
             node_sum(&gpair, Some(&rows)),
             want_rows,
-            "并行子集求和必须逐位等于串行"
+            "parallel subset sum must be bit-identical to serial"
         );
     }
 
@@ -869,17 +883,17 @@ mod tests {
                 want[slot].hess += gpair[row].hess;
             }
         }
-        assert_eq!(got, want, "去掉清零之后直方图变了");
+        assert_eq!(got, want, "histogram changed after removing the zeroing");
         assert!(
             got.iter().any(|g| g.grad != 0),
-            "参考数据太弱,全零测不出东西"
+            "reference data is too weak: all zeros cannot detect anything"
         );
     }
 
     /// debug 断言真的会拦住违约的调用方(否则契约只是注释)。
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "out 进来就是清零的")]
+    #[should_panic(expected = "out to be zeroed on entry")]
     fn build_rejects_a_dirty_buffer_in_debug() {
         let (block, n_rows, n_feats, offs, gpair, _q) = fixture();
         let mut dirty = vec![GradPairFixed { grad: 99, hess: 99 }; 12];

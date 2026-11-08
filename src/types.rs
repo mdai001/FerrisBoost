@@ -44,7 +44,7 @@ impl std::str::FromStr for GpuMath {
             "exact" => Ok(Self::Exact),
             "fast" => Ok(Self::Fast),
             other => Err(format!(
-                "gpu_math 只支持 \"exact\" 或 \"fast\",收到 {other:?}"
+                "gpu_math must be \"exact\" or \"fast\", got {other:?}"
             )),
         }
     }
@@ -178,9 +178,11 @@ impl std::ops::Sub for GradPairFixed {
     }
 }
 
-const OVERFLOW_MSG: &str = "定点梯度累加溢出。GradQuantizer 的 scale 留的 headroom 不够 —— \
-     它是按 n_rows × max|g| 算的,喂进来的行数或梯度量级和建 quantizer \
-     时不是同一批就会这样。见 types.rs::GradQuantizer::new";
+const OVERFLOW_MSG: &str =
+    "fixed-point gradient accumulation overflowed: the GradQuantizer scale has too little \
+     headroom. The scale is sized from n_rows × max|g|; this happens when the rows or \
+     gradient magnitudes differ from those used to build the quantizer. See \
+     types.rs::GradQuantizer::new";
 
 /// 梯度 → 定点的缩放因子。
 ///
@@ -329,7 +331,7 @@ fn pow2_scale(max_abs: f64, n_rows: usize) -> f64 {
     let scale = f64::exp2(scale as f64);
     debug_assert!(
         max_abs * scale * (n_rows.max(1) as f64) <= (1u64 << 62) as f64,
-        "scale {scale} 超预算:max|g| {max_abs},n_rows {n_rows}"
+        "scale {scale} exceeds the budget: max|g| {max_abs}, n_rows {n_rows}"
     );
     scale
 }
@@ -597,10 +599,13 @@ pub struct QuantileAlphas {
 
 impl QuantileAlphas {
     pub fn new(alphas: &[f32]) -> anyhow::Result<Self> {
-        crate::ensure_input!(!alphas.is_empty(), "quantile_alpha 不能是空列表");
+        crate::ensure_input!(
+            !alphas.is_empty(),
+            "quantile_alpha must not be an empty list"
+        );
         crate::ensure_input!(
             alphas.len() <= MAX_QUANTILE_ALPHAS,
-            "quantile_alpha 最多 {MAX_QUANTILE_ALPHAS} 个分位数,给了 {}",
+            "quantile_alpha accepts at most {MAX_QUANTILE_ALPHAS} quantiles, got {}",
             alphas.len()
         );
         let mut values = [0.0f32; MAX_QUANTILE_ALPHAS];
