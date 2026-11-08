@@ -29,13 +29,6 @@ use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 mod explain;
 mod margin;
 
-/// Block width for GPU file input whose row count is unknown before open
-/// (CSV / CSV.gz) when `cols_per_block` is not given. Conservative: a narrow
-/// width from the planner's candidate set (`gpu_mem_plan::CANDIDATE_WIDTHS`),
-/// so each block slot stays small whatever the row count turns out to be.
-#[cfg(feature = "cuda")]
-const DEFERRED_GPU_COLS_PER_BLOCK: usize = 8;
-
 fn on_off(flag: bool) -> &'static str {
     if flag {
         "on"
@@ -154,7 +147,7 @@ struct BlockingPlan {
     /// 常驻块数)是在**同一个内存模型**里一起解的;运行时若按自己的默认
     /// 再挑一个,预算和实际分配就对不上 —— 规划器为了装下而选了 1 条流,
     /// 运行时却按路径又开了 2 条,就是一次 OOM。
-    /// `None` = 规划器尚未参与(仅 CPU 或 deferred source 的 pre-open 几何)。
+    /// `None` = 规划器未参与(CPU)。
     hist_streams: Option<usize>,
     resident_blocks: Option<usize>,
     /// 规划器实际用的预算(字节),= `min(用户给的, 空闲显存)`。
@@ -163,19 +156,6 @@ struct BlockingPlan {
 }
 
 impl BlockingPlan {
-    /// 已经定好的宽度(用户显式给的,或规划器解出来的)。
-    fn explicit(effective: usize, n_features: usize, nthread: usize) -> Self {
-        Self {
-            requested: Some(effective),
-            effective,
-            n_blocks: n_features.max(1).div_ceil(effective.max(1)),
-            nthread,
-            hist_streams: None,
-            resident_blocks: None,
-            effective_gpu_budget: None,
-        }
-    }
-
     /// 显存规划器解出来的完整几何:块宽 + stream 数 + 常驻块数。
     fn from_plan(
         p: &crate::gpu_mem_plan::GpuStreamingPlan,
@@ -255,9 +235,12 @@ fn resolve_blocking(
             // 而下面根本没有覆盖),于是模型把上千万行当成几十行算,
             // 解出来的块宽在真实数据上放不下。
             // 「规划失败必须报错,不能悄悄回退」——顶一个假行数比报错更糟。
+            // File input without a pre-open row count plans from the exact
+            // count of the reader's first pass (see `train_file`), so `None`
+            // means a source that cannot count its rows before building blocks.
             let rows = n_rows.ok_or_else(|| {
                 PyValueError::new_err(
-                    "GPU planning needs the row count, but this input source cannot provide it before open; construct the source with an explicit cols_per_block, and planning finishes with the real aggregate row count after open",
+                    "GPU planning needs the row count, but this input source provides none before its column blocks are built",
                 )
             })?;
             let p = resolve_gpu_streaming_plan(
@@ -4261,48 +4244,40 @@ fn train_file(
     // 定块宽、建 source,Python 只给路径和参数。
     // 走 numpy 那条路等于先在 Python 里把整份数据物化一遍,
     // streaming / 部分列读 / colsample 的 I/O 削减 / 显存规划全都用不上。
-    // ⚠️ 任意拿不到 pre-open row count 的 GPU source 都走 deferred planning。
-    // 显式宽度**只用于构造 source**,不是完整 GPU plan；open 后必须用聚合的
-    // 真实行数补齐 streams / residency / effective budget。这个 seam 按能力
-    // (`n_rows_peek`)分派,不能按 CSV/Parquet 格式名特判,否则下一个 streaming
-    // 或远端 source 会重现同一个 bug。
-    let (plan, deferred_gpu_plan) = match (n_rows_peek, cfg.device) {
+    // ⚠️ A GPU source without a pre-open row count (CSV / CSV.gz) plans after
+    // the reader's first pass: that pass counts the exact aggregate rows of all
+    // files while it builds the cuts, and the block width is only needed by the
+    // second pass, which builds the blocks. The same planner then solves block
+    // width, streams, residency and the effective budget as for a source with a
+    // pre-open count, so equivalent CSV and Parquet input get the same plan.
+    // This seam dispatches on the capability (`n_rows_peek`), never on the
+    // format name. An explicit cols_per_block is honored by the planner itself.
+    let deferred_gpu_plan = match (n_rows_peek, cfg.device) {
         #[cfg(feature = "cuda")]
-        (None, Some(_)) => {
-            // Without a pre-open row count (CSV / CSV.gz) the block width cannot be
-            // solved by the memory planner, so an explicit width wins and otherwise
-            // a conservative narrow width is used: narrow blocks keep every slot
-            // small, and streams / residency / the effective budget are still
-            // planned after open with the real row count (a plan that does not fit
-            // fails there, never silently).
-            let c = match cfg.requested_cols_per_block.filter(|c| *c > 0) {
-                Some(c) => c,
-                None => {
-                    if !cfg.quiet {
-                        eprintln!(
-                            "GPU_BLOCKING cols_per_block={DEFERRED_GPU_COLS_PER_BLOCK} (default: row count unknown before open; set cols_per_block to override)"
-                        );
-                    }
-                    // Treat it as the requested width from here on, so the
-                    // post-open plan keeps the geometry the source was built with.
-                    cfg.requested_cols_per_block = Some(DEFERRED_GPU_COLS_PER_BLOCK);
-                    DEFERRED_GPU_COLS_PER_BLOCK
-                }
-            };
-            (
-                BlockingPlan::explicit(c, n_features, cfg.params.nthread),
-                true,
-            )
-        }
-        _ => (resolve_blocking(&cfg, n_features, n_rows_peek)?, false),
+        (None, Some(_)) => true,
+        _ => false,
     };
-    cfg.params.cols_per_block = plan.effective;
     let user_gpu = user_gpu_geometry(&cfg);
-    // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
-    apply_resolved_geometry(&mut cfg, &plan);
-    let cols_per_block = plan.effective;
-    let ingest_threads =
-        resolved_ingest_workers(cfg.ingest_threads, fmt, &paths, n_features, cols_per_block);
+    if !deferred_gpu_plan {
+        let plan = resolve_blocking(&cfg, n_features, n_rows_peek)?;
+        cfg.params.cols_per_block = plan.effective;
+        // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
+        apply_resolved_geometry(&mut cfg, &plan);
+    }
+    // Ingest concurrency is fixed before the first pass. A deferred width is
+    // not known yet: bound the work by the narrowest geometry (one column per
+    // block); CPU and memory limits still apply.
+    let ingest_threads = resolved_ingest_workers(
+        cfg.ingest_threads,
+        fmt,
+        &paths,
+        n_features,
+        if deferred_gpu_plan {
+            1
+        } else {
+            cfg.params.cols_per_block
+        },
+    );
     let ingest_reporter = IngestReporter::start(
         cfg.quiet,
         fmt,
@@ -4318,7 +4293,8 @@ fn train_file(
     let open_paths = |ps: &[std::path::PathBuf],
                       targets: crate::source::Targets<'_>,
                       cuts: Option<crate::columns::BinCuts>,
-                      first_csv_schema: Option<arrow::datatypes::SchemaRef>|
+                      first_csv_schema: Option<arrow::datatypes::SchemaRef>,
+                      width: csv_source::BlockWidth<'_>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         match fmt {
             "parquet" => parquet_source::open_many_observed(
@@ -4326,7 +4302,14 @@ fn train_file(
                 targets,
                 cuts,
                 max_bin,
-                cols_per_block,
+                match width {
+                    csv_source::BlockWidth::Fixed(c) => c,
+                    // Parquet has a pre-open row count, so its width is planned
+                    // before open and never deferred.
+                    csv_source::BlockWidth::FromRowCount(_) => {
+                        anyhow::bail!("Parquet input takes its block width before open")
+                    }
+                },
                 ingest_threads,
                 |phase, readers, transforms| {
                     if !ingest_quiet {
@@ -4334,27 +4317,16 @@ fn train_file(
                     }
                 },
             ),
-            "csv" => match first_csv_schema {
-                Some(schema) => csv_source::open_many_with_header_and_nthread_prepared(
-                    ps,
-                    targets,
-                    cuts,
-                    max_bin,
-                    cols_per_block,
-                    header,
-                    ingest_threads,
-                    schema,
-                ),
-                None => csv_source::open_many_with_header_and_nthread(
-                    ps,
-                    targets,
-                    cuts,
-                    max_bin,
-                    cols_per_block,
-                    header,
-                    ingest_threads,
-                ),
-            },
+            "csv" => csv_source::open_many_with_header_and_nthread_prepared(
+                ps,
+                targets,
+                cuts,
+                max_bin,
+                width,
+                header,
+                ingest_threads,
+                first_csv_schema,
+            ),
             other => Err(anyhow::anyhow!("unknown format {other:?}")),
         }
     };
@@ -4363,7 +4335,8 @@ fn train_file(
     // 按位置读的话,列顺序不同的验证文件会被静默错配,早停跟着选错轮数。
     let open_spec = |spec: &str,
                      train_features: &[String],
-                     cuts: Option<crate::columns::BinCuts>|
+                     cuts: Option<crate::columns::BinCuts>,
+                     cols_per_block: usize|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         let r = crate::source::input::resolve(&[spec.to_string()])?;
         anyhow::ensure!(
@@ -4377,7 +4350,13 @@ fn train_file(
         } else {
             targets
         };
-        open_paths(&r.paths, eval_targets, cuts, None)
+        open_paths(
+            &r.paths,
+            eval_targets,
+            cuts,
+            None,
+            csv_source::BlockWidth::Fixed(cols_per_block),
+        )
     };
 
     let device = cfg.device;
@@ -4588,23 +4567,52 @@ fn train_file(
         ));
     }
 
-    let ds = open_paths(&paths, targets, None, csv_preflight.clone()).map_err(to_py_err)?;
-    ingest_reporter.complete(ds.source.n_rows());
-    // A deferred source only learns its aggregate row count during open.
-    // Complete the GPU plan now, preserving the requested block width while
-    // resolving memory budget, stream count and residency from the real shape.
-    #[cfg(feature = "cuda")]
-    if deferred_gpu_plan {
-        let completed = resolve_blocking(&cfg, n_features, Some(ds.source.n_rows() as u64))?;
-        if completed.effective != cols_per_block {
-            return Err(PyRuntimeError::new_err(format!(
-                "deferred GPU planner changed source geometry from {cols_per_block} to {}; explicit cols_per_block must be preserved",
-                completed.effective
-            )));
+    let ds = if deferred_gpu_plan {
+        // Plan from the exact aggregate row count of the first pass; a planning
+        // error (e.g. an override over a set gpu_memory_budget) keeps its type.
+        let mut planned: Option<BlockingPlan> = None;
+        let mut plan_err: Option<PyErr> = None;
+        let mut choose = |rows: u64| -> anyhow::Result<usize> {
+            match resolve_blocking(&cfg, n_features, Some(rows)) {
+                Ok(plan) => {
+                    let width = plan.effective;
+                    planned = Some(plan);
+                    Ok(width)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    plan_err = Some(e);
+                    Err(anyhow::anyhow!(msg))
+                }
+            }
+        };
+        let opened = open_paths(
+            &paths,
+            targets,
+            None,
+            csv_preflight.clone(),
+            csv_source::BlockWidth::FromRowCount(&mut choose),
+        );
+        if let Some(e) = plan_err {
+            return Err(e);
         }
-        cfg.params.cols_per_block = completed.effective;
-        apply_resolved_geometry(&mut cfg, &completed);
-    }
+        let ds = opened.map_err(to_py_err)?;
+        let plan = planned
+            .ok_or_else(|| PyRuntimeError::new_err("the GPU plan was not resolved during open"))?;
+        cfg.params.cols_per_block = plan.effective;
+        apply_resolved_geometry(&mut cfg, &plan);
+        ds
+    } else {
+        open_paths(
+            &paths,
+            targets,
+            None,
+            csv_preflight.clone(),
+            csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+        )
+        .map_err(to_py_err)?
+    };
+    ingest_reporter.complete(ds.source.n_rows());
     {
         let mut params = cfg.params.clone();
         refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &ds.source, &mut params)?;
@@ -4662,8 +4670,13 @@ fn train_file(
     if let Some(list) = evals {
         for item in list.iter() {
             let (p, name): (String, String) = item.extract()?;
-            let d = open_spec(&p, &ds.feature_names, Some(ds.source.cuts().clone()))
-                .map_err(to_py_err)?;
+            let d = open_spec(
+                &p,
+                &ds.feature_names,
+                Some(ds.source.cuts().clone()),
+                cfg.params.cols_per_block,
+            )
+            .map_err(to_py_err)?;
             eval_paths.push(p.clone());
             let eval_paths = crate::source::input::resolve(&[p.clone()])
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?

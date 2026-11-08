@@ -1709,7 +1709,7 @@ empty `evals_result()`.
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `colsample_bylevel` | `1.0` | Per-level feature sampling in `(0, 1]` from the per-tree set; see [Feature sampling](#feature-sampling) |
 | `colsample_bynode` | `1.0` | Per-node feature sampling in `(0, 1]` from the per-level set; see [Feature sampling](#feature-sampling) |
-| `cols_per_block` | automatic | Positive integer; normally leave unset. GPU training from CSV / CSV.gz (no row count before reading) defaults to 8 |
+| `cols_per_block` | automatic | Positive integer; normally leave unset. On GPU the memory planner chooses it from the row count; for CSV / CSV.gz it uses the exact count of the first reading pass, so CSV and the equivalent Parquet get the same plan |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
 | `gpu_memory_budget` | automatic | Positive integer planner budget for GPU training memory; auto derives from free VRAM with safety headroom. Explicit `cols_per_block` / `hist_streams` / `resident_blocks` that exceed a set budget raise `ValueError` |

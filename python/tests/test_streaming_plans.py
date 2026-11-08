@@ -460,21 +460,99 @@ def test_wide_bin_blocks_spill_and_stream_like_the_cpu(tmp_path, capfd):
             assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs)
 
 
+# ------------------------------------- CSV plans like Parquet (row count from the first pass)
+
+PLAN_RE = re.compile(r"resolved:\s+(\d+) cols/block.*?hist_streams:\s+(\d+)"
+                     r".*?physical_blocks:\s+(\d+).*?resident/stream:\s+(\d+) resident"
+                     r".*?estimated_peak:\s+([\d.]+) MB", re.S)
+
+
+def _planned(info):
+    """The pre-open plan report and the executed GPU_PATH plan, as one comparable tuple."""
+    m = PLAN_RE.search(info["log"])
+    assert m, info["log"][-2000:]
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5),
+            info["layout"], info["residency"], info["resident"], info["total"], info["streams"])
+
+
+def _equivalent_sources(tmp_path, path):
+    """The same rows as a single / multi-file Parquet and a single / multi-file / gzip CSV."""
+    table = pq.read_table(path)
+    step = table.num_rows // 3 + 1
+    pq_parts, csv_parts = tmp_path / "pq_parts", tmp_path / "csv_parts"
+    pq_parts.mkdir()
+    csv_parts.mkdir()
+    frame = table.to_pandas()
+    for i in range(3):
+        pq.write_table(table.slice(i * step, step), str(pq_parts / f"part{i}.parquet"))
+        frame.iloc[i * step:(i + 1) * step].to_csv(str(csv_parts / f"part{i}.csv"),
+                                                   index=False, na_rep="")
+    csv, gz = str(tmp_path / "data.csv"), str(tmp_path / "data.csv.gz")
+    frame.to_csv(csv, index=False, na_rep="")
+    frame.to_csv(gz, index=False, na_rep="", compression="gzip")
+    return {"parquet": path, "parquet_multi": str(pq_parts), "csv": csv,
+            "csv_multi": str(csv_parts), "csv_gz": gz}
+
+
 @cuda
-def test_gpu_csv_without_cols_per_block_uses_a_default_width(tmp_path, capfd):
-    """CSV has no row count before open: without cols_per_block the GPU path uses
-    a conservative default width (announced in the log) instead of failing, and
-    the model still equals the CPU model."""
-    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major")
+def test_csv_without_cols_per_block_plans_like_the_equivalent_parquet(tmp_path, capfd):
+    """CSV has no row count before open; the planner runs after the reader's first
+    pass with its exact aggregate count. Without cols_per_block, CSV / CSV.gz (single
+    and multi-file) then choose the block width, streams and residency of the same
+    rows as Parquet, under budget-driven full / hybrid / streaming plans, and train
+    the CPU model byte for byte."""
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=3,
+                            sampling={"subsample": 0.8, "colsample_bytree": 0.8}, n_cat=1)
     p = {k: v for k, v in p.items() if k != "cols_per_block"}
-    csv = str(tmp_path / "data.csv")
-    pq.read_table(path).to_pandas().to_csv(csv, index=False, na_rep="")
-    ref = _bytes(fb.train(p, csv, quiet=True, **kw), tmp_path, "cpu")
-    capfd.readouterr()
-    gpu = fb.train({**p, "device": "cuda"}, csv, **kw)
-    log = capfd.readouterr().err
-    assert "GPU_BLOCKING cols_per_block=8" in log, log[-2000:]
-    assert _bytes(gpu, tmp_path, "gpu") == ref
+    sources = _equivalent_sources(tmp_path, path)
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    # Budgets from the planner's own estimates of each forced residency, so the
+    # case depends neither on the device nor on its free memory.
+    _, probe = _gpu(capfd, p, path, kw, resident_blocks=0)
+    total = probe["total"]
+    assert total >= 2, probe["log"][-2000:]
+    estimate = {}
+    for resident in (total, 1, 0):
+        _, info = _gpu(capfd, p, path, kw, resident_blocks=resident)
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    reserve = 512.0  # the planner's minimum safety reserve, below 3.4 GB budgets
+    residencies = set()
+    for resident in (total, 1, 0):
+        budget = int((reserve + estimate[resident] + 0.25) * MB)
+        plans = {}
+        for name, src in sources.items():
+            model, info = _gpu(capfd, p, src, kw, gpu_memory_budget=budget)
+            assert "GPU_BLOCKING" not in info["log"]
+            plans[name] = _planned(info)
+            assert _bytes(model, tmp_path, "gpu") == ref, (name, budget, plans[name])
+        assert len(set(plans.values())) == 1, plans
+        residencies.add(plans["parquet"][6])
+    assert residencies == {"full_resident", "hybrid_partial_resident", "pure_streaming"}
+
+
+@cuda
+def test_csv_plans_reject_overrides_over_a_set_budget_and_honor_explicit_widths(tmp_path, capfd):
+    """The budget-override rule holds for CSV planned after the first pass (the
+    planner's ValueError comes out unchanged), and an explicit cols_per_block is
+    still the CSV block width."""
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=2)
+    csv = _equivalent_sources(tmp_path, path)["csv"]
+    p = {**p, "hist_streams": 1}
+    estimate = {}
+    for resident in (total, 0):
+        _, info = _gpu(capfd, p, csv, kw, resident_blocks=resident)
+        _check_plan(info, "row_major", resident, total)
+        assert re.search(rf"resolved:\s+{LAYOUTS['row_major']['cols_per_block']} cols/block",
+                         info["log"]), info["log"][-2000:]
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    budget = int((512.0 + (estimate[0] + estimate[total]) / 2) * MB)  # fits streaming only
+    with pytest.raises(ValueError, match=r"resident_blocks=\d+ training needs about"):
+        fb.train({**p, "device": "cuda", "gpu_memory_budget": budget,
+                  "resident_blocks": total}, csv, quiet=True, **kw)
+    _, info = _gpu(capfd, p, csv, kw, gpu_memory_budget=budget)
+    assert info["residency"] != "full_resident"
 
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
