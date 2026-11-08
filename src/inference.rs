@@ -259,6 +259,10 @@ impl CpuInferenceTree {
 pub(crate) struct CpuInferenceModel {
     trees: Box<[CpuInferenceTree]>,
     base_margin: f32,
+    /// Multi-output models (multiclass, multi-quantile): tree `i` adds to
+    /// output `i % n_outputs`, each output starting from its own intercept.
+    n_outputs: usize,
+    output_base_margins: Box<[f32]>,
     n_features: usize,
     needs_missing_check: bool,
 }
@@ -278,9 +282,28 @@ impl CpuInferenceModel {
             .iter()
             .flat_map(|tree| &tree.nodes)
             .any(|node| !node.is_leaf && node.default_left);
+        let n_outputs = model.num_outputs();
+        // Same intercepts as the single-output class views (`Model::class_view`):
+        // identity link, base_score = the output's base margin.
+        let output_base_margins = if n_outputs > 1 {
+            (0..n_outputs)
+                .map(|output| {
+                    let view_base = model
+                        .class_base_margins
+                        .get(output)
+                        .copied()
+                        .unwrap_or(model.base_score);
+                    crate::train::base_margin(crate::types::Objective::SquaredError, view_base)
+                })
+                .collect()
+        } else {
+            vec![crate::train::base_margin(model.objective, model.base_score)]
+        };
         Ok(Self {
             trees: trees.into_boxed_slice(),
             base_margin: crate::train::base_margin(model.objective, model.base_score),
+            n_outputs,
+            output_base_margins: output_base_margins.into_boxed_slice(),
             n_features: model.n_features,
             needs_missing_check,
         })
@@ -355,6 +378,89 @@ impl CpuInferenceModel {
         }
         Ok(())
     }
+
+    pub(crate) fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
+
+    /// All outputs of a multi-output model in one pass over the rows: `out` is
+    /// row-major `rows x n_outputs`. Tree `i` of the first `n_trees` adds to
+    /// output `i % n_outputs`, so every output accumulates exactly the trees of
+    /// its class view, in the same order and rounding as scoring each view on
+    /// its own. `init` (row-major `rows x n_outputs`) replaces the intercepts.
+    pub(crate) fn predict_multi_margins_from(
+        &self,
+        row_major: &[f32],
+        n_features: usize,
+        n_trees: usize,
+        init: Option<&[f32]>,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let k = self.n_outputs;
+        if n_features != self.n_features {
+            bail!(
+                "CPU prediction input has {n_features} features, expected {}",
+                self.n_features
+            );
+        }
+        if out.len() % k != 0 {
+            bail!("multi-output buffer is not a multiple of {k} outputs");
+        }
+        let n_rows = out.len() / k;
+        let expected = n_rows
+            .checked_mul(n_features)
+            .context("CPU prediction input size overflow")?;
+        if row_major.len() != expected {
+            bail!(
+                "CPU prediction input contains {} values, expected {n_rows} rows x {n_features} = {expected}",
+                row_major.len()
+            );
+        }
+        if let Some(init) = init {
+            if init.len() != out.len() {
+                bail!(
+                    "base_margin has {} values for {n_rows} rows x {k} outputs",
+                    init.len()
+                );
+            }
+        }
+        let upto = n_trees.min(self.trees.len());
+        let mut acc = vec![0.0f32; k * CPU_PREDICTION_BLOCK_ROWS];
+        for (block, rows) in row_major
+            .chunks(CPU_PREDICTION_BLOCK_ROWS * n_features)
+            .enumerate()
+        {
+            let len = rows.len() / n_features;
+            let first = block * CPU_PREDICTION_BLOCK_ROWS;
+            for (output, margins) in acc.chunks_exact_mut(CPU_PREDICTION_BLOCK_ROWS).enumerate() {
+                match init {
+                    Some(init) => {
+                        for (row, margin) in margins[..len].iter_mut().enumerate() {
+                            *margin = init[(first + row) * k + output];
+                        }
+                    }
+                    None => margins[..len].fill(self.output_base_margins[output]),
+                }
+            }
+            let any_missing = self.needs_missing_check && rows.iter().any(|value| value.is_nan());
+            for (index, tree) in self.trees[..upto].iter().enumerate() {
+                let output = index % k;
+                let margins = &mut acc
+                    [output * CPU_PREDICTION_BLOCK_ROWS..output * CPU_PREDICTION_BLOCK_ROWS + len];
+                if any_missing {
+                    tree.add_block::<true>(rows, n_features, margins);
+                } else {
+                    tree.add_block::<false>(rows, n_features, margins);
+                }
+            }
+            for row in 0..len {
+                for output in 0..k {
+                    out[(first + row) * k + output] = acc[output * CPU_PREDICTION_BLOCK_ROWS + row];
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct CompactInferenceModel {
@@ -371,10 +477,8 @@ impl CompactInferenceModel {
     }
 
     pub(crate) fn new(canonical: &Model) -> Result<Self> {
-        // 单输出预测器:多分类模型要先拆成 `Model::class_view`。
-        if canonical.num_outputs() > 1 {
-            bail!("the prediction predictor accepts only single-output models; split multiclass models per class with class_view");
-        }
+        // Multi-output models keep their interleaved tree order; compaction only
+        // renumbers features, so every output's trees stay intact.
         if canonical.n_features == 0 {
             bail!("prediction model must contain at least one feature");
         }
@@ -453,6 +557,7 @@ impl CompactInferenceModel {
         self.canonical_features.len()
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn is_identity(&self, canonical_width: usize) -> bool {
         self.canonical_features.len() == canonical_width
             && self
@@ -578,6 +683,79 @@ mod tests {
                     actual.to_bits(),
                     model.predict_margin_upto(row, n_trees).to_bits()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn fused_multi_output_prediction_matches_each_class_view_bit_exactly() {
+        let mut trees = Vec::new();
+        for index in 0..7 {
+            let mut tree = Tree::default();
+            let root = tree.push_leaf(0.0, 1.0);
+            let (left, _) = tree.split_leaf(
+                root,
+                index % 3,
+                0.1 * index as f32 - 0.2,
+                index % 2 == 0,
+                0.0,
+                0.1 + index as f32 * 0.01,
+                1.0,
+                -0.3 + index as f32 * 0.02,
+                1.0,
+            );
+            tree.split_leaf(left, 2, 0.4, true, 0.0, 0.0078125, 1.0, -0.015625, 1.0);
+            trees.push(tree);
+        }
+        let model = Model {
+            trees,
+            base_score: 0.5,
+            objective: Objective::Softprob { num_class: 3 },
+            n_features: 3,
+            best_iteration: None,
+            best_score: None,
+            feature_names: Vec::new(),
+            schema_mode: None,
+            class_base_margins: vec![0.125, -0.25, 0.5],
+            scale_pos_weight: 1.0,
+            feature_types: Vec::new(),
+            rank_bias: None,
+        };
+        let fused = CpuInferenceModel::new(&model).unwrap();
+        let rows: Vec<f32> = (0..131 * 3)
+            .map(|i| {
+                if i % 11 == 0 {
+                    f32::NAN
+                } else {
+                    (i as f32 * 0.37).sin()
+                }
+            })
+            .collect();
+        let n_rows = rows.len() / 3;
+        let init: Vec<f32> = (0..n_rows * 3).map(|i| i as f32 * 0.001).collect();
+        for n_trees in 0..=8 {
+            for start in [None, Some(&init[..])] {
+                let mut out = vec![f32::NAN; n_rows * 3];
+                fused
+                    .predict_multi_margins_from(&rows, 3, n_trees, start, &mut out)
+                    .unwrap();
+                for class in 0..3 {
+                    let view = CpuInferenceModel::new(&model.class_view(class)).unwrap();
+                    let class_init: Option<Vec<f32>> =
+                        start.map(|m| m.chunks_exact(3).map(|row| row[class]).collect());
+                    let mut expected = vec![f32::NAN; n_rows];
+                    view.predict_margins_from(
+                        &rows,
+                        3,
+                        model.class_tree_count(n_trees, class),
+                        class_init.as_deref(),
+                        &mut expected,
+                    )
+                    .unwrap();
+                    for row in 0..n_rows {
+                        assert_eq!(out[row * 3 + class].to_bits(), expected[row].to_bits());
+                    }
+                }
             }
         }
     }
