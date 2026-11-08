@@ -627,8 +627,18 @@ JSON, or an `xgboost.Booster`. The model passed in is not modified.
   model, so `predict(iteration_range=(0, best_iteration + 1))` is the best model,
   as in XGBoost. A `best_iteration` already stored in the continued model stays if
   early stopping is not used this time.
-- Files work too (`fb.train(params, "more.parquet", label="y", xgb_model=m)`); the
-  model must record its feature schema, which any FerrisBoost-saved model does.
+- Files work too (`fb.train(params, "more.parquet", label="y", xgb_model=m)`),
+  also from an **XGBoost** JSON or `Booster`. File columns are bound to the model
+  **by name**, so the model needs feature names: a FerrisBoost model trained from
+  a DataFrame, table, Parquet or headered CSV has them, and so does an XGBoost
+  model trained with `feature_names` (a DataFrame, or `DMatrix(feature_names=...)`).
+  The file's column order is free; a missing feature column, or a surplus column
+  other than the label / weight / `qid` / `base_margin` columns, is an error. An
+  XGBoost model **without** feature names raises `ValueError` for file input: only
+  a positional binding would be left, and that mis-scores silently when the file's
+  columns are in another order. Continue it from an array (you own the column
+  order), or set `feature_names` on the `Booster`, save it again and pass that.
+  The same rule governs `predict`, `predict_to_parquet` and explanations on files.
 - `sklearn`: `fit(X, y, xgb_model=)` accepts a `Model`, another estimator, a path
   or a `Booster`, and adds `n_estimators` new rounds.
 
@@ -1490,6 +1500,10 @@ In named mode (Parquet or CSV with headers), FerrisBoost binds columns by the fe
 
 File readers validate the full canonical schema before projecting batches to the sorted set of features actually used by the ensemble. This reduces Parquet decode/materialization and GPU H2D width without weakening missing-feature checks. The canonical training/serialized model is immutable; feature remapping exists only in a lazy inference copy, so save/load and XGBoost interchange retain original feature IDs.
 
+The projection applies to every file prediction: single-output models, multiclass and multi-quantile models (the union of the features the outputs use is read once), `predict_to_parquet`, and `pred_contribs` / `pred_interactions` / `pred_leaf` (a feature no tree splits on contributes exactly zero, so its column is not read and its output stays zero). A wide file therefore costs I/O and decoding for the used columns only, however many columns it holds. The schema check still covers all of the model's features: **every feature name of the model must be present in the file, including features no tree uses** (XGBoost validates feature names the same way). Because unused columns are never decoded, an unused column holding an unsupported type or a reserved value is not an error.
+
+A model is bound to file columns by name when it has feature names, including an XGBoost model trained with `feature_names` (its JSON records no FerrisBoost schema mode; the names decide). A model without feature names that was not trained by this version of FerrisBoost (for example an XGBoost model trained on an array) is refused for file input with `ValueError`: see [An XGBoost model has no feature names](#an-xgboost-model-has-no-feature-names).
+
 Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
 
 `predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. For multiclass models and for models with several `quantile_alpha` values it writes one column per class or quantile instead (see [Multiclass prediction](#multiclass-prediction)), streamed in the same bounded batches. The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
@@ -1729,6 +1743,34 @@ labels in `[0, 1]`, `count:poisson` and `reg:tweedie` need non-negative labels,
 integer labels in `[0, num_class)`. `rank:ndcg` with `ndcg_exp_gain=True` needs
 integer relevance in `[0, 31]`, and `rank:map` (and the `map` / `pre` metrics)
 need binary 0 / 1 labels.
+
+### Which exception type is raised
+
+Rejected input raises `ValueError`: invalid parameters, labels that do not fit the
+objective (including ranking relevance labels), invalid weights or `base_margin`,
+a `base_score`, `feature_types` or objective that conflicts with the model being
+continued, missing or surplus columns in a file, unsupported column types or
+reserved values in a file, and a persistent cache that does not match the call.
+`RuntimeError` is reserved for failures that are not the caller's input: I/O
+errors while reading or writing, CUDA and device failures, and internal errors. A
+model file that does not exist raises `FileNotFoundError` (a data path that matches
+no file is rejected input, `ValueError`), an exception raised inside a callback
+propagates with its own type, and a wrong Python type for an argument raises
+`TypeError`.
+
+### An XGBoost model has no feature names
+
+An XGBoost model JSON trained on an array has no feature names and records no
+FerrisBoost schema mode, so `predict`, `predict_to_parquet`, explanations and
+`fb.train(..., xgb_model=)` on **files** raise `ValueError`. Use an array (you own
+the column order), or give the model names so that columns are bound by name:
+
+```python
+booster = xgboost.Booster()
+booster.load_model("model.json")
+booster.feature_names = ["age", "income", "tenure"]   # the training column order
+booster.save_model("model_named.json")
+```
 
 ### Ranking needs query groups
 
