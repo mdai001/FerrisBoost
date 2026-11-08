@@ -811,12 +811,15 @@ How a feature is declared:
   codes of a string dictionary differ between row groups; encode the categories
   as integers upstream, or train from an in-memory pandas or PyArrow table.
 
-Category codes must be integers in `0..=253`, with `NaN` / null for a missing
+Category codes must be integers in `0..=65533`, with `NaN` / null for a missing
 value; negative, fractional, or larger values raise `ValueError`. One feature
-can have at most 254 categories in this version, because the two largest bins
-are reserved: one for missing values and one for categories seen only at
-validation or prediction time, which always go left, as in prediction. At validation and prediction time a fractional value is read as its integer part (`1.5` is category `1`), as in XGBoost; training data must hold whole codes. XGBoost
-has no such limit; a larger limit is planned for a future release.
+can have at most 65,534 categories, because the two largest bins are reserved:
+one for missing values and one for categories seen only at validation or
+prediction time, which always go left, as in prediction. At validation and prediction time a fractional value is read as its integer part (`1.5` is category `1`), as in XGBoost; training data must hold whole codes. A feature
+whose largest code is at most 253 is stored with 8-bit bins; a larger code
+stores that feature (only) with 16-bit bins. GPU training supports 8-bit
+categorical features only in this version (codes up to 253) and reports an
+error for a larger code. XGBoost allows codes up to 2^24.
 Codes need not be contiguous, but each code up to the feature's largest costs one
 histogram bin, so prefer compact codes.
 
@@ -1861,9 +1864,11 @@ or a sorted list such as `[0.1, 0.5, 0.9]`.
 ### A categorical column is rejected
 
 - `categorical feature ... contains the value ...`: categorical columns must
-  hold integer codes in `0..=253`, with `NaN` or null for a missing value.
+  hold integer codes in `0..=65533`, with `NaN` or null for a missing value.
   Negative, fractional, or larger codes are rejected; re-encode the categories
-  compactly. A feature can have at most 254 categories in this version.
+  compactly. A feature can have at most 65,534 categories.
+- `GPU training does not support 16-bit bin columns yet`: a categorical feature
+  has a code above 253 (or `max_bin` is above 255); train on the CPU.
 - `... is a category dtype` / `... is a dictionary type`: set
   `params["enable_categorical"] = True` (or declare the column with
   `feature_types`) so a categorical column is never trained as one by accident.

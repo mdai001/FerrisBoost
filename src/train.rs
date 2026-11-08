@@ -1087,19 +1087,19 @@ fn validate_start_margins(
         "续训数据的类别特征(feature_types)和已有模型不一致"
     );
     // The new trees can only split on codes the current training supports
-    // (`MAX_CAT_CODE`); refuse a model that already splits on larger ones rather
-    // than carrying (or truncating) them.
+    // (`MAX_CAT_CODE_WIDE`); refuse a model that already splits on larger ones
+    // rather than carrying (or truncating) them.
     for (t, tree) in prior.trees.iter().enumerate() {
         for node in tree.nodes.iter().filter(|n| !n.is_leaf) {
             let Some(words) = &node.cats else { continue };
             if let Some(&big) = crate::categorical::categories_from_words(words)
                 .iter()
-                .find(|&&c| c > crate::categorical::MAX_CAT_CODE)
+                .find(|&&c| c > crate::categorical::MAX_CAT_CODE_WIDE)
             {
                 crate::bail_input!(
-                    "已有模型的第 {t} 棵树在类别特征 {} 上分裂到类别码 {big},超过当前训练支持的上限 {}(MAX_CAT_CODE);无法续训",
+                    "tree {t} of the existing model splits categorical feature {} on category code {big}, above the largest code training supports ({}); cannot continue training",
                     node.feat,
-                    crate::categorical::MAX_CAT_CODE
+                    crate::categorical::MAX_CAT_CODE_WIDE
                 );
             }
         }
@@ -1504,9 +1504,13 @@ fn train_with_backend(
             // (never a silent CPU fallback).
             crate::ensure_input!(
                 !cuts.has_wide() && evals.iter().all(|e| !e.source.cuts().has_wide()),
-                "GPU training does not support features with more than 255 bins yet \
-                 (max_bin > 255 stores them as 16-bit columns); train on the CPU or use \
-                 max_bin <= 255"
+                "GPU training does not support 16-bit bin columns yet: numeric features with \
+                 more than 255 bins (max_bin > 255) or categorical features with codes above {} \
+                 (more than {} categories); train on the CPU, or use max_bin <= 255 and \
+                 category codes <= {}",
+                crate::categorical::MAX_CAT_CODE,
+                crate::categorical::MAX_CAT_CODE + 1,
+                crate::categorical::MAX_CAT_CODE
             );
             let mut max_block_feats = 0usize;
             let mut max_hist_bins = 0usize;
@@ -1562,6 +1566,14 @@ fn train_with_backend(
                 },
                 prof::enabled(),
             )?;
+            // The histogram kernels tile a block by whole features: a feature
+            // wider than one shared-memory tile is a hard error here, before
+            // any launch (never a kernel loop without progress).
+            let max_feature_bins = (0..cuts.n_feats() as FeatId)
+                .map(|f| cuts.n_bins(f))
+                .max()
+                .unwrap_or(0);
+            ctx.ensure_features_fit_tile(max_feature_bins)?;
             if prof::enabled() {
                 eprintln!("\n=== GPU 显存预算 ===\n{}", ctx.budget().report());
                 eprintln!("{}", ctx.host_budget().report());
@@ -2574,9 +2586,13 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         .iter()
         .map(|n| {
             n.cats.as_ref().map(|words| {
-                let mut bits = crate::categorical::CatBits::empty();
+                // Only trained codes (`< n_bins`) can be a bin of this feature;
+                // a larger member (from a continued model) must never match
+                // the width's unseen-category bin.
+                let n_bins = cuts.n_bins(n.feat);
+                let mut bits = crate::categorical::CatBits::for_bins(n_bins);
                 for cat in crate::categorical::categories_from_words(words) {
-                    if cat < 256 {
+                    if (cat as usize) < n_bins {
                         bits.set(cat);
                     }
                 }
@@ -3263,7 +3279,7 @@ fn build_tree(
                         .enumerate()
                         .map(|(i, ln)| {
                             if gpu_done[i] {
-                                return gpu_candidates[i];
+                                return gpu_candidates[i].clone();
                             }
                             split::best_split_in_block_typed(
                                 &per_node[i],
@@ -3325,7 +3341,7 @@ fn build_tree(
         let mut hists: Vec<Vec<Histogram>> = Vec::with_capacity(n_blocks);
         for (per_node, cands) in per_block {
             for (i, cand) in cands.into_iter().enumerate() {
-                best[i] = split::reduce_best(&[best[i], cand]);
+                best[i] = split::reduce_best(&[best[i].take(), cand]);
             }
             hists.push(per_node);
         }
@@ -3333,7 +3349,7 @@ fn build_tree(
         // 多机/多卡时各方只看得到自己那几列,全局最优要在这里汇总。
         // 单机 Local 是恒等,但训练逻辑里不能直接挑本地最优 ——
         // 那样换个 Comm 就不对了。
-        let chosen: Vec<Option<SplitCandidate>> = best
+        let mut chosen: Vec<Option<SplitCandidate>> = best
             .into_iter()
             .map(|c| comm.allreduce_best_split(c))
             .collect();
@@ -3394,14 +3410,16 @@ fn build_tree(
                     // partition), numeric nodes keep the batch.
                     let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
                         .into_iter()
-                        .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
+                        .partition(|&(i, _)| chosen[i].as_ref().is_some_and(|c| c.cats.is_some()));
                     for (i, local) in cat_nodes {
-                        let c = chosen[i].expect("resident group contains chosen nodes");
-                        let cats = c.cats.expect("partitioned by categorical");
+                        let c = chosen[i]
+                            .as_ref()
+                            .expect("resident group contains chosen nodes");
+                        let cats = c.cats.as_ref().expect("partitioned by categorical");
                         part_tokens[i] = Some(session.partition_resident_categorical(
                             level[i].rows.device(),
                             local,
-                            &cats,
+                            cats,
                             c.missing_left,
                         )?);
                     }
@@ -3409,7 +3427,9 @@ fn build_tree(
                         let requests: Vec<_> = chunk
                             .iter()
                             .map(|&(i, local)| {
-                                let c = chosen[i].expect("resident group contains chosen nodes");
+                                let c = chosen[i]
+                                    .as_ref()
+                                    .expect("resident group contains chosen nodes");
                                 (level[i].rows.device(), local, c.bin, c.missing_left)
                             })
                             .collect();
@@ -3439,7 +3459,7 @@ fn build_tree(
                 .iter()
                 .zip(&chosen)
                 .filter_map(|(ln, c)| match (&ln.rows, c) {
-                    (NodeRows::Host(span), Some(c)) => Some((*span, *c)),
+                    (NodeRows::Host(span), Some(c)) => Some((*span, c.clone())),
                     _ => None,
                 })
                 .collect();
@@ -3502,7 +3522,7 @@ fn build_tree(
                 let started = std::time::Instant::now();
                 let mut session = ctx.partition_session(col.require_u8("GPU training")?)?;
                 for i in node_idxs {
-                    let c = chosen[i].expect("by_feat 里只放了有候选的节点");
+                    let c = chosen[i].as_ref().expect("by_feat 里只放了有候选的节点");
                     part_tokens[i] = Some(match &c.cats {
                         Some(cats) => session.partition_categorical(
                             level[i].rows.device(),
@@ -3548,7 +3568,7 @@ fn build_tree(
         let _t = prof::Timer::new(&prof::NEXT_LEVEL);
         let mut next: Vec<LevelNode> = Vec::new();
         for (i, ln) in level.into_iter().enumerate() {
-            let Some(c) = chosen[i] else {
+            let Some(c) = chosen[i].take() else {
                 // 这个节点到此就是终叶。行分区已经是答案,现在直接累加
                 // 比训练结束后再沿树下降一遍便宜得多。
                 let value = t.nodes[ln.node].leaf_value;
@@ -3706,7 +3726,7 @@ fn build_tree(
 }
 
 /// `apply_dropped_rows` 需要的、和分区完全同一套的分裂判定。
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct DropSplit {
     feat: FeatId,
     bin: u32,
@@ -3747,7 +3767,8 @@ fn apply_dropped_rows(
         missing: u32,
         bound: u32,
         missing_left: bool,
-        cats: Option<crate::categorical::CatBits>,
+        /// 类别分裂走右的集合(64 位字)。
+        cats: Option<&'a [u64]>,
         next: [u32; 2],
         value: f32,
     }
@@ -3780,7 +3801,7 @@ fn apply_dropped_rows(
                 missing: col.width().missing(),
                 bound: sp.bin,
                 missing_left: sp.missing_left,
-                cats: sp.cats,
+                cats: sp.cats.as_ref().map(|c| c.words64()),
                 next: [n.left as u32, n.right as u32],
                 value: 0.0,
             });
@@ -3845,8 +3866,8 @@ fn apply_dropped_rows(
                         // 数值分裂比 bin。
                         let go_left = if bin == st.missing {
                             st.missing_left
-                        } else if let Some(cats) = &st.cats {
-                            !cats.contains(bin)
+                        } else if let Some(cats) = st.cats {
+                            !crate::categorical::contains_in(cats, bin)
                         } else {
                             bin < st.bound
                         };
@@ -4236,15 +4257,16 @@ fn fill_partition_bits<B: crate::bins::BinCode>(
     out: &mut [u8],
 ) {
     debug_assert_eq!(out.len(), rows.len().div_ceil(8));
+    let cats = c.cats.as_ref().map(|s| s.words64());
     for (byte, chunk) in out.iter_mut().zip(rows.chunks(8)) {
         let mut acc = 0u8;
         for (j, &r) in chunk.iter().enumerate() {
             let bin = col[r as usize];
             let go_left = if bin == B::MISSING {
                 c.missing_left
-            } else if let Some(cats) = &c.cats {
+            } else if let Some(cats) = cats {
                 // Categorical: the set goes right, every other category left.
-                !cats.contains(bin.idx() as u32)
+                !crate::categorical::contains_in(cats, bin.idx() as u32)
             } else {
                 (bin.idx() as u32) < c.bin
             };

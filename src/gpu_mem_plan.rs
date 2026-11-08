@@ -933,9 +933,15 @@ mod tests {
             .parse::<usize>()
             .unwrap();
         assert_eq!(defined, CAT_SET_WORDS);
+        // The host's inline (8-bit feature) set is exactly the device set.
+        let crate::categorical::CatBits::Small(inline) = crate::categorical::CatBits::empty()
+        else {
+            unreachable!()
+        };
+        assert_eq!(std::mem::size_of_val(&inline), CAT_SET_WORDS * 4);
         assert_eq!(
-            std::mem::size_of::<crate::categorical::CatBits>(),
-            CAT_SET_WORDS * 4
+            crate::categorical::CatBits::empty().words8().len(),
+            CAT_SET_WORDS
         );
     }
 

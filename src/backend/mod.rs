@@ -252,6 +252,12 @@ pub mod cuda {
         pub fn hist_stream_count(&self) -> usize {
             match self.0 {}
         }
+        pub fn max_bins_per_tile(&self) -> usize {
+            match self.0 {}
+        }
+        pub fn ensure_features_fit_tile(&self, _max_feature_bins: usize) -> Result<()> {
+            match self.0 {}
+        }
         pub fn resident_block_count(&self) -> usize {
             match self.0 {}
         }

@@ -248,12 +248,13 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
     assert_eq!(roots_result.len(), parent_spans.len());
     for (parent, span) in parent_spans.iter().copied().enumerate() {
         assert_candidate_eq(
-            roots_result[parent].1,
+            roots_result[parent].1.clone(),
             expected_candidate_sampled(&bins, &gpair, span, &q, &params, sampled),
             &format!("tied root {parent}"),
         );
         let winner = roots_result[parent]
             .1
+            .clone()
             .expect("tied parent must produce a split");
         assert_eq!(
             winner.feat, expected_feature,
@@ -336,11 +337,13 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
             "child split stage must not return a fallback histogram"
         );
         assert_candidate_eq(
-            *candidate,
+            candidate.clone(),
             expected_candidate_sampled(&bins, &gpair, *span, &q, &params, sampled),
             &format!("tied cached child {index}"),
         );
-        let winner = candidate.expect("each tied child must produce a split");
+        let winner = candidate
+            .clone()
+            .expect("each tied child must produce a split");
         assert_eq!(
             winner.feat, expected_feature,
             "feature ties keep the first selected feature"
@@ -526,7 +529,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
             "last-level child must not return a fallback histogram"
         );
         assert_candidate_eq(
-            *candidate,
+            candidate.clone(),
             expected_candidate(&bins, &gpair, *span, &q, &params),
             &format!("child result {index}"),
         );
@@ -599,7 +602,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
     );
     for (index, ((_, span), (_, candidate, hist))) in child_spans.iter().zip(&spilled).enumerate() {
         assert_candidate_eq(
-            *candidate,
+            candidate.clone(),
             expected_candidate(&bins, &gpair, *span, &q, &params),
             &format!("spilled child result {index}"),
         );
@@ -705,14 +708,16 @@ fn constrained_kernel_matches_cpu_evaluator() {
                 );
                 let unconstrained =
                     best_split_in_block(&hist, &feats, &HIST_OFFSETS, sum, &q, &params, None);
-                if expected.map(|c| (c.feat, c.bin, c.gain.to_bits()))
-                    != unconstrained.map(|c| (c.feat, c.bin, c.gain.to_bits()))
+                if expected.as_ref().map(|c| (c.feat, c.bin, c.gain.to_bits()))
+                    != unconstrained
+                        .as_ref()
+                        .map(|c| (c.feat, c.bin, c.gain.to_bits()))
                 {
                     constrained_differs = true;
                 }
                 assert_candidate_eq(
-                    got[node].1,
-                    expected,
+                    got[node].1.clone(),
+                    expected.clone(),
                     &format!("constraints={constraints:?} bounds={bounds:?} node {node}"),
                 );
             }

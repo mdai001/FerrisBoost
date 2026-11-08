@@ -132,12 +132,12 @@ impl BinCuts {
         for (f, _) in flags.iter().enumerate().filter(|(_, &c)| c) {
             let cuts = self.cuts_for(f as FeatId);
             crate::ensure_input!(
-                cuts.len() <= crate::categorical::MAX_CAT_CODE as usize
+                cuts.len() <= crate::categorical::MAX_CAT_CODE_WIDE as usize
                     && cuts.iter().enumerate().all(|(i, &c)| c == (i + 1) as f32),
                 "categorical feature {f} needs consecutive code cuts [1..max_code] with \
                  max_code <= {} (at most {} categories)",
-                crate::categorical::MAX_CAT_CODE,
-                crate::categorical::MAX_CAT_CODE + 1
+                crate::categorical::MAX_CAT_CODE_WIDE,
+                crate::categorical::MAX_CAT_CODE_WIDE + 1
             );
         }
         self.categorical = flags.to_vec();
@@ -342,7 +342,7 @@ pub enum BinningStrategy<'a> {
     /// 自己建草图算(默认)
     Sketch { max_bins: usize },
     /// Like `Sketch`, with `categorical[f]` marking feature `f` as categorical:
-    /// its values are integer codes `0..=253` binned one per code (no sketch).
+    /// its values are integer codes `0..=65533` binned one per code (no sketch).
     /// A shorter (or empty) list leaves the remaining features numeric.
     SketchTyped {
         max_bins: usize,
@@ -479,7 +479,16 @@ mod categorical_cut_tests {
 
     #[test]
     fn categorical_cuts_above_the_code_limit_are_rejected() {
-        let max = crate::categorical::MAX_CAT_CODE as usize;
+        // 254 codes stay 8-bit, one more stores the feature at 16 bits.
+        let narrow = BinCuts::new((1..=253).map(|c| c as f32).collect(), vec![0, 253])
+            .with_categorical(&[true])
+            .unwrap();
+        assert_eq!(narrow.bin_width(0), crate::bins::BinWidth::U8);
+        let wide = BinCuts::new((1..=254).map(|c| c as f32).collect(), vec![0, 254])
+            .with_categorical(&[true])
+            .unwrap();
+        assert_eq!(wide.bin_width(0), crate::bins::BinWidth::U16);
+        let max = crate::categorical::MAX_CAT_CODE_WIDE as usize;
         let ok: Vec<f32> = (1..=max).map(|c| c as f32).collect();
         let ok_len = ok.len() as u32;
         assert!(BinCuts::new(ok, vec![0, ok_len])
@@ -489,7 +498,7 @@ mod categorical_cut_tests {
         let over: Vec<f32> = (1..=max + 1).map(|c| c as f32).collect();
         let over_len = over.len() as u32;
         match BinCuts::new(over, vec![0, over_len]).with_categorical(&[true]) {
-            Ok(_) => panic!("cuts past MAX_CAT_CODE were accepted"),
+            Ok(_) => panic!("cuts past MAX_CAT_CODE_WIDE were accepted"),
             Err(err) => assert!(err.to_string().contains("at most"), "{err}"),
         }
     }

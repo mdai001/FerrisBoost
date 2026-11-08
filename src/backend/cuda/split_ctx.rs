@@ -595,7 +595,7 @@ impl GpuBlockSession<'_> {
                     cats: (flags & 4 != 0).then(|| {
                         let words: [u32; CAT_SET_WORDS] =
                             std::array::from_fn(|w| u32_at(SPLIT_PACKET_BYTES + w * 4));
-                        crate::categorical::CatBits(std::array::from_fn(|i| {
+                        crate::categorical::CatBits::Small(std::array::from_fn(|i| {
                             u64::from(words[2 * i]) | u64::from(words[2 * i + 1]) << 32
                         }))
                     }),

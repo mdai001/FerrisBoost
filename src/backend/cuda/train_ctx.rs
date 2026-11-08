@@ -650,6 +650,21 @@ pub struct GpuTrainCtx {
     echoed_partition_batch: std::sync::atomic::AtomicBool,
 }
 
+/// The clear error for a feature wider than one shared-memory histogram tile.
+pub(crate) fn ensure_feature_fits_tile(
+    feature_bins: usize,
+    max_bins_per_tile: usize,
+) -> Result<()> {
+    if feature_bins > max_bins_per_tile {
+        return Err(crate::error::input_error(format!(
+            "GPU training cannot build the histogram of a feature with {feature_bins} bins: one \
+             shared-memory tile holds at most {max_bins_per_tile} bins on this device and \
+             configuration; train on the CPU, lower max_bin, or raise the shared-memory budget"
+        )));
+    }
+    Ok(())
+}
+
 impl GpuTrainCtx {
     /// 按**最坏情况**预分配:`max_block_feats` 是最宽的列块,
     /// `max_hist_bins` 是最宽的那块直方图。这样整个训练过程中不再有
@@ -1832,6 +1847,20 @@ impl GpuTrainCtx {
 
     pub fn hist_stream_count(&self) -> usize {
         self.hist_stream_count
+    }
+
+    /// Most histogram slots one shared-memory tile holds. Every histogram
+    /// kernel tiles a block greedily by whole features, so a feature with more
+    /// bins than this cannot be built on the device; training checks it up
+    /// front ([`Self::ensure_features_fit_tile`]).
+    pub fn max_bins_per_tile(&self) -> usize {
+        self.max_bins_per_tile
+    }
+
+    /// Refuse a feature with more bins than one shared-memory tile before any
+    /// histogram is built (the greedy feature tiling would make no progress).
+    pub fn ensure_features_fit_tile(&self, max_feature_bins: usize) -> Result<()> {
+        ensure_feature_fits_tile(max_feature_bins, self.max_bins_per_tile)
     }
 
     /// 当前 device 已用显存(总量 - 空闲)。含 driver / context 的固定开销,
@@ -3745,7 +3774,12 @@ impl GpuBlockSession<'_> {
                 {
                     end += 1;
                 }
-                debug_assert!(end > begin);
+                if end == begin {
+                    ensure_feature_fits_tile(
+                        self.feat_offsets()[begin + 1] as usize - hist_begin,
+                        self.ctx.max_bins_per_tile,
+                    )?;
+                }
                 begin = end;
                 count += 1;
             }
@@ -3800,7 +3834,13 @@ impl GpuBlockSession<'_> {
                 {
                     end += 1;
                 }
-                debug_assert!(end > probe, "单个特征的 bin 数超过 tile 上限");
+                if end == probe {
+                    // Never loop without progress (checked up front in training).
+                    ensure_feature_fits_tile(
+                        self.feat_offsets()[probe + 1] as usize - hist_begin,
+                        self.ctx.max_bins_per_tile,
+                    )?;
+                }
                 max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
                 probe = end;
             }
@@ -4192,7 +4232,13 @@ impl GpuBlockSession<'_> {
             {
                 end += 1;
             }
-            debug_assert!(end > probe, "单个特征的 bin 数超过 tile 上限");
+            if end == probe {
+                // Never loop without progress (checked up front in training).
+                ensure_feature_fits_tile(
+                    self.feat_offsets()[probe + 1] as usize - hist_begin,
+                    self.ctx.max_bins_per_tile,
+                )?;
+            }
             max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
             probe = end;
         }

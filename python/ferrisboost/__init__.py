@@ -114,7 +114,7 @@ _DEFAULTS: dict[str, Any] = {
     # `category` columns and PyArrow dictionary columns be detected as
     # categorical; `feature_types` ("c" / "q" per feature) declares them
     # explicitly for numpy and file inputs. Categories are integer codes in
-    # 0..=253. `max_cat_to_onehot`: features with fewer categories than this are
+    # 0..=65533. `max_cat_to_onehot`: features with fewer categories than this are
     # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
     # bounds the partition scan.
     "enable_categorical": False,
@@ -888,8 +888,8 @@ def train(
 
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
-    为 True 时自动识别。类别值是 0..=253 的整数码(缺失用 NaN / null),超出范围、
-    负数或非整数会报错;每个特征最多 254 个类别。
+    为 True 时自动识别。类别值是 0..=65533 的整数码(缺失用 NaN / null),超出范围、
+    负数或非整数会报错;每个特征最多 65534 个类别(GPU 训练目前最多 254 个)。
 
     `base_margin`(XGBoost 的 DMatrix `base_margin`):每行的起始 raw margin,训练从它起步
     而不是从 `base_score` 起步(截距仍然按标签估计并存进模型,和 XGBoost 一致)。数组入口给

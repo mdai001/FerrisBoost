@@ -189,8 +189,9 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int32 => visit_values!(Int32Array),
         DataType::Int64 => visit_values!(Int64Array),
         other => crate::bail_input!(
-            "第 {col} 列是 {other:?},只支持数值列。\\
-             类别特征要先在上游编码成整数类别码(0..=253),再用 feature_types=\"c\" 声明"
+            "column {col} is {other:?}; only numeric columns are supported. Encode \
+             categorical features upstream as integer category codes (0..=65533) and \
+             declare them with feature_types=\"c\""
         ),
     }
     Ok(())
@@ -1057,7 +1058,7 @@ mod tests {
             panic!("字符串列应该被拒绝");
         };
         let msg = err.to_string();
-        assert!(msg.contains("只支持数值列"), "报错要说人话,实际是:{msg}");
+        assert!(msg.contains("only numeric columns"), "报错要说人话,实际是:{msg}");
     }
 
     #[test]

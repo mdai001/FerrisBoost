@@ -452,14 +452,16 @@ def test_quantized_cache_keeps_categorical_binning(tmp_path):
 # --------------------------------------------------------------------------- validation of values
 def test_invalid_categories_are_rejected():
     x, y, ft = make_data(cat_levels=(5,), seed=18)
-    for bad in (-1.0, 2.5, 254.0, 255.0, 1000.0):
+    for bad in (-1.0, 2.5, 65534.0, 70000.0):
         x2 = x.copy()
         x2[3, 2] = bad
         with pytest.raises(ValueError, match="categor"):
             fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
-    x2 = x.copy()
-    x2[3, 2] = 253.0  # the largest supported code is fine
-    fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
+    # 253 is the largest 8-bit code; larger codes store the feature at 16 bits.
+    for fine in (253.0, 254.0, 1000.0):
+        x2 = x.copy()
+        x2[3, 2] = fine
+        fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
 
 
 def test_feature_types_length_is_checked():
