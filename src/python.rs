@@ -1510,7 +1510,8 @@ fn score_multi_output_batch(
             init.map(|m| m.chunks_exact(k_out).map(|row| row[c]).collect());
         #[cfg(feature = "cuda")]
         let col = if gpu_batch {
-            view.gpu_predictor(0)?.predict_margins(vdata, n_rows, nt)?
+            view.gpu_predictor(0)?
+                .predict_margins_from(vdata, n_rows, nt, col_init.as_deref())?
         } else {
             score_contiguous_rows_from(
                 &*vinf.cpu_predictor()?,
@@ -1949,8 +1950,7 @@ impl PyModel {
 
     /// `predict_array` with an optional per-row starting margin (`base_margin`,
     /// one value per row, single-output models only) in place of the intercept.
-    /// The device predictor has no per-row start, so `use_gpu` with a margin is
-    /// an explicit error rather than a silent CPU fallback.
+    /// The device predictor takes the same per-row start.
     #[allow(clippy::too_many_arguments)]
     fn predict_array_from<'py>(
         &self,
@@ -1963,15 +1963,7 @@ impl PyModel {
         init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
-            if init.is_some() && use_gpu {
-                return Err(PyValueError::new_err(
-                    "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
-                     start); predict on the CPU",
-                ));
-            }
             ensure_gpu_prediction_available(use_gpu)?;
-            // The device predictor has no categorical decision: such models score on the CPU.
-            let use_gpu = use_gpu && !self.inner.has_categorical_splits();
             if self.inner.num_outputs() > 1 {
                 return Err(PyValueError::new_err(
                     "多分类模型的预测是二维的,请用 Model.predict()",
@@ -2028,7 +2020,7 @@ impl PyModel {
                     let mut out = if x.is_c_contiguous() {
                         let data = x.as_slice()?;
                         if inference.is_identity(n_features) {
-                            py.detach(|| predictor.predict_margins(data, n_rows, upto))
+                            py.detach(|| predictor.predict_margins_from(data, n_rows, upto, init))
                         } else {
                             py.detach(|| {
                                 let projected = project_canonical_rows(
@@ -2037,7 +2029,7 @@ impl PyModel {
                                     n_features,
                                     inference.canonical_features(),
                                 )?;
-                                predictor.predict_margins(&projected, n_rows, upto)
+                                predictor.predict_margins_from(&projected, n_rows, upto, init)
                             })
                         }
                     } else {
@@ -2049,7 +2041,7 @@ impl PyModel {
                                     projected.push(view[(row, feature)]);
                                 }
                             }
-                            predictor.predict_margins(&projected, n_rows, upto)
+                            predictor.predict_margins_from(&projected, n_rows, upto, init)
                         })
                     }
                     .map_err(to_py_err)?;
@@ -2104,8 +2096,7 @@ impl PyModel {
 
     /// `predict_files` with an optional per-row starting margin (`base_margin`,
     /// row-major `rows x num_outputs` over all inputs in file order) replacing
-    /// the intercept. The device predictor has no per-row start, so `use_gpu`
-    /// with a margin is an explicit error.
+    /// the intercept (the device predictor takes the same per-row start).
     #[allow(clippy::too_many_arguments)]
     fn predict_files_from<'py>(
         &self,
@@ -2119,15 +2110,7 @@ impl PyModel {
         missing: f32,
         init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if init.is_some() && use_gpu {
-            return Err(PyValueError::new_err(
-                "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
-                 start); predict on the CPU",
-            ));
-        }
         ensure_gpu_prediction_available(use_gpu)?;
-        // The device predictor has no categorical decision: such models score on the CPU.
-        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
@@ -2298,7 +2281,8 @@ impl PyModel {
                                     predictor
                                 }
                             };
-                            let mut batch = predictor.predict_margins(data, n_rows, upto)?;
+                            let mut batch =
+                                predictor.predict_margins_from(data, n_rows, upto, batch_init)?;
                             transform_prediction_margins(inner, &mut batch, output_margin);
                             out.extend(batch);
                             return Ok(());
@@ -2567,8 +2551,6 @@ impl PyModel {
             );
         }
         ensure_gpu_prediction_available(use_gpu)?;
-        // The device predictor has no categorical decision: such models score on the CPU.
-        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
         if self.inner.num_outputs() > 1 {
             return self.predict_multiclass(
                 py,

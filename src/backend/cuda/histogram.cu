@@ -2354,7 +2354,8 @@ extern "C" __global__ void init_tree_rows(
 // Prediction-only compact SoA traversal. One thread owns one row and walks
 // trees in model order, matching Model::predict_margin_upto's accumulation
 // order exactly. The host applies the objective link after D2H so CUDA expf
-// cannot change prediction semantics.
+// cannot change prediction semantics. The categorical variant
+// (`predict_margin_soa_cat`) lives in its own section at the end of this file.
 extern "C" __global__ void predict_margin_soa(
     const float* __restrict__ rows,
     uint32_t n_rows,
@@ -2367,13 +2368,16 @@ extern "C" __global__ void predict_margin_soa(
     const uint32_t* __restrict__ right_children,
     const uint8_t* __restrict__ flags,
     const float* __restrict__ leaf_values,
+    const float* __restrict__ init,
     float base_margin,
     float* __restrict__ output) {
     const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
 
     const float* values = rows + (uint64_t)row * n_features;
-    float margin = base_margin;
+    // A per-row start (`base_margin`) replaces the scalar intercept; a null
+    // pointer selects the intercept. Either way the tree sum starts from it.
+    float margin = init != nullptr ? init[row] : base_margin;
     for (uint32_t tree = 0; tree < n_trees; ++tree) {
         uint32_t node = tree_offsets[tree];
         if (node == tree_offsets[tree + 1]) continue;
@@ -3148,3 +3152,73 @@ extern "C" __global__ void shx_leaf(
     }
 }
 // ================================================================ end SHAP explanations
+
+// ---------------------------------------------------------------- categorical prediction
+//
+// `predict_margin_soa_cat` is `predict_margin_soa` plus categorical decisions,
+// used when the model has any categorical split. Same traversal, same
+// accumulation order, same optional per-row start, so device output equals the
+// host path bit for bit. Flag bit 2 marks a categorical node.
+//
+// A categorical node's right-going set is an arbitrary-width bitset of
+// little-endian 32-bit words (XGBoost `CatBitField` layout), stored in
+// `cat_words` as [n_words, word_0, ..., word_{n_words-1}] per set;
+// `cat_slots[node]` is the offset of that record (unused for other nodes).
+// Decision (identical to `categorical::goes_left`): NaN follows the default
+// direction; a negative value or one >= 2^24 goes left; otherwise the value is
+// truncated toward zero and a category inside the set goes RIGHT, any other
+// (including one beyond the stored words) goes left.
+#define PREDICT_CAT_OUT_OF_RANGE 16777216.0f
+
+__device__ __forceinline__ bool predict_cat_goes_left(
+    const uint32_t* __restrict__ cat_words, uint32_t slot, float value) {
+    if (value < 0.0f || value >= PREDICT_CAT_OUT_OF_RANGE) return true;
+    const uint32_t cat = (uint32_t)value;  // round toward zero
+    const uint32_t word = cat >> 5;
+    if (word >= cat_words[slot]) return true;
+    return ((cat_words[slot + 1u + word] >> (cat & 31u)) & 1u) == 0u;
+}
+
+extern "C" __global__ void predict_margin_soa_cat(
+    const float* __restrict__ rows,
+    uint32_t n_rows,
+    uint32_t n_features,
+    const uint32_t* __restrict__ tree_offsets,
+    uint32_t n_trees,
+    const uint32_t* __restrict__ features,
+    const float* __restrict__ split_conditions,
+    const uint32_t* __restrict__ left_children,
+    const uint32_t* __restrict__ right_children,
+    const uint8_t* __restrict__ flags,
+    const float* __restrict__ leaf_values,
+    const uint32_t* __restrict__ cat_slots,
+    const uint32_t* __restrict__ cat_words,
+    const float* __restrict__ init,
+    float base_margin,
+    float* __restrict__ output) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const float* values = rows + (uint64_t)row * n_features;
+    float margin = init != nullptr ? init[row] : base_margin;
+    for (uint32_t tree = 0; tree < n_trees; ++tree) {
+        uint32_t node = tree_offsets[tree];
+        if (node == tree_offsets[tree + 1]) continue;
+        uint32_t flag = flags[node];
+        while ((flag & 1u) == 0u) {
+            const float value = values[features[node]];
+            bool go_left;
+            if (value != value) {
+                go_left = (flag & 2u) != 0u;
+            } else if ((flag & 4u) != 0u) {
+                go_left = predict_cat_goes_left(cat_words, cat_slots[node], value);
+            } else {
+                go_left = value < split_conditions[node];
+            }
+            node = go_left ? left_children[node] : right_children[node];
+            flag = flags[node];
+        }
+        margin += leaf_values[node];
+    }
+    output[row] = margin;
+}
