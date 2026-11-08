@@ -47,6 +47,7 @@ pub mod cuda {
         pub group_weights: Option<&'a [f32]>,
         pub weight_norm: f64,
         pub inv_idcg: &'a [f64],
+        pub n_positions: usize,
     }
     impl Default for SharedHistogramConfig {
         fn default() -> Self {
@@ -172,6 +173,9 @@ pub mod cuda {
             match self.0 {}
         }
         pub fn init_fast_rank(&self, _inputs: &RankDeviceInputs<'_>) -> Result<()> {
+            match self.0 {}
+        }
+        pub fn fast_rank_bias(&self) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
             match self.0 {}
         }
         pub fn fast_rank_round(
