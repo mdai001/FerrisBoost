@@ -1670,8 +1670,8 @@ impl PyModel {
     /// 多分类写 Parquet:`softprob` / margin 写 K 列 `{column}_{k}`,
     /// `softmax` 写一列类别下标。
     ///
-    /// ⚠️ 0.0.5 先在内存里算完再写(不是单输出那条有界流式管线);
-    /// 输入文件每类读一遍。0.0.6 做单遍、流式的多输出写出。
+    /// ⚠️ 仍先在内存里算完再写(不是单输出那条有界流式管线);输入只读一遍。
+    /// 流式的多输出写出是后续工作(memo 0.0.7 carry-over 8)。
     #[allow(clippy::too_many_arguments)]
     fn multiclass_to_parquet(
         &self,

@@ -246,7 +246,7 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
-### 0.0.6 (unreleased)
+### 0.0.6
 
 - Added categorical features (`feature_types`, pandas `category` columns, Arrow dictionaries).
 - Added feature importance and SHAP values (`Model.get_score`, `pred_contribs`, `pred_interactions`, `pred_leaf`).
