@@ -32,6 +32,9 @@ struct PredictionStaging {
     /// carry one, and counted in `bytes()` like every other staging buffer.
     init: Option<CudaSlice<f32>>,
     batch_rows: usize,
+    /// Model outputs per row; output and init hold `outputs` planes of
+    /// `batch_rows` values (output-major).
+    outputs: usize,
 }
 
 // Pageable host copies are not guaranteed to complete before an Async API
@@ -78,7 +81,12 @@ pub struct GpuInferenceModel {
     input_features: Vec<usize>,
     n_features: usize,
     n_trees: usize,
-    base_margin: f32,
+    /// Multi-output models: the device trees are grouped by output (output
+    /// `c` owns canonical trees `c, c + K, ...`, in order) and output `c`'s
+    /// group starts at device tree `output_first_tree[c]`. One entry for a
+    /// single-output model, whose tree order is unchanged.
+    output_first_tree: Vec<usize>,
+    output_base_margins: Vec<f32>,
     // A cached model owns one stream. Serialize calls on that stream while
     // still allowing different PyModel/device caches to run independently.
     call_lock: Mutex<Option<PredictionStaging>>,
@@ -128,7 +136,29 @@ impl GpuInferenceModel {
         let mut cat_slots: Vec<u32> = Vec::new();
         let mut cat_words: Vec<u32> = Vec::new();
 
-        for tree in &model.trees {
+        let n_outputs = model.num_outputs();
+        let mut output_first_tree = Vec::with_capacity(n_outputs);
+        let mut device_order = Vec::with_capacity(model.trees.len());
+        for output in 0..n_outputs {
+            output_first_tree.push(device_order.len());
+            device_order.extend((output..model.trees.len()).step_by(n_outputs));
+        }
+        let output_base_margins = if n_outputs > 1 {
+            // The intercepts of the class views (`Model::class_view`).
+            (0..n_outputs)
+                .map(|output| {
+                    let view_base = model
+                        .class_base_margins
+                        .get(output)
+                        .copied()
+                        .unwrap_or(model.base_score);
+                    crate::train::base_margin(crate::types::Objective::SquaredError, view_base)
+                })
+                .collect()
+        } else {
+            vec![crate::train::base_margin(model.objective, model.base_score)]
+        };
+        for tree in device_order.iter().map(|&index| &model.trees[index]) {
             let base =
                 u32::try_from(features.len()).context("GPU prediction node count exceeds u32")?;
             tree_offsets.push(base);
@@ -257,7 +287,8 @@ impl GpuInferenceModel {
             categorical,
             n_features: model.n_features,
             n_trees: model.trees.len(),
-            base_margin: crate::train::base_margin(model.objective, model.base_score),
+            output_first_tree,
+            output_base_margins,
             call_lock: Mutex::new(None),
         })
     }
@@ -284,6 +315,39 @@ impl GpuInferenceModel {
         n_trees: usize,
         init: Option<&[f32]>,
     ) -> Result<Vec<f32>> {
+        if self.output_first_tree.len() != 1 {
+            bail!("multi-output GPU prediction must use predict_multi_margins_from");
+        }
+        self.predict_outputs_from(row_major, n_rows, n_trees, init)
+    }
+
+    /// All outputs of a multi-output model from one upload of the rows:
+    /// row-major `rows x K` margins. `n_trees` is a prefix of the canonical
+    /// (interleaved) tree list; output `c` accumulates exactly its own trees
+    /// of that prefix in order, as its class view would. `init` is row-major
+    /// `rows x K` and replaces the intercepts.
+    pub fn predict_multi_margins_from(
+        &self,
+        row_major: &[f32],
+        n_rows: usize,
+        n_trees: usize,
+        init: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        self.predict_outputs_from(row_major, n_rows, n_trees, init)
+    }
+
+    pub fn n_outputs(&self) -> usize {
+        self.output_first_tree.len()
+    }
+
+    fn predict_outputs_from(
+        &self,
+        row_major: &[f32],
+        n_rows: usize,
+        n_trees: usize,
+        init: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        let k = self.output_first_tree.len();
         let expected = n_rows
             .checked_mul(self.n_features)
             .context("GPU prediction input size overflow")?;
@@ -295,9 +359,9 @@ impl GpuInferenceModel {
             );
         }
         if let Some(init) = init {
-            if init.len() != n_rows {
+            if init.len() != n_rows * k {
                 bail!(
-                    "GPU prediction base_margin has {} values, expected {n_rows}",
+                    "GPU prediction base_margin has {} values, expected {n_rows} rows x {k} outputs",
                     init.len()
                 );
             }
@@ -311,9 +375,9 @@ impl GpuInferenceModel {
             .map_err(|_| anyhow::anyhow!("GPU prediction cache poisoned"))?;
 
         // Input row + output value, plus the start margin when one is given.
-        let bytes_per_row = self
-            .n_features
-            .checked_add(1 + usize::from(init.is_some()))
+        let bytes_per_row = k
+            .checked_mul(1 + usize::from(init.is_some()))
+            .and_then(|outputs| self.n_features.checked_add(outputs))
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
             .context("GPU prediction row size overflow")?;
         let (free, _) = self
@@ -331,6 +395,7 @@ impl GpuInferenceModel {
         let cached = guard.take();
         let reusable = cached.as_ref().is_some_and(|staging| {
             staging.batch_rows >= batch_rows
+                && staging.outputs == k
                 && staging.bytes() <= usable
                 && (init.is_none() || staging.init.is_some())
         });
@@ -345,7 +410,7 @@ impl GpuInferenceModel {
                     .synchronize()
                     .context("release prediction staging")?;
             }
-            self.allocate_staging(batch_rows, init.is_some())?
+            self.allocate_staging(batch_rows, k, init.is_some())?
         };
         let result = self.predict_with_staging(row_major, n_rows, n_trees, init, &mut staging);
         if result.is_ok() && staging.bytes() <= MAX_CACHED_STAGING_BYTES {
@@ -363,12 +428,20 @@ impl GpuInferenceModel {
         result
     }
 
-    fn allocate_staging(&self, batch_rows: usize, with_init: bool) -> Result<PredictionStaging> {
+    fn allocate_staging(
+        &self,
+        batch_rows: usize,
+        outputs: usize,
+        with_init: bool,
+    ) -> Result<PredictionStaging> {
         let input_values = batch_rows
             .checked_mul(self.n_features)
             .context("GPU prediction staging size overflow")?;
+        let output_values = batch_rows
+            .checked_mul(outputs)
+            .context("GPU prediction staging size overflow")?;
         input_values
-            .checked_add(batch_rows * (1 + usize::from(with_init)))
+            .checked_add(output_values * (1 + usize::from(with_init)))
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
             .context("GPU prediction staging bytes overflow")?;
         // SAFETY: every active input value is uploaded before the kernel
@@ -378,11 +451,11 @@ impl GpuInferenceModel {
         // CompactInferenceModel retains one feature even for leaf-only models.
         let input = unsafe { self.stream.alloc::<f32>(input_values) }
             .context("allocate GPU prediction input staging")?;
-        let output = unsafe { self.stream.alloc::<f32>(batch_rows) }
+        let output = unsafe { self.stream.alloc::<f32>(output_values) }
             .context("allocate GPU prediction output staging")?;
         let init = if with_init {
             Some(
-                unsafe { self.stream.alloc::<f32>(batch_rows) }
+                unsafe { self.stream.alloc::<f32>(output_values) }
                     .context("allocate GPU prediction base_margin staging")?,
             )
         } else {
@@ -393,6 +466,7 @@ impl GpuInferenceModel {
             output,
             init,
             batch_rows,
+            outputs,
         })
     }
 
@@ -404,18 +478,42 @@ impl GpuInferenceModel {
         init: Option<&[f32]>,
         staging: &mut PredictionStaging,
     ) -> Result<Vec<f32>> {
+        let k = self.output_first_tree.len();
         let batch_rows = staging.batch_rows.min(n_rows);
-        let mut output = vec![0.0f32; n_rows];
-        // Declared after output: reverse drop order keeps host storage alive
-        // until pending copies have been drained on every early-return path.
+        let mut output = vec![0.0f32; n_rows * k];
+        // Multi-output: one batch's output-major planes come back here and are
+        // interleaved into row-major `output`; per-output starts go up
+        // output-major from `init_planes`.
+        let mut planes = if k > 1 {
+            vec![0.0f32; batch_rows * k]
+        } else {
+            Vec::new()
+        };
+        let mut init_planes = if k > 1 && init.is_some() {
+            vec![0.0f32; batch_rows * k]
+        } else {
+            Vec::new()
+        };
+        // Declared after the host buffers: reverse drop order keeps host storage
+        // alive until pending copies have been drained on every early-return path.
         let mut host_copy_guard = PredictionHostCopyGuard {
             stream: &self.stream,
             completed: false,
         };
         let n_features =
             u32::try_from(self.n_features).context("GPU prediction feature count exceeds u32")?;
-        let n_trees = u32::try_from(n_trees.min(self.n_trees))
-            .context("GPU prediction tree count exceeds u32")?;
+        let upto = n_trees.min(self.n_trees);
+        let output_trees = (0..k)
+            .map(|output| {
+                // Trees `output, output + K, ...` below the canonical prefix.
+                let count = if upto <= output {
+                    0
+                } else {
+                    (upto - output).div_ceil(k)
+                };
+                u32::try_from(count).context("GPU prediction tree count exceeds u32")
+            })
+            .collect::<Result<Vec<u32>>>()?;
 
         for first_row in (0..n_rows).step_by(batch_rows) {
             let rows = (n_rows - first_row).min(batch_rows);
@@ -435,13 +533,30 @@ impl GpuInferenceModel {
                     .init
                     .as_mut()
                     .context("GPU prediction base_margin staging missing")?;
-                let mut init_view = device_init.slice_mut(..rows);
+                let batch_init = &init[first_row * k..(first_row + rows) * k];
+                let host: &[f32] = if k > 1 {
+                    // The previous batch's upload must finish before the host
+                    // planes are rewritten.
+                    if first_row > 0 {
+                        self.stream
+                            .synchronize()
+                            .context("wait for prediction base_margin upload")?;
+                    }
+                    for (row, starts) in batch_init.chunks_exact(k).enumerate() {
+                        for (output, &start) in starts.iter().enumerate() {
+                            init_planes[output * rows + row] = start;
+                        }
+                    }
+                    &init_planes[..rows * k]
+                } else {
+                    batch_init
+                };
+                let mut init_view = device_init.slice_mut(..rows * k);
                 self.stream
-                    .memcpy_htod(&init[first_row..first_row + rows], &mut init_view)
+                    .memcpy_htod(host, &mut init_view)
                     .context("prediction base_margin H2D")?;
             }
             let input_view = staging.input.slice(..values);
-            let mut output_view = staging.output.slice_mut(..rows);
             let rows_u32 =
                 u32::try_from(rows).context("GPU prediction batch row count exceeds u32")?;
             let config = LaunchConfig {
@@ -449,39 +564,66 @@ impl GpuInferenceModel {
                 block_dim: (PREDICT_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            // Only a call that carries margins reads the buffer, even when a cached
-            // staging from an earlier call still holds one.
-            let init_view = match (init, staging.init.as_ref()) {
-                (Some(_), Some(buffer)) => Some(buffer.slice(..rows)),
-                _ => None,
-            };
-            // A null start pointer selects the scalar intercept.
-            let no_init = 0u64;
-            let mut launch = self.stream.launch_builder(&self.predict_fn);
-            launch
-                .arg(&input_view)
-                .arg(&rows_u32)
-                .arg(&n_features)
-                .arg(&self.tree_offsets)
-                .arg(&n_trees)
-                .arg(&self.features)
-                .arg(&self.split_conditions)
-                .arg(&self.left_children)
-                .arg(&self.right_children)
-                .arg(&self.flags)
-                .arg(&self.leaf_values);
-            if let Some(sets) = &self.categorical {
-                launch.arg(&sets.slots).arg(&sets.words);
+            for output in 0..k {
+                let mut output_view = staging.output.slice_mut(output * rows..(output + 1) * rows);
+                // Only a call that carries margins reads the buffer, even when a
+                // cached staging from an earlier call still holds one.
+                let init_view = match (init, staging.init.as_ref()) {
+                    (Some(_), Some(buffer)) => {
+                        Some(buffer.slice(output * rows..(output + 1) * rows))
+                    }
+                    _ => None,
+                };
+                let tree_offsets = self.tree_offsets.slice(self.output_first_tree[output]..);
+                // A null start pointer selects the scalar intercept.
+                let no_init = 0u64;
+                let mut launch = self.stream.launch_builder(&self.predict_fn);
+                launch
+                    .arg(&input_view)
+                    .arg(&rows_u32)
+                    .arg(&n_features)
+                    .arg(&tree_offsets)
+                    .arg(&output_trees[output])
+                    .arg(&self.features)
+                    .arg(&self.split_conditions)
+                    .arg(&self.left_children)
+                    .arg(&self.right_children)
+                    .arg(&self.flags)
+                    .arg(&self.leaf_values);
+                if let Some(sets) = &self.categorical {
+                    launch.arg(&sets.slots).arg(&sets.words);
+                }
+                match &init_view {
+                    Some(view) => launch.arg(view),
+                    None => launch.arg(&no_init),
+                };
+                launch
+                    .arg(&self.output_base_margins[output])
+                    .arg(&mut output_view);
+                unsafe { launch.launch(config) }.context("launch predict_margin_soa")?;
             }
-            match &init_view {
-                Some(view) => launch.arg(view),
-                None => launch.arg(&no_init),
-            };
-            launch.arg(&self.base_margin).arg(&mut output_view);
-            unsafe { launch.launch(config) }.context("launch predict_margin_soa")?;
-            self.stream
-                .memcpy_dtoh(&output_view, &mut output[first_row..first_row + rows])
-                .context("prediction output D2H")?;
+            if k == 1 {
+                let output_view = staging.output.slice(..rows);
+                self.stream
+                    .memcpy_dtoh(&output_view, &mut output[first_row..first_row + rows])
+                    .context("prediction output D2H")?;
+            } else {
+                let output_view = staging.output.slice(..rows * k);
+                self.stream
+                    .memcpy_dtoh(&output_view, &mut planes[..rows * k])
+                    .context("prediction output D2H")?;
+                self.stream
+                    .synchronize()
+                    .context("wait for GPU prediction batch")?;
+                for (row, margins) in output[first_row * k..(first_row + rows) * k]
+                    .chunks_exact_mut(k)
+                    .enumerate()
+                {
+                    for (output, margin) in margins.iter_mut().enumerate() {
+                        *margin = planes[output * rows + row];
+                    }
+                }
+            }
         }
         self.stream
             .synchronize()

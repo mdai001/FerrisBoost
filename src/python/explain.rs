@@ -71,7 +71,7 @@ fn explain_batch(
     rows: &[f32],
     n_rows: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     margin: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
     #[cfg(feature = "cuda")]

@@ -600,7 +600,7 @@ impl<'a> Explainer<'a> {
         rows: &[f32],
         n_rows: usize,
         workers: usize,
-        pool: &mut Option<rayon::ThreadPool>,
+        pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     ) -> Result<Vec<f32>> {
         self.compute_with_margin(kind, rows, n_rows, workers, pool, None)
     }
@@ -615,7 +615,7 @@ impl<'a> Explainer<'a> {
         rows: &[f32],
         n_rows: usize,
         workers: usize,
-        pool: &mut Option<rayon::ThreadPool>,
+        pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
         margin: Option<&[f32]>,
     ) -> Result<Vec<f32>> {
         let nf = self.n_features;
@@ -646,7 +646,7 @@ impl<'a> Explainer<'a> {
             return Ok(out);
         }
         if pool.is_none() {
-            *pool = Some(crate::threading::build_pool(workers)?);
+            *pool = Some(crate::threading::prediction_pool(workers)?);
         }
         let chunk_rows = n_rows.div_ceil(workers.saturating_mul(4)).max(1);
         pool.as_ref().expect("pool just built").install(|| {

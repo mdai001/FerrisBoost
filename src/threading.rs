@@ -14,7 +14,20 @@
 ///
 /// **用户显式给了 >0 就原样返回**,自动探测绝不覆盖。
 pub(crate) fn effective_threads(nthread: usize) -> usize {
-    resolve(nthread, physical_cores(), fallback_parallelism())
+    if nthread > 0 {
+        return nthread;
+    }
+    resolve(nthread, cached_physical_cores(), fallback_parallelism())
+}
+
+/// Machine topology does not change while the process runs, so the sysfs /
+/// procfs scan (one directory listing plus a file read per logical CPU) runs
+/// once. It used to run on every `effective_threads` call, which a single
+/// small prediction makes several times. The process-visible parallelism
+/// (affinity / cgroup quota) is still queried on every call.
+fn cached_physical_cores() -> Option<usize> {
+    static PHYSICAL: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PHYSICAL.get_or_init(physical_cores)
 }
 
 /// Static I/O worker resolver shared by ingest and model file I/O.
@@ -215,6 +228,32 @@ pub(crate) fn build_pool(nthread: usize) -> anyhow::Result<rayon::ThreadPool> {
         .num_threads(resolved)
         .build()
         .map_err(anyhow::Error::from)
+}
+
+/// Worker pool for prediction-time row scoring, reused across calls.
+///
+/// Building a Rayon pool spawns and later joins every worker thread, which
+/// costs far more than scoring a small batch. Prediction keeps the most
+/// recently used pool (keyed by its resolved worker count) alive for the
+/// process; a request for another count replaces it, and the old pool's
+/// threads exit once its last in-flight user drops it. Work assignment is
+/// unchanged (callers still split rows into deterministic disjoint ranges),
+/// so reuse cannot change any result.
+pub(crate) fn prediction_pool(nthread: usize) -> anyhow::Result<std::sync::Arc<rayon::ThreadPool>> {
+    static POOL: std::sync::Mutex<Option<(usize, std::sync::Arc<rayon::ThreadPool>)>> =
+        std::sync::Mutex::new(None);
+    let resolved = effective_threads(nthread);
+    let mut slot = POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((workers, pool)) = slot.as_ref() {
+        if *workers == resolved {
+            return Ok(std::sync::Arc::clone(pool));
+        }
+    }
+    let pool = std::sync::Arc::new(build_pool(resolved)?);
+    *slot = Some((resolved, std::sync::Arc::clone(&pool)));
+    Ok(pool)
 }
 
 #[cfg(test)]
