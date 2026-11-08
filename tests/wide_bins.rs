@@ -8,7 +8,7 @@
 //! - Dense ≡ Parquet in memory ≡ Parquet spilled ≡ reused 16-bit cache;
 //! - all-8-bit data keeps the version-2 cache format;
 //! - wide training data is learned at full resolution (thresholds beyond the
-//!   8-bit range), and the GPU refuses 16-bit columns instead of misreading them.
+//!   8-bit range), and the GPU trains the CPU model with 16-bit columns.
 use ferrisboost::bins::BinWidth;
 use ferrisboost::columns::BinningStrategy;
 use ferrisboost::comm::Local;
@@ -131,14 +131,25 @@ fn wide_features_get_16_bit_blocks_and_others_stay_8_bit() {
         );
         assert_eq!(n > 255, d > 255, "feature {f}");
     }
+    // A 16-bit block holds ⌈cpb / 2⌉ features (about the bytes of an 8-bit block).
     let blocks = block_widths(&src);
     assert_eq!(
         blocks,
         vec![
             (vec![0, 2], BinWidth::U8),
+            (vec![1], BinWidth::U16),
+            (vec![3], BinWidth::U16),
+            (vec![4], BinWidth::U16),
+            (vec![5], BinWidth::U8),
+            (vec![6], BinWidth::U16),
+        ]
+    );
+    assert_eq!(
+        block_widths(&dense(&x, 4, 1)),
+        vec![
+            (vec![0, 2, 5], BinWidth::U8),
             (vec![1, 3], BinWidth::U16),
             (vec![4, 6], BinWidth::U16),
-            (vec![5], BinWidth::U8),
         ]
     );
     // max_bin <= 255 keeps every block 8-bit and the contiguous grouping.
@@ -219,7 +230,7 @@ fn parquet_memory_spill_and_reused_wide_cache_match_dense() {
     let tmp = TmpDir::new("parquet");
     let path = tmp.0.join("t.parquet");
     write_parquet(&path, &x, &y);
-    let cpb = 2;
+    let cpb = 4;
     let reference = model_json(&dense(&x, cpb, 1), &y, params(1, cpb));
 
     let (mem, labels) = ParquetBlockSource::open(&path, "label", 1024, cpb).unwrap();
@@ -265,7 +276,7 @@ fn parquet_memory_spill_and_reused_wide_cache_match_dense() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    assert_eq!(widths, vec![1, 2, 2, 1]);
+    assert_eq!(widths, vec![1, 2, 2]);
     // Block files hold `feats × rows × width` bytes.
     let len = std::fs::metadata(cache.join("block-1.bin")).unwrap().len();
     assert_eq!(len as usize, 2 * N_ROWS * 2);
@@ -278,7 +289,7 @@ fn parquet_memory_spill_and_reused_wide_cache_match_dense() {
 
     // A manifest whose widths disagree with its cuts is rejected.
     let mut bad = m.clone();
-    bad["block_widths"] = serde_json::json!([1, 1, 2, 1]);
+    bad["block_widths"] = serde_json::json!([1, 1, 2]);
     std::fs::write(
         cache.join("manifest.json"),
         serde_json::to_vec(&bad).unwrap(),
@@ -339,12 +350,29 @@ fn max_bin_above_the_16_bit_tier_is_rejected() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn gpu_refuses_16_bit_columns() {
+fn gpu_trains_the_cpu_model_with_16_bit_columns() {
+    // 16-bit numeric blocks run on the device (column-major, host split for features above
+    // 255 bins); exact GPU models are byte-identical to the CPU under pure
+    // streaming and full residency, for 8-bit / 16-bit mixed blockings.
     let (x, y) = data();
-    let src = dense(&x, 2, 1);
-    let cfg = TrainConfig::new(params(1, 2), Objective::Logistic);
-    let err = ferrisboost::train::train_gpu(0, &src, &y, &[], &cfg, &mut [], &Local)
-        .err()
-        .expect("GPU training with 16-bit columns must fail");
-    assert!(format!("{err:#}").contains("255 bins"), "{err:#}");
+    for cpb in [2, 4] {
+        let src = dense(&x, cpb, 1);
+        let reference = model_json(&src, &y, params(1, cpb));
+        for resident in [0, src.n_blocks()] {
+            let cfg = TrainConfig::new(
+                TrainParams {
+                    resident_blocks: Some(resident),
+                    ..params(2, cpb)
+                },
+                Objective::Logistic,
+            );
+            let model =
+                ferrisboost::train::train_gpu(0, &src, &y, &[], &cfg, &mut [], &Local).unwrap();
+            assert_eq!(
+                model.to_xgboost_json().unwrap(),
+                reference,
+                "cols_per_block={cpb} resident_blocks={resident}"
+            );
+        }
+    }
 }

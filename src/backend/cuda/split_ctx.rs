@@ -8,6 +8,10 @@ use crate::types::{FeatId, TrainParams};
 #[path = "packet_tests.rs"]
 mod packet_tests;
 
+/// Most bins per feature the device split path takes: every 8-bit feature
+/// (the kernels give one CTA thread to each bin, `SPLIT_CTA_THREADS` = 256).
+const SPLIT_KERNEL_MAX_BINS: u32 = 255;
+
 pub(super) struct ResidentSplitBuffers {
     previous: CudaSlice<i64>,
     next: CudaSlice<i64>,
@@ -144,6 +148,17 @@ impl GpuBlockSession<'_> {
         let Some(cache) = split_cache.as_mut() else {
             return Ok(false);
         };
+        // The device split kernels give one thread to each bin of a feature
+        // (`SPLIT_CTA_THREADS`, 256). A block holding a wider feature (a
+        // 16-bit block: max_bin > 255 or more than 254 categories) is split
+        // on the host from its downloaded histograms, exactly like a streamed
+        // block; its histograms are still built on the device.
+        if offsets_host
+            .windows(2)
+            .any(|w| w[1] - w[0] > SPLIT_KERNEL_MAX_BINS)
+        {
+            return Ok(false);
+        }
         if depth == 0 {
             cache.previous_ids.clear();
             cache.layout.clone_from(offsets_host);
@@ -357,7 +372,9 @@ impl GpuBlockSession<'_> {
             "GPU split feature shape mismatch"
         );
         anyhow::ensure!(
-            self.feat_offsets().windows(2).all(|x| x[1] - x[0] <= 255),
+            self.feat_offsets()
+                .windows(2)
+                .all(|x| x[1] - x[0] <= SPLIT_KERNEL_MAX_BINS),
             "GPU split requires at most 255 bins per feature"
         );
         let nodes = groups

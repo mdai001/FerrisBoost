@@ -219,10 +219,21 @@ def _has_cuda():
 
 
 @pytest.mark.skipif(not _has_cuda(), reason="no usable CUDA build or device")
-def test_gpu_refuses_16_bit_categorical_columns():
-    x, y, ft = make(4000, (1000,), seed=11)
-    with pytest.raises(ValueError, match="16-bit"):
-        fb_train(x, y, ft, {"device": "cuda", "objective": "reg:squarederror"}, 1)
+def test_gpu_trains_the_cpu_model_with_16_bit_categorical_columns(tmp_path):
+    # 1,000 and 20,000 categories (16-bit blocks; 20,000 slots exceed one
+    # shared-memory histogram tile) next to 8-bit features.
+    x, y, ft = make(4000, (1000, 20000, 12), seed=11)
+    p = {"objective": "reg:squarederror", "max_depth": 5, "subsample": 0.8}
+
+    def raw(model, name):
+        path = tmp_path / f"{name}.json"
+        model.save_model(str(path), quiet=True)
+        return path.read_bytes()
+
+    cpu = raw(fb_train(x, y, ft, p, 3), "cpu")
+    for resident in (0, 8):
+        gpu = fb_train(x, y, ft, {**p, "device": "cuda", "resident_blocks": resident}, 3)
+        assert raw(gpu, "gpu") == cpu, f"resident_blocks={resident}"
     # Up to 254 categories the GPU trains as before.
     x, y, ft = make(4000, (254,), seed=11)
     fb_train(x, y, ft, {"device": "cuda", "objective": "reg:squarederror"}, 1)

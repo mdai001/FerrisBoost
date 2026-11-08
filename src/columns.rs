@@ -419,6 +419,10 @@ pub fn partition_features(n_feats: usize, cols_per_block: usize) -> Vec<Vec<Feat
 /// Block order then no longer follows feature order everywhere, which is why
 /// the cross-block split reduction breaks equal gains by feature id
 /// (`split::reduce_best`), not by block position.
+///
+/// A 16-bit block holds `⌈cols_per_block / 2⌉` features, so its payload has
+/// about the bytes of an 8-bit block: GPU slots are sized by the widest block
+/// in bytes, and a wide block of full width would double every slot.
 pub fn partition_features_by_width(widths: &[BinWidth], cols_per_block: usize) -> Vec<Vec<FeatId>> {
     assert!(cols_per_block > 0, "cols_per_block must be > 0");
     let mut classes: Vec<BinWidth> = widths.to_vec();
@@ -429,7 +433,8 @@ pub fn partition_features_by_width(widths: &[BinWidth], cols_per_block: usize) -
         let feats: Vec<FeatId> = (0..widths.len() as FeatId)
             .filter(|&f| widths[f as usize] == w)
             .collect();
-        blocks.extend(feats.chunks(cols_per_block).map(|c| c.to_vec()));
+        let per_block = cols_per_block.div_ceil(w.bytes());
+        blocks.extend(feats.chunks(per_block).map(|c| c.to_vec()));
     }
     blocks.sort_by_key(|b| b[0]);
     blocks
@@ -538,11 +543,14 @@ mod width_grouping_tests {
     #[test]
     fn wide_features_get_their_own_blocks_in_first_feature_order() {
         let widths = [U8, U8, U16, U8, U16, U16, U8, U8];
+        // 16-bit blocks hold ⌈cpb / 2⌉ features (about the bytes of an 8-bit block).
         let blocks = partition_features_by_width(&widths, 2);
         assert_eq!(
             blocks,
-            vec![vec![0, 1], vec![2, 4], vec![3, 6], vec![5], vec![7]]
+            vec![vec![0, 1], vec![2], vec![3, 6], vec![4], vec![5], vec![7]]
         );
+        let blocks = partition_features_by_width(&widths, 4);
+        assert_eq!(blocks, vec![vec![0, 1, 3, 6], vec![2, 4], vec![5], vec![7]]);
         for b in &blocks {
             assert!(b
                 .iter()

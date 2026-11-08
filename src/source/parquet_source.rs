@@ -1814,7 +1814,9 @@ impl BlockSource for ParquetBlockSource {
                 let width = self.cuts.block_width(feat_ids);
                 let col_bytes = self.n_rows * width.bytes();
                 let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
-                let mut bytes = vec![0u8; cols.len() * col_bytes];
+                // Read straight into the block's typed cells (no byte-to-cell copy).
+                let mut data = BinData::missing(width, cols.len() * self.n_rows);
+                let bytes = data.as_le_bytes_mut();
                 for (slot, &l) in cols.iter().enumerate() {
                     anyhow::ensure!(
                         l < feat_ids.len(),
@@ -1825,10 +1827,10 @@ impl BlockSource for ParquetBlockSource {
                 }
                 self.cache_reads.fetch_add(1, Ordering::Relaxed);
                 self.source_bytes
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    .fetch_add(data.byte_len() as u64, Ordering::Relaxed);
                 let block = ColumnBlock {
                     feat_ids: cols.iter().map(|&l| feat_ids[l]).collect(),
-                    data: BinData::from_le_bytes(width, bytes)?,
+                    data,
                     n_rows: self.n_rows,
                 };
                 f(&block);
@@ -1875,12 +1877,15 @@ impl BlockSource for ParquetBlockSource {
                     .ok_or_else(|| anyhow::anyhow!("column block {i} does not exist"))?
                     .clone();
                 let width = self.cuts.block_width(&feat_ids);
-                let mut data = Vec::new();
-                File::open(dir.join(format!("block-{i}.bin")))?.read_to_end(&mut data)?;
+                let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
                 anyhow::ensure!(
-                    data.len() == feat_ids.len() * self.n_rows * width.bytes(),
+                    file.metadata()?.len() == (feat_ids.len() * self.n_rows * width.bytes()) as u64,
                     "cache block {i} length differs"
                 );
+                // Read straight into the block's typed cells (no byte-to-cell copy).
+                let mut cells = BinData::missing(width, feat_ids.len() * self.n_rows);
+                file.read_exact(cells.as_le_bytes_mut())?;
+                let data = cells.as_le_bytes();
                 // 整块读也如实计数 —— 只有把「读了多少」和「传了多少」
                 // 分开记,才看得出省的到底是哪一段。
                 self.source_bytes
@@ -1901,7 +1906,7 @@ impl BlockSource for ParquetBlockSource {
                 }
                 f(&ColumnBlock {
                     feat_ids,
-                    data: BinData::from_le_bytes(width, data)?,
+                    data: cells,
                     n_rows: self.n_rows,
                 });
             }

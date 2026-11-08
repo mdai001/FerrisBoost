@@ -1526,32 +1526,13 @@ fn train_with_backend(
     let gpu = match gpu_device {
         Some(device) => {
             let cuts = source.cuts();
-            // The CUDA kernels read 8-bit bins only. Refuse 16-bit columns up
-            // front with a clear message instead of failing at the first block
-            // (never a silent CPU fallback).
-            crate::ensure_input!(
-                !cuts.has_wide() && evals.iter().all(|e| !e.source.cuts().has_wide()),
-                "GPU training does not support 16-bit bin columns yet: numeric features with \
-                 more than 255 bins (max_bin > 255) or categorical features with codes above {} \
-                 (more than {} categories); train on the CPU, or use max_bin <= 255 and \
-                 category codes <= {}",
-                crate::categorical::MAX_CAT_CODE,
-                crate::categorical::MAX_CAT_CODE + 1,
-                crate::categorical::MAX_CAT_CODE
-            );
-            let mut max_block_feats = 0usize;
-            let mut max_hist_bins = 0usize;
-            for b in 0..source.n_blocks() {
-                let feats = source.block_features(b)?;
-                max_block_feats = max_block_feats.max(feats.len());
-                let offsets = cuts.block_hist_offsets(&feats);
-                max_hist_bins = max_hist_bins.max(*offsets.last().unwrap() as usize);
-            }
-            let ctx = crate::backend::cuda::GpuTrainCtx::new(
+            // 16-bit blocks run on the device too (column-major, byte-sized
+            // slots); the context allocates for the real block shape.
+            let shape = gpu_block_shape(source)?;
+            let ctx = crate::backend::cuda::GpuTrainCtx::new_with_shape(
                 device,
                 n,
-                max_block_feats,
-                max_hist_bins,
+                shape,
                 source.n_blocks(),
                 crate::gpu_mem_plan::GPU_PARTITION_THREADS,
                 crate::backend::cuda::SharedHistogramConfig {
@@ -1593,14 +1574,17 @@ fn train_with_backend(
                 },
                 prof::enabled(),
             )?;
-            // The histogram kernels tile a block by whole features: a feature
-            // wider than one shared-memory tile is a hard error here, before
+            // The histogram kernels tile a block by whole features. A 16-bit
+            // feature wider than one shared-memory tile is accumulated in
+            // global memory; an 8-bit feature always fits a tile unless the
+            // shared-memory budget is tiny, which is a hard error here, before
             // any launch (never a kernel loop without progress).
-            let max_feature_bins = (0..cuts.n_feats() as FeatId)
+            let max_u8_feature_bins = (0..cuts.n_feats() as FeatId)
+                .filter(|&f| cuts.bin_width(f) == crate::bins::BinWidth::U8)
                 .map(|f| cuts.n_bins(f))
                 .max()
                 .unwrap_or(0);
-            ctx.ensure_features_fit_tile(max_feature_bins)?;
+            ctx.ensure_features_fit_tile(max_u8_feature_bins)?;
             if prof::enabled() {
                 eprintln!("\n=== GPU memory budget ===\n{}", ctx.budget().report());
                 eprintln!("{}", ctx.host_budget().report());
@@ -2877,7 +2861,11 @@ fn build_tree(
     // 直方图只建采样中的列:CPU 恒如此(内核按列切片取列,不需要压实块),
     // column-major GPU 视后端能力而定。没采样的列根本不进 split 枚举,
     // 给它们建直方图是纯白算 —— colsample_bytree=0.6 时那是近一半的累加。
-    let compact_hist = gpu.map_or(true, |c| c.supports_compact_column_histogram());
+    let compact_hist = |physical: usize| {
+        gpu.map_or(true, |c| {
+            c.supports_compact_column_histogram_for(cuts.block_width(&all_block_feats[physical]))
+        })
+    };
     let supports_cols = source.supports_column_selection();
     let plans: Vec<BlockPlan> = match sampled {
         Some(sel) => crate::colsample::required_blocks(sel, &all_block_feats)
@@ -2897,7 +2885,7 @@ fn build_tree(
                 } else {
                     all_block_feats[physical].clone()
                 };
-                let hist_feats = if compact_hist {
+                let hist_feats = if compact_hist(physical) {
                     sampled_global.clone()
                 } else {
                     handed_feats.clone()
@@ -3105,8 +3093,9 @@ fn build_tree(
             let mut submitted = Vec::with_capacity(n_blocks);
             for (b, plan) in plans.iter().enumerate() {
                 let selected_local = sampled.map(|_| plan.orig_local.as_slice());
-                let Some(mut session) = ctx.block_session_resident(
+                let Some(mut session) = ctx.block_session_resident_width(
                     plan.physical,
+                    cuts.block_width(&plan.handed_feats),
                     source.n_rows(),
                     plan.handed_feats.len(),
                     &plan.hist_offsets,
@@ -3228,9 +3217,9 @@ fn build_tree(
                         Some(session) => session,
                         None => {
                             let block = block.context("GPU cache miss requires source payload")?;
-                            ctx.block_session(
+                            ctx.block_session_bins(
                                 phys,
-                                block.bins().require_u8("GPU training")?,
+                                block.bins(),
                                 block.n_rows,
                                 block.n_feats(),
                                 &plan.hist_offsets,
@@ -3427,8 +3416,9 @@ fn build_tree(
             // source read/checksum path.
             if !plan.compact {
                 if let Some(ctx) = gpu {
-                    if let Some(session) = ctx.block_session_resident(
+                    if let Some(session) = ctx.block_session_resident_width(
                         phys,
+                        cuts.block_width(&plan.handed_feats),
                         source.n_rows(),
                         plan.handed_feats.len(),
                         &plan.hist_offsets,
@@ -3574,7 +3564,21 @@ fn build_tree(
             }
             let mut blocks: Vec<usize> = numeric.iter().map(|&(_, b, _)| b).collect();
             blocks.dedup(); // `numeric` is grouped by ascending block
-            for block_chunk in blocks.chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS) {
+                            // A batch reads blocks of one bin width (8-bit blocks may be
+                            // row-major on the device, 16-bit ones are column-major): 8-bit
+                            // blocks first, exactly as before, then the 16-bit blocks.
+            let wide_block = |block: usize| {
+                plans.iter().any(|pl| {
+                    pl.physical == block
+                        && cuts.block_width(&pl.handed_feats) == crate::bins::BinWidth::U16
+                })
+            };
+            let (wide_blocks, narrow_blocks): (Vec<usize>, Vec<usize>) =
+                blocks.into_iter().partition(|&b| wide_block(b));
+            let block_chunks = narrow_blocks
+                .chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS)
+                .chain(wide_blocks.chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS));
+            for block_chunk in block_chunks {
                 let Some(mut session) = ctx.partition_session_resident_blocks(block_chunk)? else {
                     continue; // nonresident: the per-feature fallback below
                 };
@@ -3681,7 +3685,7 @@ fn build_tree(
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
-                let mut session = ctx.partition_session(col.require_u8("GPU training")?)?;
+                let mut session = ctx.partition_session_bins(col)?;
                 for i in node_idxs {
                     let c = chosen[i]
                         .as_ref()
@@ -3894,6 +3898,42 @@ fn build_tree(
     }
 
     Ok(t)
+}
+
+/// The bin geometry GPU training allocates for: block widths in features and
+/// bytes per row, the largest block histogram, the widest 8-bit block (the
+/// device row-major gate) and the widest category set a partition ships.
+/// Pure metadata: no block payload is read.
+pub(crate) fn gpu_block_shape(
+    source: &dyn BlockSource,
+) -> anyhow::Result<crate::gpu_mem_plan::GpuBlockShape> {
+    use crate::bins::BinWidth;
+    let cuts = source.cuts();
+    let mut shape = crate::gpu_mem_plan::GpuBlockShape::all_u8(0, 0);
+    for b in 0..source.n_blocks() {
+        let feats = source.block_features(b)?;
+        let width = cuts.block_width(&feats);
+        shape.max_block_feats = shape.max_block_feats.max(feats.len());
+        shape.max_block_row_bytes = shape.max_block_row_bytes.max(feats.len() * width.bytes());
+        let offsets = cuts.block_hist_offsets(&feats);
+        shape.max_hist_bins = shape.max_hist_bins.max(*offsets.last().unwrap() as usize);
+        match width {
+            BinWidth::U8 => {
+                shape.max_u8_block_feats = shape.max_u8_block_feats.max(feats.len());
+            }
+            BinWidth::U16 => {
+                shape.max_cell_bytes = 2;
+                for &f in &feats {
+                    if cuts.is_categorical(f) {
+                        // Two 32-bit words per 64-bit set word (CatBits::words64).
+                        shape.cat_mask_words =
+                            shape.cat_mask_words.max(cuts.n_bins(f).div_ceil(64) * 2);
+                    }
+                }
+            }
+        }
+    }
+    Ok(shape)
 }
 
 /// `apply_dropped_rows` 需要的、和分区完全同一套的分裂判定。

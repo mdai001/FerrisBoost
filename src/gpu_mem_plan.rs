@@ -58,6 +58,56 @@ pub(crate) fn categorical_split_cache_bytes(cols: u64, hist_nodes_per_batch: u64
         + categorical_split_cache_fixed_bytes(hist_nodes_per_batch)
 }
 
+/// The bin geometry of the real column blocks that GPU training allocates for.
+///
+/// Column blocks are homogeneous in bin width (8- or 16-bit cells, see
+/// [`crate::bins`]). Slots are byte buffers sized by the widest block in bytes,
+/// so an all-8-bit dataset has exactly the shape of the 8-bit-only runtime.
+/// `GpuTrainCtx` allocates from this shape and the post-open planner prices the
+/// same numbers ([`StreamingMemModel::new_for_shape`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuBlockShape {
+    /// Widest block in features.
+    pub max_block_feats: usize,
+    /// Widest block in bytes per row (features × bytes per cell).
+    pub max_block_row_bytes: usize,
+    /// Largest histogram of one block (sum of its features' bins).
+    pub max_hist_bins: usize,
+    /// Widest 8-bit block in features: the device row-major gate looks at the
+    /// 8-bit blocks only (16-bit blocks always run column-major). 0 = none.
+    pub max_u8_block_feats: usize,
+    /// Bytes per cell of the widest column (the partition column buffer).
+    pub max_cell_bytes: usize,
+    /// 32-bit words of the widest category set a partition ships to the device
+    /// (8 for 8-bit categorical features: the fixed 256-bit set).
+    pub cat_mask_words: usize,
+}
+
+impl GpuBlockShape {
+    /// The shape of 8-bit-only blocks (every pre-0.0.8 caller).
+    pub fn all_u8(max_block_feats: usize, max_hist_bins: usize) -> Self {
+        Self {
+            max_block_feats,
+            max_block_row_bytes: max_block_feats,
+            max_hist_bins,
+            max_u8_block_feats: max_block_feats,
+            max_cell_bytes: 1,
+            cat_mask_words: CAT_SET_WORDS,
+        }
+    }
+
+    /// Whether any block stores 16-bit cells.
+    pub fn has_wide(&self) -> bool {
+        self.max_cell_bytes > 1
+    }
+
+    /// Partition descriptor words: the batch descriptors, or the widest
+    /// category set (shipped through the same buffer), whichever is larger.
+    pub fn partition_descriptor_words(&self) -> usize {
+        (PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS).max(self.cat_mask_words)
+    }
+}
+
 pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usize, usize) {
     // Disjoint nonempty spans: sum ceil(len/T) <= ceil(N/T) + K - 1,
     // and never exceeds N. Every segment needs its own scan sentinel.
@@ -252,6 +302,76 @@ impl StreamingMemModel {
             staging_rows: n_rows,
             staging_budget: stage,
         }
+    }
+
+    /// The model of an opened source: the physical block width `cols` is fixed
+    /// and every slot is priced from the real blocks — the widest block in
+    /// bytes (8- and 16-bit cells) and the largest block histogram from the
+    /// actual per-feature bin counts — instead of `cols` columns at the scalar
+    /// `max_bin`. These are exactly the numbers `GpuTrainCtx::new_with_shape`
+    /// allocates with. Device row-major staging applies only when an 8-bit
+    /// block exists and fits the row-major gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_shape(
+        n_rows: u64,
+        shape: &GpuBlockShape,
+        cols: u64,
+        hist_streams: u64,
+        hist_nodes_per_batch: u64,
+        device_quantize: bool,
+        fast_math: bool,
+        rm_stage_bytes: u64,
+    ) -> Self {
+        let row_major =
+            shape.max_u8_block_feats > 0 && shape.max_u8_block_feats as u64 <= ROW_MAJOR_MAX_FEATS;
+        let mut model = Self::new(
+            n_rows,
+            0,
+            hist_streams,
+            hist_nodes_per_batch,
+            device_quantize,
+            fast_math,
+            row_major,
+            rm_stage_bytes,
+        );
+        // Partition column of the widest cell, and the descriptor buffer that
+        // also carries the widest 16-bit category set.
+        model.fixed_bytes += n_rows * (shape.max_cell_bytes as u64).saturating_sub(1)
+            + (shape.partition_descriptor_words()
+                - PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS) as u64
+                * 4;
+        let slot = shape.max_block_row_bytes as u64 * n_rows
+            + shape.max_hist_bins as u64 * 16 * hist_nodes_per_batch;
+        model.slot_col_bytes = slot.div_ceil(cols.max(1));
+        model.per_col_bytes = model.slot_col_bytes * hist_streams;
+        model
+    }
+
+    /// [`Self::with_resident_split_cache`] (and its categorical / node-mask
+    /// parts) priced from the real block shape, like [`Self::new_for_shape`].
+    pub fn with_resident_split_cache_for_shape(
+        mut self,
+        shape: &GpuBlockShape,
+        cols: u64,
+        hist_nodes_per_batch: u64,
+        categorical: bool,
+        node_masks: bool,
+    ) -> Self {
+        if hist_nodes_per_batch < 2 {
+            return self;
+        }
+        let cap = hist_nodes_per_batch;
+        let feats = shape.max_block_feats as u64;
+        let mut slot = shape.max_hist_bins as u64 * 16 * 2 * cap + feats * (cap * 64 + 12);
+        if categorical {
+            slot += categorical_split_cache_bytes(feats, cap);
+        }
+        if node_masks {
+            slot += node_feature_mask_bytes(feats, cap);
+        }
+        self.resident_extra_col_bytes = slot.div_ceil(cols.max(1));
+        self.resident_extra_fixed_bytes = cap * (40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
+        self
     }
 
     /// `gpu_math = "fast"` 且带样本权重:权重常驻 device,+4 B/行。
@@ -691,6 +811,36 @@ pub fn resolve_gpu_streaming_plan(
             Ok(one)
         }
     }
+}
+
+/// [`resolve_gpu_streaming_plan`] for an opened source whose block width is
+/// already fixed: the physical block count is the real one (16-bit blocks hold
+/// half the features, so it can exceed `ceil(features / cols)`), and the
+/// residency is solved against it.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_gpu_streaming_plan_for_blocks(
+    cols: usize,
+    explicit_streams: Option<usize>,
+    explicit_resident: Option<usize>,
+    n_features: u64,
+    physical_blocks: u64,
+    free_vram: u64,
+    total_vram: u64,
+    make_model: impl Fn(u64) -> StreamingMemModel,
+) -> anyhow::Result<GpuStreamingPlan> {
+    let mut plan = resolve_gpu_streaming_plan(
+        Some(cols),
+        explicit_streams,
+        explicit_resident,
+        n_features,
+        free_vram,
+        total_vram,
+        &make_model,
+    )?;
+    plan.physical_blocks = physical_blocks.max(1);
+    let model = make_model(plan.resolved_hist_streams);
+    fill_residency(&mut plan, explicit_resident, &model);
+    Ok(plan)
 }
 
 /// 几何定下来之后,**把剩余安全预算换成常驻物理块**。

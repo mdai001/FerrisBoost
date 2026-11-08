@@ -210,6 +210,28 @@ impl BinData {
         }
     }
 
+    /// The payload as little-endian bytes, borrowed (the host is little-endian,
+    /// so 16-bit cells already are their on-disk / device byte image).
+    pub fn as_le_bytes(&self) -> &[u8] {
+        self.as_slice().as_le_bytes()
+    }
+
+    /// The payload as mutable little-endian bytes (for reading a cache block
+    /// straight into its typed storage, without a byte-to-cell conversion copy).
+    pub fn as_le_bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            BinData::U8(v) => v,
+            // SAFETY: u16 has no padding and every byte pattern is a valid u16;
+            // the view covers exactly the vector's initialised cells.
+            BinData::U16(v) => unsafe {
+                std::slice::from_raw_parts_mut(
+                    v.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of_val(v.as_slice()),
+                )
+            },
+        }
+    }
+
     /// Inverse of [`Self::to_le_bytes`].
     // Keep the portable forms until the crate's supported Rust version is explicit.
     #[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
@@ -282,6 +304,19 @@ impl<'a> BinSlice<'a> {
         }
     }
 
+    /// The cells as little-endian bytes, borrowed (no copy: the host is
+    /// little-endian). This is the cache file and device upload image.
+    pub fn as_le_bytes(&self) -> &'a [u8] {
+        match *self {
+            BinSlice::U8(s) => s,
+            // SAFETY: u16 has no padding and any byte pattern is a valid u8; the
+            // view covers exactly the same cells for the same lifetime.
+            BinSlice::U16(s) => unsafe {
+                std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s))
+            },
+        }
+    }
+
     /// The 8-bit payload, if this is an 8-bit slice.
     pub fn as_u8(&self) -> Option<&'a [u8]> {
         match *self {
@@ -303,6 +338,9 @@ impl<'a> BinSlice<'a> {
         }
     }
 }
+
+#[cfg(not(target_endian = "little"))]
+compile_error!("16-bit bins are stored and uploaded as little-endian bytes");
 
 /// Run `$body` with `$s` bound to the typed slice of a [`BinSlice`].
 #[macro_export]
@@ -351,5 +389,10 @@ mod tests {
         assert_eq!(BinData::from_le_bytes(BinWidth::U16, bytes).unwrap(), wide);
         assert!(BinData::from_le_bytes(BinWidth::U16, vec![1, 2, 3]).is_err());
         assert_eq!(wide.byte_len(), 6);
+        assert_eq!(wide.as_le_bytes(), &[0, 0, 44, 1, 255, 255]);
+        let mut read = BinData::missing(BinWidth::U16, 3);
+        read.as_le_bytes_mut()
+            .copy_from_slice(&[0, 0, 44, 1, 255, 255]);
+        assert_eq!(read, wide);
     }
 }

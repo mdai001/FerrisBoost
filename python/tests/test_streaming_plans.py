@@ -65,11 +65,11 @@ STREAMS_RE = re.compile(r"hist_streams=(\d+)")
 
 
 def _write(tmp_path, name, objective, n, n_feats, seed, n_cat=0, weights=False,
-           base_margin=False, num_class=4):
+           base_margin=False, num_class=4, cat_k=(12, 40)):
     rng = np.random.default_rng(seed)
     x = rng.normal(size=(n, n_feats)).astype(np.float32)
     cats = CAT_FEATURES[:n_cat]
-    for c, k in zip(cats, (12, 40)):
+    for c, k in zip(cats, cat_k):
         x[:, c] = rng.integers(0, k, n).astype(np.float32)
     x[rng.random(x.shape) < 0.03] = np.nan
     xs = np.nan_to_num(x)
@@ -116,13 +116,14 @@ def _bytes(model, tmp_path, name):
 
 def _setup(tmp_path, objective, layout, n=4000, seed=0, sampling=None, n_cat=0,
            weights=False, base_margin=False, evals=False, init_model=False, rounds=4,
-           max_depth=5, **extra):
+           max_depth=5, cat_k=(12, 40), **extra):
     """Data, params and train kwargs for one matrix case (CPU params; add the GPU keys)."""
     lay = LAYOUTS[layout]
     unbiased = objective.endswith("+unbiased")
     objective = objective.split("+")[0]
     tag = f"{objective.replace(':', '_')}_{layout}_{seed}"
-    path = _write(tmp_path, tag, objective, n, lay["n_feats"], seed, n_cat, weights, base_margin)
+    path = _write(tmp_path, tag, objective, n, lay["n_feats"], seed, n_cat, weights, base_margin,
+                  cat_k=cat_k)
     p = {"objective": objective, "max_depth": max_depth, "eta": 0.3, "nthread": 2,
          "cols_per_block": lay["cols_per_block"], "seed": 7, "max_bin": 64,
          **(sampling or {}), **extra}
@@ -145,7 +146,7 @@ def _setup(tmp_path, objective, layout, n=4000, seed=0, sampling=None, n_cat=0,
             [f"bm{j}" for j in range(4)] if objective == "multi:softprob" else "bm0")
     if evals:
         vpath = _write(tmp_path, tag + "_val", objective, n // 2, lay["n_feats"], seed + 1,
-                       n_cat, weights, base_margin)
+                       n_cat, weights, base_margin, cat_k=cat_k)
         kw.update(evals=[(vpath, "val")], early_stopping_rounds=2, num_boost_round=12)
     if init_model:
         prior_kw = {**kw, "num_boost_round": 2}
@@ -352,6 +353,91 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
                 assert _bytes(model, tmp_path, "gpu") == ref, (src, resident, spill)
 
 
+# ------------------------------------------------- 16-bit column blocks (0.0.8 wide bins)
+
+# Features with more than 255 bins (max_bin > 255) or more than 254 categories are
+# stored in 16-bit blocks of ceil(cols_per_block / 2) features; 8-bit features keep
+# their own blocks. 16-bit blocks always run column-major on the device (histograms
+# with features wider than one shared-memory tile accumulate in global memory) and
+# are split on the host from their histograms; 8-bit blocks keep their layout.
+WIDE_CASES = {
+    "numeric_max_bin_1024": dict(max_bin=1024),
+    "numeric_max_bin_4096": dict(max_bin=4096),
+    # 20,000 categories: one feature has more histogram slots than a shared tile
+    "categorical_1000_and_20000": dict(n_cat=2, cat_k=(1000, 20000)),
+    # 8-bit categorical and numeric blocks next to 16-bit ones
+    "mixed_8_and_16_bit": dict(max_bin=300, n_cat=2, cat_k=(40, 20000)),
+}
+
+
+def _wide_plan(capfd, p, path, kw, **gpu):
+    model, info = _gpu(capfd, p, path, kw, **gpu)
+    assert "bins_16bit=col_major" in info["log"], info["log"][-1500:]
+    return model, info
+
+
+@cuda
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("case", list(WIDE_CASES))
+def test_wide_bin_blocks_train_the_cpu_model_under_every_plan(tmp_path, capfd, case, layout):
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", layout, sampling=SAMPLE_ALL,
+                            **WIDE_CASES[case])
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    _, probe = _wide_plan(capfd, p, path, kw, resident_blocks=0)
+    total = probe["total"]
+    assert total > LAYOUTS[layout]["blocks"] or case == "categorical_1000_and_20000"
+    for resident in _plans(total):
+        model, info = _wide_plan(capfd, p, path, kw, gpu_math="exact", resident_blocks=resident)
+        _check_plan(info, probe["layout"], resident, total)
+        assert _bytes(model, tmp_path, "gpu") == ref, (
+            f"{case}: {info['residency']} {resident}/{total} differs from the CPU model")
+
+
+@cuda
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("objective", ["multi:softprob", "rank:ndcg", "reg:quantileerror"])
+def test_wide_bin_blocks_with_training_features(tmp_path, capfd, objective, layout):
+    path, p, kw, _ = _setup(tmp_path, objective, layout, max_bin=600, n_cat=2,
+                            cat_k=(300, 5000), weights=True, evals=True, init_model=True,
+                            sampling=SAMPLE_ALL)
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    _, probe = _wide_plan(capfd, p, path, kw, resident_blocks=0)
+    for resident in (probe["total"], 1, 0):
+        model, info = _wide_plan(capfd, p, path, kw, gpu_math="exact", resident_blocks=resident)
+        assert _bytes(model, tmp_path, "gpu") == ref, (objective, info["residency"])
+
+
+@cuda
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_wide_bin_blocks_fast_math_is_deterministic_and_plan_invariant(tmp_path, capfd, layout):
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", layout, sampling=SAMPLE_ALL,
+                            weights=True, **WIDE_CASES["mixed_8_and_16_bit"])
+    _, probe = _wide_plan(capfd, p, path, kw, resident_blocks=0)
+    seen = {}
+    for resident in _plans(probe["total"]):
+        runs = [_bytes(_wide_plan(capfd, p, path, kw, gpu_math="fast",
+                                  resident_blocks=resident)[0], tmp_path, "fast")
+                for _ in range(2)]
+        assert runs[0] == runs[1], f"fast is not deterministic with {resident} resident blocks"
+        seen[resident] = runs[0]
+    assert len(set(seen.values())) == 1, "fast models differ between residency plans"
+
+
+@cuda
+def test_wide_bin_blocks_spill_and_stream_like_the_cpu(tmp_path, capfd):
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major", sampling=SAMPLE_ALL,
+                            **WIDE_CASES["mixed_8_and_16_bit"])
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
+    spill = {**p, "cache_budget_bytes": 0}
+    assert _bytes(fb.train(spill, path, quiet=True, **kw), tmp_path, "cpu_spill") == ref
+    for resident in (None, 1, 0):
+        for hs in (1, 2):
+            gpu = {"hist_streams": hs} if resident is None else {
+                "hist_streams": hs, "resident_blocks": resident}
+            model, info = _wide_plan(capfd, spill, path, kw, **gpu)
+            assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs)
+
+
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
 def _used_mb():
@@ -464,3 +550,54 @@ def test_large_forced_plans_with_multi_chunk_row_major_upload(
                 # the 32 MB staging budget is split across slots (and halved when pinned)
                 assert chunk < 3_000_000, "the case must exercise multi-chunk uploads"
             assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs, pinned)
+
+
+@cuda
+@slow
+@pytest.mark.parametrize("math", ["exact", "fast"])
+def test_large_wide_bin_plans_stay_within_the_planner_estimate(tmp_path, capfd, math):
+    """1M rows with max_bin=1024 numeric features and a 20,000-category feature:
+    automatic and budget-forced plans train the CPU model (exact) or one model
+    (fast), and the observed device memory never exceeds the re-planned estimate
+    (priced from the opened 16-bit blocks)."""
+    n, f = 1_000_000, 12
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(n, f)).astype(np.float32)
+    x[:, 3] = rng.integers(0, 20_000, n)
+    x[:, 6] = rng.integers(0, 30, n)
+    x[rng.random(x.shape) < 0.02] = np.nan
+    xs = np.nan_to_num(x)
+    eff = rng.normal(0, 1, 20_000)
+    y = (xs[:, 0] - 0.5 * xs[:, 5] + eff[xs[:, 3].astype(int)] + rng.normal(0, 0.7, n) > 0)
+    path = str(tmp_path / "wide.parquet")
+    pq.write_table(pa.table({**{f"f{i}": x[:, i] for i in range(f)},
+                             "label": y.astype(np.float32)}), path, row_group_size=200_000)
+    p = {"objective": "binary:logistic", "max_depth": 6, "nthread": 4, "seed": 1,
+         "max_bin": 1024, "subsample": 0.8, "colsample_bytree": 0.8}
+    kw = {"label": "label", "num_boost_round": 3,
+          "feature_types": ["c" if i in (3, 6) else "q" for i in range(f)]}
+    ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu") if math == "exact" else None
+    fb.train({"device": "cuda", "max_depth": 1}, np.zeros((64, 2), np.float32),
+             np.zeros(64, np.float32), num_boost_round=1, quiet=True)
+    base = _used_mb()
+    seen, labels = {}, set()
+    for budget in (None, 700, 650, 620, 600):
+        gpu = {"gpu_math": math, **({"gpu_memory_budget": budget * MB} if budget else {})}
+        try:
+            with _PeakVram() as peak:
+                model, info = _wide_plan(capfd, p, path, kw, **gpu)
+        except (ValueError, RuntimeError) as e:
+            assert "does not fit" in str(e) and budget is not None
+            continue
+        labels.add(info["residency"])
+        # the last plan report is the one priced from the opened blocks
+        est = float(re.findall(r"estimated_peak:\s+([\d.]+) MB", info["log"])[-1])
+        assert "priced from the opened blocks" in info["log"]
+        if base is not None:
+            assert peak.peak - base <= est + 1, (budget, peak.peak - base, est)
+        out = _bytes(model, tmp_path, "gpu")
+        if ref is not None:
+            assert out == ref, f"budget {budget}: {info['residency']} differs from the CPU model"
+        seen[budget] = out
+    assert "pure_streaming" in labels or "hybrid_partial_resident" in labels, labels
+    assert len(set(seen.values())) == 1

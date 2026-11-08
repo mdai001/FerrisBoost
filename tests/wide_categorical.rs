@@ -8,8 +8,8 @@
 //! - splits use category sets beyond the 8-bit range;
 //! - Dense ≡ Parquet dictionary column in memory ≡ spilled 16-bit cache (v3)
 //!   ≡ reused cache;
-//! - codes above 65533 are rejected, and the GPU refuses 16-bit categorical
-//!   columns up front.
+//! - codes above 65533 are rejected;
+//! - the GPU trains the CPU model with 16-bit categorical columns.
 use ferrisboost::bins::BinWidth;
 use ferrisboost::columns::BinningStrategy;
 use ferrisboost::comm::Local;
@@ -156,12 +156,21 @@ fn wide_categorical_features_get_16_bit_blocks() {
             assert_eq!(src.cuts().n_bins(f as u32), d, "feature {f}");
         }
     }
+    // A 16-bit block holds ⌈cpb / 2⌉ features (about the bytes of an 8-bit block).
     assert_eq!(
         block_widths(&src),
         vec![
             (vec![0, 2], BinWidth::U8),
-            (vec![1, 4], BinWidth::U16),
+            (vec![1], BinWidth::U16),
             (vec![3, 5], BinWidth::U8),
+            (vec![4], BinWidth::U16),
+        ]
+    );
+    assert_eq!(
+        block_widths(&dense(&x, 4, 1)),
+        vec![
+            (vec![0, 2, 3, 5], BinWidth::U8),
+            (vec![1, 4], BinWidth::U16),
         ]
     );
 }
@@ -272,7 +281,7 @@ fn parquet_dictionary_columns_and_the_16_bit_cache_match_dense() {
     let m: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cache.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(m["version"], 3);
-    assert_eq!(m["block_widths"], serde_json::json!([1, 2, 1]));
+    assert_eq!(m["block_widths"], serde_json::json!([1, 2, 1, 2]));
     let (reused, _) =
         ParquetBlockSource::open_with_cache(&path, "label", 255, cpb, opts()).unwrap();
     assert_eq!(model_json(&reused, &y, params(1, cpb)), reference, "reused");
@@ -327,13 +336,29 @@ fn codes_above_the_16_bit_limit_are_rejected() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn gpu_refuses_16_bit_categorical_columns() {
+fn gpu_trains_the_cpu_model_with_16_bit_categorical_columns() {
+    // 16-bit categorical blocks run on the device (column-major, host split for features above
+    // 255 bins); exact GPU models are byte-identical to the CPU under pure
+    // streaming and full residency, for 8-bit / 16-bit mixed blockings.
     let (x, y) = data();
-    let src = dense(&x, 2, 1);
-    let cfg = TrainConfig::new(params(1, 2), Objective::SquaredError);
-    let err = ferrisboost::train::train_gpu(0, &src, &y, &[], &cfg, &mut [], &Local)
-        .err()
-        .expect("GPU training with 16-bit categorical columns must fail");
-    let msg = format!("{err:#}");
-    assert!(msg.contains("16-bit") && msg.contains("categor"), "{msg}");
+    for cpb in [2, 4] {
+        let src = dense(&x, cpb, 1);
+        let reference = model_json(&src, &y, params(1, cpb));
+        for resident in [0, src.n_blocks()] {
+            let cfg = TrainConfig::new(
+                TrainParams {
+                    resident_blocks: Some(resident),
+                    ..params(2, cpb)
+                },
+                Objective::SquaredError,
+            );
+            let model =
+                ferrisboost::train::train_gpu(0, &src, &y, &[], &cfg, &mut [], &Local).unwrap();
+            assert_eq!(
+                model.to_xgboost_json().unwrap(),
+                reference,
+                "cols_per_block={cpb} resident_blocks={resident}"
+            );
+        }
+    }
 }

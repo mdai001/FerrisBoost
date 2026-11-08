@@ -226,7 +226,7 @@ fn resolve_blocking(
     match cfg.device {
         #[cfg(feature = "cuda")]
         Some(ordinal) => {
-            use crate::gpu_mem_plan::{resolve_gpu_streaming_plan, StreamingMemModel};
+            use crate::gpu_mem_plan::resolve_gpu_streaming_plan;
             // ⚠️ **必须查用户真正要用的那张卡。** 这里以前固定
             // `CudaContext::new(0)`,而 buffer 实际分配在 `train_gpu(ordinal, ..)`
             // 指定的卡上 —— `device="cuda:1"` 时预算读的是 GPU 0 的空闲显存,
@@ -243,8 +243,6 @@ fn resolve_blocking(
             // **整个乘以 stream 数** —— 所以块宽和 stream 数必须**一起解**。
             // 分开解会得到一个装不下的组合:规划器按单流选了宽块,运行时
             // 却按路径开了双流,然后 CUDA OOM(而不是明确的规划失败)。
-            let fast = matches!(cfg.params.gpu_math, crate::types::GpuMath::Fast);
-            let max_bin = cfg.params.max_bin as u64;
             // ⚠️ **拿不到真实行数就明确报错,不要拿别的数顶上。**
             // 这里曾经传的是 `n_rounds`(注释还写着"下面用真实行数覆盖",
             // 而下面根本没有覆盖),于是模型把上千万行当成几十行算,
@@ -264,86 +262,7 @@ fn resolve_blocking(
                     .gpu_memory_budget
                     .map_or(free as u64, |b| (b as u64).min(free as u64)),
                 total as u64,
-                |streams| {
-                    let model = StreamingMemModel::new(
-                        rows,
-                        max_bin,
-                        streams,
-                        cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
-                        cfg.params.device_quantize.unwrap_or(true),
-                        fast,
-                        true,
-                        crate::gpu_mem_plan::RM_STAGE_BYTES,
-                    );
-                    // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
-                    // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
-                    // 和训练时的分配用同一个判断。
-                    let model = if fast
-                        && crate::train::has_gradient_weights(
-                            cfg.objective,
-                            cfg.weighted,
-                            cfg.params.scale_pos_weight,
-                        ) {
-                        model.with_fast_weights(rows)
-                    } else {
-                        model
-                    };
-                    // fast 多分类:K 份常驻 prediction + softmax 统计量。
-                    // exact 的多分类在 host 算梯度,device 上不多占。
-                    let model = if fast && cfg.objective.is_multi_quantile() {
-                        // 多个 quantile_alpha:K 份 prediction,没有 softmax 统计量。
-                        model.with_fast_multi_quantile(rows, cfg.objective.num_outputs() as u64)
-                    } else if fast {
-                        model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
-                    } else {
-                        model
-                    };
-                    // fast ranking: the device LambdaMART buffers. The group count is
-                    // known up front for arrays; file inputs plan with the row count
-                    // (an upper bound) and allocate for the real groups.
-                    let model = match (fast, cfg.objective.rank()) {
-                        (true, Some((kind, params))) => model.with_fast_rank(
-                            rows,
-                            &crate::gpu_mem_plan::FastRankShape {
-                                n_groups: cfg
-                                    .group_ptr
-                                    .as_ref()
-                                    .map_or(rows, |g| (g.len() - 1) as u64),
-                                map: kind == crate::rank::RankKind::Map,
-                                mean: params.pair_method == crate::rank::PairMethod::Mean,
-                                // the largest group is not known for file inputs: the
-                                // row count is an upper bound
-                                n_positions: params.device_bias_positions(
-                                    cfg.group_ptr
-                                        .as_deref()
-                                        .map_or(rows as usize, crate::rank::max_group_size),
-                                ),
-                            },
-                        ),
-                        _ => model,
-                    };
-                    if cfg.params.gpu_split_cache
-                        && !matches!(
-                            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
-                            Ok("1") | Ok("true")
-                        )
-                    {
-                        let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
-                        // Categorical set outputs are reserved unconditionally:
-                        // Arrow dictionary columns make a file input categorical
-                        // without a declaration (tiny: ~0.5 KB / column / slot).
-                        let model = model
-                            .with_resident_split_cache(max_bin, cap)
-                            .with_categorical_split_cache(cap);
-                        if cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0 {
-                            model.with_node_feature_masks(cap)
-                        } else {
-                            model
-                        }
-                    } else {
-                        model
-                    }
-                },
+                |streams| gpu_plan_model(cfg, rows, streams, None),
             )
             .map_err(to_py_err)?;
             if !cfg.quiet {
@@ -362,6 +281,225 @@ fn resolve_blocking(
             cfg.params.max_bin as usize,
         )),
     }
+}
+
+/// The streaming memory model the GPU planner prices one candidate stream
+/// count with. Pre-open (`shape = None`) every column is priced at the scalar
+/// `max_bin` and one byte per cell; after open, `Some((shape, cols))` prices the
+/// real blocks (16-bit cells, actual per-feature bins) at the fixed width.
+#[cfg(feature = "cuda")]
+fn gpu_plan_model(
+    cfg: &Parsed,
+    rows: u64,
+    streams: u64,
+    shape: Option<(&crate::gpu_mem_plan::GpuBlockShape, u64)>,
+) -> crate::gpu_mem_plan::StreamingMemModel {
+    use crate::gpu_mem_plan::StreamingMemModel;
+    let fast = matches!(cfg.params.gpu_math, crate::types::GpuMath::Fast);
+    let max_bin = cfg.params.max_bin as u64;
+    let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
+    let device_quantize = cfg.params.device_quantize.unwrap_or(true);
+    let model = match shape {
+        None => StreamingMemModel::new(
+            rows,
+            max_bin,
+            streams,
+            cap,
+            device_quantize,
+            fast,
+            true,
+            crate::gpu_mem_plan::RM_STAGE_BYTES,
+        ),
+        Some((shape, cols)) => StreamingMemModel::new_for_shape(
+            rows,
+            shape,
+            cols,
+            streams,
+            cap,
+            device_quantize,
+            fast,
+            crate::gpu_mem_plan::RM_STAGE_BYTES,
+        ),
+    };
+    // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
+    // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
+    // 和训练时的分配用同一个判断。
+    let model = if fast
+        && crate::train::has_gradient_weights(
+            cfg.objective,
+            cfg.weighted,
+            cfg.params.scale_pos_weight,
+        ) {
+        model.with_fast_weights(rows)
+    } else {
+        model
+    };
+    // fast 多分类:K 份常驻 prediction + softmax 统计量。
+    // exact 的多分类在 host 算梯度,device 上不多占。
+    let model = if fast && cfg.objective.is_multi_quantile() {
+        // 多个 quantile_alpha:K 份 prediction,没有 softmax 统计量。
+        model.with_fast_multi_quantile(rows, cfg.objective.num_outputs() as u64)
+    } else if fast {
+        model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
+    } else {
+        model
+    };
+    // fast ranking: the device LambdaMART buffers. The group count is
+    // known up front for arrays; file inputs plan with the row count
+    // (an upper bound) and allocate for the real groups.
+    let model = match (fast, cfg.objective.rank()) {
+        (true, Some((kind, params))) => model.with_fast_rank(
+            rows,
+            &crate::gpu_mem_plan::FastRankShape {
+                n_groups: cfg
+                    .group_ptr
+                    .as_ref()
+                    .map_or(rows, |g| (g.len() - 1) as u64),
+                map: kind == crate::rank::RankKind::Map,
+                mean: params.pair_method == crate::rank::PairMethod::Mean,
+                // the largest group is not known for file inputs: the
+                // row count is an upper bound
+                n_positions: params.device_bias_positions(
+                    cfg.group_ptr
+                        .as_deref()
+                        .map_or(rows as usize, crate::rank::max_group_size),
+                ),
+            },
+        ),
+        _ => model,
+    };
+    if !cfg.params.gpu_split_cache
+        || matches!(
+            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    {
+        return model;
+    }
+    let node_masks = cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0;
+    match shape {
+        // Categorical set outputs are reserved unconditionally:
+        // Arrow dictionary columns make a file input categorical
+        // without a declaration (tiny: ~0.5 KB / column / slot).
+        None => {
+            let model = model
+                .with_resident_split_cache(max_bin, cap)
+                .with_categorical_split_cache(cap);
+            if node_masks {
+                model.with_node_feature_masks(cap)
+            } else {
+                model
+            }
+        }
+        Some((shape, cols)) => {
+            model.with_resident_split_cache_for_shape(shape, cols, cap, true, node_masks)
+        }
+    }
+}
+
+/// The GPU geometry the user asked for, before the planner overwrote
+/// `TrainParams` with its resolved values.
+#[derive(Clone, Copy)]
+struct UserGpuGeometry {
+    hist_streams: Option<usize>,
+    resident_blocks: Option<usize>,
+    gpu_memory_budget: Option<usize>,
+}
+
+fn user_gpu_geometry(cfg: &Parsed) -> UserGpuGeometry {
+    UserGpuGeometry {
+        hist_streams: cfg.params.hist_streams,
+        resident_blocks: cfg.params.resident_blocks,
+        gpu_memory_budget: cfg.params.gpu_memory_budget,
+    }
+}
+
+/// Re-plan the GPU memory once the source is open and its real blocks are
+/// known, when the pre-open pricing could not know them: any 16-bit block
+/// (features with more than 255 bins or 254 categories) or `max_bin > 255`
+/// (pre-open pricing charges every column `max_bin` bins). The block width is
+/// kept (the source is already built with it); streams and residency are
+/// solved again against the real block count and slot bytes, from the user's
+/// original requests. 8-bit data with `max_bin <= 255` keeps its pre-open plan.
+#[allow(unused_variables)]
+fn refine_gpu_plan_for_source(
+    cfg: &Parsed,
+    user: UserGpuGeometry,
+    n_features: usize,
+    source: &dyn crate::train::BlockSource,
+    params: &mut crate::types::TrainParams,
+) -> PyResult<()> {
+    #[cfg(feature = "cuda")]
+    if let Some(ordinal) = cfg.device {
+        let shape = crate::train::gpu_block_shape(source).map_err(to_py_err)?;
+        if !shape.has_wide() && cfg.params.max_bin <= 255 {
+            return Ok(());
+        }
+        let ctx = crate::backend::cuda::cuda_context(ordinal).map_err(|e| {
+            PyValueError::new_err(format!("cannot open CUDA device {ordinal}: {e}"))
+        })?;
+        let (free, total) = ctx
+            .mem_get_info()
+            .map_err(|e| PyValueError::new_err(format!("cannot read device memory info: {e}")))?;
+        let budget = user
+            .gpu_memory_budget
+            .map_or(free as u64, |b| (b as u64).min(free as u64));
+        let rows = source.n_rows() as u64;
+        let cols = params.cols_per_block.max(1);
+        let model = |streams| gpu_plan_model(cfg, rows, streams, Some((&shape, cols as u64)));
+        let plan = |streams: Option<usize>| {
+            crate::gpu_mem_plan::resolve_gpu_streaming_plan_for_blocks(
+                cols,
+                streams,
+                user.resident_blocks,
+                n_features as u64,
+                source.n_blocks() as u64,
+                budget,
+                total as u64,
+                model,
+            )
+            .map_err(to_py_err)
+        };
+        // Streaming-only floor of a plan: its block width and streams, nothing
+        // resident. The second stream is dropped (when the user did not fix
+        // the count) before the configuration is declared too large.
+        let floor = |p: &crate::gpu_mem_plan::GpuStreamingPlan| {
+            model(p.resolved_hist_streams).peak_for_layout(cols as u64, p.resolved_hist_streams, 0)
+        };
+        let mut p = plan(user.hist_streams)?;
+        if user.hist_streams.is_none()
+            && p.resolved_hist_streams > 1
+            && floor(&p) > budget.saturating_sub(p.reserve)
+        {
+            p = plan(Some(1))?;
+        }
+        let floor = floor(&p);
+        if floor > budget.saturating_sub(p.reserve) {
+            return Err(PyValueError::new_err(format!(
+                "the streaming configuration of these column blocks does not fit in GPU memory: \
+                 needs about {:.1} MB, budget is only {:.1} MB (free {:.1} MB − reserve {:.1} MB); \
+                 lower cols_per_block or max_bin, or raise gpu_memory_budget",
+                floor as f64 / 1048576.0,
+                budget.saturating_sub(p.reserve) as f64 / 1048576.0,
+                budget as f64 / 1048576.0,
+                p.reserve as f64 / 1048576.0,
+            )));
+        }
+        if !cfg.quiet {
+            eprintln!(
+                "{}\n               priced from the opened blocks: {} blocks, widest {} B/row, \
+                 largest histogram {} bins",
+                p.report(),
+                source.n_blocks(),
+                shape.max_block_row_bytes,
+                shape.max_hist_bins
+            );
+        }
+        params.hist_streams = Some(p.resolved_hist_streams as usize);
+        params.resident_blocks = Some(p.resident_blocks as usize);
+        params.gpu_memory_budget = Some(p.free_vram as usize);
+    }
+    Ok(())
 }
 
 /// 把规划器解出来的几何写回训练参数。
@@ -3603,6 +3741,7 @@ fn train_dense(
     // 这里是 Python 侧唯一一次决定物理块宽的地方。
     let plan = resolve_blocking(&cfg, n_features, Some(n_rows as u64))?;
     cfg.params.cols_per_block = plan.effective;
+    let user_gpu = user_gpu_geometry(&cfg);
     // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
     apply_resolved_geometry(&mut cfg, &plan);
     if let Some(w) = &weights {
@@ -3661,6 +3800,11 @@ fn train_dense(
         cfg.params.nthread,
         sketch_weights,
     );
+    {
+        let mut params = cfg.params.clone();
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &train_src, &mut params)?;
+        cfg.params = params;
+    }
 
     // 验证集必须复用训练集的 cuts,否则同一个值会落进不同的 bin
     #[allow(clippy::type_complexity)]
@@ -4102,6 +4246,7 @@ fn train_file(
         _ => (resolve_blocking(&cfg, n_features, n_rows_peek)?, false),
     };
     cfg.params.cols_per_block = plan.effective;
+    let user_gpu = user_gpu_geometry(&cfg);
     // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
     apply_resolved_geometry(&mut cfg, &plan);
     let cols_per_block = plan.effective;
@@ -4235,6 +4380,7 @@ fn train_file(
             },
         )
         .map_err(to_py_err)?;
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &src, &mut train_cfg.params)?;
         // 权重是单独一列,不进量化缓存;每次 open 都从源文件读。
         let read_weights = |p: &str| -> PyResult<Option<Vec<f32>>> {
             let Some(w) = targets.weight else {
@@ -4407,6 +4553,11 @@ fn train_file(
         }
         cfg.params.cols_per_block = completed.effective;
         apply_resolved_geometry(&mut cfg, &completed);
+    }
+    {
+        let mut params = cfg.params.clone();
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &ds.source, &mut params)?;
+        cfg.params = params;
     }
     cfg.resolve_monotone(n_features, &ds.feature_names)?;
     margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;

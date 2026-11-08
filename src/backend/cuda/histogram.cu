@@ -1502,8 +1502,31 @@ extern "C" __global__ void hist_build_shared(
 // 这是有意的:tile 边界原本由 host 算(依赖 driver 报的 shared 上限),融合
 // 之后必须让 kernel 自己走同一套贪心切分,所以那个上限得传进来。既有的
 // 七参数 kernel 一个都没改。
-extern "C" __global__ void hist_build_shared_planar32_fused(
-    const uint8_t* bins,
+// Bin storage width of a column block: 8-bit blocks (`uint8_t`) and 16-bit
+// blocks (`uint16_t`) run the same templated bodies; a launch never mixes
+// widths. The largest code is the missing sentinel.
+template <typename T>
+__device__ __forceinline__ T bin_missing() { return (T)~(T)0; }
+
+// A 16-bit feature can have more histogram slots than one shared-memory tile
+// (a high-cardinality categorical feature). The greedy tiling then cannot place
+// it (`f1 == f0`); such a feature alone is accumulated straight into the global
+// histogram with native 64-bit integer atomics. Integer addition modulo 2^64 is
+// order independent, so this is bit-identical to the shared-tile path. The
+// branch depends only on the offsets, so it is uniform across the block, and
+// it is compiled out of the 8-bit instantiations (255 slots always fit a tile).
+template <typename T>
+__device__ __forceinline__ void hist_wide_feature_global(
+    T bin, uint32_t off, int64_t* out, unsigned long long grad, unsigned long long hess) {
+    if (bin == bin_missing<T>()) return;
+    const uint64_t slot = (uint64_t)off + bin;
+    atomicAdd(reinterpret_cast<unsigned long long*>(out) + slot * 2, grad);
+    atomicAdd(reinterpret_cast<unsigned long long*>(out) + slot * 2 + 1, hess);
+}
+
+template <typename T>
+__device__ __forceinline__ void hist_fused_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1534,6 +1557,12 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+            hist_wide_feature_global<T>(bins[(uint64_t)f0 * n_rows + row], hist_begin,
+                                        out_hist, row_grad, row_hess);
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist;
@@ -1547,8 +1576,8 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
         __syncthreads();
 
         for (uint32_t feat = f0; feat < f1; ++feat) {
-            const uint8_t bin = bins[(uint64_t)feat * n_rows + row];
-            if (bin == UINT8_MAX) {
+            const T bin = bins[(uint64_t)feat * n_rows + row];
+            if (bin == bin_missing<T>()) {
                 continue;
             }
             const uint32_t s = feat_offsets[feat] + bin - hist_begin;
@@ -1580,6 +1609,19 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
     }
 }
 
+extern "C" __global__ void hist_build_shared_planar32_fused(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                             max_tile_bins);
+}
+extern "C" __global__ void hist_build_shared_planar32_fused_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                              max_tile_bins);
+}
+
 // R=4 multi-row/thread:每个线程处理 4 行,其余全部不变。
 //
 // **收益来源只有摊薄**:一个 block 的 shared init、flush、barrier 和 launch
@@ -1595,8 +1637,9 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
 // ⚠️ 2026-09-02 第一次做时实测只有 2.2%(wide),按当时 5% 的门槛回滚了;
 // 实现从未进过提交。现在基线快了一倍,同样的约 24 ms 绝对收益约合 3.3%,
 // 所以按 memo 重开 —— **这是重写,不是恢复**。
-extern "C" __global__ void hist_build_shared_planar32_fused_r4(
-    const uint8_t* bins,
+template <typename T>
+__device__ __forceinline__ void hist_fused_r4_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1632,6 +1675,17 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                hist_wide_feature_global<T>(
+                    bins[(uint64_t)f0 * n_rows + rows_v[r]], hist_begin, out_hist,
+                    ((unsigned long long)g_hi[r] << 32) | g_lo[r],
+                    ((unsigned long long)h_hi[r] << 32) | h_lo[r]);
+            }
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist_r4;
@@ -1648,8 +1702,8 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
             const uint32_t off = feat_offsets[feat] - hist_begin;
 #pragma unroll
             for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-                const uint8_t bin = bins[(uint64_t)feat * n_rows + rows_v[r]];
-                if (bin == UINT8_MAX) {
+                const T bin = bins[(uint64_t)feat * n_rows + rows_v[r]];
+                if (bin == bin_missing<T>()) {
                     continue;
                 }
                 const uint32_t s = off + bin;
@@ -1682,6 +1736,19 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
 }
 
 
+extern "C" __global__ void hist_build_shared_planar32_fused_r4(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_r4_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                                max_tile_bins);
+}
+extern "C" __global__ void hist_build_shared_planar32_fused_r4_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_r4_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                                 max_tile_bins);
+}
+
 // 一层里多个 Accumulate 节点合并进一次 launch。
 //
 // **几何完全不变**:仍然是一个 block 负责一个节点的 `blockDim.x *
@@ -1700,8 +1767,9 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
 // block 的调度顺序,不改变任何一次加法的操作数。越界行走
 // `ok[r] == false` 直接跳过,和「不存在这一行」等价 —— 不是加 0,
 // 所以连原子次数都不变。
-extern "C" __global__ void hist_build_shared_planar32_batched(
-    const uint8_t* bins,
+template <typename T>
+__device__ __forceinline__ void hist_batched_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1777,6 +1845,22 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+            const uint32_t physical_feat =
+                selection_active != 0 ? feature_select[f0] : f0;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                if (!ok[r]) {
+                    continue;
+                }
+                hist_wide_feature_global<T>(
+                    bins[(uint64_t)physical_feat * n_rows + rows_v[r]], hist_begin, out,
+                    ((unsigned long long)g_hi[r] << 32) | g_lo[r],
+                    ((unsigned long long)h_hi[r] << 32) | h_lo[r]);
+            }
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist_b;
@@ -1798,8 +1882,8 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
                 if (!ok[r]) {
                     continue;
                 }
-                const uint8_t bin = bins[(uint64_t)physical_feat * n_rows + rows_v[r]];
-                if (bin == UINT8_MAX) {
+                const T bin = bins[(uint64_t)physical_feat * n_rows + rows_v[r]];
+                if (bin == bin_missing<T>()) {
                     continue;
                 }
                 const uint32_t s = off + bin;
@@ -1829,6 +1913,24 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
 
         f0 = f1;
     }
+}
+
+
+extern "C" __global__ void hist_build_shared_planar32_batched(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins,
+    const uint32_t* batch_idx, uint32_t n_nodes, uint32_t hist_stride,
+    const uint32_t* feature_select, uint32_t selection_active) {
+    hist_batched_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+        max_tile_bins, batch_idx, n_nodes, hist_stride, feature_select, selection_active);
+}
+extern "C" __global__ void hist_build_shared_planar32_batched_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins,
+    const uint32_t* batch_idx, uint32_t n_nodes, uint32_t hist_stride,
+    const uint32_t* feature_select, uint32_t selection_active) {
+    hist_batched_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+        max_tile_bins, batch_idx, n_nodes, hist_stride, feature_select, selection_active);
 }
 
 
@@ -1990,6 +2092,53 @@ __device__ __forceinline__ uint32_t partition_goes_left(
     if (bin == UINT8_MAX) return missing_left;
     if (split_bin == CAT_SPLIT) return ((cat_mask[bin >> 5] >> (bin & 31)) & 1u) ^ 1u;
     return (uint32_t)(bin < split_bin);
+}
+
+// 16-bit column: the category set covers `mask_words` words (sized by the
+// feature's bins, not a fixed 256); a bin beyond it is not in the set.
+__device__ __forceinline__ uint32_t partition_goes_left_u16(
+    uint16_t bin, uint32_t split_bin, uint32_t missing_left, const uint32_t* cat_mask,
+    uint32_t mask_words) {
+    if (bin == UINT16_MAX) return missing_left;
+    if (split_bin == CAT_SPLIT) {
+        const uint32_t w = (uint32_t)bin >> 5;
+        return w < mask_words ? ((cat_mask[w] >> (bin & 31)) & 1u) ^ 1u : 1u;
+    }
+    return (uint32_t)(bin < split_bin);
+}
+
+// `partition_count` over a 16-bit column (same flags / block-count contract).
+extern "C" __global__ void partition_count_u16(
+    const uint16_t* col,
+    const uint32_t* rows,
+    uint32_t n_rows,
+    uint32_t n_selected,
+    uint32_t split_bin,
+    uint32_t missing_left,
+    uint8_t* flags,
+    uint32_t* block_left_counts,
+    const uint32_t* cat_mask,
+    uint32_t mask_words) {
+    extern __shared__ uint32_t counts_u16[];
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t left = 0;
+    if (idx < n_selected) {
+        const uint32_t row = rows[idx];
+        left = partition_goes_left_u16(col[(uint64_t)row], split_bin, missing_left, cat_mask,
+                                       mask_words);
+        flags[idx] = (uint8_t)left;
+    }
+    counts_u16[threadIdx.x] = left;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            counts_u16[threadIdx.x] += counts_u16[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        block_left_counts[blockIdx.x] = counts_u16[0];
+    }
 }
 
 extern "C" __global__ void partition_count(
@@ -2175,6 +2324,35 @@ extern "C" __global__ void partition_count_batched(
         __syncthreads();
     }
     if (threadIdx.x == 0) counts[blockIdx.x] = sums[0];
+}
+
+// `partition_count_batched` over resident 16-bit blocks (column-major only:
+// 16-bit blocks never take the device row-major layout). A batch holds blocks
+// of one width; the host launches 8-bit and 16-bit nodes as separate batches.
+extern "C" __global__ void partition_count_batched_u16(
+    const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
+    uint32_t nodes, uint32_t n_rows, uint8_t* flags, uint32_t* counts) {
+    const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
+    const uint32_t* d = descriptors + node * PART_DESC_WORDS;
+    const uint32_t local_block = blockIdx.x - d[5];
+    const uint32_t idx = local_block * blockDim.x + threadIdx.x;
+    uint32_t left = 0;
+    if (idx < d[1]) {
+        const uint16_t* bins = (const uint16_t*)blocks.base[d[10]];
+        const uint32_t arena = d[0] + idx;
+        const uint32_t row = rows[arena];
+        const uint16_t bin = bins[(uint64_t)d[2] * n_rows + row];
+        left = bin == UINT16_MAX ? d[4] : (uint32_t)(bin < d[3]);
+        flags[arena] = (uint8_t)left;
+    }
+    extern __shared__ uint32_t sums_u16[];
+    sums_u16[threadIdx.x] = left;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sums_u16[threadIdx.x] += sums_u16[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) counts[blockIdx.x] = sums_u16[0];
 }
 
 extern "C" __global__ void partition_scan_batched(

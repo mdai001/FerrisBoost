@@ -25,6 +25,7 @@ use cudarc::driver::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use crate::bins::{BinSlice, BinWidth};
 use crate::categorical::CatBits;
 use crate::types::{Bin, GradPair, GradPairFixed, GradQuantizer, RowId};
 
@@ -503,6 +504,23 @@ struct GpuHistBuffers {
     /// `Some(block)` marks an immutable, device-resident training block.
     /// Streaming slots always leave this as None.
     resident_block: Option<usize>,
+    /// Cell width of the resident block (written together with its shape).
+    resident_width: BinWidth,
+}
+
+/// The 16-bit kernel set (see `GpuTrainCtx::wide`).
+struct WideKernels {
+    hist_fused: CudaFunction,
+    hist_fused_r4: CudaFunction,
+    hist_batched: CudaFunction,
+    count: CudaFunction,
+    count_batched: CudaFunction,
+}
+
+/// Byte image of a block payload, borrowed straight from the host cache
+/// buffer at its own width (no conversion, no extra copy).
+fn bin_bytes(bins: BinSlice<'_>) -> &'_ [u8] {
+    bins.as_le_bytes()
 }
 
 struct HistSlotPool {
@@ -605,6 +623,12 @@ pub struct GpuTrainCtx {
     hist_fused_r4_fn: Option<CudaFunction>,
     /// 整层多节点合并 launch 的 kernel。`hist_nodes_per_batch <= 1` 时为 None。
     hist_batched_fn: Option<CudaFunction>,
+    /// 16-bit column-block variants of the fused / R=4 / batched histogram and
+    /// of the two partition count kernels. Loaded only when some block is
+    /// 16-bit; those blocks always run column-major on the device.
+    wide: Option<WideKernels>,
+    /// Bin geometry of the real blocks (byte-sized slots, partition buffers).
+    shape: crate::gpu_mem_plan::GpuBlockShape,
     /// `gpu_math = "fast"` 的 prediction-apply + gradient kernel。
     apply_grad_fn: Option<CudaFunction>,
     /// `gpu_math = "fast"` 多分类(`n_outputs > 1`)的三个 kernel:
@@ -717,6 +741,36 @@ impl GpuTrainCtx {
         config: SharedHistogramConfig,
         timing: bool,
     ) -> Result<Self> {
+        Self::new_with_shape(
+            device_ordinal,
+            n_rows,
+            crate::gpu_mem_plan::GpuBlockShape::all_u8(max_block_feats, max_hist_bins),
+            n_blocks,
+            partition_threads,
+            config,
+            timing,
+        )
+    }
+
+    /// [`Self::new`] for blocks of mixed bin widths: slots are sized in bytes
+    /// by the widest block, 16-bit kernels are loaded when a block needs them.
+    pub fn new_with_shape(
+        device_ordinal: usize,
+        n_rows: usize,
+        shape: crate::gpu_mem_plan::GpuBlockShape,
+        n_blocks: usize,
+        partition_threads: u32,
+        config: SharedHistogramConfig,
+        timing: bool,
+    ) -> Result<Self> {
+        let max_block_feats = shape.max_block_feats;
+        let max_hist_bins = shape.max_hist_bins;
+        if shape.max_block_row_bytes < max_block_feats
+            || shape.max_u8_block_feats > max_block_feats
+            || !matches!(shape.max_cell_bytes, 1 | 2)
+        {
+            bail!("inconsistent GPU block shape {shape:?}");
+        }
         if n_rows == 0 {
             bail!("GPU training context requires non-empty data");
         }
@@ -732,6 +786,13 @@ impl GpuTrainCtx {
         }
 
         let bucket_profile = env_flag("FB_HIST_BUCKET_PROFILE");
+        if bucket_profile && shape.has_wide() {
+            return Err(crate::error::input_error(
+                "FB_HIST_BUCKET_PROFILE (per-tile diagnostic histograms) supports 8-bit column \
+                 blocks only; unset it to train with 16-bit blocks (max_bin > 255 or more than \
+                 254 categories)",
+            ));
+        }
         let state = device_state(device_ordinal)?;
         let stream = state.ctx.default_stream();
         let hist_fn = state
@@ -899,9 +960,29 @@ impl GpuTrainCtx {
         // 一行最多 32 个特征是 kernel 的硬上界,超过就明确回退到列主序。
         // ⚠️ 上界用 `gpu_mem_plan` 里那个**共享常量** —— 显存规划器要靠同一个
         // 值预测运行时会不会开第二条流,两边各写一个 32 就会悄悄漂移。
+        // The gate looks at the 8-bit blocks: 16-bit blocks run column-major on
+        // the device whatever this decides (no 16-bit transpose).
         let row_major = row_major_requested
             && hist_fused_fn.is_some()
-            && max_block_feats as u64 <= crate::gpu_mem_plan::ROW_MAJOR_MAX_FEATS;
+            && shape.max_u8_block_feats > 0
+            && shape.max_u8_block_feats as u64 <= crate::gpu_mem_plan::ROW_MAJOR_MAX_FEATS;
+        let wide = if shape.has_wide() {
+            let load = |name: &str| -> Result<CudaFunction> {
+                state
+                    .module
+                    .load_function(name)
+                    .with_context(|| format!("{name} not found in PTX"))
+            };
+            Some(WideKernels {
+                hist_fused: load("hist_build_shared_planar32_fused_u16")?,
+                hist_fused_r4: load("hist_build_shared_planar32_fused_r4_u16")?,
+                hist_batched: load("hist_build_shared_planar32_batched_u16")?,
+                count: load("partition_count_u16")?,
+                count_batched: load("partition_count_batched_u16")?,
+            })
+        } else {
+            None
+        };
         let (rm_transpose_fn, rm_hist_fn, rm_count_fn) = if row_major {
             (
                 Some(
@@ -1041,9 +1122,9 @@ impl GpuTrainCtx {
 
         let (n_part_blocks, n_part_offsets) =
             crate::gpu_mem_plan::partition_batch_capacities(n_rows, partition_threads as usize);
-        let n_part_descriptors = crate::gpu_mem_plan::PARTITION_BATCH_CAPACITY
-            * crate::gpu_mem_plan::PARTITION_DESCRIPTOR_WORDS;
-        let bins_len = max_block_feats * n_rows;
+        let n_part_descriptors = shape.partition_descriptor_words();
+        // Slots are byte buffers sized by the widest block in bytes.
+        let bins_len = shape.max_block_row_bytes * n_rows;
         let hist_words = max_hist_bins * 2;
         let offsets_len = max_block_feats + 1;
         // [blk_ptr(batch+1) | node_off(batch) | node_len(batch)]
@@ -1171,7 +1252,7 @@ impl GpuTrainCtx {
             .alloc_zeros::<u32>(n_rows)
             .context("allocate row_idx buffer")?;
         let part_col = stream
-            .alloc_zeros::<u8>(n_rows)
+            .alloc_zeros::<u8>(n_rows * shape.max_cell_bytes)
             .context("allocate partition column buffer")?;
         let part_flags = stream
             .alloc_zeros::<u8>(n_rows)
@@ -1275,7 +1356,7 @@ impl GpuTrainCtx {
         let rm_chunk_rows = if row_major {
             crate::gpu_mem_plan::row_major_stage_rows(
                 n_rows as u64,
-                max_block_feats as u64,
+                shape.max_u8_block_feats as u64,
                 rm_slot_count as u64,
                 rm_bufs as u64,
                 RM_STAGE_BYTES as u64,
@@ -1283,7 +1364,7 @@ impl GpuTrainCtx {
         } else {
             0
         };
-        let rm_stage_len = rm_chunk_rows * max_block_feats;
+        let rm_stage_len = rm_chunk_rows * shape.max_u8_block_feats;
         let alloc_rm_staging = |stream: &Arc<CudaStream>,
                                 what: &str|
          -> Result<Option<RmStaging>> {
@@ -1326,6 +1407,9 @@ impl GpuTrainCtx {
             }))
         };
 
+        // Whole-block pinned staging serves the column-major upload: every block
+        // without row-major, and 16-bit blocks under row-major.
+        let pinned_col_staging = use_pinned && (!row_major || shape.has_wide());
         let mut hist_slots = Vec::with_capacity(hist_stream_count);
         for (slot, hist_stream) in hist_streams.into_iter().enumerate() {
             let bins = hist_stream
@@ -1346,7 +1430,7 @@ impl GpuTrainCtx {
             // 只有**列主序**那条臂会用 `bins_host`;行主序有自己的分块 pinned
             // 暂存(`RmStaging.host`),再留一份整块大小的 pinned buffer 是
             // 纯浪费(而且是按最宽块 × 行数算的,不小)。
-            let bins_host = if use_pinned && !row_major {
+            let bins_host = if pinned_col_staging {
                 Some(
                     unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }.with_context(
                         || format!("allocate histogram slot {slot} pinned staging"),
@@ -1383,6 +1467,7 @@ impl GpuTrainCtx {
                 resident_feats: 0,
                 resident_rows: 0,
                 resident_block: None,
+                resident_width: BinWidth::U8,
             }));
         }
         for cache_slot in 0..resident_block_count {
@@ -1419,7 +1504,7 @@ impl GpuTrainCtx {
             // 以前这里恒为 None,于是 `FB_CUDA_PINNED=1` + 常驻块直接报
             // 「pinned 列块 staging 未分配」—— 在 residency 还是 env-only、
             // 默认 0 的年代没人同时打开这两个开关,所以一直没暴露。
-            let bins_host = if use_pinned && !row_major {
+            let bins_host = if pinned_col_staging {
                 Some(
                     unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }.with_context(
                         || format!("allocate resident block {cache_slot} pinned staging"),
@@ -1458,6 +1543,7 @@ impl GpuTrainCtx {
                 resident_feats: 0,
                 resident_rows: 0,
                 resident_block: None,
+                resident_width: BinWidth::U8,
             }));
         }
 
@@ -1581,7 +1667,7 @@ impl GpuTrainCtx {
             partition_scratch_bytes: n_rows
                 + (n_part_blocks + n_part_offsets * 2 + n_part_descriptors) * 4
                 + MAX_LEVEL_NODES * 2 * 4,
-            partition_col_bytes: n_rows,
+            partition_col_bytes: n_rows * shape.max_cell_bytes,
             block_bins_bytes: bins_len * (hist_stream_count + resident_block_count),
             hist_bytes: hist_words
                 * 8
@@ -1635,7 +1721,7 @@ impl GpuTrainCtx {
         // pinned 暂存(每 slot 两块)。之前这里恒按 `use_pinned × bins_len ×
         // hist_stream_count` 算,于是行主序下报了 160 MB 根本没分配的内存,
         // 同时把真正分配了的行主序暂存漏掉 —— 两个方向都错。
-        let pinned_col_slots = if use_pinned && !row_major {
+        let pinned_col_slots = if pinned_col_staging {
             hist_stream_count + resident_block_count
         } else {
             0
@@ -1697,6 +1783,8 @@ impl GpuTrainCtx {
             hist_fused_fn,
             hist_fused_r4_fn,
             hist_batched_fn,
+            wide,
+            shape,
             gpair_max_fn,
             gpair_quantize_fn,
             gpair_scale_fn,
@@ -1879,6 +1967,17 @@ impl GpuTrainCtx {
                 if self.budget.split_cache_bytes > 0 { "gpu_resident_cache" } else { "cpu" },
                 if self.budget.split_cache_bytes > 0 { self.hist_nodes_per_batch } else { 0 },
                 self.budget.split_cache_bytes)
+            + &if self.shape.has_wide() {
+                // Only echoed when a block stores 16-bit cells, so 8-bit runs
+                // print exactly what they always did.
+                format!(
+                    " bins_16bit=col_major slot_row_bytes={} wide_hist_over_tile=global_atomic \
+                     wide_split_over_256_bins=host",
+                    self.shape.max_block_row_bytes
+                )
+            } else {
+                String::new()
+            }
             + " hist_metadata=slot_reuse"
             + &format!(" packet_collection={} packet_window_batches={}",
                 if self.budget.split_cache_bytes > 0 { "bounded_window" } else { "cpu" },
@@ -1902,6 +2001,12 @@ impl GpuTrainCtx {
     /// batched column-major path. Bucket profiling keeps the legacy kernels.
     pub fn supports_compact_column_histogram(&self) -> bool {
         self.rm_hist_fn.is_none() && self.hist_batched_fn.is_some()
+    }
+
+    /// [`Self::supports_compact_column_histogram`] for a block of the given
+    /// width: 16-bit blocks run column-major even under device row-major.
+    pub fn supports_compact_column_histogram_for(&self, width: BinWidth) -> bool {
+        (self.rm_hist_fn.is_none() || width == BinWidth::U16) && self.hist_batched_fn.is_some()
     }
 
     pub fn hist_stream_count(&self) -> usize {
@@ -3324,9 +3429,31 @@ impl GpuTrainCtx {
         feat_offsets: &[u32],
         selected_local: Option<&[usize]>,
     ) -> Result<GpuBlockSession<'_>> {
+        self.block_session_bins(
+            block_index,
+            BinSlice::U8(block_data),
+            block_n_rows,
+            n_feats,
+            feat_offsets,
+            selected_local,
+        )
+    }
+
+    /// [`Self::block_session`] for a block of either bin width. The payload is
+    /// uploaded at its own width, straight from the borrowed host buffer.
+    pub fn block_session_bins(
+        &self,
+        block_index: usize,
+        block_data: BinSlice<'_>,
+        block_n_rows: usize,
+        n_feats: usize,
+        feat_offsets: &[u32],
+        selected_local: Option<&[usize]>,
+    ) -> Result<GpuBlockSession<'_>> {
         self.block_session_impl(
             block_index,
             Some(block_data),
+            block_data.width(),
             block_n_rows,
             n_feats,
             feat_offsets,
@@ -3346,9 +3473,9 @@ impl GpuTrainCtx {
         feat_offsets: &[u32],
         selected_local: Option<&[usize]>,
     ) -> Result<Option<GpuBlockSession<'_>>> {
-        self.block_session_impl(
+        self.block_session_resident_width(
             block_index,
-            None,
+            BinWidth::U8,
             block_n_rows,
             n_feats,
             feat_offsets,
@@ -3356,15 +3483,42 @@ impl GpuTrainCtx {
         )
     }
 
-    fn block_session_impl(
+    /// [`Self::block_session_resident`] for a block of the given cell width
+    /// (from the cuts); a resident slot holding another width is an error.
+    pub fn block_session_resident_width(
         &self,
         block_index: usize,
-        block_payload: Option<&[Bin]>,
+        width: BinWidth,
         block_n_rows: usize,
         n_feats: usize,
         feat_offsets: &[u32],
         selected_local: Option<&[usize]>,
     ) -> Result<Option<GpuBlockSession<'_>>> {
+        self.block_session_impl(
+            block_index,
+            None,
+            width,
+            block_n_rows,
+            n_feats,
+            feat_offsets,
+            selected_local,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_session_impl(
+        &self,
+        block_index: usize,
+        block_payload: Option<BinSlice<'_>>,
+        width: BinWidth,
+        block_n_rows: usize,
+        n_feats: usize,
+        feat_offsets: &[u32],
+        selected_local: Option<&[usize]>,
+    ) -> Result<Option<GpuBlockSession<'_>>> {
+        if width == BinWidth::U16 && self.wide.is_none() {
+            bail!("16-bit column block {block_index} needs a context built for 16-bit blocks");
+        }
         // selected-row packing 之后,交给 histogram 的块**行数会更少**
         // (只含采样行),所以这里不能再要求等于训练行数。
         //
@@ -3386,7 +3540,8 @@ impl GpuTrainCtx {
         }
         // No fake/zero-filled host block is allocated for the resident entry.
         // This slice is only consumed when an actual payload is present.
-        let block_data = block_payload.unwrap_or(&[]);
+        let block_data = block_payload.map_or(&[][..], bin_bytes);
+        let payload_bytes = payload_len * width.bytes();
         if feat_offsets.is_empty() || feat_offsets.first() != Some(&0) {
             bail!("feat_offsets must be non-empty and start at 0");
         }
@@ -3401,7 +3556,8 @@ impl GpuTrainCtx {
                 bail!("colsample local features must be strictly increasing and less than the physical n_feats");
             }
         }
-        let column_major = self.rm_transpose_fn.is_none();
+        // 16-bit blocks always run column-major on the device.
+        let column_major = self.rm_transpose_fn.is_none() || width == BinWidth::U16;
         // Bucket profiling uses the legacy full-width column-major kernels.
         // They cannot consume a selected-index map; sampling is still applied
         // by host split enumeration. Do not validate that map as compact ABI.
@@ -3433,18 +3589,20 @@ impl GpuTrainCtx {
         // 产生,要么 < n_bins 要么是 MISSING_BIN。debug 构建仍然验一遍,
         // 因为越界的后果是 shared memory 越界写,不是一个错数字。
         debug_assert!(
-            block_payload.is_none()
-                || (0..hist_n_feats).all(|hist_feat| {
-                    let physical_feat = if column_major {
-                        selected_local.map_or(hist_feat, |selected| selected[hist_feat])
-                    } else {
-                        hist_feat
-                    };
-                    let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
-                    block_data[physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows]
-                        .iter()
-                        .all(|&bin| bin == crate::types::MISSING_BIN || u32::from(bin) < n_bins)
-                }),
+            block_payload.is_none_or(|payload| (0..hist_n_feats).all(|hist_feat| {
+                let physical_feat = if column_major {
+                    selected_local.map_or(hist_feat, |selected| selected[hist_feat])
+                } else {
+                    hist_feat
+                };
+                let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
+                let col =
+                    payload.slice(physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows);
+                (0..col.len()).all(|i| {
+                    let bin = col.get(i);
+                    bin == width.missing() || bin < n_bins
+                })
+            })),
             "column block contains a bin beyond its feat_offsets width"
         );
 
@@ -3460,10 +3618,10 @@ impl GpuTrainCtx {
         let mut slot = self.hist_slots[slot_index]
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU histogram slot {slot_index} poisoned"))?;
-        if payload_len > slot.bins.len() {
+        if payload_bytes > slot.bins.len() {
             bail!(
                 "column block of {} bytes exceeds the preallocated {}-byte buffer",
-                payload_len,
+                payload_bytes,
                 slot.bins.len()
             );
         }
@@ -3482,7 +3640,9 @@ impl GpuTrainCtx {
         let cache_hit = slot.resident_block == Some(block_index);
         if cache_hit {
             anyhow::ensure!(
-                slot.resident_rows == block_n_rows && slot.resident_feats == n_feats,
+                slot.resident_rows == block_n_rows
+                    && slot.resident_feats == n_feats
+                    && slot.resident_width == width,
                 "resident block shape differs from source metadata"
             );
         } else if block_payload.is_none() {
@@ -3505,7 +3665,7 @@ impl GpuTrainCtx {
         // 行主序的 pinned 落地在下面的分块循环里做(`RmStaging.host`),
         // 这里这次预拷贝**只服务列主序那条臂**。不加这个判据的话,行主序
         // 下会白白把整块再搬进一个根本不会被读的 buffer。
-        if self.use_pinned && !cache_hit && self.rm_transpose_fn.is_none() {
+        if self.use_pinned && !cache_hit && column_major {
             let host = slot
                 .bins_host
                 .as_mut()
@@ -3529,7 +3689,7 @@ impl GpuTrainCtx {
                 // Arrow / 量化 cache / FFI 全不动),只是先落到暂存区,再在
                 // device 上转置一次进 slot.bins。转置**每个 resident 块只做一次**,
                 // 之后所有层、所有轮直接复用 —— 这是能不能摊薄的关键。
-                match self.rm_transpose_fn.as_ref() {
+                match self.rm_transpose_fn.as_ref().filter(|_| !column_major) {
                     Some(tfn) => {
                         // **按行分块**上传 + 转置,暂存区因此和列块大小无关。
                         // 每块的列主序源数据在 host 上是 n_feats 段、段内连续,
@@ -3650,6 +3810,7 @@ impl GpuTrainCtx {
                 // 而那正是上面说的那个读偏。
                 slot.resident_feats = n_feats;
                 slot.resident_rows = block_n_rows;
+                slot.resident_width = width;
                 slot.resident_block = Some(block_index);
             }
         }
@@ -3717,6 +3878,7 @@ impl GpuTrainCtx {
             ctx: self,
             slot: Some(slot),
             lease,
+            width,
             physical_n_feats: n_feats,
             n_feats: hist_n_feats,
             n_hist,
@@ -3764,17 +3926,18 @@ impl GpuTrainCtx {
         // 列主序取的是连续一列 `[feat*n_rows, (feat+1)*n_rows)`;
         // 行主序按 `row * n_feats + feat` 寻址,约束是 `feat < n_feats`。
         let feats = slot.resident_feats;
-        if feats == 0 || feats > slot.bins.len() / self.n_rows.max(1) {
+        let cell = slot.resident_width.bytes();
+        if feats == 0 || feats * cell > slot.bins.len() / self.n_rows.max(1) {
             bail!("resident block {block_index} feature count {feats} does not match its buffer");
         }
-        if self.rm_count_fn.is_some() {
+        if self.rm_count_fn.is_some() && slot.resident_width == BinWidth::U8 {
             if local_feat >= feats {
                 bail!("resident column {local_feat} exceeds block width {feats}");
             }
         } else {
             let end = local_feat
                 .checked_add(1)
-                .and_then(|f| f.checked_mul(self.n_rows))
+                .and_then(|f| f.checked_mul(self.n_rows * cell))
                 .context("resident column offset overflow")?;
             if end > slot.bins.len() {
                 bail!("resident column {local_feat} exceeds the block buffer");
@@ -3787,6 +3950,7 @@ impl GpuTrainCtx {
             buf,
             resident: Some((slot, local_feat)),
             more_resident: Vec::new(),
+            upload_width: BinWidth::U8,
             timing: GpuSegmentTiming::default(),
         }))
     }
@@ -3810,7 +3974,7 @@ impl GpuTrainCtx {
         if blocks.iter().any(|&b| b >= self.resident_block_count) {
             return Ok(None);
         }
-        let mut guards = Vec::with_capacity(blocks.len());
+        let mut guards: Vec<MutexGuard<'_, GpuHistBuffers>> = Vec::with_capacity(blocks.len());
         // Slots before the core buffers, in ascending order (same order as
         // every other path that holds both).
         for &block in blocks {
@@ -3822,8 +3986,16 @@ impl GpuTrainCtx {
                 return Ok(None);
             }
             let feats = slot.resident_feats;
-            if feats == 0 || feats > slot.bins.len() / self.n_rows.max(1) {
+            if feats == 0
+                || feats * slot.resident_width.bytes() > slot.bins.len() / self.n_rows.max(1)
+            {
                 bail!("resident block {block} width {feats} does not match its buffer");
+            }
+            if let Some(first) = guards.first() {
+                ensure!(
+                    slot.resident_width == first.resident_width,
+                    "a batched partition session holds blocks of one bin width"
+                );
             }
             guards.push(slot);
         }
@@ -3836,6 +4008,7 @@ impl GpuTrainCtx {
             buf,
             resident: Some((first, 0)),
             more_resident: guards.collect(),
+            upload_width: BinWidth::U8,
             timing: GpuSegmentTiming::default(),
         }))
     }
@@ -3866,7 +4039,18 @@ impl GpuTrainCtx {
     /// **这是回退路径**:streaming 块,或者 resident 尚未命中时才走。
     /// resident 命中请走 `partition_session_resident`。
     pub fn partition_session(&self, col: &[Bin]) -> Result<GpuPartitionSession<'_>> {
-        if col.len() != self.n_rows {
+        self.partition_session_bins(BinSlice::U8(col))
+    }
+
+    /// [`Self::partition_session`] for a column of either bin width, uploaded
+    /// at its own width.
+    pub fn partition_session_bins(&self, col: BinSlice<'_>) -> Result<GpuPartitionSession<'_>> {
+        if col.width() == BinWidth::U16 && self.wide.is_none() {
+            bail!("16-bit partition column needs a context built for 16-bit blocks");
+        }
+        let width = col.width();
+        let col = bin_bytes(col);
+        if col.len() != self.n_rows * width.bytes() {
             bail!(
                 "partition column length {} does not match training row count {}",
                 col.len(),
@@ -3877,7 +4061,7 @@ impl GpuTrainCtx {
         self.sync_if_timing()?;
         let started = std::time::Instant::now();
         self.stream
-            .memcpy_htod(col, &mut buf.part_col)
+            .memcpy_htod(col, &mut buf.part_col.slice_mut(..col.len()))
             .context("partition column H2D")?;
         self.sync_if_timing()?;
         let h2d_ms = if self.timing {
@@ -3897,6 +4081,7 @@ impl GpuTrainCtx {
             buf,
             resident: None,
             more_resident: Vec::new(),
+            upload_width: width,
             timing,
         })
     }
@@ -3935,6 +4120,8 @@ pub struct GpuBlockSession<'a> {
     // Option 只为 Drop 时先释放 mutex guard、再把 slot 号还给 pool。
     slot: Option<MutexGuard<'a, GpuHistBuffers>>,
     lease: Option<HistSlotLease<'a>>,
+    /// Cell width of this block (16-bit blocks always run column-major).
+    width: BinWidth,
     /// Number of columns in the resident/streamed bins allocation.
     physical_n_feats: usize,
     /// Number of logical columns represented in the histogram output.
@@ -3954,6 +4141,44 @@ impl Drop for GpuBlockSession<'_> {
 }
 
 impl GpuBlockSession<'_> {
+    /// Device row-major applies to 8-bit blocks of a row-major context only.
+    fn row_major(&self) -> bool {
+        self.ctx.rm_hist_fn.is_some() && self.width == BinWidth::U8
+    }
+
+    /// Largest shared tile (in slots) the kernels' greedy feature tiling uses
+    /// for this block; the kernel runs the same loop. A 16-bit feature wider
+    /// than one tile is accumulated in global memory instead (it occupies no
+    /// shared slots); an 8-bit one cannot exist past the up-front check.
+    fn max_tile_slots(&self) -> Result<usize> {
+        let offsets = self.feat_offsets();
+        let mut max_tile_slots = 0usize;
+        let mut probe = 0usize;
+        while probe < self.n_feats {
+            let hist_begin = offsets[probe] as usize;
+            let mut end = probe;
+            while end < self.n_feats
+                && offsets[end + 1] as usize - hist_begin <= self.ctx.max_bins_per_tile
+            {
+                end += 1;
+            }
+            if end == probe {
+                if self.width == BinWidth::U16 {
+                    probe += 1;
+                    continue;
+                }
+                // Never loop without progress (checked up front in training).
+                ensure_feature_fits_tile(
+                    offsets[probe + 1] as usize - hist_begin,
+                    self.ctx.max_bins_per_tile,
+                )?;
+            }
+            max_tile_slots = max_tile_slots.max(offsets[end] as usize - hist_begin);
+            probe = end;
+        }
+        Ok(max_tile_slots)
+    }
+
     fn feat_offsets(&self) -> &[u32] {
         &self
             .slot
@@ -4079,6 +4304,11 @@ impl GpuBlockSession<'_> {
         // bins 读取量、shared 原子次数、init/flush 次数完全不变,所以
         // 位精确不受影响。
         if let Some(fused_fn) = self.ctx.hist_fused_fn.as_ref() {
+            let (fused_fn, r4_wide) = match (self.width, self.ctx.wide.as_ref()) {
+                (BinWidth::U8, _) => (fused_fn, None),
+                (BinWidth::U16, Some(w)) => (&w.hist_fused, Some(&w.hist_fused_r4)),
+                (BinWidth::U16, None) => bail!("16-bit histogram kernels are not loaded"),
+            };
             // R=4 时每个 block 覆盖 threads*4 行,余数交回 R=1 的融合 kernel。
             // 两个 kernel 的数值行为完全相同(同样的 atomic、同样的进位),
             // 所以拆不拆边界都不影响位精确。
@@ -4099,27 +4329,7 @@ impl GpuBlockSession<'_> {
             // `max_bins_per_tile` 顶格要 —— 窄列块顶格会白占 shared,
             // 把每个 SM 能常驻的 block 数压下去。这里跑的贪心切分和
             // kernel 内的逐字相同。
-            let mut max_tile_slots = 0usize;
-            let mut probe = 0usize;
-            while probe < self.n_feats {
-                let hist_begin = self.feat_offsets()[probe] as usize;
-                let mut end = probe;
-                while end < self.n_feats
-                    && self.feat_offsets()[end + 1] as usize - hist_begin
-                        <= self.ctx.max_bins_per_tile
-                {
-                    end += 1;
-                }
-                if end == probe {
-                    // Never loop without progress (checked up front in training).
-                    ensure_feature_fits_tile(
-                        self.feat_offsets()[probe + 1] as usize - hist_begin,
-                        self.ctx.max_bins_per_tile,
-                    )?;
-                }
-                max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
-                probe = end;
-            }
+            let max_tile_slots = self.max_tile_slots()?;
             let shared_mem_bytes = u32::try_from(max_tile_slots * bytes_per_bin)
                 .context("shared-memory tile size exceeds u32")?;
             let n_feats_u32 =
@@ -4135,17 +4345,18 @@ impl GpuBlockSession<'_> {
                 ..
             } = &mut **slot;
             let GpuBuffers { gpair, rows, .. } = &*core;
-            let bins_view = bins.slice(0..self.n_feats * self.ctx.n_rows);
+            let bins_view = bins.slice(0..self.n_feats * self.ctx.n_rows * self.width.bytes());
             let offsets_view = offsets.slice(0..=self.n_feats);
             let mut out_view = hist_out.slice_mut(..self.n_hist * 2);
 
             // R=4 段:整块整块地吃掉 rows_per_block 的整数倍。
             if r4_blocks > 0 {
-                let r4_fn = self
-                    .ctx
-                    .hist_fused_r4_fn
-                    .as_ref()
-                    .expect("R=4 kernel must be loaded when r4_blocks > 0");
+                let r4_fn = r4_wide.unwrap_or_else(|| {
+                    self.ctx
+                        .hist_fused_r4_fn
+                        .as_ref()
+                        .expect("R=4 kernel must be loaded when r4_blocks > 0")
+                });
                 let rows_view = rows.slice(span.offset..span.offset + r4_rows);
                 let cfg = LaunchConfig {
                     grid_dim: (r4_blocks, 1, 1),
@@ -4215,6 +4426,10 @@ impl GpuBlockSession<'_> {
             }
             self.feature_tiles = 1;
         } else {
+            ensure!(
+                self.width == BinWidth::U8,
+                "the per-tile diagnostic histogram path reads 8-bit blocks only"
+            );
             let mut feature_tiles = 0usize;
             let mut feat_begin = 0usize;
             while feat_begin < self.n_feats {
@@ -4400,12 +4615,19 @@ impl GpuBlockSession<'_> {
         // Both layouts use the same R=4 launch geometry: each block covers
         // threads_per_block * 4 rows. The packed-index ABI changes feature
         // addressing, not node block boundaries.
-        let row_major = self.ctx.rm_hist_fn.is_some();
+        let row_major = self.row_major();
         let batched_fn = if row_major {
             self.ctx
                 .rm_hist_fn
                 .as_ref()
                 .expect("row_major implies the kernel is loaded")
+        } else if self.width == BinWidth::U16 {
+            self.ctx
+                .hist_batched_fn
+                .as_ref()
+                .and_then(|_| self.ctx.wide.as_ref())
+                .map(|w| &w.hist_batched)
+                .context("16-bit batched histogram kernel is not loaded")?
         } else {
             self.ctx
                 .hist_batched_fn
@@ -4499,26 +4721,7 @@ impl GpuBlockSession<'_> {
 
         // shared 仍然按这个列块**实际用到的最大 tile** 要,和融合路径逐字
         // 相同的贪心切分 —— 几何不变是这次实验的前提。
-        let mut max_tile_slots = 0usize;
-        let mut probe = 0usize;
-        while probe < self.n_feats {
-            let hist_begin = self.feat_offsets()[probe] as usize;
-            let mut end = probe;
-            while end < self.n_feats
-                && self.feat_offsets()[end + 1] as usize - hist_begin <= self.ctx.max_bins_per_tile
-            {
-                end += 1;
-            }
-            if end == probe {
-                // Never loop without progress (checked up front in training).
-                ensure_feature_fits_tile(
-                    self.feat_offsets()[probe + 1] as usize - hist_begin,
-                    self.ctx.max_bins_per_tile,
-                )?;
-            }
-            max_tile_slots = max_tile_slots.max(self.feat_offsets()[end] as usize - hist_begin);
-            probe = end;
-        }
+        let max_tile_slots = self.max_tile_slots()?;
         let shared_mem_bytes = u32::try_from(max_tile_slots * bytes_per_bin)
             .context("shared-memory tile size exceeds u32")?;
         let n_feats_u32 =
@@ -4555,7 +4758,8 @@ impl GpuBlockSession<'_> {
                 ..
             } = &mut **slot;
             let GpuBuffers { gpair, rows, .. } = &*core;
-            let bins_view = bins.slice(0..self.physical_n_feats * self.ctx.n_rows);
+            let bins_view =
+                bins.slice(0..self.physical_n_feats * self.ctx.n_rows * self.width.bytes());
             let offsets_view = offsets.slice(0..=self.n_feats);
             let feature_select_view = feature_select.slice(0..self.n_feats.max(1));
             // The kernel derives all three offsets from this packed allocation.
@@ -4666,7 +4870,7 @@ impl GpuBlockSession<'_> {
 
     /// 本 session 一次最多能合并多少个节点。1 表示 batching 关闭。
     pub fn hist_nodes_batch_capacity(&self) -> usize {
-        if self.ctx.hist_batched_fn.is_some() || self.ctx.rm_hist_fn.is_some() {
+        if self.ctx.hist_batched_fn.is_some() || self.row_major() {
             self.ctx.hist_nodes_per_batch
         } else {
             1
@@ -4682,7 +4886,7 @@ impl GpuBlockSession<'_> {
     /// 这个 bug 被 `gpu_multi_node_batching_crosses_the_batch_boundary`
     /// 抓到过一次。
     pub fn requires_batched_hist(&self) -> bool {
-        self.ctx.rm_hist_fn.is_some() || self.selection_active
+        self.row_major() || self.selection_active
     }
 
     pub fn timing(&self) -> GpuSegmentTiming {
@@ -4704,6 +4908,8 @@ pub struct GpuPartitionSession<'a> {
     /// Further resident blocks a level-wide batch may read
     /// ([`GpuTrainCtx::partition_session_resident_blocks`]).
     more_resident: Vec<MutexGuard<'a, GpuHistBuffers>>,
+    /// Cell width of the uploaded `part_col` (non-resident sessions).
+    upload_width: BinWidth,
     timing: GpuSegmentTiming,
 }
 
@@ -4881,7 +5087,13 @@ impl GpuPartitionSession<'_> {
             }
             let n_nodes = requests.len() as u32;
             let n_rows = self.ctx.n_rows as u32;
-            let row_major = u32::from(self.ctx.rm_count_fn.is_some());
+            let width = self
+                .resident
+                .as_ref()
+                .expect("validated resident")
+                .0
+                .resident_width;
+            let row_major = u32::from(self.ctx.rm_count_fn.is_some() && width == BinWidth::U8);
             {
                 let GpuBuffers {
                     rows,
@@ -4905,7 +5117,8 @@ impl GpuPartitionSession<'_> {
                 {
                     let feats = slot.resident_feats;
                     ensure!(
-                        self.ctx.n_rows * feats <= slot.bins.len(),
+                        slot.resident_width == width
+                            && self.ctx.n_rows * feats * width.bytes() <= slot.bins.len(),
                         "resident block width does not match its buffer"
                     );
                     // The prefix view would have the same base pointer.
@@ -4915,16 +5128,29 @@ impl GpuPartitionSession<'_> {
                         .context("resident partition block width exceeds u32")?;
                     reads.push(read);
                 }
-                let mut launch = stream.launch_builder(&self.ctx.partition_batch_count_fn);
+                let wide_count = match width {
+                    BinWidth::U8 => None,
+                    BinWidth::U16 => Some(
+                        &self
+                            .ctx
+                            .wide
+                            .as_ref()
+                            .context("16-bit partition kernels are not loaded")?
+                            .count_batched,
+                    ),
+                };
+                let mut launch =
+                    stream.launch_builder(wide_count.unwrap_or(&self.ctx.partition_batch_count_fn));
                 launch
                     .arg(&part_blocks)
                     .arg(&*rows)
                     .arg(&*part_descriptors)
                     .arg(&n_nodes)
-                    .arg(&n_rows)
-                    .arg(&row_major)
-                    .arg(part_flags)
-                    .arg(part_block_counts);
+                    .arg(&n_rows);
+                if wide_count.is_none() {
+                    launch.arg(&row_major);
+                }
+                launch.arg(part_flags).arg(part_block_counts);
                 unsafe {
                     launch.launch(LaunchConfig {
                         grid_dim: (blocks as u32, 1, 1),
@@ -5113,7 +5339,34 @@ impl GpuPartitionSession<'_> {
         // A categorical split ships its 256-bit right-going set to the first 8
         // words of the (stream-ordered) descriptor buffer; the batched kernels
         // that also use that buffer rewrite it before each of their launches.
+        let width = match self.resident.as_ref() {
+            Some((slot, _)) => slot.resident_width,
+            None => self.upload_width,
+        };
+        // 16-bit categorical features ship a set sized by their bins (two
+        // 32-bit words per 64-bit word), through the same descriptor buffer.
+        let mut mask_words = 8u32;
         let split_bin = match cats {
+            Some(cats) if width == BinWidth::U16 => {
+                let words: Vec<u32> = cats
+                    .words64()
+                    .iter()
+                    .flat_map(|&w| [w as u32, (w >> 32) as u32])
+                    .collect();
+                ensure!(
+                    words.len() <= self.buf.part_descriptors.len(),
+                    "category set of {} words exceeds the preallocated {}",
+                    words.len(),
+                    self.buf.part_descriptors.len()
+                );
+                mask_words = u32::try_from(words.len()).context("category set exceeds u32")?;
+                let mut dst = self.buf.part_descriptors.slice_mut(..words.len());
+                self.ctx
+                    .stream
+                    .memcpy_htod(&words, &mut dst)
+                    .context("partition category set H2D")?;
+                u32::MAX
+            }
             Some(cats) => {
                 let words = cats.words8();
                 let mut dst = self.buf.part_descriptors.slice_mut(..8);
@@ -5147,7 +5400,8 @@ impl GpuPartitionSession<'_> {
             // 行主序:没有连续的一列,但也**不需要**物化一列 ——
             // 直接按 active row 算地址 `row * n_feats + feat`。
             // 代价只随 active row 走,不随 n_rows 走。
-            let rm = self.ctx.rm_count_fn.is_some();
+            let rm = self.ctx.rm_count_fn.is_some() && width == BinWidth::U8;
+            let cell = width.bytes();
             let (col_view, rm_feat) = match self.resident.as_ref() {
                 Some((slot, local_feat)) if rm => {
                     // 用**这个块自己**的宽度,不是 buffer 容量反推的宽度。
@@ -5159,11 +5413,12 @@ impl GpuPartitionSession<'_> {
                     )
                 }
                 Some((slot, local_feat)) => (
-                    slot.bins
-                        .slice(local_feat * n_rows_usize..(local_feat + 1) * n_rows_usize),
+                    slot.bins.slice(
+                        local_feat * n_rows_usize * cell..(local_feat + 1) * n_rows_usize * cell,
+                    ),
                     None,
                 ),
-                None => (part_col.slice(..n_rows_usize), None),
+                None => (part_col.slice(..n_rows_usize * cell), None),
             };
             let rows_view = rows_dev.slice(span.offset..span.offset + span.len);
             // Scalar fallback immediately consumes prefix scratch. Batches use
@@ -5198,6 +5453,27 @@ impl GpuPartitionSession<'_> {
                         .arg(&mut counts_view)
                         .arg(&*part_descriptors);
                     unsafe { launch.launch(cfg) }.context("launch partition_count_rm")?;
+                }
+                None if width == BinWidth::U16 => {
+                    let count_fn = &self
+                        .ctx
+                        .wide
+                        .as_ref()
+                        .context("16-bit partition kernels are not loaded")?
+                        .count;
+                    let mut launch = self.ctx.stream.launch_builder(count_fn);
+                    launch
+                        .arg(&col_view)
+                        .arg(&rows_view)
+                        .arg(&n_rows_u32)
+                        .arg(&n_selected)
+                        .arg(&split_bin)
+                        .arg(&missing_left_u32)
+                        .arg(&mut flags_view)
+                        .arg(&mut counts_view)
+                        .arg(&*part_descriptors)
+                        .arg(&mask_words);
+                    unsafe { launch.launch(cfg) }.context("launch partition_count_u16")?;
                 }
                 None => {
                     let mut launch = self.ctx.stream.launch_builder(&self.ctx.count_fn);
