@@ -144,6 +144,14 @@ pub mod cuda {
         ) -> Result<()> {
             match self.0 {}
         }
+        pub fn init_fast_math_rows(
+            &self,
+            _labels: &[f32],
+            _weights: Option<&[f32]>,
+            _row_margins: &[f32],
+        ) -> Result<()> {
+            match self.0 {}
+        }
         pub fn fast_multiclass_begin_round(&self) -> Result<()> {
             match self.0 {}
         }

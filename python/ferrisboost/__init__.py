@@ -636,6 +636,106 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
     )
 
 
+def _num_outputs(p: Mapping[str, Any]) -> int:
+    """Outputs per row: `num_class` for the multiclass objectives, else 1."""
+    if str(p["objective"]).startswith("multi:"):
+        return int(p["num_class"] or 1)
+    return 1
+
+
+def _as_base_margin(margin: Any, k: int, what: str = "base_margin") -> np.ndarray:
+    """`base_margin` -> C-contiguous float32 `(rows, k)` matrix.
+
+    XGBoost shapes: `(n,)` (or `(n, 1)`) for one output, `(n, num_class)` for
+    multiclass. Lists, pandas Series / DataFrames and pyarrow arrays are
+    accepted; every value must be finite.
+    """
+    if hasattr(margin, "to_numpy") and not isinstance(margin, np.ndarray):
+        margin = margin.to_numpy()
+    elif hasattr(margin, "to_pandas") and not isinstance(margin, np.ndarray):
+        margin = margin.to_pandas().to_numpy()
+    arr = np.asarray(margin, dtype=np.float32)
+    if arr.ndim == 1 and k == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2 or arr.shape[1] != k:
+        want = "(n,) or (n, 1)" if k == 1 else f"(n, {k})"
+        raise ValueError(f"{what} must have shape {want}, got {tuple(arr.shape)}")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{what} contains NaN or inf; every starting margin must be finite")
+    return np.ascontiguousarray(arr)
+
+
+def _load_prior(xgb_model: Any) -> Model | None:
+    """`xgb_model` -> a Model: a FerrisBoost Model, a path to FerrisBoost or
+    XGBoost JSON, or an object with `save_raw` (an `xgboost.Booster`)."""
+    if xgb_model is None:
+        return None
+    if isinstance(xgb_model, Model):
+        return xgb_model
+    if isinstance(xgb_model, (str, os.PathLike)):
+        return Model.load_model(os.fspath(xgb_model), quiet=True)
+    if hasattr(xgb_model, "save_raw"):
+        import tempfile
+
+        raw = bytes(xgb_model.save_raw(raw_format="json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.json")
+            with open(path, "wb") as f:
+                f.write(raw)
+            return Model.load_model(path, quiet=True)
+    raise TypeError(
+        "xgb_model must be a ferrisboost.Model, a path to a model JSON "
+        f"(FerrisBoost or XGBoost) or an xgboost.Booster, got {type(xgb_model).__name__}"
+    )
+
+
+def _adopt_prior_params(params: Mapping[str, Any], prior: Model) -> dict[str, Any]:
+    """Continuation keeps the model's objective: without an explicit one in
+    `params` the prior's `objective` / `num_class` are used."""
+    out = dict(params)
+    if "objective" not in out:
+        out["objective"] = prior.objective
+        if prior.num_class > 1 and "num_class" not in out:
+            out["num_class"] = prior.num_class
+    return out
+
+
+def _check_prior(prior: Model, p: Mapping[str, Any], n_features: int | None) -> None:
+    """Fail early (before scoring the prior on the new data) when the model to
+    continue cannot be continued with these parameters / this data."""
+    if prior.objective != p["objective"]:
+        raise ValueError(
+            f"xgb_model was trained with objective {prior.objective!r}, "
+            f"params ask for {p['objective']!r}"
+        )
+    k = _num_outputs(p)
+    if prior.num_class != k:
+        raise ValueError(
+            f"xgb_model has {prior.num_class} output(s) per row, params give num_class={k}"
+        )
+    if n_features is not None and prior.n_features != n_features:
+        raise ValueError(
+            f"xgb_model was trained on {prior.n_features} features, the new data has {n_features}"
+        )
+
+
+def _prior_margin(
+    prior: Model, data: Any, base_margin: Any, p: Mapping[str, Any], *, header: bool = True
+) -> np.ndarray:
+    """The prior model's raw margin on `data` as a `(rows, k)` matrix: the
+    starting predictions of a continued run. A `base_margin` replaces the
+    prior's intercept (XGBoost: starting margin + the existing trees)."""
+    out = prior.predict(
+        data,
+        output_margin=True,
+        header=header,
+        predict_threads=p["nthread"],
+        missing=p["missing"],
+        base_margin=base_margin,
+    )
+    return np.ascontiguousarray(np.asarray(out, dtype=np.float32).reshape(-1, _num_outputs(p)))
+
+
 def train(
     params: Mapping[str, Any],
     data: Any,
@@ -650,6 +750,9 @@ def train(
     quiet: bool = False,
     weight: Any = None,
     feature_types: Sequence[str] | None = None,
+    base_margin: Any = None,
+    base_margin_eval_set: Sequence[Any] | None = None,
+    xgb_model: Any = None,
 ) -> Model:
     """训一个模型。
 
@@ -683,8 +786,30 @@ def train(
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
     为 True 时自动识别。类别值是 0..=254 的整数码(缺失用 NaN / null),超出范围、
     负数或非整数会报错;每个特征最多 255 个类别。
+
+    `base_margin`(XGBoost 的 DMatrix `base_margin`):每行的起始 raw margin,训练从它起步
+    而不是从 `base_score` 起步(截距仍然按标签估计并存进模型,和 XGBoost 一致)。数组入口给
+    `(n,)`(多分类 `(n, num_class)`);文件入口给**列名**(多分类给 `num_class` 个列名的列表,
+    无表头 CSV 给列下标),该列不进特征。验证集的 margin 用 `base_margin_eval_set`
+    (和 `evals` 平行的列表,没有的项给 `None`);文件入口的验证集沿用同样的列名。预测时
+    要自己给同样的 margin(`Model.predict(..., base_margin=...)`)。
+
+    `xgb_model`(训练继续):已有的 FerrisBoost `Model`、FerrisBoost / XGBoost 模型 JSON 的路径,
+    或 `xgboost.Booster`。训练从该模型在新数据(和每个验证集)上的预测起步,沿用它的
+    `base_score` 和 objective,`num_boost_round` 棵**新**树接在它后面;objective / num_class /
+    特征数 / 特征名 / 类别特征不一致会报错。分箱边界按新数据重新采样(旧树用的是浮点阈值,
+    所以旧树的预测不依赖新边界)。`evals_result` 只含新的轮次;早停的 `best_iteration` 是
+    整个模型里的绝对轮次。
     """
+    prior = _load_prior(xgb_model)
+    if prior is not None:
+        params = _adopt_prior_params(params, prior)
     p = _normalize_params(params, num_boost_round)
+    k_out = _num_outputs(p)
+    if base_margin_eval_set is not None and len(base_margin_eval_set) != len(evals):
+        raise ValueError(
+            f"base_margin_eval_set has {len(base_margin_eval_set)} entries, evals has {len(evals)}"
+        )
     # Private wire field: quiet is a public call option, not a tree parameter.
     p["_quiet"] = bool(quiet)
     explicit_types = _feature_flags(feature_types, None)
@@ -720,19 +845,59 @@ def train(
         # columns (label / weight excluded); the length is checked in Rust, where
         # the schema is known. Dictionary columns are detected there.
         p["_feature_types"] = explicit_types or None
+        if base_margin_eval_set is not None:
+            raise ValueError(
+                "file inputs read the base_margin column from every eval file: "
+                "base_margin_eval_set is for array inputs"
+            )
+        if base_margin is not None:
+            names = base_margin if isinstance(base_margin, (list, tuple)) else [base_margin]
+            ok = all(isinstance(n, str) for n in names) if header else all(
+                isinstance(n, int) and not isinstance(n, bool) for n in names
+            )
+            if not ok:
+                raise ValueError(
+                    "file inputs take base_margin as column name(s)"
+                    + ("" if header else " (zero-based column indices for header=False)")
+                )
+            base_margin = list(names)
+        start = eval_start = None
+        if prior is not None:
+            _check_prior(prior, p, None)
+            # Starting margins of a continued run: the prior scored over the files.
+            # A named base_margin column (not usable for a positional prior's
+            # predict) replaces the prior's intercept, as in XGBoost.
+            start = _prior_margin(prior, specs, base_margin, p, header=header)
+            eval_start = [
+                _prior_margin(prior, spec, base_margin, p, header=header)
+                for spec, _ in eval_specs
+            ]
         # 格式由 Rust 从解析出的文件判定 —— Python 不再按后缀猜,也不做
         # 文件系统判断(目录/glob 展开、排序、schema 一致性全在 Rust)。
         model = _core.train_file(specs, label, p, header, eval_specs,
                                  early_stopping_rounds, verbose, cb_list,
-                                 weight=weight)
+                                 weight=weight, base_margin=base_margin,
+                                 start_margin=start, eval_start_margins=eval_start,
+                                 prior_model=prior)
     else:
         table = _arrow_table(data)
         frame = data if _is_pandas_frame(data) else None
         enable_cat = p["enable_categorical"]
         auto_flags, levels, names = None, {}, None
+        # A continued model indexes features by position: named data is bound to
+        # the model's feature names (any column order), like evals are.
+        prior_names = list(prior.feature_names) if prior is not None else []
         if table is not None:
-            x, names, auto_flags, levels = _table_matrix(table, None, enable_cat)
+            x, names, auto_flags, levels = _table_matrix(
+                table, prior_names or None, enable_cat
+            )
         elif frame is not None:
+            if prior_names:
+                cols = [str(c) for c in frame.columns]
+                absent = [n for n in prior_names if n not in cols]
+                if absent:
+                    raise ValueError(f"data is missing the features of xgb_model: {absent}")
+                frame = frame[[c for n in prior_names for c in frame.columns if str(c) == n]]
             x, names, auto_flags, levels = _frame_matrix(frame, enable_cat)
         else:
             x = _as_matrix(data)
@@ -749,7 +914,13 @@ def train(
         if isinstance(weight, str):
             raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
         w = None if weight is None else _as_weights(weight, x.shape[0])
+        bm = None if base_margin is None else _as_base_margin(base_margin, k_out)
+        if bm is not None and bm.shape[0] != x.shape[0]:
+            raise ValueError(f"base_margin has {bm.shape[0]} rows, data has {x.shape[0]}")
+        if prior is not None:
+            _check_prior(prior, p, x.shape[1])
         eval_specs = []
+        eval_bms: list[Any] = []
         for item in evals:
             if len(item) == 3:
                 ed, el, name = item
@@ -775,9 +946,31 @@ def train(
             if ew is not None:
                 ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")
             eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name)))
+            ebm = None
+            if base_margin_eval_set is not None and base_margin_eval_set[len(eval_bms)] is not None:
+                ebm = _as_base_margin(
+                    base_margin_eval_set[len(eval_bms)], k_out, f"base_margin_eval_set[{name}]"
+                )
+                if ebm.shape[0] != ex.shape[0]:
+                    raise ValueError(
+                        f"base_margin_eval_set[{name}] has {ebm.shape[0]} rows, "
+                        f"the set has {ex.shape[0]}"
+                    )
+            eval_bms.append(ebm)
+        if prior is not None:
+            # Starting predictions: the prior's margin on each data set (on top of a
+            # supplied base_margin, which replaces the prior's intercept).
+            bm = _prior_margin(prior, x, bm, p)
+            eval_bms = [
+                _prior_margin(prior, spec[0], ebm, p) for spec, ebm in zip(eval_specs, eval_bms)
+            ]
         model = _core.train_dense(x, y, p, eval_specs, early_stopping_rounds,
                                   verbose, cb_list, weight=w,
-                                  feature_names=None if names is None else [str(n) for n in names])
+                                  feature_names=None if names is None else [str(n) for n in names],
+                                  base_margin=bm,
+                                  eval_base_margins=eval_bms if any(
+                                      m is not None for m in eval_bms) else None,
+                                  prior_model=prior)
 
     if evals_result is not None:
         evals_result.clear()

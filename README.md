@@ -246,6 +246,11 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
+### 0.0.7 (unreleased)
+
+- Added `base_margin`.
+- Added training continuation (`xgb_model`).
+
 ### 0.0.6 (unreleased)
 
 - Added categorical features (`feature_types`, pandas `category` columns, Arrow dictionaries).

@@ -3001,3 +3001,54 @@ fn gpu_multiclass_fast_budget_matches_planner_and_echo() {
         assert_eq!(planned.fixed_bytes - base.fixed_bytes, extra as u64);
     }
 }
+
+/// `base_margin` on the fast path: the resident device prediction is filled from
+/// per-row margins (class-major `K x n`) exactly as given, and a constant margin
+/// is the same state as the per-output initialization.
+#[test]
+fn gpu_fast_per_row_margins_initialize_the_device_prediction() {
+    for k in [1usize, 3] {
+        let n_rows = 2500usize;
+        let (_, labels, weights) = multiclass_fixture(n_rows, 4, k.max(2));
+        let labels: Vec<f32> = labels.iter().map(|&y| if k == 1 { y.min(1.0) } else { y }).collect();
+        let config = SharedHistogramConfig {
+            runtime_log: false,
+            gpu_math: ferrisboost::types::GpuMath::Fast,
+            fast_weights: true,
+            n_outputs: k,
+            ..Default::default()
+        };
+        let make = || GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
+        // Distinct finite values everywhere, including negative zero.
+        let rows: Vec<f32> = (0..k * n_rows)
+            .map(|i| if i == 7 { -0.0 } else { ((i * 31 % 977) as f32 - 488.0) * 0.003 })
+            .collect();
+        let ctx = make();
+        ctx.init_fast_math_rows(&labels, Some(&weights), &rows).unwrap();
+        let mut back = vec![0.0f32; k * n_rows];
+        ctx.sync_prediction_to_host(&mut back).unwrap();
+        assert!(
+            rows.iter().zip(&back).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "k={k}: device prediction must equal the uploaded margins bit for bit"
+        );
+        // A constant per-row margin == the per-output initialization.
+        let per_output: Vec<f32> = (0..k).map(|c| 0.25 * c as f32 - 0.1).collect();
+        let constant: Vec<f32> = per_output
+            .iter()
+            .flat_map(|&m| std::iter::repeat_n(m, n_rows))
+            .collect();
+        let a = make();
+        a.init_fast_math(&labels, Some(&weights), &per_output).unwrap();
+        let b = make();
+        b.init_fast_math_rows(&labels, Some(&weights), &constant).unwrap();
+        let (mut ha, mut hb) = (vec![0.0f32; k * n_rows], vec![0.0f32; k * n_rows]);
+        a.sync_prediction_to_host(&mut ha).unwrap();
+        b.sync_prediction_to_host(&mut hb).unwrap();
+        assert_eq!(
+            ha.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            hb.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // Wrong length is an explicit error.
+        assert!(make().init_fast_math_rows(&labels, Some(&weights), &rows[1..]).is_err());
+    }
+}

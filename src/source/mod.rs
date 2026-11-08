@@ -35,6 +35,10 @@ pub struct Targets<'a> {
     /// NaN / null. NaN (the default) means no extra sentinel. Applies to feature
     /// columns only, never to the label or weight column.
     pub missing: f32,
+    /// File columns holding a per-row starting margin (`base_margin`, one per
+    /// model output). Like the label and weight they are excluded from the
+    /// features; they are read separately as plain f32 columns.
+    pub base_margin: Option<&'a [String]>,
 }
 
 impl<'a> Targets<'a> {
@@ -49,7 +53,16 @@ impl<'a> Targets<'a> {
             features: None,
             categorical: None,
             missing: f32::NAN,
+            base_margin: None,
         })
+    }
+
+    /// Name the `base_margin` column(s): excluded from the features.
+    pub fn with_base_margin(self, names: &'a [String]) -> Self {
+        Self {
+            base_margin: (!names.is_empty()).then_some(names),
+            ..self
+        }
     }
 
     /// Treat feature values equal to `missing` as missing (see the field docs).
@@ -123,9 +136,11 @@ impl<'a> Targets<'a> {
         Ok((idx, want.to_vec()))
     }
 
-    /// 这一列是标签或权重(不进特征)。
+    /// 这一列是标签、权重或 base_margin(不进特征)。
     pub fn excludes(&self, name: &str) -> bool {
-        name == self.label || self.weight == Some(name)
+        name == self.label
+            || self.weight == Some(name)
+            || self.base_margin.is_some_and(|cols| cols.iter().any(|c| c == name))
     }
 }
 
@@ -137,6 +152,7 @@ impl<'a> From<&'a str> for Targets<'a> {
             features: None,
             categorical: None,
             missing: f32::NAN,
+            base_margin: None,
         }
     }
 }
@@ -149,6 +165,7 @@ impl<'a> From<&'a String> for Targets<'a> {
             features: None,
             categorical: None,
             missing: f32::NAN,
+            base_margin: None,
         }
     }
 }

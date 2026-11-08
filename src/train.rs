@@ -636,6 +636,25 @@ pub struct TrainConfig {
     /// (`Objective::estimate_base_score`);给了值就原样用。
     /// 训练出来的 `Model.base_score` 永远是解析后的那个数。
     pub base_score: Option<f32>,
+    /// Per-row starting raw margin for the training set (XGBoost `base_margin`),
+    /// class-major: `base_margin[k * n + i]` is row `i`, output `k` (so a
+    /// single-output objective is simply `n` values). It **replaces** the
+    /// `base_score` as the starting prediction; the intercept is still
+    /// estimated from the labels (or taken from `base_score`) and stored in the
+    /// model, exactly as XGBoost does. `None` = start from the intercept.
+    pub base_margin: Option<Vec<f32>>,
+    /// Per-validation-set starting margins, parallel to the `evals` slice
+    /// (same layout as `base_margin`). A missing tail or a `None` entry means
+    /// that set starts from the intercept.
+    pub eval_base_margins: Vec<Option<Vec<f32>>>,
+    /// Training continuation: the model whose trees, intercept (`base_score` /
+    /// class margins), feature names and best-iteration metadata are carried
+    /// into the result, with the newly trained trees appended. The caller must
+    /// supply `base_margin` / `eval_base_margins` equal to this model's raw
+    /// margin on the respective data (the starting predictions); the model
+    /// itself is never evaluated here, because the data arrives binned with
+    /// freshly sketched cuts while its splits are float thresholds.
+    pub prior_model: Option<Model>,
 }
 
 impl TrainConfig {
@@ -647,7 +666,15 @@ impl TrainConfig {
             quiet: false,
             eval_metrics: vec![crate::metrics::default_metric(objective)],
             base_score: None,
+            base_margin: None,
+            eval_base_margins: Vec::new(),
+            prior_model: None,
         }
+    }
+
+    /// The starting margins of validation set `i`, if it has any.
+    fn eval_margin(&self, i: usize) -> Option<&[f32]> {
+        self.eval_base_margins.get(i).and_then(|m| m.as_deref())
     }
 
     /// 解析 base_score:用户给的值,或从训练标签/权重估计。
@@ -948,6 +975,140 @@ fn validate_source_metadata(source: &dyn BlockSource, name: &str) -> anyhow::Res
     Ok(())
 }
 
+/// Checks for the starting-margin inputs (`base_margin`, per-eval margins and
+/// the continuation model): shapes, finiteness, and that a continued model is
+/// compatible with the new run. Shared by every backend.
+fn validate_start_margins(
+    cfg: &TrainConfig,
+    source: &dyn BlockSource,
+    evals: &[EvalSet],
+) -> anyhow::Result<()> {
+    let k = cfg.objective.num_outputs();
+    let check = |margin: &[f32], rows: usize, what: &str| -> anyhow::Result<()> {
+        anyhow::ensure!(
+            margin.len() == rows * k,
+            "{what}的 base_margin 有 {} 个值,应为 {rows} 行 × {k} 个输出 = {}",
+            margin.len(),
+            rows * k
+        );
+        anyhow::ensure!(
+            margin.iter().all(|v| v.is_finite()),
+            "{what}的 base_margin 必须全部是有限值"
+        );
+        Ok(())
+    };
+    if let Some(m) = &cfg.base_margin {
+        check(m, source.n_rows(), "训练集")?;
+    }
+    anyhow::ensure!(
+        cfg.eval_base_margins.len() <= evals.len(),
+        "eval_base_margins 有 {} 项,但只有 {} 个验证集",
+        cfg.eval_base_margins.len(),
+        evals.len()
+    );
+    for (i, ev) in evals.iter().enumerate() {
+        if let Some(m) = cfg.eval_margin(i) {
+            check(m, ev.source.n_rows(), &format!("验证集 {:?} ", ev.name))?;
+        }
+    }
+    let Some(prior) = &cfg.prior_model else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        prior.objective.name() == cfg.objective.name(),
+        "续训的 objective 是 {:?},已有模型的是 {:?}",
+        cfg.objective.name(),
+        prior.objective.name()
+    );
+    anyhow::ensure!(
+        prior.num_outputs() == k,
+        "续训的输出数是 {k}(num_class),已有模型的是 {}",
+        prior.num_outputs()
+    );
+    anyhow::ensure!(
+        prior.n_features == source.n_features(),
+        "续训的数据有 {} 个特征,已有模型有 {} 个",
+        source.n_features(),
+        prior.n_features
+    );
+    anyhow::ensure!(
+        prior.trees.len() % k == 0,
+        "已有模型有 {} 棵树,不是 {k} 个输出的整数轮",
+        prior.trees.len()
+    );
+    // An empty `feature_types` means every feature is numeric.
+    let flags = |f: &[bool], n: usize| -> Vec<bool> {
+        if f.is_empty() {
+            vec![false; n]
+        } else {
+            f.to_vec()
+        }
+    };
+    let n_features = source.n_features();
+    anyhow::ensure!(
+        flags(&prior.feature_types, n_features)
+            == flags(source.cuts().categorical_flags(), n_features),
+        "续训数据的类别特征(feature_types)和已有模型不一致"
+    );
+    // The new trees can only split on codes the current training supports
+    // (`MAX_CAT_CODE`); refuse a model that already splits on larger ones rather
+    // than carrying (or truncating) them.
+    for (t, tree) in prior.trees.iter().enumerate() {
+        for node in tree.nodes.iter().filter(|n| !n.is_leaf) {
+            let Some(words) = &node.cats else { continue };
+            if let Some(&big) = crate::categorical::categories_from_words(words)
+                .iter()
+                .find(|&&c| c > crate::categorical::MAX_CAT_CODE)
+            {
+                anyhow::bail!(
+                    "已有模型的第 {t} 棵树在类别特征 {} 上分裂到类别码 {big},超过当前训练支持的上限 {}(MAX_CAT_CODE);无法续训",
+                    node.feat,
+                    crate::categorical::MAX_CAT_CODE
+                );
+            }
+        }
+    }
+    if let Some(b) = cfg.base_score {
+        let model_b = if k > 1 {
+            prior.class_base_margins.first().copied().unwrap_or(b)
+        } else {
+            prior.base_score
+        };
+        anyhow::ensure!(
+            k > 1 || b.to_bits() == model_b.to_bits(),
+            "续训时 base_score 沿用已有模型的 {model_b},不能改成 {b}"
+        );
+    }
+    if !prior.trees.is_empty() {
+        anyhow::ensure!(
+            cfg.base_margin.is_some(),
+            "续训必须带已有模型在训练集上的 raw margin 作为 base_margin"
+        );
+        for (i, ev) in evals.iter().enumerate() {
+            anyhow::ensure!(
+                cfg.eval_margin(i).is_some(),
+                "续训必须带已有模型在验证集 {:?} 上的 raw margin 作为 base_margin",
+                ev.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Row-major `n x k` host margins -> class-major `k x n`.
+pub fn class_major_from_rows(rows: &[f32], n: usize, k: usize) -> Vec<f32> {
+    if k == 1 {
+        return rows.to_vec();
+    }
+    let mut out = vec![0.0f32; n * k];
+    for (i, row) in rows.chunks_exact(k).enumerate() {
+        for (c, &v) in row.iter().enumerate() {
+            out[c * n + i] = v;
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn train_with_backend(
     source: &dyn BlockSource,
@@ -981,18 +1142,23 @@ fn train_with_backend(
     cfg.objective.validate_labels(labels, "训练集")?;
     cfg.objective.validate_params()?;
     let num_class = cfg.objective.num_outputs();
+    validate_start_margins(cfg, source, evals)?;
     // 多分类:每类一个 base margin。用户给了 base_score 就每类都用它
     // (XGBoost 把标量复制成 K 份),否则按类别频率估计。
+    // 续训:截距永远是已有模型的(XGBoost 同样保留模型的 base_score)。
     let class_margins: Vec<f32> = if num_class > 1 {
         cfg.objective.validate_labels(labels, "训练集")?;
-        match cfg.base_score {
-            Some(b) => vec![b; num_class],
-            None => cfg.objective.initial_class_margins(labels, weights),
+        match (&cfg.prior_model, cfg.base_score) {
+            (Some(prior), _) => prior.class_base_margins.clone(),
+            (None, Some(b)) => vec![b; num_class],
+            (None, None) => cfg.objective.initial_class_margins(labels, weights),
         }
     } else {
         Vec::new()
     };
-    let base_score = if num_class > 1 {
+    let base_score = if let Some(prior) = &cfg.prior_model {
+        prior.base_score
+    } else if num_class > 1 {
         class_margins[0]
     } else {
         cfg.resolve_base_score(labels, weights)
@@ -1139,8 +1305,16 @@ fn train_with_backend(
     // host 的训练预测;`gpu_math="fast"` 时 device 是权威副本、host 这份从不
     // 读写,所以下面确定了 fast 之后才按需分配(省 4 B/行的常驻内存)。
     let mut predictions: Vec<f32> = Vec::new();
+    // 续训:已有的树先放进模型,新树接在后面;早停的轮次是**整个模型里**的
+    // 绝对序号(XGBoost 的 `EarlyStopping` 同样加上 `starting_round`)。
+    let prior_trees: &[Tree] = cfg.prior_model.as_ref().map_or(&[], |m| m.trees.as_slice());
+    let prior_rounds = prior_trees.len() / num_class;
     let mut model = Model {
-        trees: Vec::with_capacity(cfg.params.n_rounds),
+        trees: {
+            let mut trees = Vec::with_capacity(prior_trees.len() + cfg.params.n_rounds * num_class);
+            trees.extend_from_slice(prior_trees);
+            trees
+        },
         base_score,
         objective: cfg.objective,
         n_features: source.n_features(),
@@ -1151,8 +1325,10 @@ fn train_with_backend(
         class_base_margins: Vec::new(),
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: source.cuts().categorical_flags().to_vec(),
-        best_iteration: None,
-        best_score: None,
+        // 和 XGBoost 一样,续训时旧模型的 best_iteration / best_score 属性原样保留,
+        // 本次若开了早停再覆盖。
+        best_iteration: cfg.prior_model.as_ref().and_then(|m| m.best_iteration),
+        best_score: cfg.prior_model.as_ref().and_then(|m| m.best_score),
     };
 
     // 每个验证集缓存一份 raw margin,每轮只把**新加的那棵树**累上去。
@@ -1161,9 +1337,14 @@ fn train_with_backend(
     // 光评估就比建树还贵,而 early stopping 的全部意义就是快速迭代。
     // CLAUDE.md 说这个优化要等数值对齐之后再做 —— 现在对齐了,而且有
     // tests/bit_exact_vs_xgboost.rs 兜底,可以动了。
+    // `base_margin`(含续训的既有预测)给了就从它起步,否则从截距起步。
     let mut eval_preds: Vec<Vec<f32>> = evals
         .iter()
-        .map(|e| vec![base_margin(cfg.objective, base_score); e.source.n_rows()])
+        .enumerate()
+        .map(|(i, e)| match cfg.eval_margin(i) {
+            Some(m) if num_class == 1 => m.to_vec(),
+            _ => vec![base_margin(cfg.objective, base_score); e.source.n_rows()],
+        })
         .collect();
 
     // GPU 资源按**最坏情况**在训练开始分配一次:gpair、row index、
@@ -1250,12 +1431,18 @@ fn train_with_backend(
     let fast_math = gpu.as_ref().is_some_and(|c| c.fast_math_enabled());
     // 多分类有自己的 K 份预测(train_multiclass_rounds),也不需要这一份。
     if !fast_math && num_class == 1 {
-        predictions = vec![margin; n];
+        predictions = match &cfg.base_margin {
+            Some(m) => m.clone(),
+            None => vec![margin; n],
+        };
     }
     if fast_math {
-        gpu.as_ref()
-            .expect("fast_math 蕴含 gpu 存在")
-            .init_fast_math(
+        let ctx = gpu.as_ref().expect("fast_math 蕴含 gpu 存在");
+        match &cfg.base_margin {
+            // device prediction 直接从逐行 margin 起步(class-major,K × n):
+            // 缓冲区本来就按 K × n 分配,规划器不用多记一项。
+            Some(m) => ctx.init_fast_math_rows(labels, grad_weights, m)?,
+            None => ctx.init_fast_math(
                 labels,
                 grad_weights,
                 // 多分类:K 个 base margin(class-major 的 K 份 device prediction)。
@@ -1264,7 +1451,8 @@ fn train_with_backend(
                 } else {
                     std::slice::from_ref(&margin)
                 },
-            )?;
+            )?,
+        }
     }
 
     if num_class > 1 {
@@ -1289,6 +1477,10 @@ fn train_with_backend(
     let mut pending_delta = false;
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
+        // 采样种子按模型里的**绝对**轮次取:续训接着旧模型的轮次往下走,
+        // 于是 N 轮 + M 轮和一次训 N+M 轮在同一份数据上完全相同(含 subsample /
+        // colsample);`round` 仍是本次的相对轮次,给 callback 和 evals_result 用。
+        let key_round = prior_rounds + round;
         // 浮点梯度只用来求 scale 和转定点,**转完就扔**。
         //
         // 留着它等于在 build_tree(整轮内存最紧的地方)白占一份
@@ -1414,7 +1606,7 @@ fn train_with_backend(
                 // 这一遍以前是串行的:1050 万次 SplitMix 哈希挂在训练线程上,
                 // 其余线程全程空等。
                 let th = crate::subsample::threshold_for(cfg.params.subsample);
-                let (seed, tree) = (cfg.params.seed, round as u64);
+                let (seed, tree) = (cfg.params.seed, key_round as u64);
                 gpair_f32
                     .par_iter_mut()
                     .enumerate()
@@ -1456,7 +1648,7 @@ fn train_with_backend(
                 cfg.objective,
                 crate::subsample::threshold_for(cfg.params.subsample),
                 cfg.params.seed,
-                round as u64,
+                key_round as u64,
             )?;
             // delta 已经被 device kernel 吃掉,不再欠 host 一次施加。
             pending_delta = false;
@@ -1468,7 +1660,7 @@ fn train_with_backend(
                 &gpair_f32,
                 crate::subsample::threshold_for(cfg.params.subsample),
                 cfg.params.seed,
-                round as u64,
+                key_round as u64,
             )?;
             drop(_t);
             if prof::enabled() {
@@ -1526,7 +1718,7 @@ fn train_with_backend(
                 source.n_features(),
                 cfg.params.colsample_bytree,
                 cfg.params.seed,
-                round,
+                key_round,
             ))
         } else {
             None
@@ -1546,7 +1738,7 @@ fn train_with_backend(
                     cfg.params.colsample_bylevel,
                     cfg.params.colsample_bynode,
                     cfg.params.seed,
-                    round,
+                    key_round,
                 ),
             )
         })?;
@@ -1641,7 +1833,7 @@ fn train_with_backend(
     // 注意**预测默认仍然用全部树**(XGBoost 的 Booster 也是),
     // 要截断得显式调 predict_margin_upto。
     if let Some((iter, score)) = callbacks.iter().find_map(|cb| cb.best_iteration()) {
-        model.best_iteration = Some(iter);
+        model.best_iteration = Some(iter + prior_rounds);
         model.best_score = Some(score);
     }
 
@@ -1835,20 +2027,32 @@ fn train_multiclass_rounds(
     let n = source.n_rows();
     let k_count = cfg.objective.num_outputs();
     let margins = model.class_base_margins.clone();
+    // Absolute round of the first new tree (continuation): sampling seeds key on
+    // it, so continuing equals uninterrupted training on the same data.
+    let prior_rounds = model.trees.len() / k_count;
+    let model_prior_rounds = prior_rounds;
     // fast:device 是 prediction 的权威副本,host 这份不存在。
     let fast_math = gpu.is_some_and(|c| c.fast_math_enabled());
+    // 逐行 base_margin(class-major,K × n)给了就按类切开作为起点,否则每类一个截距。
+    let split_classes = |m: &[f32], rows: usize| -> Vec<Vec<f32>> {
+        m.chunks_exact(rows).map(<[f32]>::to_vec).collect()
+    };
     let mut class_preds: Vec<Vec<f32>> = if fast_math {
         Vec::new()
+    } else if let Some(m) = &cfg.base_margin {
+        split_classes(m, n)
     } else {
         margins.iter().map(|&m| vec![m; n]).collect()
     };
     let mut eval_class_preds: Vec<Vec<Vec<f32>>> = evals
         .iter()
-        .map(|e| {
-            margins
+        .enumerate()
+        .map(|(i, e)| match cfg.eval_margin(i) {
+            Some(m) => split_classes(m, e.source.n_rows()),
+            None => margins
                 .iter()
                 .map(|&m| vec![m; e.source.n_rows()])
-                .collect()
+                .collect(),
         })
         .collect();
     let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
@@ -1868,7 +2072,7 @@ fn train_multiclass_rounds(
             });
         }
         for class in 0..k_count {
-            let tree_index = (round * k_count + class) as u64;
+            let tree_index = ((prior_rounds + round) * k_count + class) as u64;
             let mut gpair_f32 = if fast_math {
                 Vec::new()
             } else {
@@ -2017,7 +2221,7 @@ fn train_multiclass_rounds(
         cb.after_training();
     }
     if let Some((iter, score)) = callbacks.iter().find_map(|cb| cb.best_iteration()) {
-        model.best_iteration = Some(iter);
+        model.best_iteration = Some(iter + model_prior_rounds);
         model.best_score = Some(score);
     }
     Ok(model)
@@ -5587,5 +5791,348 @@ mod tests {
                 "out-of-range row must panic with a {threads}-thread pool"
             );
         }
+    }
+
+    // ---- base_margin / training continuation -------------------------------
+
+    fn float_margins(model: &Model, x: &[f32], n_features: usize) -> Vec<f32> {
+        x.chunks_exact(n_features)
+            .map(|row| model.predict_margin(row))
+            .collect()
+    }
+
+    fn trees_bits(model: &Model) -> Vec<(u32, u32, u32)> {
+        model
+            .trees
+            .iter()
+            .flat_map(|t| &t.nodes)
+            .map(|n| (n.feat, n.split_cond.to_bits(), n.leaf_value.to_bits()))
+            .collect()
+    }
+
+    /// A margin equal to the intercept's margin is the same start as no margin:
+    /// bit-identical model.
+    #[test]
+    fn base_margin_equal_to_the_intercept_changes_nothing() {
+        let (x, y, nf) = step_data(80);
+        let p = params(3, 6);
+        for obj in [Objective::SquaredError, Objective::Logistic] {
+            let src = DenseSource::from_row_major(&x, 80, nf, p.max_bin, p.cols_per_block);
+            let plain = train(
+                &src,
+                &y,
+                &[],
+                &TrainConfig::new(p.clone(), obj),
+                &mut [],
+                &Local,
+            )
+            .unwrap();
+            let margin = base_margin(obj, plain.base_score);
+            let cfg = TrainConfig {
+                base_margin: Some(vec![margin; 80]),
+                ..TrainConfig::new(p.clone(), obj)
+            };
+            let with = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+            assert_eq!(trees_bits(&plain), trees_bits(&with), "{obj:?}");
+            assert_eq!(plain.base_score.to_bits(), with.base_score.to_bits());
+        }
+    }
+
+    /// The margin is the starting point: with label = margin + 1 everywhere the
+    /// first leaf is the step towards +1, and the stored intercept is still the
+    /// label estimate (XGBoost does not look at base_margin there).
+    #[test]
+    fn base_margin_replaces_the_start_but_not_the_estimated_intercept() {
+        let n = 16usize;
+        let x = vec![0.0f32; n];
+        let margin: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        let y: Vec<f32> = margin.iter().map(|m| m + 1.0).collect();
+        let mut p = params(0, 1);
+        p.lambda = 0.0;
+        p.learning_rate = 1.0;
+        let src = DenseSource::from_row_major(&x, n, 1, p.max_bin, p.cols_per_block);
+        let cfg = TrainConfig {
+            base_margin: Some(margin.clone()),
+            ..TrainConfig::new(p, Objective::SquaredError)
+        };
+        let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+        let mean = y.iter().sum::<f32>() / n as f32;
+        assert!((model.base_score - mean).abs() < 1e-5, "{}", model.base_score);
+        // gradient = pred - y = -1 for every row, hessian 1: leaf = +1.
+        assert_eq!(model.trees[0].nodes[0].leaf_value, 1.0);
+    }
+
+    #[test]
+    fn base_margin_shape_and_values_are_validated() {
+        let (x, y, nf) = step_data(20);
+        let p = params(2, 2);
+        let src = DenseSource::from_row_major(&x, 20, nf, p.max_bin, p.cols_per_block);
+        let bad = |margin: Vec<f32>| {
+            let cfg = TrainConfig {
+                base_margin: Some(margin),
+                ..TrainConfig::new(p.clone(), Objective::SquaredError)
+            };
+            train(&src, &y, &[], &cfg, &mut [], &Local)
+                .expect_err("must be rejected")
+                .to_string()
+        };
+        assert!(bad(vec![0.0; 19]).contains("base_margin"));
+        let mut nan = vec![0.0; 20];
+        nan[3] = f32::NAN;
+        assert!(bad(nan).contains("有限"));
+        let eval = EvalSet {
+            name: "v".into(),
+            source: &src,
+            labels: &y,
+            weights: None,
+        };
+        let cfg = TrainConfig {
+            eval_base_margins: vec![Some(vec![0.0; 3])],
+            ..TrainConfig::new(p.clone(), Objective::SquaredError)
+        };
+        let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).unwrap_err();
+        assert!(err.to_string().contains("验证集"), "{err:#}");
+    }
+
+    /// Multiclass margins are class-major `K x n`: class `k` of row `i` starts at
+    /// `margin[k * n + i]`.
+    #[test]
+    fn multiclass_base_margin_is_class_major() {
+        let n = 30usize;
+        let x: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let obj = Objective::Softprob { num_class: 3 };
+        let p = params(2, 3);
+        let src = DenseSource::from_row_major(&x, n, 1, p.max_bin, p.cols_per_block);
+        let plain = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(p.clone(), obj),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        // Starting every row at the class intercepts reproduces the plain model.
+        let mut margin = Vec::new();
+        for k in 0..3 {
+            margin.extend(std::iter::repeat_n(plain.class_base_margins[k], n));
+        }
+        let cfg = TrainConfig {
+            base_margin: Some(margin),
+            ..TrainConfig::new(p.clone(), obj)
+        };
+        let with = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+        assert_eq!(trees_bits(&plain), trees_bits(&with));
+        // A genuinely different start changes the trees.
+        let skew: Vec<f32> = (0..3 * n)
+            .map(|i| if i < n { 2.0 } else { 0.0 })
+            .collect();
+        let cfg = TrainConfig {
+            base_margin: Some(skew),
+            ..TrainConfig::new(p, obj)
+        };
+        let skewed = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
+        assert_ne!(trees_bits(&plain), trees_bits(&skewed));
+        assert_eq!(skewed.class_base_margins, plain.class_base_margins);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_from(
+        model: Model,
+        src: &DenseSource,
+        x: &[f32],
+        y: &[f32],
+        n_features: usize,
+        p: TrainParams,
+        obj: Objective,
+    ) -> anyhow::Result<Model> {
+        let k = obj.num_outputs();
+        let rows = y.len();
+        let mut margins = Vec::with_capacity(rows * k);
+        for row in x.chunks_exact(n_features) {
+            margins.extend(model.predict_margins_upto(row, model.trees.len()));
+        }
+        let cfg = TrainConfig {
+            base_margin: Some(class_major_from_rows(&margins, rows, k)),
+            prior_model: Some(model),
+            ..TrainConfig::new(p, obj)
+        };
+        train(src, y, &[], &cfg, &mut [], &Local)
+    }
+
+    /// On the same data (same cuts), N rounds + M continued rounds is exactly N+M
+    /// rounds, including row / column sampling (seeds key on the absolute round).
+    #[test]
+    fn continuation_on_the_same_data_equals_uninterrupted_training() {
+        let (x, y, nf) = step_data(120);
+        for obj in [Objective::SquaredError, Objective::Logistic] {
+            let mut full_p = params(3, 8);
+            full_p.subsample = 0.8;
+            full_p.colsample_bytree = 0.75;
+            let src =
+                DenseSource::from_row_major(&x, 120, nf, full_p.max_bin, full_p.cols_per_block);
+            let full = train(
+                &src,
+                &y,
+                &[],
+                &TrainConfig::new(full_p.clone(), obj),
+                &mut [],
+                &Local,
+            )
+            .unwrap();
+            let first_p = TrainParams {
+                n_rounds: 3,
+                ..full_p.clone()
+            };
+            let first = train(
+                &src,
+                &y,
+                &[],
+                &TrainConfig::new(first_p, obj),
+                &mut [],
+                &Local,
+            )
+            .unwrap();
+            let tail_p = TrainParams {
+                n_rounds: 5,
+                ..full_p
+            };
+            let joined = continue_from(first, &src, &x, &y, nf, tail_p, obj).unwrap();
+            assert_eq!(joined.trees.len(), 8);
+            assert_eq!(trees_bits(&full), trees_bits(&joined), "{obj:?}");
+            assert_eq!(full.base_score.to_bits(), joined.base_score.to_bits());
+        }
+    }
+
+    #[test]
+    fn multiclass_continuation_equals_uninterrupted_training() {
+        let n = 90usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 7) % 11) as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| ((i * 7) % 11 / 4) as f32).collect();
+        let obj = Objective::Softprob { num_class: 3 };
+        let full_p = params(2, 6);
+        let src = DenseSource::from_row_major(&x, n, 1, full_p.max_bin, full_p.cols_per_block);
+        let full = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(full_p.clone(), obj),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        let first_p = TrainParams {
+            n_rounds: 2,
+            ..full_p.clone()
+        };
+        let first = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(first_p, obj),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        let tail_p = TrainParams {
+            n_rounds: 4,
+            ..full_p
+        };
+        let joined = continue_from(first, &src, &x, &y, 1, tail_p, obj).unwrap();
+        assert_eq!(joined.trees.len(), 18);
+        assert_eq!(trees_bits(&full), trees_bits(&joined));
+        assert_eq!(full.class_base_margins, joined.class_base_margins);
+    }
+
+    #[test]
+    fn continuation_rejects_incompatible_models_and_missing_margins() {
+        let (x, y, nf) = step_data(40);
+        let p = params(2, 2);
+        let src = DenseSource::from_row_major(&x, 40, nf, p.max_bin, p.cols_per_block);
+        let prior = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(p.clone(), Objective::SquaredError),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        // A model's intercept is not up for change.
+        let cfg = TrainConfig {
+            prior_model: Some(prior.clone()),
+            base_margin: Some(float_margins(&prior, &x, nf)),
+            base_score: Some(prior.base_score + 1.0),
+            ..TrainConfig::new(p.clone(), Objective::SquaredError)
+        };
+        let err = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap_err();
+        assert!(err.to_string().contains("base_score"), "{err:#}");
+        // The prior's predictions must come with it.
+        let cfg = TrainConfig {
+            prior_model: Some(prior.clone()),
+            ..TrainConfig::new(p.clone(), Objective::SquaredError)
+        };
+        let err = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap_err();
+        assert!(err.to_string().contains("base_margin"), "{err:#}");
+        // Different objective.
+        let cfg = TrainConfig {
+            prior_model: Some(prior.clone()),
+            base_margin: Some(float_margins(&prior, &x, nf)),
+            ..TrainConfig::new(p.clone(), Objective::Logistic)
+        };
+        let err = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap_err();
+        assert!(err.to_string().contains("objective"), "{err:#}");
+        // Different feature count.
+        let narrow = DenseSource::from_row_major(&x[..], 80, nf / 2, p.max_bin, p.cols_per_block);
+        let y2: Vec<f32> = (0..80).map(|i| (i % 2) as f32).collect();
+        let cfg = TrainConfig {
+            prior_model: Some(prior.clone()),
+            base_margin: Some(vec![0.0; 80]),
+            ..TrainConfig::new(p, Objective::SquaredError)
+        };
+        let err = train(&narrow, &y2, &[], &cfg, &mut [], &Local).unwrap_err();
+        assert!(err.to_string().contains("特征"), "{err:#}");
+    }
+
+    /// Early stopping while continuing reports the absolute round in the whole
+    /// model, and evaluation starts from the prior model's predictions.
+    #[test]
+    fn continuation_best_iteration_is_absolute() {
+        let (x, y, nf) = step_data(100);
+        let p = params(2, 2);
+        let src = DenseSource::from_row_major(&x, 100, nf, p.max_bin, p.cols_per_block);
+        let prior = train(
+            &src,
+            &y,
+            &[],
+            &TrainConfig::new(p.clone(), Objective::Logistic),
+            &mut [],
+            &Local,
+        )
+        .unwrap();
+        let margins = float_margins(&prior, &x, nf);
+        let eval = EvalSet {
+            name: "valid".into(),
+            source: &src,
+            labels: &y,
+            weights: None,
+        };
+        let cfg = TrainConfig {
+            base_margin: Some(margins.clone()),
+            eval_base_margins: vec![Some(margins)],
+            prior_model: Some(prior.clone()),
+            ..TrainConfig::new(TrainParams { n_rounds: 6, ..p }, Objective::Logistic)
+        };
+        let mut cbs: Vec<Box<dyn Callback>> = vec![Box::new(EarlyStopping::new(2, true))];
+        let model = train(&src, &y, &[eval], &cfg, &mut cbs, &Local).unwrap();
+        let best = model
+            .best_iteration
+            .expect("early stopping records the best round");
+        assert!(best < model.trees.len());
+        assert!(model.trees.len() > 2);
+        // The best round is a round of the *whole* model: it is at least the
+        // prior's last round whenever any new round improved on it.
+        assert!(best >= 1, "absolute round in the whole model, got {best}");
     }
 }

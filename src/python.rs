@@ -27,6 +27,7 @@ use crate::source::{csv_source, parquet_source, DenseSource};
 use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 
 mod explain;
+mod margin;
 
 fn on_off(flag: bool) -> &'static str {
     if flag {
@@ -909,8 +910,11 @@ where
 
 /// Cache-friendly fast path for C-contiguous NumPy input. Parallelism still
 /// owns disjoint deterministic row ranges; inside each range the CPU inference
-/// model blocks rows while preserving every row's original tree-add order.
-fn score_contiguous_rows(
+/// model blocks rows while preserving every row's original tree-add order. An
+/// optional per-row starting margin (`base_margin`, one value per row) replaces the
+/// model intercept.
+#[allow(clippy::too_many_arguments)]
+fn score_contiguous_rows_from(
     model: &crate::inference::CpuInferenceModel,
     data: &[f32],
     n_rows: usize,
@@ -918,13 +922,14 @@ fn score_contiguous_rows(
     n_trees: usize,
     workers: usize,
     pool: &mut Option<rayon::ThreadPool>,
+    init: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
     let mut out = vec![0.0f32; n_rows];
     if n_rows == 0 {
         return Ok(out);
     }
     if workers <= 1 {
-        model.predict_margins(data, n_features, n_trees, &mut out)?;
+        model.predict_margins_from(data, n_features, n_trees, init, &mut out)?;
         return Ok(out);
     }
     if pool.is_none() {
@@ -941,10 +946,11 @@ fn score_contiguous_rows(
                     let first = chunk * rows_per_chunk;
                     let value_first = first * n_features;
                     let value_last = value_first + values.len() * n_features;
-                    model.predict_margins(
+                    model.predict_margins_from(
                         &data[value_first..value_last],
                         n_features,
                         n_trees,
+                        init.map(|m| &m[first..first + values.len()]),
                         values,
                     )
                 })
@@ -1051,6 +1057,7 @@ fn predict_files_to_parquet(
     header: bool,
     predict_threads: usize,
     missing: f32,
+    init: Option<&[f32]>,
 ) -> PyResult<usize> {
     use crate::tree::SchemaMode;
 
@@ -1201,6 +1208,7 @@ fn predict_files_to_parquet(
         rows_total,
     );
     let mut predict_pool = None;
+    let mut row_offset = 0usize;
     let input_result = py.detach(|| {
         let predictor = inference.cpu_predictor()?;
         crate::source::predict_input::for_each_projected_contiguous_batch(
@@ -1218,7 +1226,18 @@ fn predict_files_to_parquet(
                     n_rows,
                     work_per_row,
                 );
-                let mut batch = score_contiguous_rows(
+                let batch_init = match init {
+                    Some(m) => {
+                        anyhow::ensure!(
+                            row_offset + n_rows <= m.len(),
+                            "base_margin has fewer rows than the data"
+                        );
+                        Some(&m[row_offset..row_offset + n_rows])
+                    }
+                    None => None,
+                };
+                row_offset += n_rows;
+                let mut batch = score_contiguous_rows_from(
                     &predictor,
                     data,
                     n_rows,
@@ -1226,6 +1245,7 @@ fn predict_files_to_parquet(
                     upto,
                     workers,
                     &mut predict_pool,
+                    batch_init,
                 )?;
                 transform_prediction_margins(inner, &mut batch, output_margin);
                 sender
@@ -1257,6 +1277,17 @@ fn predict_files_to_parquet(
         return Err(PyValueError::new_err(format!("{input_error:#}")));
     }
     let rows_read = input_result.expect("checked above");
+    if let Some(m) = init {
+        if m.len() != rows_read {
+            drop(sender);
+            let _ = writer_handle.join();
+            let _ = std::fs::remove_file(&output_path);
+            return Err(PyValueError::new_err(format!(
+                "base_margin has {} values, the files have {rows_read} rows",
+                m.len()
+            )));
+        }
+    }
     if sender.send(PredictionParquetMessage::Finish).is_err() {
         drop(sender);
         return match writer_handle.join() {
@@ -1557,10 +1588,11 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
         missing: f32,
+        init: Option<&[f32]>,
     ) -> PyResult<(usize, Vec<f32>)> {
         let k = self.inner.num_outputs();
         if let Some(specs) = path_specs_of(data)? {
-            let arr = self.predict_files(
+            let arr = self.predict_files_from(
                 py,
                 specs,
                 true,
@@ -1569,6 +1601,7 @@ impl PyModel {
                 predict_threads,
                 use_gpu,
                 missing,
+                init,
             )?;
             let arr = arr
                 .cast::<numpy::PyArray2<f32>>()
@@ -1579,8 +1612,27 @@ impl PyModel {
         let views = self.class_views().map_err(to_py_err)?;
         let upto = n_trees.unwrap_or(self.inner.trees.len());
         let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
+        // A per-row start scores through the array path of each class view.
+        let start_matrix = match init {
+            Some(_) => Some(array_input(py, data)?),
+            None => None,
+        };
         for (c, view) in views.iter().enumerate() {
             let nt = self.inner.class_tree_count(upto, c);
+            if let (Some(x), Some(m)) = (&start_matrix, init) {
+                let col_init: Vec<f32> = m.chunks_exact(k).map(|row| row[c]).collect();
+                let out = view.predict_array_from(
+                    py,
+                    x.clone(),
+                    true,
+                    Some(nt),
+                    predict_threads,
+                    use_gpu,
+                    Some(&col_init),
+                )?;
+                cols.push(out.readonly().as_slice()?.to_vec());
+                continue;
+            }
             let out = view.predict(
                 py,
                 data,
@@ -1596,6 +1648,7 @@ impl PyModel {
                 false,
                 // Array input: the sentinel was already mapped to NaN by `predict`.
                 f64::NAN,
+                None,
             )?;
             let arr = out
                 .cast::<PyArray1<f32>>()
@@ -1625,10 +1678,11 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
         missing: f32,
+        init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // 文件输入:单遍读、按 batch 给每类打分(见 predict_files)。
         if let Some(specs) = path_specs_of(data)? {
-            return self.predict_files(
+            return self.predict_files_from(
                 py,
                 specs,
                 output_margin,
@@ -1637,6 +1691,7 @@ impl PyModel {
                 predict_threads,
                 use_gpu,
                 missing,
+                init,
             );
         }
         let (n, mut margins) = self.multiclass_margins(
@@ -1647,6 +1702,7 @@ impl PyModel {
             predict_threads,
             use_gpu,
             missing,
+            init,
         )?;
         let k = self.inner.num_outputs();
         if !output_margin {
@@ -1684,6 +1740,7 @@ impl PyModel {
         predict_threads: usize,
         prediction_column: &str,
         missing: f32,
+        init: Option<&[f32]>,
     ) -> PyResult<usize> {
         use arrow::array::{ArrayRef, Float32Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1726,6 +1783,7 @@ impl PyModel {
             predict_threads,
             false,
             missing,
+            init,
         )?;
         let file = match std::fs::OpenOptions::new()
             .write(true)
@@ -1812,179 +1870,12 @@ impl PyModel {
         Ok(n)
     }
 
-    fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
-        let mut cache = self
-            .cpu_predictor
-            .lock()
-            .map_err(|_| anyhow::anyhow!("CPU prediction model cache poisoned"))?;
-        if let Some(model) = cache.as_ref() {
-            return Ok(Arc::clone(model));
-        }
-        let model = Arc::new(crate::inference::CpuInferenceModel::new(&self.inner)?);
-        *cache = Some(Arc::clone(&model));
-        Ok(model)
-    }
-
-    fn inference_model(&self) -> anyhow::Result<Arc<crate::inference::CompactInferenceModel>> {
-        let mut cache = self
-            .inference_model
-            .lock()
-            .map_err(|_| anyhow::anyhow!("compact inference model cache poisoned"))?;
-        if let Some(model) = cache.as_ref() {
-            return Ok(Arc::clone(model));
-        }
-        let model = Arc::new(crate::inference::CompactInferenceModel::new(&self.inner)?);
-        *cache = Some(Arc::clone(&model));
-        Ok(model)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn gpu_predictor(
-        &self,
-        device_ordinal: usize,
-    ) -> anyhow::Result<Arc<crate::backend::cuda::GpuInferenceModel>> {
-        let mut cache = self
-            .gpu_predictors
-            .lock()
-            .map_err(|_| anyhow::anyhow!("GPU prediction model cache poisoned"))?;
-        if let Some(predictor) = cache.get(&device_ordinal) {
-            return Ok(Arc::clone(predictor));
-        }
-        let inference = self.inference_model()?;
-        let predictor = Arc::new(crate::backend::cuda::GpuInferenceModel::from_compact(
-            &inference,
-            device_ordinal,
-        )?);
-        cache.insert(device_ordinal, Arc::clone(&predictor));
-        Ok(predictor)
-    }
-}
-
-#[pymethods]
-impl PyModel {
-    /// 预测。`output_margin=True` 给链接函数之前的原始分数。
-    ///
-    /// 和 XGBoost 的 `Booster.predict()` 一样,**默认用全部树**,
-    /// 即使早停记了 best_iteration。要截断传 `n_trees`。
-    #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, use_gpu=false, iteration_range=None,
-                        pred_contribs=false, approx_contribs=false, pred_interactions=false,
-                        pred_leaf=false, missing=f64::NAN))]
-    /// 预测。`data` 可以是:
-    ///
-    /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
-    ///   按模型 schema 绑列(**产品的主路径**);
-    /// * 二维 f32 numpy 数组 —— 仍然支持,小数据方便。
-    ///
-    /// 两条都返回一维 `numpy.ndarray`。
-    #[allow(clippy::too_many_arguments)] // Public Python keyword API must remain unchanged.
-    fn predict<'py>(
-        &self,
-        py: Python<'py>,
-        data: &Bound<'py, PyAny>,
-        output_margin: bool,
-        n_trees: Option<usize>,
-        header: bool,
-        predict_threads: usize,
-        use_gpu: bool,
-        iteration_range: Option<(usize, usize)>,
-        pred_contribs: bool,
-        approx_contribs: bool,
-        pred_interactions: bool,
-        pred_leaf: bool,
-        missing: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        // `missing` (XGBoost semantics): feature values equal to it score as
-        // NaN. Array-likes are normalized (and the sentinel mapped) here, once,
-        // so every branch below sees a plain f32 matrix; file inputs carry the
-        // sentinel into the reader.
-        let missing = crate::source::validate_missing(missing)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        // A pandas DataFrame / pyarrow Table is bound to the model's feature
-        // names (when it has them) before anything else, like evals in training.
-        let data = &bind_named_table(py, data, &self.inner.feature_names)?;
-        let data = &normalize_array_input(py, data, missing)?;
-        // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
-        // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
-        let mut n_trees = n_trees;
-        if let Some(range) = iteration_range {
-            match self.plan_iteration_range(range, n_trees)? {
-                IterationPlan::Prefix(n) => n_trees = Some(n),
-                IterationPlan::Slice(sliced) => {
-                    return sliced.predict(
-                        py,
-                        data,
-                        output_margin,
-                        None,
-                        header,
-                        predict_threads,
-                        use_gpu,
-                        None,
-                        pred_contribs,
-                        approx_contribs,
-                        pred_interactions,
-                        pred_leaf,
-                        f64::from(missing),
-                    );
-                }
-            }
-        }
-        // SHAP contributions / interactions / leaf indices (CPU only; `use_gpu`
-        // does not apply). Single code path for all objectives and inputs.
-        let explain = explain::ExplainRequest {
-            contribs: pred_contribs,
-            approx: approx_contribs,
-            interactions: pred_interactions,
-            leaf: pred_leaf,
-        };
-        if explain.any() {
-            return self.predict_explain(
-                py,
-                data,
-                explain,
-                output_margin,
-                n_trees,
-                header,
-                predict_threads,
-                missing,
-            );
-        }
-        ensure_gpu_prediction_available(use_gpu)?;
-        // The device predictor has no categorical decision: such models score on the CPU.
-        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
-        if self.inner.num_outputs() > 1 {
-            return self.predict_multiclass(
-                py,
-                data,
-                output_margin,
-                n_trees,
-                header,
-                predict_threads,
-                use_gpu,
-                missing,
-            );
-        }
-        // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
-        if let Some(specs) = path_specs_of(data)? {
-            return self.predict_files(
-                py,
-                specs,
-                output_margin,
-                n_trees,
-                header,
-                predict_threads,
-                use_gpu,
-                missing,
-            );
-        }
-        let x: PyReadonlyArray2<'py, f32> = array_input(py, data)?;
-        self.predict_array(py, x, output_margin, n_trees, predict_threads, use_gpu)
-            .map(Bound::into_any)
-    }
-
-    #[pyo3(signature = (x, output_margin=false, n_trees=None, *,
-                        predict_threads=0, use_gpu=false))]
-    fn predict_array<'py>(
+    /// `predict_array` with an optional per-row starting margin (`base_margin`,
+    /// one value per row, single-output models only) in place of the intercept.
+    /// The device predictor has no per-row start, so `use_gpu` with a margin is
+    /// an explicit error rather than a silent CPU fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_array_from<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'py, f32>,
@@ -1992,8 +1883,15 @@ impl PyModel {
         n_trees: Option<usize>,
         predict_threads: usize,
         use_gpu: bool,
+        init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
+            if init.is_some() && use_gpu {
+                return Err(PyValueError::new_err(
+                    "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
+                     start); predict on the CPU",
+                ));
+            }
             ensure_gpu_prediction_available(use_gpu)?;
             // The device predictor has no categorical decision: such models score on the CPU.
             let use_gpu = use_gpu && !self.inner.has_categorical_splits();
@@ -2009,6 +1907,14 @@ impl PyModel {
                     "模型是按 {} 个特征训的,传进来的是 {n_features} 列",
                     self.inner.n_features
                 )));
+            }
+            if let Some(m) = init {
+                if m.len() != n_rows {
+                    return Err(PyValueError::new_err(format!(
+                        "base_margin has {} values, the data has {n_rows} rows",
+                        m.len()
+                    )));
+                }
             }
             // 和训练一样拒绝保留值 f32::MAX(CPU 和 GPU 预测都走这里)。
             let has_max = if x.is_c_contiguous() {
@@ -2084,12 +1990,22 @@ impl PyModel {
             // Only C-contiguous input may use the zero-copy row-major fast path.
             // Other layouts are enumerated logically, so storage order is never
             // interpreted as row-major.
-            let out = if x.is_c_contiguous() {
-                let data = x.as_slice()?;
+            // A per-row start always goes through the blocked contiguous scorer;
+            // a non-contiguous array is gathered once (O(rows x features)).
+            let gathered: Vec<f32>;
+            let contiguous: Option<&[f32]> = if x.is_c_contiguous() {
+                Some(x.as_slice()?)
+            } else if init.is_some() {
+                gathered = x.as_array().iter().copied().collect();
+                Some(&gathered)
+            } else {
+                None
+            };
+            let out = if let Some(data) = contiguous {
                 let predictor = self.cpu_predictor().map_err(to_py_err)?;
                 py.detach(|| {
-                    let mut out = score_contiguous_rows(
-                        &predictor, data, n_rows, n_features, upto, workers, &mut pool,
+                    let mut out = score_contiguous_rows_from(
+                        &predictor, data, n_rows, n_features, upto, workers, &mut pool, init,
                     )?;
                     transform_prediction_margins(&self.inner, &mut out, output_margin);
                     Ok(out)
@@ -2109,19 +2025,12 @@ impl PyModel {
         })
     }
 
-    /// 存成 XGBoost 能加载的 JSON。
-    /// 文件预测。`path_specs` 和训练接受的写法完全一样(单文件、列表、
-    /// 目录、glob),复用同一套发现 / 排序 / 格式判定 —— **不另起一套路径解析**。
-    ///
-    /// 输出恒为 1 维 `numpy.ndarray`,长度等于所有输入文件的总行数,
-    /// 顺序就是文件顺序(字典序)加文件内行序。
-    ///
-    /// ⚠️ **不需要标签列。** 标签是训练期元信息;文件里带着也不影响,
-    /// 因为选列是按模型的特征名单来的,不是"除某列外全要"。
-    #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true, *,
-                        predict_threads=0, use_gpu=false, missing=f32::NAN))]
-    #[allow(clippy::too_many_arguments)] // Keep the installed public keyword API stable.
-    fn predict_files<'py>(
+    /// `predict_files` with an optional per-row starting margin (`base_margin`,
+    /// row-major `rows x num_outputs` over all inputs in file order) replacing
+    /// the intercept. The device predictor has no per-row start, so `use_gpu`
+    /// with a margin is an explicit error.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_files_from<'py>(
         &self,
         py: Python<'py>,
         path_specs: Vec<String>,
@@ -2131,8 +2040,15 @@ impl PyModel {
         predict_threads: usize,
         use_gpu: bool,
         missing: f32,
+        init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
         use crate::tree::SchemaMode;
+        if init.is_some() && use_gpu {
+            return Err(PyValueError::new_err(
+                "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
+                 start); predict on the CPU",
+            ));
+        }
         ensure_gpu_prediction_available(use_gpu)?;
         // The device predictor has no categorical decision: such models score on the CPU.
         let use_gpu = use_gpu && !self.inner.has_categorical_splits();
@@ -2260,6 +2176,7 @@ impl PyModel {
             rows_total,
         );
         let mut predict_pool = None;
+        let mut row_offset = 0usize;
         let rows = py
             .detach(|| {
                 #[cfg(feature = "cuda")]
@@ -2274,6 +2191,20 @@ impl PyModel {
                     ingest_workers,
                     missing,
                     |data, n_rows| {
+                        // This batch's slice of the per-row start (row-major
+                        // `n_rows x k_out`); batches arrive in file/row order.
+                        let batch_init = match init {
+                            Some(m) => {
+                                let (lo, hi) = (row_offset * k_out, (row_offset + n_rows) * k_out);
+                                anyhow::ensure!(
+                                    hi <= m.len(),
+                                    "base_margin has fewer rows than the data"
+                                );
+                                Some(&m[lo..hi])
+                            }
+                            None => None,
+                        };
+                        row_offset += n_rows;
                         let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
                             gpu_prediction_selected(use_gpu, n_rows, n_features, work_per_row)
                         });
@@ -2299,11 +2230,14 @@ impl PyModel {
                                     )?;
                                     &gathered
                                 };
+                                let col_init: Option<Vec<f32>> = batch_init.map(|m| {
+                                    m.chunks_exact(k_out).map(|row| row[c]).collect()
+                                });
                                 #[cfg(feature = "cuda")]
                                 let col = if gpu_batch {
                                     view.gpu_predictor(0)?.predict_margins(vdata, n_rows, nt)?
                                 } else {
-                                    score_contiguous_rows(
+                                    score_contiguous_rows_from(
                                         &*vinf.cpu_predictor()?,
                                         vdata,
                                         n_rows,
@@ -2311,12 +2245,13 @@ impl PyModel {
                                         nt,
                                         workers,
                                         &mut predict_pool,
+                                        col_init.as_deref(),
                                     )?
                                 };
                                 #[cfg(not(feature = "cuda"))]
                                 let col = {
                                     let _ = (gpu_batch, view);
-                                    score_contiguous_rows(
+                                    score_contiguous_rows_from(
                                         &*vinf.cpu_predictor()?,
                                         vdata,
                                         n_rows,
@@ -2324,6 +2259,7 @@ impl PyModel {
                                         nt,
                                         workers,
                                         &mut predict_pool,
+                                        col_init.as_deref(),
                                     )?
                                 };
                                 for (i, v) in col.into_iter().enumerate() {
@@ -2380,7 +2316,7 @@ impl PyModel {
                                 predictor
                             }
                         };
-                        let mut batch = score_contiguous_rows(
+                        let mut batch = score_contiguous_rows_from(
                             &predictor,
                             data,
                             n_rows,
@@ -2388,6 +2324,7 @@ impl PyModel {
                             upto,
                             workers,
                             &mut predict_pool,
+                            batch_init,
                         )?;
                         transform_prediction_margins(inner, &mut batch, output_margin);
                         // Batch completion order is irrelevant: the reader yields
@@ -2400,6 +2337,14 @@ impl PyModel {
             })
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
         reporter.complete(rows);
+        if let Some(m) = init {
+            if m.len() != rows * k_out {
+                return Err(PyValueError::new_err(format!(
+                    "base_margin has {} values, the files have {rows} rows x {k_out} outputs",
+                    m.len()
+                )));
+            }
+        }
         let two_d = k_out > 1
             && (output_margin
                 || !matches!(
@@ -2416,12 +2361,245 @@ impl PyModel {
         Ok(PyArray1::from_vec(py, out).into_any())
     }
 
+    fn cpu_predictor(&self) -> anyhow::Result<Arc<crate::inference::CpuInferenceModel>> {
+        let mut cache = self
+            .cpu_predictor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU prediction model cache poisoned"))?;
+        if let Some(model) = cache.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(crate::inference::CpuInferenceModel::new(&self.inner)?);
+        *cache = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
+    fn inference_model(&self) -> anyhow::Result<Arc<crate::inference::CompactInferenceModel>> {
+        let mut cache = self
+            .inference_model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compact inference model cache poisoned"))?;
+        if let Some(model) = cache.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(crate::inference::CompactInferenceModel::new(&self.inner)?);
+        *cache = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn gpu_predictor(
+        &self,
+        device_ordinal: usize,
+    ) -> anyhow::Result<Arc<crate::backend::cuda::GpuInferenceModel>> {
+        let mut cache = self
+            .gpu_predictors
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU prediction model cache poisoned"))?;
+        if let Some(predictor) = cache.get(&device_ordinal) {
+            return Ok(Arc::clone(predictor));
+        }
+        let inference = self.inference_model()?;
+        let predictor = Arc::new(crate::backend::cuda::GpuInferenceModel::from_compact(
+            &inference,
+            device_ordinal,
+        )?);
+        cache.insert(device_ordinal, Arc::clone(&predictor));
+        Ok(predictor)
+    }
+}
+
+#[pymethods]
+impl PyModel {
+    /// 预测。`output_margin=True` 给链接函数之前的原始分数。
+    ///
+    /// 和 XGBoost 的 `Booster.predict()` 一样,**默认用全部树**,
+    /// 即使早停记了 best_iteration。要截断传 `n_trees`。
+    #[pyo3(signature = (data, output_margin=false, n_trees=None, header=true, *,
+                        predict_threads=0, use_gpu=false, iteration_range=None,
+                        pred_contribs=false, approx_contribs=false, pred_interactions=false,
+                        pred_leaf=false, missing=f64::NAN, base_margin=None))]
+    /// 预测。`data` 可以是:
+    ///
+    /// * 文件路径 / 路径列表 / 目录 / glob —— 走 Rust 的文件路径,
+    ///   按模型 schema 绑列(**产品的主路径**);
+    /// * 二维 f32 numpy 数组 —— 仍然支持,小数据方便。
+    ///
+    /// 两条都返回一维 `numpy.ndarray`。
+    #[allow(clippy::too_many_arguments)] // Public Python keyword API must remain unchanged.
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
+        iteration_range: Option<(usize, usize)>,
+        pred_contribs: bool,
+        approx_contribs: bool,
+        pred_interactions: bool,
+        pred_leaf: bool,
+        missing: f64,
+        base_margin: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // `missing` (XGBoost semantics): feature values equal to it score as
+        // NaN. Array-likes are normalized (and the sentinel mapped) here, once,
+        // so every branch below sees a plain f32 matrix; file inputs carry the
+        // sentinel into the reader.
+        let missing = crate::source::validate_missing(missing)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // A pandas DataFrame / pyarrow Table is bound to the model's feature
+        // names (when it has them) before anything else, like evals in training.
+        let data = &bind_named_table(py, data, &self.inner.feature_names)?;
+        let data = &normalize_array_input(py, data, missing)?;
+        // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
+        // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
+        let mut n_trees = n_trees;
+        if let Some(range) = iteration_range {
+            match self.plan_iteration_range(range, n_trees)? {
+                IterationPlan::Prefix(n) => n_trees = Some(n),
+                IterationPlan::Slice(sliced) => {
+                    return sliced.predict(
+                        py,
+                        data,
+                        output_margin,
+                        None,
+                        header,
+                        predict_threads,
+                        use_gpu,
+                        None,
+                        pred_contribs,
+                        approx_contribs,
+                        pred_interactions,
+                        pred_leaf,
+                        f64::from(missing),
+                        base_margin,
+                    );
+                }
+            }
+        }
+        // `base_margin` (XGBoost semantics): a per-row starting margin that
+        // replaces the model's intercept. Resolved once into row-major
+        // `rows x num_outputs` values; every path below consumes the same slice.
+        let margin_values: Option<Vec<f32>> = match base_margin {
+            Some(bm) if !bm.is_none() => Some(self.resolve_predict_margin(py, data, bm, header)?),
+            _ => None,
+        };
+        let init = margin_values.as_deref();
+        // SHAP contributions / interactions / leaf indices (CPU only; `use_gpu`
+        // does not apply). Single code path for all objectives and inputs.
+        let explain = explain::ExplainRequest {
+            contribs: pred_contribs,
+            approx: approx_contribs,
+            interactions: pred_interactions,
+            leaf: pred_leaf,
+        };
+        if explain.any() {
+            return self.predict_explain(
+                py,
+                data,
+                explain,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                missing,
+                init,
+            );
+        }
+        ensure_gpu_prediction_available(use_gpu)?;
+        // The device predictor has no categorical decision: such models score on the CPU.
+        let use_gpu = use_gpu && !self.inner.has_categorical_splits();
+        if self.inner.num_outputs() > 1 {
+            return self.predict_multiclass(
+                py,
+                data,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+                missing,
+                init,
+            );
+        }
+        // 先认路径:字符串 / PathLike / 它们的序列。认不出来才当数组。
+        if let Some(specs) = path_specs_of(data)? {
+            return self.predict_files_from(
+                py,
+                specs,
+                output_margin,
+                n_trees,
+                header,
+                predict_threads,
+                use_gpu,
+                missing,
+                init,
+            );
+        }
+        let x: PyReadonlyArray2<'py, f32> = array_input(py, data)?;
+        self.predict_array_from(py, x, output_margin, n_trees, predict_threads, use_gpu, init)
+            .map(Bound::into_any)
+    }
+
+    #[pyo3(signature = (x, output_margin=false, n_trees=None, *,
+                        predict_threads=0, use_gpu=false))]
+    fn predict_array<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        predict_threads: usize,
+        use_gpu: bool,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        self.predict_array_from(py, x, output_margin, n_trees, predict_threads, use_gpu, None)
+    }
+
+    /// 存成 XGBoost 能加载的 JSON。
+    /// 文件预测。`path_specs` 和训练接受的写法完全一样(单文件、列表、
+    /// 目录、glob),复用同一套发现 / 排序 / 格式判定 —— **不另起一套路径解析**。
+    ///
+    /// 输出恒为 1 维 `numpy.ndarray`,长度等于所有输入文件的总行数,
+    /// 顺序就是文件顺序(字典序)加文件内行序。
+    ///
+    /// ⚠️ **不需要标签列。** 标签是训练期元信息;文件里带着也不影响,
+    /// 因为选列是按模型的特征名单来的,不是"除某列外全要"。
+    #[pyo3(signature = (path_specs, output_margin=false, n_trees=None, header=true, *,
+                        predict_threads=0, use_gpu=false, missing=f32::NAN))]
+    #[allow(clippy::too_many_arguments)] // Keep the installed public keyword API stable.
+    fn predict_files<'py>(
+        &self,
+        py: Python<'py>,
+        path_specs: Vec<String>,
+        output_margin: bool,
+        n_trees: Option<usize>,
+        header: bool,
+        predict_threads: usize,
+        use_gpu: bool,
+        missing: f32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.predict_files_from(
+            py,
+            path_specs,
+            output_margin,
+            n_trees,
+            header,
+            predict_threads,
+            use_gpu,
+            missing,
+            None,
+        )
+    }
+
     /// Stream file prediction directly to one Parquet file. CPU scoring uses
     /// deterministic row-parallel workers; one ordered writer thread overlaps
     /// Parquet encoding/output with the next ingest/score batch.
     #[pyo3(signature = (data, output_path, output_margin=false, n_trees=None, header=true, *,
                         predict_threads=0, prediction_column="prediction",
-                        iteration_range=None, missing=f64::NAN))]
+                        iteration_range=None, missing=f64::NAN, base_margin=None))]
     #[allow(clippy::too_many_arguments)] // Public output/lifecycle options are independently specified.
     fn predict_to_parquet(
         &self,
@@ -2435,6 +2613,7 @@ impl PyModel {
         prediction_column: &str,
         iteration_range: Option<(usize, usize)>,
         missing: f64,
+        base_margin: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<usize> {
         let missing = crate::source::validate_missing(missing)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -2454,6 +2633,7 @@ impl PyModel {
                         prediction_column,
                         None,
                         f64::from(missing),
+                        base_margin,
                     );
                 }
             }
@@ -2464,6 +2644,14 @@ impl PyModel {
                     "predict_to_parquet 只接受文件路径、路径列表、目录或 glob 输入",
                 )
             })?;
+            // A per-row starting margin is read from file column(s) next to the features.
+            let margin_values: Option<Vec<f32>> = match base_margin {
+                Some(bm) if !bm.is_none() => {
+                    Some(self.resolve_predict_margin(py, data, bm, header)?)
+                }
+                _ => None,
+            };
+            let init = margin_values.as_deref();
             if self.inner.num_outputs() > 1 {
                 return self.multiclass_to_parquet(
                     py,
@@ -2475,6 +2663,7 @@ impl PyModel {
                     predict_threads,
                     prediction_column,
                     missing,
+                    init,
                 );
             }
             predict_files_to_parquet(
@@ -2488,6 +2677,7 @@ impl PyModel {
                 header,
                 predict_threads,
                 missing,
+                init,
             )
         })
     }
@@ -2576,6 +2766,12 @@ impl PyModel {
     #[getter]
     fn n_features(&self) -> usize {
         self.inner.n_features
+    }
+
+    /// The model's feature names (empty for a positional model: numpy input).
+    #[getter]
+    fn feature_names(&self) -> Vec<String> {
+        self.inner.feature_names.clone()
     }
 
     /// XGBoost objective 名字(如 `binary:logistic`)。
@@ -3200,7 +3396,8 @@ fn check_categorical_codes(
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None, weight=None, feature_names=None))]
+                    verbose_eval=None, callbacks=None, weight=None, feature_names=None,
+                    base_margin=None, eval_base_margins=None, prior_model=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_dense(
     py: Python<'_>,
@@ -3213,6 +3410,13 @@ fn train_dense(
     callbacks: Option<&Bound<'_, PyList>>,
     weight: Option<PyReadonlyArray1<'_, f32>>,
     feature_names: Option<Vec<String>>,
+    // Per-row starting margin `(rows, num_outputs)` (for continuation: the
+    // prior model's margin on this data); one entry per eval set in
+    // `eval_base_margins`, `None` for a set that starts from the intercept.
+    base_margin: Option<PyReadonlyArray2<'_, f32>>,
+    eval_base_margins: Option<&Bound<'_, PyList>>,
+    // Training continuation: trees, intercept and metadata carried over.
+    prior_model: Option<PyRef<'_, PyModel>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
@@ -3315,7 +3519,30 @@ fn train_dense(
     let device = cfg.device;
     // numpy 入口没有列名:只接受按位置的约束(Python 层已把 pyarrow 列名解析掉)。
     cfg.resolve_monotone(n_features, &[])?;
-    let (train_cfg, lower_is_better) = cfg.train_config()?;
+    let (mut train_cfg, lower_is_better) = cfg.train_config()?;
+    let k_out = train_cfg.objective.num_outputs();
+    if let Some(bm) = &base_margin {
+        train_cfg.base_margin = Some(margin::class_major_margin(bm, n_rows, k_out, "base_margin")?);
+    }
+    if let Some(list) = eval_base_margins {
+        for (i, item) in list.iter().enumerate() {
+            let rows = eval_data.get(i).map_or(0, |e| e.1.n_rows());
+            train_cfg.eval_base_margins.push(if item.is_none() {
+                None
+            } else {
+                let m: PyReadonlyArray2<f32> = item.extract()?;
+                Some(margin::class_major_margin(
+                    &m,
+                    rows,
+                    k_out,
+                    &format!("eval set {:?} base_margin", eval_data[i].0),
+                )?)
+            });
+        }
+    }
+    if let Some(prior) = &prior_model {
+        train_cfg.prior_model = Some(prior.inner.clone());
+    }
     let Callbacks {
         list: mut cbs,
         history: handle,
@@ -3413,6 +3640,7 @@ fn train_dense(
             names
         }
     };
+    let feature_names = margin::continued_feature_names(prior_model.as_deref(), feature_names)?;
     Ok(finish(
         model,
         handle,
@@ -3426,7 +3654,8 @@ fn train_dense(
 /// 文件入口。**格式由 Rust 从解析出的文件判定**,不再由 Python 按后缀猜。
 #[pyfunction]
 #[pyo3(signature = (path_specs, label, params, header=true, evals=None, early_stopping_rounds=None,
-                    verbose_eval=None, callbacks=None, weight=None))]
+                    verbose_eval=None, callbacks=None, weight=None, base_margin=None,
+                    start_margin=None, eval_start_margins=None, prior_model=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_file(
     py: Python<'_>,
@@ -3442,6 +3671,14 @@ fn train_file(
     verbose_eval: Option<usize>,
     callbacks: Option<&Bound<'_, PyList>>,
     weight: Option<&Bound<'_, PyAny>>,
+    // `base_margin`: file column name(s) holding the per-row starting margin
+    // (one per output), excluded from the features like the label / weight.
+    // `start_margin` / `eval_start_margins`: explicit `(rows, outputs)` arrays
+    // that take precedence (continuation passes the prior model's margins).
+    base_margin: Option<&Bound<'_, PyAny>>,
+    start_margin: Option<&Bound<'_, PyAny>>,
+    eval_start_margins: Option<&Bound<'_, PyList>>,
+    prior_model: Option<PyRef<'_, PyModel>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
@@ -3516,8 +3753,23 @@ fn train_file(
             )
         }
     };
+    let k_out = cfg.objective.num_outputs();
+    let margin_names: Vec<String> = match base_margin {
+        Some(v) if !v.is_none() => {
+            margin::file_margin_names(v, k_out, header, csv_preflight.as_deref(), label)?
+        }
+        _ => Vec::new(),
+    };
+    if let (Some(w), true) = (weight_owned.as_deref(), !margin_names.is_empty()) {
+        if margin_names.iter().any(|n| n == w) {
+            return Err(PyValueError::new_err(format!(
+                "the base_margin column and the weight column cannot be the same ({w:?})"
+            )));
+        }
+    }
     let targets = crate::source::Targets::new(label, weight_owned.as_deref())
-        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        .map_err(|e| PyValueError::new_err(format!("{e}")))?
+        .with_base_margin(&margin_names);
     // **peek schema → 定 blocking → 才真正 open**。Parquet / CSV 在 open
     // 之前不知道特征数,而自动选块宽需要它;单独 peek 一次(只读 footer /
     // 只推断 schema,不解压数据)就能把策略决定留在这一层,
@@ -3679,7 +3931,9 @@ fn train_file(
     if fmt == "parquet" && paths.len() == 1 {
         let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         cfg.resolve_monotone(n_features, &names)?;
-        let (train_cfg, lower_is_better) = cfg.train_config()?;
+        margin::continued_feature_names(prior_model.as_deref(), names.clone())?;
+        let (mut train_cfg, lower_is_better) = cfg.train_config()?;
+        train_cfg.prior_model = prior_model.as_ref().map(|p| p.inner.clone());
         let Callbacks {
             list: mut cbs,
             history: handle,
@@ -3728,9 +3982,11 @@ fn train_file(
         let weights = read_weights(path)?;
         ingest_reporter.complete(src.n_rows());
         let mut eval_data = Vec::new();
+        let mut eval_paths: Vec<String> = Vec::new();
         if let Some(list) = evals {
             for item in list.iter() {
                 let (p, name): (String, String) = item.extract()?;
+                eval_paths.push(p.clone());
                 // 验证集继承**预算**但绝不继承 **cache_path**:它的量化
                 // 结果和训练集不同,共用一个目录会互相覆盖(而且下次复用
                 // 时校验会直接报错)。给它自己的路径要用户显式指定。
@@ -3749,6 +4005,29 @@ fn train_file(
                 let ew = read_weights(&p)?;
                 eval_data.push((name, d, ew));
             }
+        }
+        // Starting margins (see `margin::dataset_margin`): train, then each eval.
+        train_cfg.base_margin = margin::dataset_margin(
+            start_margin,
+            &resolved,
+            &margin_names,
+            header,
+            src.n_rows(),
+            k_out,
+            "training set",
+        )?;
+        for (i, (name, (_, l), _)) in eval_data.iter().enumerate() {
+            let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            train_cfg.eval_base_margins.push(margin::dataset_margin(
+                margin::list_item(eval_start_margins, i)?.as_ref(),
+                &eval_resolved,
+                &margin_names,
+                header,
+                l.len(),
+                k_out,
+                &format!("eval set {name:?}"),
+            )?);
         }
         let evals_ref: Vec<EvalSet> = eval_data
             .iter()
@@ -3808,6 +4087,7 @@ fn train_file(
         }
         raise_callback_error(&cb_error)?;
         // 命名模式:列名取自 parquet schema,标签列已排除(分支开头已读出)。
+        let names = margin::continued_feature_names(prior_model.as_deref(), names)?;
         return Ok(finish(
             model,
             handle,
@@ -3836,7 +4116,9 @@ fn train_file(
         apply_resolved_geometry(&mut cfg, &completed);
     }
     cfg.resolve_monotone(n_features, &ds.feature_names)?;
-    let (train_cfg, lower_is_better) = cfg.train_config()?;
+    margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
+    let (mut train_cfg, lower_is_better) = cfg.train_config()?;
+    train_cfg.prior_model = prior_model.as_ref().map(|p| p.inner.clone());
     let Callbacks {
         list: mut cbs,
         history: handle,
@@ -3855,13 +4137,37 @@ fn train_file(
         );
     }
     let mut eval_data = Vec::new();
+    let mut eval_paths: Vec<String> = Vec::new();
     if let Some(list) = evals {
         for item in list.iter() {
             let (p, name): (String, String) = item.extract()?;
             let d = open_spec(&p, &ds.feature_names, Some(ds.source.cuts().clone()))
                 .map_err(to_py_err)?;
+            eval_paths.push(p);
             eval_data.push((name, d));
         }
+    }
+    train_cfg.base_margin = margin::dataset_margin(
+        start_margin,
+        &resolved,
+        &margin_names,
+        header,
+        ds.source.n_rows(),
+        k_out,
+        "training set",
+    )?;
+    for (i, (name, d)) in eval_data.iter().enumerate() {
+        let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        train_cfg.eval_base_margins.push(margin::dataset_margin(
+            margin::list_item(eval_start_margins, i)?.as_ref(),
+            &eval_resolved,
+            &margin_names,
+            header,
+            d.labels.len(),
+            k_out,
+            &format!("eval set {name:?}"),
+        )?);
     }
     let evals_ref: Vec<EvalSet> = eval_data
         .iter()
@@ -3923,10 +4229,11 @@ fn train_file(
         );
     }
     raise_callback_error(&cb_error)?;
+    let names = margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
     Ok(finish(
         model,
         handle,
-        ds.feature_names.clone(),
+        names,
         cfg.quiet,
         cfg.model_io_threads,
         cfg.ingest_threads,
