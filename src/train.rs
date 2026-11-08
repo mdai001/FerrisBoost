@@ -2807,7 +2807,10 @@ fn build_tree(
     // GPU resident 的块保持原样(整块常驻,采样只影响 compute);
     // 其余块允许按采样列压实,从而在 source 侧就少读。
     let resident_upto = gpu.map_or(0, |c| c.resident_block_count());
-    let compact_gpu_hist = gpu.is_some_and(|c| c.supports_compact_column_histogram());
+    // 直方图只建采样中的列:CPU 恒如此(内核按列切片取列,不需要压实块),
+    // column-major GPU 视后端能力而定。没采样的列根本不进 split 枚举,
+    // 给它们建直方图是纯白算 —— colsample_bytree=0.6 时那是近一半的累加。
+    let compact_hist = gpu.map_or(true, |c| c.supports_compact_column_histogram());
     let supports_cols = source.supports_column_selection();
     let plans: Vec<BlockPlan> = match sampled {
         Some(sel) => crate::colsample::required_blocks(sel, &all_block_feats)
@@ -2827,7 +2830,7 @@ fn build_tree(
                 } else {
                     all_block_feats[physical].clone()
                 };
-                let hist_feats = if compact_gpu_hist {
+                let hist_feats = if compact_hist {
                     sampled_global.clone()
                 } else {
                     handed_feats.clone()
@@ -3165,13 +3168,20 @@ fn build_tree(
                     } else {
                         let block = block.context("CPU histogram requires source payload")?;
                         let _t = prof::Timer::new(&prof::HIST);
+                        // `hist_feats` 的每一列在交回块里的位置:整块交回时是
+                        // 采样列的原始局部下标,压实块或不采样时就是全部列。
+                        let all_cols =
+                            hist::block_columns(&block.data, block.n_rows, block.n_feats());
+                        let cols: Vec<&[Bin]> = match selected_local {
+                            Some(sel) => sel.iter().map(|&l| all_cols[l]).collect(),
+                            None => all_cols,
+                        };
+                        debug_assert_eq!(cols.len(), plan.hist_feats.len());
                         if depth == 0 && !drop_zero_rows {
                             // 根节点走 None 那条路:少一层行下标的间接寻址,
                             // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                            hist::build(
-                                &block.data,
-                                block.n_rows,
-                                block.n_feats(),
+                            hist::build_cols(
+                                &cols,
                                 &plan.hist_offsets,
                                 gpair,
                                 None,
@@ -3188,14 +3198,7 @@ fn build_tree(
                                 .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
                                 .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
                                 .collect();
-                            hist::build_nodes(
-                                &block.data,
-                                block.n_rows,
-                                block.n_feats(),
-                                &plan.hist_offsets,
-                                gpair,
-                                &mut targets,
-                            );
+                            hist::build_nodes_cols(&cols, &plan.hist_offsets, gpair, &mut targets);
                         }
                     }
                     // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
