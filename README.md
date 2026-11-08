@@ -15,32 +15,32 @@ affiliated with or endorsed by the XGBoost project or its maintainers.
 
 In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not by GPU compute kernels, but by host-memory overhead, data ingest, and rigid memory limits. FerrisBoost focuses on reducing ingest, memory, and execution overhead in large tabular workflows:
 
-- **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–8× faster** while slashing peak host RAM by **2–4×** (`0.24–0.48× XGBoost`).
+- **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–4× faster** while cutting peak host RAM by **2–3×** (`0.29–0.47× XGBoost`).
 - **Adaptive VRAM Management**: FerrisBoost's GPU memory planner selects a stable full-residency, hybrid-residency, or streaming plan from the dataset shape and available memory budget. The plan stays fixed during training rather than continuously migrating data between modes.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
 - **Deterministic Parity & Flexible Math Modes**: FerrisBoost provides deterministic training semantics. Use `gpu_math="exact"` (default) for byte-identical CPU/GPU models, or `gpu_math="fast"` for maximum GPU throughput; `fast` is deterministic but does not guarantee byte-identical CPU/GPU models.
-- **File-First Rust Data Pipeline**: Train directly from Parquet, CSV, or CSV.gz (single or partitioned files), PyArrow tables, or NumPy arrays without constructing an intermediate `DMatrix`, `QuantileDMatrix`, or custom iterator. **Parquet is the recommended file format** for production and repeated training or prediction because it preserves typed schemas, supports efficient column projection, and avoids CSV text-parsing overhead. CSV and CSV.gz remain fully supported compatibility inputs for existing pipelines. The Rust CSV path reuses schema preflight, computes cuts and the exact row count on its first pass, then extracts labels and quantizes directly into final column-major buffers on its second pass. File prediction can stream deterministic CPU results directly into one Parquet output without materializing a full NumPy result.
+- **File-First Rust Data Pipeline**: Train directly from Parquet, CSV, or CSV.gz (single or partitioned files), pandas DataFrames, PyArrow tables, or NumPy arrays without constructing an intermediate `DMatrix`, `QuantileDMatrix`, or custom iterator. **Parquet is the recommended file format** for production and repeated training or prediction because it preserves typed schemas, supports efficient column projection, and avoids CSV text-parsing overhead. CSV and CSV.gz remain fully supported compatibility inputs for existing pipelines. The Rust CSV path reuses schema preflight, computes cuts and the exact row count on its first pass, then extracts labels and quantizes directly into final column-major buffers on its second pass. File prediction can stream deterministic CPU results directly into one Parquet output without materializing a full NumPy result.
 
 ## Performance vs XGBoost
 
-FerrisBoost focuses its performance engineering on GPU acceleration, memory efficiency, and data pipelining. The CPU engine is the reference implementation with the supported exactness contract; it has had less performance tuning than the GPU path.
+FerrisBoost focuses its performance engineering on GPU acceleration, memory efficiency, and data pipelining. The CPU engine is the reference implementation with the supported exactness contract.
 
-The following ratios compare FerrisBoost with the corresponding XGBoost backend on standardized HIGGS Parquet and Epsilon CSV workloads. Timing and memory values are **FerrisBoost / XGBoost**, so values below `1.0×` favor FerrisBoost. Accuracy is also **FerrisBoost / XGBoost**, where values close to `1.0×` indicate equivalent predictive quality.
+The following ratios compare FerrisBoost with the corresponding XGBoost backend on standardized HIGGS and Epsilon Parquet workloads, with XGBoost 3.4.1. Timing and memory values are **FerrisBoost / XGBoost**, so values below `1.0×` favor FerrisBoost. Accuracy is also **FerrisBoost / XGBoost**, where values close to `1.0×` indicate equivalent predictive quality.
 
 | Workload | FerrisBoost backend | Setup time | Training time | Setup + training | Peak host RAM | RAM + active VRAM | Accuracy |
 |---|---|---:|---:|---:|---:|---:|---:|
-| HIGGS, narrow Parquet | CPU | **0.29×** | 1.46× | 1.14× | **0.46×** | — | 1.0002× |
-| HIGGS, narrow Parquet | GPU exact | **0.35×** | 2.65× | **0.96×** | **0.43×** | **0.68×** | 0.9999× |
-| HIGGS, narrow Parquet | GPU fast | **0.36×** | **0.97×** | **0.52×** | **0.33×** | **0.65×** | 0.9999× |
-| Epsilon, wide CSV | CPU | **0.14×** | **0.59×** | **0.31×** | **0.42×** | — | 0.9964× |
-| Epsilon, wide CSV | GPU exact | **0.15×** | **0.98×** | **0.19×** | **0.42×** | **0.47×** | 0.9987× |
-| Epsilon, wide CSV | GPU fast | **0.15×** | **0.99×** | **0.19×** | **0.43×** | **0.48×** | 0.9987× |
+| HIGGS, narrow Parquet | CPU | **0.38×** | **0.84×** | **0.68×** | **0.45×** | — | 0.9998× |
+| HIGGS, narrow Parquet | GPU exact | **0.46×** | 1.44× | **0.65×** | **0.47×** | **0.72×** | 0.9995× |
+| HIGGS, narrow Parquet | GPU fast | **0.45×** | **0.73×** | **0.51×** | **0.36×** | **0.68×** | 0.9995× |
+| Epsilon, wide Parquet | CPU | **0.27×** | **0.53×** | **0.44×** | **0.29×** | — | 0.9987× |
+| Epsilon, wide Parquet | GPU exact | **0.28×** | **0.38×** | **0.29×** | **0.32×** | **0.43×** | 0.9996× |
+| Epsilon, wide Parquet | GPU fast | **0.28×** | **0.37×** | **0.29×** | **0.33×** | **0.44×** | 0.9996× |
 
-On these workloads, FerrisBoost used approximately **0.14–0.36×** XGBoost setup time, **0.33–0.46×** peak host RAM, and **0.47–0.68×** combined RAM plus active VRAM on GPU. GPU-fast training used **0.97–0.99×** XGBoost GPU training time, while setup plus GPU-fast training used **0.19–0.52×** total time. Accuracy ratios remained within **0.996–1.001×** of XGBoost.
+On these workloads, FerrisBoost used approximately **0.27–0.46×** XGBoost setup time, **0.29–0.47×** peak host RAM, and **0.43–0.72×** combined RAM plus active VRAM on GPU. CPU training used **0.53–0.84×** XGBoost CPU training time and GPU-fast training **0.37–0.73×** XGBoost GPU training time. Accuracy ratios remained within **0.9987–0.9998×** of XGBoost.
 
-These ratios describe the tested workloads and hardware, not universal performance guarantees. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
+These ratios describe the tested workloads and hardware, not universal performance guarantees. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Training uses row and column subsampling of 0.6. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
 
 ## Install
 
@@ -160,7 +160,7 @@ model = fb.train(params, "train.csv", label=4, header=False)
 prediction = model.predict("test.csv", header=False)
 ```
 
-### Convenience APIs (NumPy & PyArrow)
+### Convenience APIs (NumPy, pandas & PyArrow)
 
 For in-memory arrays or exploratory workflows where data is already loaded in Python:
 
@@ -201,7 +201,7 @@ model = fb.train(
 )
 ```
 
-For scikit-learn pipelines, `FerrisBoostClassifier` and `FerrisBoostRegressor` (in `ferrisboost.sklearn`, also importable from `ferrisboost`) follow the `XGBClassifier` / `XGBRegressor` interface; scikit-learn is an optional dependency. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) are available on any model, including models loaded from XGBoost JSON.
+For scikit-learn pipelines, use `FerrisBoostClassifier` and `FerrisBoostRegressor`, which follow the `XGBClassifier` / `XGBRegressor` interface. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) work on any model, including models loaded from XGBoost.
 
 ### XGBoost Interchange
 
@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** categories are integer codes `0..=253` (at most 254 per feature in this version; a larger limit is planned). GPU training runs the split search for categorical features on the host, and prediction from a categorical model runs on the CPU.
+* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned. On GPU, categorical features train more slowly than numeric ones, and prediction from a categorical model runs on the CPU.
 * **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
