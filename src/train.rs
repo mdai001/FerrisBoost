@@ -3923,13 +3923,21 @@ pub(crate) fn gpu_block_shape(
             }
             BinWidth::U16 => {
                 shape.max_cell_bytes = 2;
+                let (mut cat_feats, mut cat_bins, mut set_words) = (0, 0, 0);
                 for &f in &feats {
                     if cuts.is_categorical(f) {
                         // Two 32-bit words per 64-bit set word (CatBits::words64).
-                        shape.cat_mask_words =
-                            shape.cat_mask_words.max(cuts.n_bins(f).div_ceil(64) * 2);
+                        let words = cuts.n_bins(f).div_ceil(64) * 2;
+                        shape.cat_mask_words = shape.cat_mask_words.max(words);
+                        cat_feats += 1;
+                        cat_bins += cuts.n_bins(f);
+                        set_words += words;
                     }
                 }
+                // Device split buffers of the block's categorical features.
+                shape.wide_cat_feats = shape.wide_cat_feats.max(cat_feats);
+                shape.wide_cat_bins = shape.wide_cat_bins.max(cat_bins);
+                shape.wide_cat_set_words = shape.wide_cat_set_words.max(set_words);
             }
         }
     }

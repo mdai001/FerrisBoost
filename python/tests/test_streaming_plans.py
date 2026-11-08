@@ -358,8 +358,10 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
 # Features with more than 255 bins (max_bin > 255) or more than 254 categories are
 # stored in 16-bit blocks of ceil(cols_per_block / 2) features; 8-bit features keep
 # their own blocks. 16-bit blocks always run column-major on the device (histograms
-# with features wider than one shared-memory tile accumulate in global memory) and
-# are split on the host from their histograms; 8-bit blocks keep their layout.
+# with features wider than one shared-memory tile accumulate in global memory).
+# Resident 16-bit blocks are split by the device split cache (tiled numeric scans,
+# categorical top-k selection of the sorted partition, one-hot); streamed blocks
+# are split on the host from their histograms, like 8-bit ones.
 WIDE_CASES = {
     "numeric_max_bin_1024": dict(max_bin=1024),
     "numeric_max_bin_4096": dict(max_bin=4096),
@@ -367,12 +369,24 @@ WIDE_CASES = {
     "categorical_1000_and_20000": dict(n_cat=2, cat_k=(1000, 20000)),
     # 8-bit categorical and numeric blocks next to 16-bit ones
     "mixed_8_and_16_bit": dict(max_bin=300, n_cat=2, cat_k=(40, 20000)),
+    # sorted partition scanning more than one 256-category selection tile
+    "categorical_multi_tile_partition": dict(n_cat=2, cat_k=(1500, 5000),
+                                             max_cat_threshold=700),
+    # one-hot enumeration over more than 256 categories
+    "categorical_wide_one_hot": dict(n_cat=2, cat_k=(300, 700), max_cat_to_onehot=1000),
+    # monotone constraints (numeric and next to categorical), L1, max_delta_step and
+    # per-node column sampling: the given-weight gain and node masks on wide features
+    "wide_constrained_bynode": dict(max_bin=1024, n_cat=2, cat_k=(600, 3000),
+                                    monotone_constraints={"f0": 1, "f5": -1},
+                                    alpha=0.3, max_delta_step=0.8, colsample_bynode=0.7),
 }
 
 
 def _wide_plan(capfd, p, path, kw, **gpu):
     model, info = _gpu(capfd, p, path, kw, **gpu)
     assert "bins_16bit=col_major" in info["log"], info["log"][-1500:]
+    # the split cache (on by default) takes resident 16-bit blocks on the device
+    assert "wide_split_over_255_bins=device_resident" in info["log"], info["log"][-1500:]
     return model, info
 
 
@@ -385,7 +399,8 @@ def test_wide_bin_blocks_train_the_cpu_model_under_every_plan(tmp_path, capfd, c
     ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
     _, probe = _wide_plan(capfd, p, path, kw, resident_blocks=0)
     total = probe["total"]
-    assert total > LAYOUTS[layout]["blocks"] or case == "categorical_1000_and_20000"
+    # cases without max_bin > 255 add a single 16-bit categorical block
+    assert total > LAYOUTS[layout]["blocks"] or "max_bin" not in WIDE_CASES[case]
     for resident in _plans(total):
         model, info = _wide_plan(capfd, p, path, kw, gpu_math="exact", resident_blocks=resident)
         _check_plan(info, probe["layout"], resident, total)
