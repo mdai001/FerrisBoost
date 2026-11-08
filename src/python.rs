@@ -1088,6 +1088,25 @@ where
     Ok(out)
 }
 
+/// Rows per parallel task of the blocked CPU scorers, or `None` to score on
+/// the calling thread. Tasks cover whole `CPU_PREDICTION_BLOCK_ROWS` row
+/// blocks (a smaller task loses the per-block tree reuse) and at least
+/// `AUTO_PREDICT_MIN_WORK` traversal steps each, the same crossover the
+/// automatic worker count uses. A small batch therefore occupies fewer
+/// workers than requested, or runs serially (waking pool threads costs more
+/// than scoring it); the pool keeps the requested size. Every row is still
+/// scored on its own, in tree order, so the split cannot change a result.
+fn blocked_rows_per_chunk(n_rows: usize, workers: usize, work_per_row: usize) -> Option<usize> {
+    const BLOCK: usize = crate::inference::CPU_PREDICTION_BLOCK_ROWS;
+    let blocks = n_rows.div_ceil(BLOCK);
+    let by_work = n_rows.saturating_mul(work_per_row) / AUTO_PREDICT_MIN_WORK;
+    let chunks = workers.saturating_mul(4).min(blocks).min(by_work);
+    if workers <= 1 || chunks <= 1 {
+        return None;
+    }
+    Some(n_rows.div_ceil(chunks).div_ceil(BLOCK) * BLOCK)
+}
+
 /// Cache-friendly fast path for C-contiguous NumPy input. Parallelism still
 /// owns disjoint deterministic row ranges; inside each range the CPU inference
 /// model blocks rows while preserving every row's original tree-add order. An
@@ -1108,15 +1127,14 @@ fn score_contiguous_rows_from(
     if n_rows == 0 {
         return Ok(out);
     }
-    if workers <= 1 {
+    let Some(rows_per_chunk) = blocked_rows_per_chunk(n_rows, workers, model.work_per_row(n_trees))
+    else {
         model.predict_margins_from(data, n_features, n_trees, init, &mut out)?;
         return Ok(out);
-    }
+    };
     if pool.is_none() {
         *pool = Some(crate::threading::prediction_pool(workers)?);
     }
-    let chunks = workers.saturating_mul(4).max(1);
-    let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
     pool.as_ref()
         .expect("prediction pool just initialized")
         .install(|| {
@@ -1176,13 +1194,12 @@ fn score_contiguous_multi_from(
     if n_rows == 0 {
         return Ok(out);
     }
-    if workers <= 1 {
+    let Some(rows_per_chunk) = blocked_rows_per_chunk(n_rows, workers, model.work_per_row(n_trees))
+    else {
         model.predict_multi_margins_from(data, n_features, n_trees, init, &mut out)?;
         return Ok(out);
-    }
+    };
     let pool = crate::threading::prediction_pool(workers)?;
-    let chunks = workers.saturating_mul(4).max(1);
-    let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
     pool.install(|| {
         out.par_chunks_mut(rows_per_chunk * k)
             .enumerate()

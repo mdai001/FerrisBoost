@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::tree::Model;
 
-const CPU_PREDICTION_BLOCK_ROWS: usize = 64;
+pub(crate) const CPU_PREDICTION_BLOCK_ROWS: usize = 64;
 
 /// Prediction-only CPU tree. Keeping independently accessed fields in separate
 /// arrays avoids pulling training-only gain/Hessian data through L1 while
@@ -425,6 +425,17 @@ impl CpuInferenceModel {
 
     pub(crate) fn n_outputs(&self) -> usize {
         self.n_outputs
+    }
+
+    /// Upper bound of the traversal steps one row takes through the first
+    /// `n_trees` trees (each tree's deepest path, leaf included), the unit of
+    /// the prediction work heuristics.
+    pub(crate) fn work_per_row(&self, n_trees: usize) -> usize {
+        self.trees[..n_trees.min(self.trees.len())]
+            .iter()
+            .map(|tree| tree.max_depth + 1)
+            .sum::<usize>()
+            .max(1)
     }
 
     /// All outputs of a multi-output model in one pass over the rows: `out` is
