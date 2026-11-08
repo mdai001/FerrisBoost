@@ -1399,7 +1399,11 @@ memory budget, without manual chunk or batch tuning:
 - **`gpu_memory_budget`**: Sets the planner's budget for GPU training memory.
   When omitted, the planner derives a budget from currently free VRAM and keeps
   safety headroom. It is not a hard cap on all GPU memory used by this process
-  or by other processes.
+  or by other processes. When you set it together with an explicit
+  `cols_per_block`, `hist_streams` or `resident_blocks`, the planned training
+  memory must fit: an override that needs more raises `ValueError` before
+  training starts, naming the override and the memory it needs. Without a budget,
+  explicit overrides are used as given.
 - **`gpu_math`**: `"exact"` (default) produces a byte-by-byte exact model
   matching CPU training. `"fast"` is deterministic, but CPU and GPU models are
   not guaranteed to be bit-identical; FerrisBoost does not promise universal
@@ -1705,14 +1709,14 @@ empty `evals_result()`.
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `colsample_bylevel` | `1.0` | Per-level feature sampling in `(0, 1]` from the per-tree set; see [Feature sampling](#feature-sampling) |
 | `colsample_bynode` | `1.0` | Per-node feature sampling in `(0, 1]` from the per-level set; see [Feature sampling](#feature-sampling) |
-| `cols_per_block` | automatic | Positive integer; normally leave unset |
+| `cols_per_block` | automatic | Positive integer; normally leave unset. GPU training from CSV / CSV.gz (no row count before reading) defaults to 8 |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
-| `gpu_memory_budget` | automatic | Positive integer planner budget for GPU training memory; auto derives from free VRAM with safety headroom |
+| `gpu_memory_budget` | automatic | Positive integer planner budget for GPU training memory; auto derives from free VRAM with safety headroom. Explicit `cols_per_block` / `hist_streams` / `resident_blocks` that exceed a set budget raise `ValueError` |
 | `gpu_math` | `"exact"` | `"exact"` (byte-by-byte identical to CPU) or deterministic `"fast"` (CPU/GPU models need not be bit-identical); see [Train on GPU](#train-on-gpu) for objective support |
 | `device_quantize` | `True` | Fixed-point gradient/Hessian quantization on GPU; feature binning remains on host/source. `gpu_math="fast"` requires it |
 | `hist_streams` | automatic | Planned by GPU planner based on execution path, block width, and VRAM; override with `1` or `2` |
-| `resident_blocks` | automatic | Number of physical column blocks kept resident on the GPU; `0` means pure streaming. A larger value uses more VRAM and reduces repeated uploads; normally leave unset (the planner chooses and clamps it to the block count) |
+| `resident_blocks` | automatic | Number of physical column blocks kept resident on the GPU; `0` means pure streaming. A larger value uses more VRAM and reduces repeated uploads; normally leave unset (the planner chooses and clamps it to the block count). Must fit `gpu_memory_budget` when one is set |
 | `hist_nodes_per_batch` | automatic | GPU only: number of nodes merged into one histogram launch (`1..=32`, `1` disables merging; the GPU default is 16) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |

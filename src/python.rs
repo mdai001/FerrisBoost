@@ -29,6 +29,13 @@ use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 mod explain;
 mod margin;
 
+/// Block width for GPU file input whose row count is unknown before open
+/// (CSV / CSV.gz) when `cols_per_block` is not given. Conservative: a narrow
+/// width from the planner's candidate set (`gpu_mem_plan::CANDIDATE_WIDTHS`),
+/// so each block slot stays small whatever the row count turns out to be.
+#[cfg(feature = "cuda")]
+const DEFERRED_GPU_COLS_PER_BLOCK: usize = 8;
+
 fn on_off(flag: bool) -> &'static str {
     if flag {
         "on"
@@ -267,6 +274,35 @@ fn resolve_blocking(
             .map_err(to_py_err)?;
             if !cfg.quiet {
                 eprintln!("{}", p.report());
+            }
+            // A user-set gpu_memory_budget is a limit: explicit layout overrides
+            // that push the planned peak past it fail up front instead of
+            // training over budget. Without a budget the overrides win as before.
+            if let Some(budget) = cfg.params.gpu_memory_budget {
+                let usable = p.free_vram.saturating_sub(p.reserve);
+                if p.estimated_peak > usable {
+                    let mut set = Vec::new();
+                    if let Some(c) = cfg.requested_cols_per_block.filter(|c| *c > 0) {
+                        set.push(format!("cols_per_block={c}"));
+                    }
+                    if let Some(n) = cfg.params.hist_streams {
+                        set.push(format!("hist_streams={n}"));
+                    }
+                    if let Some(r) = cfg.params.resident_blocks {
+                        set.push(format!("resident_blocks={r}"));
+                    }
+                    if !set.is_empty() {
+                        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+                        return Err(PyValueError::new_err(format!(
+                            "with {} training needs about {:.1} MB of GPU memory, but gpu_memory_budget={:.1} MB allows {:.1} MB after the {:.1} MB safety reserve; raise the budget or remove the override(s)",
+                            set.join(", "),
+                            mb(p.estimated_peak),
+                            mb(budget as u64),
+                            mb(usable),
+                            mb(p.reserve),
+                        )));
+                    }
+                }
             }
             Ok(BlockingPlan::from_plan(&p, n_features, cfg.params.nthread))
         }
@@ -4233,11 +4269,26 @@ fn train_file(
     let (plan, deferred_gpu_plan) = match (n_rows_peek, cfg.device) {
         #[cfg(feature = "cuda")]
         (None, Some(_)) => {
-            let c = cfg.requested_cols_per_block.filter(|c| *c > 0).ok_or_else(|| {
-                PyValueError::new_err(
-                    "GPU input needs an explicit cols_per_block when the row count is unavailable before open; memory, stream and residency planning finish with the real row count after open",
-                )
-            })?;
+            // Without a pre-open row count (CSV / CSV.gz) the block width cannot be
+            // solved by the memory planner, so an explicit width wins and otherwise
+            // a conservative narrow width is used: narrow blocks keep every slot
+            // small, and streams / residency / the effective budget are still
+            // planned after open with the real row count (a plan that does not fit
+            // fails there, never silently).
+            let c = match cfg.requested_cols_per_block.filter(|c| *c > 0) {
+                Some(c) => c,
+                None => {
+                    if !cfg.quiet {
+                        eprintln!(
+                            "GPU_BLOCKING cols_per_block={DEFERRED_GPU_COLS_PER_BLOCK} (default: row count unknown before open; set cols_per_block to override)"
+                        );
+                    }
+                    // Treat it as the requested width from here on, so the
+                    // post-open plan keeps the geometry the source was built with.
+                    cfg.requested_cols_per_block = Some(DEFERRED_GPU_COLS_PER_BLOCK);
+                    DEFERRED_GPU_COLS_PER_BLOCK
+                }
+            };
             (
                 BlockingPlan::explicit(c, n_features, cfg.params.nthread),
                 true,

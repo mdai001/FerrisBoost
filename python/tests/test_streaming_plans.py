@@ -331,6 +331,28 @@ def test_budget_driven_plans_without_override_train_the_cpu_model(tmp_path, capf
                  path, quiet=True, **kw)
 
 
+
+@cuda
+def test_override_over_a_set_budget_raises_before_training(tmp_path, capfd):
+    """A user-set gpu_memory_budget is a limit: an explicit resident_blocks that
+    needs more memory fails up front; the same override without a budget trains."""
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=2)
+    p = {**p, "hist_streams": 1}
+    estimate = {}
+    for resident in (total, 0):
+        _, info = _gpu(capfd, p, path, kw, resident_blocks=resident)
+        estimate[resident] = float(re.search(r"estimated_peak:\s+([\d.]+) MB",
+                                             info["log"]).group(1))
+    assert estimate[0] < estimate[total]
+    reserve = 512.0
+    budget = int((reserve + (estimate[0] + estimate[total]) / 2) * MB)  # fits streaming only
+    with pytest.raises(ValueError, match=r"resident_blocks=\d+ training needs about"):
+        fb.train({**p, "device": "cuda", "gpu_memory_budget": budget,
+                  "resident_blocks": total}, path, quiet=True, **kw)
+    # The budget alone plans a plan that fits.
+    _, info = _gpu(capfd, p, path, kw, gpu_memory_budget=budget)
+    assert info["residency"] != "full_resident"
+
 @cuda
 def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd):
     path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major",
@@ -437,6 +459,22 @@ def test_wide_bin_blocks_spill_and_stream_like_the_cpu(tmp_path, capfd):
             model, info = _wide_plan(capfd, spill, path, kw, **gpu)
             assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs)
 
+
+@cuda
+def test_gpu_csv_without_cols_per_block_uses_a_default_width(tmp_path, capfd):
+    """CSV has no row count before open: without cols_per_block the GPU path uses
+    a conservative default width (announced in the log) instead of failing, and
+    the model still equals the CPU model."""
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major")
+    p = {k: v for k, v in p.items() if k != "cols_per_block"}
+    csv = str(tmp_path / "data.csv")
+    pq.read_table(path).to_pandas().to_csv(csv, index=False, na_rep="")
+    ref = _bytes(fb.train(p, csv, quiet=True, **kw), tmp_path, "cpu")
+    capfd.readouterr()
+    gpu = fb.train({**p, "device": "cuda"}, csv, **kw)
+    log = capfd.readouterr().err
+    assert "GPU_BLOCKING cols_per_block=8" in log, log[-2000:]
+    assert _bytes(gpu, tmp_path, "gpu") == ref
 
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
