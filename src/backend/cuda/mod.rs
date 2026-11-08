@@ -156,6 +156,15 @@ pub struct SharedHistogramConfig {
     /// `K > 1` 才有内存代价:常驻 prediction 变成 `K × n`,外加每行 softmax 统计量。
     /// 规划器必须用同一个 K(`gpu_mem_plan::fast_multiclass_extra_bytes`)。
     pub n_outputs: usize,
+    /// The training data has categorical features. The resident split cache then
+    /// also allocates the category-set outputs (and 96 B packets) and loads the
+    /// categorical split kernels; the planner prices the same buffers
+    /// (`StreamingMemModel::with_resident_split_cache`).
+    pub has_categorical: bool,
+    /// bylevel / bynode column sampling is active: the resident split cache
+    /// then also allocates a per-(node, column) feature mask
+    /// (`gpu_mem_plan::with_node_feature_masks` prices it).
+    pub node_feature_masks: bool,
 }
 
 impl Default for SharedHistogramConfig {
@@ -176,6 +185,8 @@ impl Default for SharedHistogramConfig {
             gpu_math: crate::types::GpuMath::Exact,
             fast_weights: false,
             n_outputs: 1,
+            has_categorical: false,
+            node_feature_masks: false,
         }
     }
 }

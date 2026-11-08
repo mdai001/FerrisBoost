@@ -291,10 +291,18 @@ fn resolve_blocking(
                             Ok("1") | Ok("true")
                         )
                     {
-                        model.with_resident_split_cache(
-                            max_bin,
-                            cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
-                        )
+                        let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
+                        // Categorical set outputs are reserved unconditionally:
+                        // Arrow dictionary columns make a file input categorical
+                        // without a declaration (tiny: ~0.5 KB / column / slot).
+                        let model = model
+                            .with_resident_split_cache(max_bin, cap)
+                            .with_categorical_split_cache(cap);
+                        if cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0 {
+                            model.with_node_feature_masks(cap)
+                        } else {
+                            model
+                        }
                     } else {
                         model
                     }
@@ -2930,12 +2938,6 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             }
         },
     };
-    // The device split kernels only know ordered bins, so categorical training
-    // keeps the exact host split search and allocates no resident split cache.
-    // Plan memory with the same decision the runtime makes.
-    if parsed.categorical.iter().any(|&c| c) {
-        parsed.params.gpu_split_cache = false;
-    }
     Ok(parsed)
 }
 

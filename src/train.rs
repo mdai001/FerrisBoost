@@ -119,6 +119,7 @@ pub mod prof {
     pub static GPU_SPLIT_CACHE_ADMITTED_NODES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_SPLIT_CACHE_SPILLED_NODES: AtomicU64 = AtomicU64::new(0);
     pub static GPU_SPLIT_EVALUATED_NODES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_SPLIT_CAT_EVALUATED: AtomicU64 = AtomicU64::new(0);
     pub static ROUND_WALL: AtomicU64 = AtomicU64::new(0);
 
     /// partition 的规模:取了多少次列、处理了多少行。
@@ -165,6 +166,7 @@ pub mod prof {
             &GPU_SPLIT_CACHE_ADMITTED_NODES,
             &GPU_SPLIT_CACHE_SPILLED_NODES,
             &GPU_SPLIT_EVALUATED_NODES,
+            &GPU_SPLIT_CAT_EVALUATED,
             &ROUND_WALL,
         ] {
             c.store(0, Ordering::Relaxed);
@@ -366,8 +368,9 @@ pub mod prof {
         let cache_admitted_nodes = GPU_SPLIT_CACHE_ADMITTED_NODES.load(Ordering::Relaxed);
         let cache_spilled_nodes = GPU_SPLIT_CACHE_SPILLED_NODES.load(Ordering::Relaxed);
         let split_evaluated_nodes = GPU_SPLIT_EVALUATED_NODES.load(Ordering::Relaxed);
+        let split_cat_evaluated = GPU_SPLIT_CAT_EVALUATED.load(Ordering::Relaxed);
         eprintln!(
-            "GPU_SPLIT_CACHE parents_hit={cache_parent_hits} parents_miss={cache_parent_misses} admitted_nodes={cache_admitted_nodes} spilled_nodes={cache_spilled_nodes} evaluated_nodes={split_evaluated_nodes}"
+            "GPU_SPLIT_CACHE parents_hit={cache_parent_hits} parents_miss={cache_parent_misses} admitted_nodes={cache_admitted_nodes} spilled_nodes={cache_spilled_nodes} evaluated_nodes={split_evaluated_nodes} categorical_feature_nodes={split_cat_evaluated}"
         );
     }
 
@@ -419,6 +422,7 @@ pub mod prof {
         GPU_SPLIT_CACHE_ADMITTED_NODES.fetch_add(t.cache_admitted_nodes, Ordering::Relaxed);
         GPU_SPLIT_CACHE_SPILLED_NODES.fetch_add(t.cache_spilled_nodes, Ordering::Relaxed);
         GPU_SPLIT_EVALUATED_NODES.fetch_add(t.split_evaluated_nodes, Ordering::Relaxed);
+        GPU_SPLIT_CAT_EVALUATED.fetch_add(t.split_cat_evaluated, Ordering::Relaxed);
 
         // The call site identifies histogram versus partition; the segment
         // itself carries exact counts/bytes from the CUDA boundary.
@@ -1199,11 +1203,13 @@ fn train_with_backend(
                     // 规划之后这个字段保存的是**生效值**(见 TrainParams 文档)。
                     gpu_memory_budget: cfg.params.gpu_memory_budget,
                     hist_nodes_per_batch: cfg.params.hist_nodes_per_batch,
-                    // Categorical features are enumerated on the host (the device
-                    // split kernels only know ordered bins), so a categorical
-                    // training run keeps the exact host fallback and allocates
-                    // no resident split cache. See `gpu_split_cache_enabled`.
-                    gpu_split_cache: gpu_split_cache_enabled(&cfg.params, source.cuts()),
+                    // Categorical features are enumerated by the device split
+                    // cache too (one-hot and sorted-partition kernels); the
+                    // flag adds their set outputs to the cache allocation.
+                    gpu_split_cache: cfg.params.gpu_split_cache,
+                    has_categorical: source.cuts().has_categorical(),
+                    node_feature_masks: cfg.params.colsample_bylevel < 1.0
+                        || cfg.params.colsample_bynode < 1.0,
                     gpu_math: cfg.params.gpu_math,
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
@@ -2452,8 +2458,8 @@ fn build_tree(
         //
         // 层集合每层采一次,节点集合每节点采一次(嵌套:节点 ⊂ 层 ⊂ 树)。
         // 种子只看 (seed, 树, 深度 / 节点号),CPU 与 GPU 同一个集合。
-        // 嵌套采样激活时 GPU 绕开 device split cache(它只有树级的特征掩码),
-        // 改用下载的直方图 + host 枚举 —— 与 cache 路径逐位等价的既有回退。
+        // 嵌套采样激活时 device split cache 按 (节点, 特征) 上传 host 算好的
+        // 字节掩码,与 host 枚举用同一个 `enum_features` 集合。
         let level_set: Option<Vec<FeatId>> = nested.map(|n| n.level_set(&tree_features, depth));
         let node_sets: Option<Vec<Vec<FeatId>>> = match (nested, level_set.as_deref()) {
             (Some(n), Some(ls)) if n.samples_nodes() => Some(
@@ -2584,7 +2590,10 @@ fn build_tree(
                         // 节点也必须走它。
                         let must_batch = session.requires_batched_hist();
                         #[cfg(feature = "cuda")]
-                        if nested.is_none() && session.begin_split_level(depth)? {
+                        if session.begin_split_level(depth)? {
+                            let node_enabled = |node: usize, feat: FeatId| {
+                                enum_features(node).is_none_or(|s| s.binary_search(&feat).is_ok())
+                            };
                             use crate::backend::cuda::GpuSplitGroup;
                             let mut groups = Vec::new();
                             if depth == 0 {
@@ -2615,6 +2624,12 @@ fn build_tree(
                                 &groups,
                                 &plan.hist_feats,
                                 sampled,
+                                cuts.has_categorical().then(|| cuts.categorical_flags()),
+                                // bylevel / bynode: the level node's feature set is
+                                // the host's `enum_features`, uploaded as a byte mask.
+                                nested
+                                    .is_some()
+                                    .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
                                 q,
                                 p,
                                 depth + 1 < p.max_depth,
@@ -3277,19 +3292,6 @@ fn identity_rows(n: usize) -> Vec<RowId> {
             }
         });
     rows
-}
-
-/// Whether the bounded resident GPU split cache is used for this run.
-///
-/// The device split kernels enumerate ordered bins only. A categorical
-/// feature needs XGBoost's one-hot / sorted-partition enumeration, which runs
-/// on the host over the downloaded histograms (the same exact fallback that
-/// already serves cache overflow and streaming). Keeping that single code path
-/// is what makes `gpu_math = "exact"` byte-identical to the CPU for
-/// categorical data; the price is one histogram download per node, so a
-/// categorical GPU run does not get the split-cache speedup.
-pub fn gpu_split_cache_enabled(params: &TrainParams, cuts: &BinCuts) -> bool {
-    params.gpu_split_cache && !cuts.has_categorical()
 }
 
 /// 约束模式下 split 枚举要的上下文;没有非 0 约束时是 `None`(无约束路径)。

@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** categories are integer codes `0..=254` (at most 255 per feature). GPU training runs the split search for categorical features on the host, and prediction from a categorical model runs on the CPU.
+* **Categorical features:** categories are integer codes `0..=254` (at most 255 per feature). Prediction from a categorical model runs on the CPU.
 * **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -245,6 +245,10 @@ Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
+
+### 0.0.7 (unreleased)
+
+- GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6 (unreleased)
 

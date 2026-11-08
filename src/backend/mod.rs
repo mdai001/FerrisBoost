@@ -33,6 +33,8 @@ pub mod cuda {
         pub gpu_math: crate::types::GpuMath,
         pub fast_weights: bool,
         pub n_outputs: usize,
+        pub has_categorical: bool,
+        pub node_feature_masks: bool,
     }
     impl Default for SharedHistogramConfig {
         fn default() -> Self {
@@ -47,6 +49,8 @@ pub mod cuda {
                 gpu_math: crate::types::GpuMath::Exact,
                 fast_weights: false,
                 n_outputs: 1,
+                has_categorical: false,
+                node_feature_masks: false,
             }
         }
     }
@@ -89,6 +93,7 @@ pub mod cuda {
         pub cache_admitted_nodes: u64,
         pub cache_spilled_nodes: u64,
         pub split_evaluated_nodes: u64,
+        pub split_cat_evaluated: u64,
     }
     impl GpuSegmentTiming {
         pub fn h2d_ms(&self) -> f32 {

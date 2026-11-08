@@ -9,6 +9,16 @@ struct SplitPacket {
     float left_weight, right_weight, left_hess, right_hess;
 };
 static_assert(sizeof(SplitPacket) == 64, "split packet ABI");
+// Categorical split capacity. One CTA handles one feature with one thread per
+// bin, so a categorical feature may have up to SPLIT_CTA_THREADS bins, and a
+// category set is CAT_SET_WORDS 32-bit words (a bitset over those bins). Both
+// size the shared scratch, the per-winner set output and the packet tail, and
+// must match `gpu_mem_plan::CAT_SET_WORDS` (checked by a unit test). Wider
+// categorical features (more than SPLIT_CTA_THREADS bins) need these raised
+// and the per-thread bin loops below turned into strided loops.
+#define SPLIT_CTA_THREADS 256
+#define CAT_SET_WORDS 8
+static_assert(CAT_SET_WORDS * 32 >= SPLIT_CTA_THREADS, "set must cover every bin");
 __device__ SplitPair split_add(SplitPair a, SplitPair b) {
     return {(int64_t)((uint64_t)a.grad + (uint64_t)b.grad),
             (int64_t)((uint64_t)a.hess + (uint64_t)b.hess)};
@@ -100,12 +110,65 @@ __device__ bool split_better(SplitPacket a, uint32_t ao, SplitPacket b, uint32_t
         (a.gain == b.gain && ao < bo));
 }
 
+// Inclusive two-stage CTA scan of one SplitPair per thread. Integer addition
+// is modulo 2^64, so this has exactly the serial prefix. Shuffle operands never
+// cross a warp; shared cross-warp data is protected by full CTA barriers before
+// publication and consumption. All 256 threads must call it (zero-padded bins).
+__device__ __forceinline__ SplitPair split_block_scan(SplitPair v, SplitPair* warp_totals) {
+    uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    SplitPair scanned = v;
+    for (uint32_t step = 1; step < 32; step *= 2) {
+        SplitPair prev{__shfl_up_sync(0xffffffffu, scanned.grad, step),
+                       __shfl_up_sync(0xffffffffu, scanned.hess, step)};
+        if (lane >= step) scanned = split_add(scanned, prev);
+    }
+    if (lane == 31) warp_totals[warp] = scanned;
+    __syncthreads();
+    if (warp == 0) {
+        SplitPair total = lane < 8 ? warp_totals[lane] : SplitPair{};
+        for (uint32_t step = 1; step < 8; step *= 2) {
+            SplitPair prev{__shfl_up_sync(0xffffffffu, total.grad, step),
+                           __shfl_up_sync(0xffffffffu, total.hess, step)};
+            if (lane >= step) total = split_add(total, prev);
+        }
+        if (lane < 8) warp_totals[lane] = total;
+    }
+    __syncthreads();
+    if (warp) scanned = split_add(warp_totals[warp - 1], scanned);
+    return scanned;
+}
+// One candidate, with the monotone / unconstrained form chosen uniformly.
+__device__ __forceinline__ SplitPacket split_any_candidate(SplitPair l, SplitPair r,
+    uint32_t feat, uint32_t bin, bool missing, double parent, float mono_parent_gain,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds, uint32_t has_monotone, int32_t constraint,
+    float lower, float upper) {
+    return has_monotone
+        ? mono_candidate(l, r, feat, bin, missing, mono_parent_gain, ig, ih, lambda, gamma,
+            mcw, alpha, mds, constraint, lower, upper)
+        : split_candidate(l, r, feat, bin, missing, parent, ig, ih, lambda, gamma, mcw);
+}
+
 // Per-node metadata: working output slot, small-input slot, previous-cache
 // parent slot (UINT32_MAX = direct), next-cache slot (UINT32_MAX = uncached).
 // Cache generations are disjoint; no CTA writes an input used by another CTA.
 // Monotone: `bounds[n*2..]` = node [lower, upper], `monotone[f]` = direction of
 // block-local feature f; both read only when has_monotone != 0 (uniform).
-extern "C" __global__ void split_cached_features(
+//
+// Feature enable: `node_enabled` (nullable) is a per-(node, block-local feature)
+// byte mask for nested column sampling; otherwise the tree-level `enabled[f]`.
+//
+// Categorical (CAT instantiation only): `cat_info[f]` is 0 for an ordered
+// feature, else 1 + the feature's ordinal among the block's categorical
+// features. A categorical CTA enumerates exactly FerrisBoost's host
+// `enumerate_categorical`: one-hot when the bin count < max_onehot, else a
+// stable (weight, category) sort and forward / backward prefix scans of
+// min(max_threshold, bins) - 1 prefixes. Candidate ordinals follow the host's
+// offer order, so the strict-greater / first-wins tie rule is identical. The
+// winner's category set is written to `cat_out[(n * n_cat + ordinal) * CAT_SET_WORDS ..]`;
+// the winning packet carries the categorical flag (4) and the ordinal in `bin`.
+template <bool CAT>
+__device__ __forceinline__ void split_features_body(
     SplitPair* hist, const SplitPair* previous, SplitPair* next,
     const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
     const SplitPair* sums, const uint32_t* metadata, uint32_t features,
@@ -113,13 +176,20 @@ extern "C" __global__ void split_cached_features(
     double ig, double ih, float lambda, float gamma, float mcw,
     float alpha, float mds,
     const float* bounds, const int32_t* monotone, uint32_t has_monotone,
-    SplitPacket* output) {
+    SplitPacket* output,
+    const uint8_t* node_enabled, const uint32_t* cat_info, uint32_t n_cat,
+    uint32_t max_onehot, uint32_t max_threshold, uint32_t* cat_out) {
     __shared__ SplitPair prefix[256];
     __shared__ SplitPair warp_totals[8];
     __shared__ double parent_gain;
     __shared__ float mono_parent;
+    // `winners` doubles as scratch for the categorical sort (weights, sorted
+    // bins); the scratch is dead before the first winners[] write, which is
+    // separated from the last scratch read by the scan's CTA barrier.
     __shared__ SplitPacket winners[256];
     __shared__ uint32_t ordinals[256];
+    __shared__ uint16_t cat_order[CAT ? 256 : 1];
+    __shared__ uint32_t cat_words[CAT ? CAT_SET_WORDS : 1];
     uint32_t t = threadIdx.x, f = blockIdx.x, n = blockIdx.y;
     uint32_t lo = offsets[f], count = offsets[f + 1] - lo;
     const uint32_t* m = metadata + n * 4;
@@ -143,54 +213,113 @@ extern "C" __global__ void split_cached_features(
     }
     if (!t) {
         parent_gain = split_gain(sums[n], ig, ih, lambda);
-        if (has_monotone)
-            mono_parent = mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, lower, upper);
+        mono_parent = has_monotone
+            ? mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, lower, upper) : 0.0f;
     }
-    // All 256 threads participate, including zero-padded bins. Integer addition
-    // is modulo 2^64, so this two-stage scan has exactly the serial prefix.
-    // Shuffle operands never cross a warp; shared cross-warp data is protected
-    // by full CTA barriers before publication and consumption.
-    uint32_t lane = t & 31u, warp = t >> 5;
-    SplitPair scanned = v;
-    for (uint32_t step = 1; step < 32; step *= 2) {
-        SplitPair prev{__shfl_up_sync(0xffffffffu, scanned.grad, step),
-                       __shfl_up_sync(0xffffffffu, scanned.hess, step)};
-        if (lane >= step) scanned = split_add(scanned, prev);
-    }
-    if (lane == 31) warp_totals[warp] = scanned;
-    __syncthreads();
-    if (warp == 0) {
-        SplitPair total = lane < 8 ? warp_totals[lane] : SplitPair{};
-        for (uint32_t step = 1; step < 8; step *= 2) {
-            SplitPair prev{__shfl_up_sync(0xffffffffu, total.grad, step),
-                           __shfl_up_sync(0xffffffffu, total.hess, step)};
-            if (lane >= step) total = split_add(total, prev);
-        }
-        if (lane < 8) warp_totals[lane] = total;
-    }
-    __syncthreads();
-    if (warp) scanned = split_add(warp_totals[warp - 1], scanned);
-    prefix[t] = scanned;
-    __syncthreads();
+    const bool on = (node_enabled ? node_enabled[(size_t)n * features + f] : enabled[f]) != 0;
+    const uint32_t kind = CAT ? cat_info[f] : 0u;
     SplitPacket best{}; uint32_t ordinal = 0xffffffffu;
-    if (t < count && enabled[f]) {
-        SplitPair sum = sums[n], total = prefix[count - 1];
-        best = has_monotone
-            ? mono_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1, false,
-                mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
-            : split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
-                false, parent_gain, ig, ih, lambda, gamma, mcw);
-        ordinal = t;
-        if (total.grad != sum.grad || total.hess != sum.hess) {
-            SplitPair before = t ? prefix[t - 1] : SplitPair{};
-            SplitPair right = split_sub(total, before);
-            SplitPacket reverse = has_monotone
-                ? mono_candidate(split_sub(sum, right), right, feats[f], t, true,
+    bool onehot = false;
+    uint32_t n_scan = 0;
+    if (CAT && kind) {
+        // ---- categorical feature (block-uniform branch) ----
+        onehot = count < max_onehot;
+        n_scan = count < max_threshold ? count : max_threshold;
+        const bool active = on && (onehot || n_scan >= 2);
+        const uint32_t cat_ord = kind - 1;
+        if (active) {
+            SplitPair sum = sums[n];
+            if (onehot) {
+                prefix[t] = split_block_scan(v, warp_totals);
+                __syncthreads();
+                if (t < count) {
+                    SplitPair total = prefix[count - 1];
+                    SplitPair missing = split_sub(sum, total);
+                    // Category t alone goes right; missing rows go left first,
+                    // then with the category.
+                    best = split_any_candidate(split_sub(sum, v), v, feats[f], cat_ord, true,
+                        parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
+                        has_monotone, constraint, lower, upper);
+                    ordinal = 2 * t;
+                    SplitPair right = split_add(v, missing);
+                    SplitPacket alt = split_any_candidate(split_sub(sum, right), right,
+                        feats[f], cat_ord, false, parent_gain, mono_parent, ig, ih, lambda,
+                        gamma, mcw, alpha, mds, has_monotone, constraint, lower, upper);
+                    if (split_better(alt, 2 * t + 1, best, ordinal)) { best = alt; ordinal = 2 * t + 1; }
+                }
+            } else {
+                float* wts = (float*)winners;
+                // Scratch layout inside `winners`: SPLIT_CTA_THREADS weights, then bins.
+                static_assert(SPLIT_CTA_THREADS * (sizeof(float) + sizeof(SplitPair))
+                              <= SPLIT_CTA_THREADS * sizeof(SplitPacket), "scratch fits");
+                SplitPair* sorted = (SplitPair*)((char*)winners + SPLIT_CTA_THREADS * sizeof(float));
+                float w = 0.0f;
+                if (t < count) {
+                    double g = split_value(v.grad, ig), h = split_value(v.hess, ih);
+                    w = mono_weight(g, h, lambda, alpha, mds);
+                }
+                wts[t] = w;
+                __syncthreads();
+                if (t < count) {
+                    // Stable rank by (weight, category): equal weights (incl.
+                    // -0.0 / 0.0) keep ascending category order, like the
+                    // host's stable sort with `<`.
+                    uint32_t rank = 0;
+                    for (uint32_t u = 0; u < count; ++u) {
+                        float wu = wts[u];
+                        rank += (wu < w || (wu == w && u < t)) ? 1u : 0u;
+                    }
+                    cat_order[rank] = (uint16_t)t;
+                    sorted[rank] = v;
+                }
+                __syncthreads();
+                SplitPair x = t < count ? sorted[t] : SplitPair{};
+                prefix[t] = split_block_scan(x, warp_totals);
+                __syncthreads();
+                if (t + 1 < n_scan) {
+                    SplitPair total = prefix[count - 1];
+                    // Forward: first t+1 sorted categories right, missing left.
+                    SplitPair right = prefix[t];
+                    best = split_any_candidate(split_sub(sum, right), right, feats[f], cat_ord,
+                        true, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
+                        has_monotone, constraint, lower, upper);
+                    ordinal = t;
+                    // Backward: sorted tail j.. on the left, missing right; the
+                    // first j sorted categories are the set.
+                    uint32_t j = count - 1 - t;
+                    SplitPair left = split_sub(total, prefix[j - 1]);
+                    SplitPacket alt = split_any_candidate(left, split_sub(sum, left), feats[f],
+                        cat_ord, false, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw,
+                        alpha, mds, has_monotone, constraint, lower, upper);
+                    uint32_t ro = n_scan - 1 + t;
+                    if (split_better(alt, ro, best, ordinal)) { best = alt; ordinal = ro; }
+                }
+            }
+            if (best.flags & 1u) best.flags |= 4u;
+        }
+    } else {
+        SplitPair scanned = split_block_scan(v, warp_totals);
+        prefix[t] = scanned;
+        __syncthreads();
+        if (t < count && on) {
+            SplitPair sum = sums[n], total = prefix[count - 1];
+            best = has_monotone
+                ? mono_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1, false,
                     mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
-                : split_candidate(split_sub(sum, right), right, feats[f], t,
-                    true, parent_gain, ig, ih, lambda, gamma, mcw);
-            uint32_t ro = count + count - 1 - t;
-            if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
+                : split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
+                    false, parent_gain, ig, ih, lambda, gamma, mcw);
+            ordinal = t;
+            if (total.grad != sum.grad || total.hess != sum.hess) {
+                SplitPair before = t ? prefix[t - 1] : SplitPair{};
+                SplitPair right = split_sub(total, before);
+                SplitPacket reverse = has_monotone
+                    ? mono_candidate(split_sub(sum, right), right, feats[f], t, true,
+                        mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
+                    : split_candidate(split_sub(sum, right), right, feats[f], t,
+                        true, parent_gain, ig, ih, lambda, gamma, mcw);
+                uint32_t ro = count + count - 1 - t;
+                if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
+            }
         }
     }
     winners[t] = best; ordinals[t] = ordinal; __syncthreads();
@@ -202,6 +331,50 @@ extern "C" __global__ void split_cached_features(
         __syncthreads();
     }
     if (!t) output[(size_t)n * features + f] = winners[0];
+    if (CAT && kind && (winners[0].flags & 1u)) {
+        if (t < CAT_SET_WORDS) cat_words[t] = 0u;
+        __syncthreads();
+        uint32_t o = ordinals[0];
+        if (onehot) {
+            if (!t) atomicOr(&cat_words[(o >> 1) >> 5], 1u << ((o >> 1) & 31u));
+        } else {
+            // Forward ordinal o holds o+1 sorted categories; backward ordinal
+            // n_scan-1+e holds the first (count-1-e).
+            uint32_t k = o < n_scan - 1 ? o + 1 : count - 1 - (o - (n_scan - 1));
+            if (t < k) atomicOr(&cat_words[cat_order[t] >> 5], 1u << (cat_order[t] & 31u));
+        }
+        __syncthreads();
+        if (t < CAT_SET_WORDS) cat_out[((size_t)n * n_cat + (kind - 1)) * CAT_SET_WORDS + t] = cat_words[t];
+    }
+}
+extern "C" __global__ void split_cached_features(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    SplitPacket* output, const uint8_t* node_enabled) {
+    split_features_body<false>(hist, previous, next, offsets, feats, enabled, sums, metadata,
+        features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
+        monotone, has_monotone, output, node_enabled, nullptr, 0, 0, 0, nullptr);
+}
+extern "C" __global__ void split_cached_features_cat(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    SplitPacket* output, const uint8_t* node_enabled,
+    const uint32_t* cat_info, uint32_t n_cat, uint32_t max_onehot, uint32_t max_threshold,
+    uint32_t* cat_out) {
+    split_features_body<true>(hist, previous, next, offsets, feats, enabled, sums, metadata,
+        features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
+        monotone, has_monotone, output, node_enabled, cat_info, n_cat, max_onehot,
+        max_threshold, cat_out);
 }
 extern "C" __global__ void split_cached_nodes(const SplitPacket* features,
     uint32_t n_features, double ig, double ih, float lambda, SplitPacket* output) {
@@ -215,6 +388,30 @@ extern "C" __global__ void split_cached_nodes(const SplitPacket* features,
     // sums. Leaf weights are computed once after the global block reduction;
     // avoid repeating unused divisions for every block-local candidate.
     output[blockIdx.x] = best;
+}
+// Node reduction for blocks with categorical features. Packets are `stride`
+// bytes apart: a 64 B packet, then the 256-bit category set of a categorical
+// winner (zero otherwise). The packet's `bin` (the feature's categorical
+// ordinal) is cleared once the set has been located.
+extern "C" __global__ void split_cached_nodes_cat(const SplitPacket* features,
+    uint32_t n_features, const uint32_t* cat_sets, uint32_t n_cat,
+    uint8_t* output, uint32_t stride) {
+    if (threadIdx.x) return;
+    SplitPacket best{};
+    for (uint32_t f = 0; f < n_features; ++f) {
+        SplitPacket p = features[(size_t)blockIdx.x * n_features + f];
+        if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
+    }
+    uint8_t* out = output + (size_t)blockIdx.x * stride;
+    uint32_t* words = (uint32_t*)(out + sizeof(SplitPacket));
+    if (best.flags & 4u) {
+        const uint32_t* src = cat_sets + ((size_t)blockIdx.x * n_cat + best.bin) * CAT_SET_WORDS;
+        for (uint32_t w = 0; w < CAT_SET_WORDS; ++w) words[w] = src[w];
+        best.bin = 0;
+    } else {
+        for (uint32_t w = 0; w < CAT_SET_WORDS; ++w) words[w] = 0u;
+    }
+    *(SplitPacket*)out = best;
 }
 
 // R=4 multi-row/thread 的每线程行数。见 hist_build_shared_planar32_fused_r4。
