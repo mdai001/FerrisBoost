@@ -8,8 +8,10 @@ use crate::types::{FeatId, TrainParams};
 #[path = "packet_tests.rs"]
 mod packet_tests;
 
-/// Most bins per feature the device split path takes: every 8-bit feature
-/// (the kernels give one CTA thread to each bin, `SPLIT_CTA_THREADS` = 256).
+/// Most bins per feature the one-thread-per-bin split kernels take (every
+/// 8-bit feature; `SPLIT_CTA_THREADS` = 256). A block holding a wider feature
+/// (16-bit blocks: max_bin > 255, more than 254 categories) runs the tiled
+/// `split_cached_features_wide*` kernels instead.
 const SPLIT_KERNEL_MAX_BINS: u32 = 255;
 
 pub(super) struct ResidentSplitBuffers {
@@ -42,10 +44,35 @@ pub(super) struct ResidentSplitBuffers {
     /// sampling (a one-byte dummy otherwise).
     node_enabled: CudaSlice<u8>,
     node_masks: bool,
-    /// Bytes between consecutive node packets: `SPLIT_PACKET_BYTES`, plus a
-    /// category set on the categorical path.
+    /// Bytes between consecutive node packets of the current block:
+    /// `SPLIT_PACKET_BYTES`, plus a category set on the categorical path (8
+    /// words, or the widest set of a 16-bit block's categorical features).
     packet_stride: usize,
+    /// `packet_stride` of 8-bit blocks.
+    base_packet_stride: usize,
     n_cat: u32,
+    /// The current block has a feature above `SPLIT_KERNEL_MAX_BINS` bins
+    /// and runs the wide kernels (decided per tree in `begin_split_level`).
+    wide: bool,
+    /// Wide categorical path (allocated only for 16-bit categorical
+    /// features, priced by `wide_categorical_split_cache_bytes`):
+    /// per-(node, categorical feature) weight keys and category sets, and the
+    /// per-ordinal layout `[set offset, set words, key offset]`.
+    wide_keys: CudaSlice<u32>,
+    wide_sets: CudaSlice<u32>,
+    wide_layout: CudaSlice<u32>,
+    /// Per-node set words / key elements of the current wide block.
+    wide_set_words: u32,
+    wide_key_elems: u32,
+    /// Allocated per-node capacity of `wide_sets` / `wide_keys` and of the
+    /// layout (in categorical features).
+    wide_set_capacity: usize,
+    wide_key_capacity: usize,
+    wide_cat_capacity: usize,
+    /// Set words of each categorical feature of the current wide block (the
+    /// packet decode trims the set to its feature's own size, like the host
+    /// `CatBits::for_bins`).
+    wide_cat_words: Vec<(FeatId, usize)>,
     stride: usize,
     capacity: usize,
     previous_ids: Vec<(usize, usize)>,
@@ -63,9 +90,27 @@ impl ResidentSplitBuffers {
         cap: usize,
         categorical: bool,
         node_masks: bool,
+        shape: &crate::gpu_mem_plan::GpuBlockShape,
     ) -> Result<Self> {
         let packet_stride = SPLIT_PACKET_BYTES + if categorical { CAT_SET_WORDS * 4 } else { 0 };
-        let packet_bytes = cap * packet_stride * SPLIT_PACKET_WINDOW_BATCHES;
+        // 16-bit categorical sets widen the packet window to the widest set
+        // (`wide_categorical_split_cache_bytes` prices the difference).
+        let wide_cat = categorical && shape.wide_cat_feats > 0;
+        let max_packet_stride = if wide_cat {
+            SPLIT_PACKET_BYTES + CAT_SET_WORDS.max(shape.cat_mask_words) * 4
+        } else {
+            packet_stride
+        };
+        let packet_bytes = cap * max_packet_stride * SPLIT_PACKET_WINDOW_BATCHES;
+        let (wide_set_capacity, wide_key_capacity, wide_cat_capacity) = if wide_cat {
+            (
+                shape.wide_cat_set_words,
+                shape.wide_cat_bins,
+                shape.wide_cat_feats,
+            )
+        } else {
+            (0, 0, 0)
+        };
         // SAFETY: the pinned bytes are only read after a D2H has written them
         // (`collect_split_packets` waits for the copy's event first).
         let packets_host = unsafe { stream.context().alloc_pinned::<u8>(packet_bytes.max(1)) }?;
@@ -96,7 +141,18 @@ impl ResidentSplitBuffers {
             })?,
             node_masks,
             packet_stride,
+            base_packet_stride: packet_stride,
             n_cat: 0,
+            wide: false,
+            wide_keys: stream.alloc_zeros::<u32>((cap * wide_key_capacity).max(1))?,
+            wide_sets: stream.alloc_zeros::<u32>((cap * wide_set_capacity).max(1))?,
+            wide_layout: stream.alloc_zeros::<u32>((wide_cat_capacity * 3).max(1))?,
+            wide_set_words: 0,
+            wide_key_elems: 0,
+            wide_set_capacity,
+            wide_key_capacity,
+            wide_cat_capacity,
+            wide_cat_words: Vec::new(),
             stride: bins,
             capacity: cap,
             previous_ids: Vec::with_capacity(cap),
@@ -139,6 +195,7 @@ impl GpuBlockSession<'_> {
         if self.n_feats == 0 || self.n_hist == 0 {
             return Ok(false);
         }
+        let has_wide_split = self.ctx.wide.as_ref().is_some_and(|w| w.split.is_some());
         let slot = self.slot.as_mut().expect("histogram slot lease missing");
         let super::GpuHistBuffers {
             split_cache,
@@ -148,21 +205,22 @@ impl GpuBlockSession<'_> {
         let Some(cache) = split_cache.as_mut() else {
             return Ok(false);
         };
-        // The device split kernels give one thread to each bin of a feature
-        // (`SPLIT_CTA_THREADS`, 256). A block holding a wider feature (a
-        // 16-bit block: max_bin > 255 or more than 254 categories) is split
-        // on the host from its downloaded histograms, exactly like a streamed
-        // block; its histograms are still built on the device.
-        if offsets_host
+        // A block holding a feature wider than one CTA of bins (a 16-bit
+        // block: max_bin > 255 or more than 254 categories) runs the tiled
+        // wide kernels; they are loaded whenever a 16-bit block exists.
+        let wide = offsets_host
             .windows(2)
-            .any(|w| w[1] - w[0] > SPLIT_KERNEL_MAX_BINS)
-        {
-            return Ok(false);
-        }
+            .any(|w| w[1] - w[0] > SPLIT_KERNEL_MAX_BINS);
+        anyhow::ensure!(
+            !wide || has_wide_split,
+            "GPU split cache: wide split kernels missing for a 16-bit block"
+        );
         if depth == 0 {
             cache.previous_ids.clear();
             cache.layout.clone_from(offsets_host);
             cache.features_ready = false;
+            cache.wide = wide;
+            cache.packet_stride = cache.base_packet_stride;
         } else {
             anyhow::ensure!(
                 cache.depth == Some(depth - 1),
@@ -371,11 +429,17 @@ impl GpuBlockSession<'_> {
             feats.len() == self.n_feats,
             "GPU split feature shape mismatch"
         );
+        let wide = self
+            .slot
+            .as_ref()
+            .and_then(|s| s.split_cache.as_ref())
+            .is_some_and(|c| c.wide);
         anyhow::ensure!(
-            self.feat_offsets()
+            wide || self
+                .feat_offsets()
                 .windows(2)
                 .all(|x| x[1] - x[0] <= SPLIT_KERNEL_MAX_BINS),
-            "GPU split requires at most 255 bins per feature"
+            "GPU split: a feature above 255 bins needs the wide split kernels"
         );
         let nodes = groups
             .iter()
@@ -397,6 +461,7 @@ impl GpuBlockSession<'_> {
             split_cache,
             hist_out,
             offsets,
+            offsets_host,
             start_event,
             end_event,
             ..
@@ -478,6 +543,52 @@ impl GpuBlockSession<'_> {
                 stream.memcpy_htod(&info, &mut cache.cat_info.slice_mut(..info.len()))?;
                 self.timing.split_metadata_h2d_calls += 1;
                 self.timing.split_metadata_h2d_bytes += (info.len() * 4) as u64;
+                if cache.wide {
+                    // Per categorical ordinal: set offset and words inside a
+                    // node's sets, key offset inside a node's keys. Sets are
+                    // whole 64-bit words (CatBits::words64), so packet tails
+                    // stay 8-byte aligned.
+                    let mut layout = Vec::with_capacity(ordinal as usize * 3);
+                    let (mut set_words, mut key_elems, mut widest) = (0usize, 0usize, 0usize);
+                    cache.wide_cat_words.clear();
+                    for (local, f) in feats.iter().enumerate() {
+                        if !is_cat(f) {
+                            continue;
+                        }
+                        let bins = (offsets_host[local + 1] - offsets_host[local]) as usize;
+                        let words = bins.div_ceil(64) * 2;
+                        layout.extend_from_slice(&[
+                            set_words as u32,
+                            words as u32,
+                            key_elems as u32,
+                        ]);
+                        cache.wide_cat_words.push((*f, words));
+                        set_words += words;
+                        key_elems += bins;
+                        widest = widest.max(words);
+                    }
+                    anyhow::ensure!(
+                        ordinal as usize <= cache.wide_cat_capacity
+                            && set_words <= cache.wide_set_capacity
+                            && key_elems <= cache.wide_key_capacity
+                            && SPLIT_PACKET_BYTES + widest * 4
+                                <= cache.packets_host.len()
+                                    / (cache.capacity * SPLIT_PACKET_WINDOW_BATCHES),
+                        "GPU split cache: 16-bit categorical block exceeds the planned \
+                         split buffers"
+                    );
+                    if !layout.is_empty() {
+                        stream.memcpy_htod(
+                            &layout,
+                            &mut cache.wide_layout.slice_mut(..layout.len()),
+                        )?;
+                        self.timing.split_metadata_h2d_calls += 1;
+                        self.timing.split_metadata_h2d_bytes += (layout.len() * 4) as u64;
+                    }
+                    cache.wide_set_words = set_words as u32;
+                    cache.wide_key_elems = key_elems as u32;
+                    cache.packet_stride = SPLIT_PACKET_BYTES + widest * 4;
+                }
             } else {
                 anyhow::ensure!(
                     !categorical.is_some_and(|c| feats
@@ -544,10 +655,12 @@ impl GpuBlockSession<'_> {
         let n_cat = cache.n_cat;
         let max_onehot = p.max_cat_to_onehot;
         let max_threshold = p.max_cat_threshold;
-        let split_fn = if cache.cat_enabled {
-            self.ctx.split_features_cat_fn.as_ref()
-        } else {
-            self.ctx.split_features_fn.as_ref()
+        let wide_fns = self.ctx.wide.as_ref();
+        let split_fn = match (cache.wide, cache.cat_enabled) {
+            (true, true) => wide_fns.and_then(|w| w.split_cat.as_ref()).map(|w| &w.0),
+            (true, false) => wide_fns.and_then(|w| w.split.as_ref()),
+            (false, true) => self.ctx.split_features_cat_fn.as_ref(),
+            (false, false) => self.ctx.split_features_fn.as_ref(),
         };
         let mut launch = stream.launch_builder(split_fn.context("GPU split kernel unavailable")?);
         launch
@@ -578,7 +691,19 @@ impl GpuBlockSession<'_> {
         } else {
             launch.arg(&no_node_mask);
         }
-        if cache.cat_enabled {
+        let wide_set_words = cache.wide_set_words;
+        let wide_key_elems = cache.wide_key_elems;
+        if cache.cat_enabled && cache.wide {
+            launch
+                .arg(&cache.cat_info)
+                .arg(&cache.wide_layout)
+                .arg(&max_onehot)
+                .arg(&max_threshold)
+                .arg(&wide_set_words)
+                .arg(&wide_key_elems)
+                .arg(&mut cache.wide_keys)
+                .arg(&mut cache.wide_sets);
+        } else if cache.cat_enabled {
             launch
                 .arg(&cache.cat_info)
                 .arg(&n_cat)
@@ -601,15 +726,22 @@ impl GpuBlockSession<'_> {
         let mut packet_output = cache
             .packets
             .slice_mut(packet_offset * packet_stride..(packet_offset + nodes) * packet_stride);
-        let nodes_fn = if cache.cat_enabled {
-            self.ctx.split_nodes_cat_fn.as_ref()
-        } else {
-            self.ctx.split_nodes_fn.as_ref()
+        let nodes_fn = match (cache.wide, cache.cat_enabled) {
+            (true, true) => wide_fns.and_then(|w| w.split_cat.as_ref()).map(|w| &w.1),
+            (_, true) => self.ctx.split_nodes_cat_fn.as_ref(),
+            (_, false) => self.ctx.split_nodes_fn.as_ref(),
         };
         let mut launch =
             stream.launch_builder(nodes_fn.context("GPU split reduction unavailable")?);
         launch.arg(&cache.candidates).arg(&features);
-        if cache.cat_enabled {
+        if cache.cat_enabled && cache.wide {
+            launch
+                .arg(&cache.wide_sets)
+                .arg(&cache.wide_layout)
+                .arg(&wide_set_words)
+                .arg(&mut packet_output)
+                .arg(&stride_arg);
+        } else if cache.cat_enabled {
             launch
                 .arg(&cache.cat_sets)
                 .arg(&n_cat)
@@ -723,11 +855,26 @@ impl GpuBlockSession<'_> {
                     },
                     missing_left: flags & 2 != 0,
                     cats: (flags & 4 != 0).then(|| {
-                        let words: [u32; CAT_SET_WORDS] =
-                            std::array::from_fn(|w| u32_at(SPLIT_PACKET_BYTES + w * 4));
-                        crate::categorical::CatBits::Small(std::array::from_fn(|i| {
-                            u64::from(words[2 * i]) | u64::from(words[2 * i + 1]) << 32
-                        }))
+                        if cache.wide {
+                            // The winner's own set words (the feature's bins
+                            // in 64-bit words), sized like `CatBits::for_bins`.
+                            let feat = u32_at(0);
+                            let words = cache
+                                .wide_cat_words
+                                .iter()
+                                .find(|(f, _)| *f == feat)
+                                .map_or(0, |&(_, w)| w);
+                            let words: Vec<u32> = (0..words)
+                                .map(|w| u32_at(SPLIT_PACKET_BYTES + w * 4))
+                                .collect();
+                            crate::categorical::CatBits::from_words(&words)
+                        } else {
+                            let words: [u32; CAT_SET_WORDS] =
+                                std::array::from_fn(|w| u32_at(SPLIT_PACKET_BYTES + w * 4));
+                            crate::categorical::CatBits::Small(std::array::from_fn(|i| {
+                                u64::from(words[2 * i]) | u64::from(words[2 * i + 1]) << 32
+                            }))
+                        }
                     }),
                 });
                 let hist = if keep_next && !batch.cached[local] {

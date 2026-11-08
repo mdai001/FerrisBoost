@@ -515,6 +515,12 @@ struct WideKernels {
     hist_batched: CudaFunction,
     count: CudaFunction,
     count_batched: CudaFunction,
+    /// Device split of blocks holding a feature with more than 255 bins
+    /// (tiled scans; categorical top-k selection). `None` without the
+    /// resident split cache. The categorical variants come with their node
+    /// reduction (variable-length category sets).
+    split: Option<CudaFunction>,
+    split_cat: Option<(CudaFunction, CudaFunction)>,
 }
 
 /// Byte image of a block payload, borrowed straight from the host cache
@@ -979,6 +985,19 @@ impl GpuTrainCtx {
                 hist_batched: load("hist_build_shared_planar32_batched_u16")?,
                 count: load("partition_count_u16")?,
                 count_batched: load("partition_count_batched_u16")?,
+                split: if split_cache_enabled {
+                    Some(load("split_cached_features_wide")?)
+                } else {
+                    None
+                },
+                split_cat: if split_cat_enabled {
+                    Some((
+                        load("split_cached_features_wide_cat")?,
+                        load("split_cached_nodes_wide_cat")?,
+                    ))
+                } else {
+                    None
+                },
             })
         } else {
             None
@@ -1522,6 +1541,7 @@ impl GpuTrainCtx {
                         hist_nodes_per_batch,
                         split_cat_enabled,
                         config.node_feature_masks,
+                        &shape,
                     )?)
                 } else {
                     None
@@ -1694,10 +1714,13 @@ impl GpuTrainCtx {
                             0
                         }
                         + if split_cat_enabled {
-                            crate::gpu_mem_plan::categorical_split_cache_bytes(
+                            (crate::gpu_mem_plan::categorical_split_cache_bytes(
                                 max_block_feats as u64,
                                 hist_nodes_per_batch as u64,
-                            ) as usize
+                            ) + crate::gpu_mem_plan::wide_categorical_split_cache_bytes(
+                                &shape,
+                                hist_nodes_per_batch as u64,
+                            )) as usize
                         } else {
                             0
                         })
@@ -1972,8 +1995,15 @@ impl GpuTrainCtx {
                 // print exactly what they always did.
                 format!(
                     " bins_16bit=col_major slot_row_bytes={} wide_hist_over_tile=global_atomic \
-                     wide_split_over_256_bins=host",
-                    self.shape.max_block_row_bytes
+                     wide_split_over_255_bins={}",
+                    self.shape.max_block_row_bytes,
+                    match self.wide.as_ref().map(|w| w.split.is_some()) {
+                        // Resident 16-bit blocks: tiled scans and categorical
+                        // top-k on the device; streamed blocks are split on
+                        // the host from their histograms, like 8-bit ones.
+                        Some(true) => "device_resident",
+                        _ => "host",
+                    }
                 )
             } else {
                 String::new()

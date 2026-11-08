@@ -25,7 +25,8 @@ pub(crate) const PARTITION_MAX_BLOCKS: usize = 32;
 pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
 /// 32-bit words in one categorical winner's category set (a bitset over the
 /// feature's bins). Must equal `CAT_SET_WORDS` in `histogram.cu` (unit-tested).
-/// 16-bit categorical bins would raise this together with the kernel constant.
+/// 16-bit categorical features use variable-length sets instead
+/// ([`wide_categorical_split_cache_bytes`]).
 pub(crate) const CAT_SET_WORDS: usize = 8;
 /// One categorical winner's category set, in bytes.
 pub(crate) const CAT_SET_BYTES: u64 = CAT_SET_WORDS as u64 * 4;
@@ -58,6 +59,31 @@ pub(crate) fn categorical_split_cache_bytes(cols: u64, hist_nodes_per_batch: u64
         + categorical_split_cache_fixed_bytes(hist_nodes_per_batch)
 }
 
+/// Device split-cache bytes one resident slot adds for 16-bit categorical
+/// features (features with more than 254 categories), on top of
+/// [`categorical_split_cache_bytes`]: per cache node, one weight key per
+/// category (the sorted-partition selection) and one variable-length set per
+/// categorical feature; the per-feature layout words; and the packet-window
+/// slots widened from the fixed 8-word set to the widest 16-bit set. Zero
+/// without a 16-bit categorical feature. The runtime allocation
+/// (`ResidentSplitBuffers`) and the planner use this one function.
+pub(crate) fn wide_categorical_split_cache_bytes(
+    shape: &GpuBlockShape,
+    hist_nodes_per_batch: u64,
+) -> u64 {
+    if shape.wide_cat_feats == 0 {
+        return 0;
+    }
+    let cap = hist_nodes_per_batch;
+    cap * shape.wide_cat_bins as u64 * 4
+        + cap * shape.wide_cat_set_words as u64 * 4
+        + shape.wide_cat_feats as u64 * 3 * 4
+        + cap
+            * SPLIT_PACKET_WINDOW_BATCHES as u64
+            * shape.cat_mask_words.saturating_sub(CAT_SET_WORDS) as u64
+            * 4
+}
+
 /// The bin geometry of the real column blocks that GPU training allocates for.
 ///
 /// Column blocks are homogeneous in bin width (8- or 16-bit cells, see
@@ -81,6 +107,16 @@ pub struct GpuBlockShape {
     /// 32-bit words of the widest category set a partition ships to the device
     /// (8 for 8-bit categorical features: the fixed 256-bit set).
     pub cat_mask_words: usize,
+    /// Most categorical features in one 16-bit block (0 = none). With the
+    /// two fields below it sizes the device split buffers of 16-bit
+    /// categorical features ([`wide_categorical_split_cache_bytes`]).
+    pub wide_cat_feats: usize,
+    /// Largest sum of categorical bins in one 16-bit block (one weight key
+    /// per category and cache node).
+    pub wide_cat_bins: usize,
+    /// Largest sum of categorical set words in one 16-bit block (one set per
+    /// categorical feature and cache node).
+    pub wide_cat_set_words: usize,
 }
 
 impl GpuBlockShape {
@@ -93,6 +129,9 @@ impl GpuBlockShape {
             max_u8_block_feats: max_block_feats,
             max_cell_bytes: 1,
             cat_mask_words: CAT_SET_WORDS,
+            wide_cat_feats: 0,
+            wide_cat_bins: 0,
+            wide_cat_set_words: 0,
         }
     }
 
@@ -364,7 +403,8 @@ impl StreamingMemModel {
         let feats = shape.max_block_feats as u64;
         let mut slot = shape.max_hist_bins as u64 * 16 * 2 * cap + feats * (cap * 64 + 12);
         if categorical {
-            slot += categorical_split_cache_bytes(feats, cap);
+            slot += categorical_split_cache_bytes(feats, cap)
+                + wide_categorical_split_cache_bytes(shape, cap);
         }
         if node_masks {
             slot += node_feature_mask_bytes(feats, cap);
@@ -1120,6 +1160,38 @@ mod tests {
             categorical_split_cache_bytes(7, 16),
             7 * (4 + 16 * 32) + 16 * 32 * SPLIT_PACKET_WINDOW_BATCHES as u64
         );
+    }
+
+    #[test]
+    fn wide_categorical_split_buffers_are_priced_from_the_block_shape() {
+        let narrow = GpuBlockShape::all_u8(8, 8 * 256);
+        assert_eq!(wide_categorical_split_cache_bytes(&narrow, 16), 0);
+        // One 16-bit block holding a 20,000- and a 1,000-category feature.
+        let wide = GpuBlockShape {
+            max_block_feats: 4,
+            max_block_row_bytes: 8,
+            max_hist_bins: 21_000 + 2 * 1024,
+            max_u8_block_feats: 0,
+            max_cell_bytes: 2,
+            cat_mask_words: 20_000usize.div_ceil(64) * 2,
+            wide_cat_feats: 2,
+            wide_cat_bins: 21_000,
+            wide_cat_set_words: (20_000usize.div_ceil(64) + 1_000usize.div_ceil(64)) * 2,
+        };
+        let cap = 16;
+        let expected = cap * 21_000 * 4
+            + cap * wide.wide_cat_set_words as u64 * 4
+            + 2 * 3 * 4
+            + cap * SPLIT_PACKET_WINDOW_BATCHES as u64 * (626 - 8) * 4;
+        assert_eq!(wide_categorical_split_cache_bytes(&wide, cap), expected);
+        // The resident slot price carries exactly that addition.
+        let slot = wide.max_hist_bins as u64 * 16 * 2 * cap
+            + 4 * (cap * 64 + 12)
+            + categorical_split_cache_bytes(4, cap)
+            + expected;
+        let model = StreamingMemModel::new_for_shape(1_000_000, &wide, 4, 1, cap, true, false, 0)
+            .with_resident_split_cache_for_shape(&wide, 4, cap, true, false);
+        assert_eq!(model.resident_extra_col_bytes, slot.div_ceil(4));
     }
 
     #[test]
