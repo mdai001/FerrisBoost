@@ -57,7 +57,7 @@ fn ensure_cuda_driver(device_ordinal: usize) -> Result<()> {
 
 pub(crate) fn cuda_context(device_ordinal: usize) -> Result<Arc<CudaContext>> {
     ensure_cuda_driver(device_ordinal)?;
-    CudaContext::new(device_ordinal).context("创建 CUDA context")
+    CudaContext::new(device_ordinal).context("create CUDA context")
 }
 
 fn device_state(device_ordinal: usize) -> Result<Arc<DeviceState>> {
@@ -74,7 +74,7 @@ fn device_state(device_ordinal: usize) -> Result<Arc<DeviceState>> {
     let ctx = cuda_context(device_ordinal)?;
     let module = ctx
         .load_module(Ptx::from_src(HISTOGRAM_PTX))
-        .context("加载预编译 histogram PTX")?;
+        .context("load precompiled histogram PTX")?;
     let state = Arc::new(DeviceState { ctx, module });
     states.insert(device_ordinal, state.clone());
     Ok(state)
@@ -324,10 +324,10 @@ fn partition_rows_gpu_impl(
     threads_per_block: u32,
 ) -> Result<((Vec<RowId>, Vec<RowId>), PartitionProfile)> {
     if block_n_rows == 0 || feature >= block_data.len().checked_div(block_n_rows).unwrap_or(0) {
-        bail!("partition GPU 的 feature 不在 bins 列范围内");
+        bail!("partition GPU feature is outside the bins column range");
     }
     if threads_per_block == 0 || threads_per_block > 1024 || !threads_per_block.is_power_of_two() {
-        bail!("partition threads_per_block 必须是 1..=1024 的 2 次幂");
+        bail!("partition threads_per_block must be a power of two in 1..=1024");
     }
     if rows.is_empty() {
         return Ok((
@@ -340,10 +340,11 @@ fn partition_rows_gpu_impl(
         ));
     }
     if rows.iter().any(|&row| row as usize >= block_n_rows) {
-        bail!("partition row_idx 含越界行");
+        bail!("partition row_idx contains an out-of-range row");
     }
-    let n_rows_u32 = u32::try_from(block_n_rows).context("partition 物理行数超过 u32")?;
-    let n_selected = u32::try_from(rows.len()).context("partition 行数超过 u32")?;
+    let n_rows_u32 =
+        u32::try_from(block_n_rows).context("partition physical row count exceeds u32")?;
+    let n_selected = u32::try_from(rows.len()).context("partition row count exceeds u32")?;
     let n_blocks = (rows.len() as u32).div_ceil(threads_per_block);
     let state = device_state(device_ordinal)?;
     let ctx = &state.ctx;
@@ -351,13 +352,13 @@ fn partition_rows_gpu_impl(
     let module = &state.module;
     let count_fn = module
         .load_function("partition_count")
-        .context("PTX 中找不到 partition_count")?;
+        .context("partition_count not found in PTX")?;
     let scan_fn = module
         .load_function("partition_scan_blocks")
-        .context("PTX 中找不到 partition_scan_blocks")?;
+        .context("partition_scan_blocks not found in PTX")?;
     let scatter_fn = module
         .load_function("partition_scatter")
-        .context("PTX 中找不到 partition_scatter")?;
+        .context("partition_scatter not found in PTX")?;
 
     let col_dev = stream
         .clone_htod(&block_data[feature * block_n_rows..(feature + 1) * block_n_rows])
@@ -383,7 +384,7 @@ fn partition_rows_gpu_impl(
         .context("partition right output allocation")?;
     let start = stream
         .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-        .context("记录 partition 起始 event")?;
+        .context("record partition start event")?;
 
     let count_config = LaunchConfig {
         grid_dim: (n_blocks, 1, 1),
@@ -425,7 +426,7 @@ fn partition_rows_gpu_impl(
     // 优化,但必须满足同一个 kernel 签名,所以给它一个一次性的单槽 buffer。
     let mut totals_dev = stream
         .alloc_zeros::<u32>(2)
-        .context("partition totals 分配")?;
+        .context("allocate partition totals")?;
     let totals_slot = 0u32;
     let mut launch = stream.launch_builder(&scan_fn);
     launch
@@ -467,10 +468,10 @@ fn partition_rows_gpu_impl(
 
     let end = stream
         .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-        .context("记录 partition 结束 event")?;
+        .context("record partition end event")?;
     let kernel_ms = start
         .elapsed_ms(&end)
-        .context("计算 partition kernel 时间")?;
+        .context("compute partition kernel time")?;
 
     let left = stream
         .clone_dtoh(&left_out_dev)
@@ -520,9 +521,10 @@ pub fn build_histogram(
         return Ok(vec![GradPairFixed::default(); n_hist]);
     }
 
-    let n_rows_u32 = u32::try_from(block_n_rows).context("CUDA histogram 行数超过 u32")?;
-    let n_feats_u32 = u32::try_from(n_feats).context("CUDA histogram 特征数超过 u32")?;
-    let n_selected_u32 = u32::try_from(n_selected).context("CUDA histogram 子集超过 u32")?;
+    let n_rows_u32 = u32::try_from(block_n_rows).context("CUDA histogram row count exceeds u32")?;
+    let n_feats_u32 = u32::try_from(n_feats).context("CUDA histogram feature count exceeds u32")?;
+    let n_selected_u32 =
+        u32::try_from(n_selected).context("CUDA histogram row subset exceeds u32")?;
 
     // FFI 明确把梯度和输出描述为交错 int64。这里显式摊平,不要求
     // cudarc 理解 Rust struct,也让 host/device 布局契约一眼可见。
@@ -538,20 +540,20 @@ pub fn build_histogram(
     let module = &state.module;
     let function = module
         .load_function("hist_build")
-        .context("PTX 中找不到 hist_build")?;
+        .context("hist_build not found in PTX")?;
 
     let bins_dev = stream.clone_htod(block_data).context("bins H2D")?;
     let gpair_dev = stream.clone_htod(&gpair_words).context("gpair H2D")?;
     let rows_dev = match row_idx {
         Some(rows) => stream.clone_htod(rows).context("row_idx H2D")?,
-        None => stream.null::<u32>().context("创建 null row_idx")?,
+        None => stream.null::<u32>().context("create null row_idx")?,
     };
     let offsets_dev = stream
         .clone_htod(feat_offsets)
         .context("feat_offsets H2D")?;
     let mut out_dev = stream
         .alloc_zeros::<i64>(n_hist * 2)
-        .context("分配 CUDA histogram")?;
+        .context("allocate CUDA histogram")?;
 
     // 一个 block 只有一个线程,因此 grid.x 精确等于 selected-row 数量。
     // 这是第一版用 launch geometry 携带 subset 长度、同时保持既定 FFI
@@ -656,10 +658,10 @@ pub fn build_histogram_shared_with_config(
         ));
     }
     if config.threads_per_block == 0 || config.threads_per_block > 1024 {
-        bail!("threads_per_block 要在 1..=1024");
+        bail!("threads_per_block must be in 1..=1024");
     }
 
-    let n_rows_u32 = u32::try_from(block_n_rows).context("CUDA histogram 行数超过 u32")?;
+    let n_rows_u32 = u32::try_from(block_n_rows).context("CUDA histogram row count exceeds u32")?;
     let mut gpair_words = Vec::with_capacity(gpair.len() * 2);
     for pair in gpair {
         gpair_words.push(pair.grad);
@@ -675,21 +677,21 @@ pub fn build_histogram_shared_with_config(
     let module = &state.module;
     let function = module
         .load_function(config.layout.kernel_name())
-        .with_context(|| format!("PTX 中找不到 {}", config.layout.kernel_name()))?;
+        .with_context(|| format!("{} not found in PTX", config.layout.kernel_name()))?;
 
     // 先只使用无需 cuFuncSetAttribute opt-in 的默认上限。Ampere 通常是
     // 48 KiB,但这里以 driver 报告值为准;将来扫 100 KiB 档时再显式 opt-in。
     let device_shared_bytes = ctx
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)
-        .context("读取每 block shared-memory 上限")?;
+        .context("query per-block shared-memory limit")?;
     let max_threads_per_sm = ctx
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)
-        .context("读取每 SM 最大线程数")? as u32;
+        .context("query max threads per SM")? as u32;
     let static_shared_bytes = function
         .shared_size_bytes()
-        .context("读取 kernel 静态 shared-memory 大小")?;
+        .context("query kernel static shared-memory size")?;
     let device_shared_limit = usize::try_from(device_shared_bytes - static_shared_bytes)
-        .context("shared-memory 上限无效")?;
+        .context("invalid shared-memory limit")?;
     let shared_limit_bytes = config
         .shared_memory_budget_bytes
         .unwrap_or(device_shared_limit)
@@ -697,7 +699,7 @@ pub fn build_histogram_shared_with_config(
     let bytes_per_bin = std::mem::size_of::<GradPairFixed>();
     let max_bins_per_tile = shared_limit_bytes / bytes_per_bin;
     if max_bins_per_tile == 0 {
-        bail!("设备没有足够 shared memory 放一个 GradPairFixed");
+        bail!("device does not have enough shared memory for one GradPairFixed");
     }
 
     let h2d_start = std::time::Instant::now();
@@ -717,17 +719,17 @@ pub fn build_histogram_shared_with_config(
     let h2d_ms = h2d_start.elapsed().as_secs_f32() * 1e3;
     let mut out_dev = stream
         .alloc_zeros::<i64>(n_hist * 2)
-        .context("分配 CUDA histogram")?;
+        .context("allocate CUDA histogram")?;
 
     let threads_per_block = config.threads_per_block;
     let full_rows = n_selected / threads_per_block as usize * threads_per_block as usize;
     let full_blocks = u32::try_from(full_rows / threads_per_block as usize)
-        .context("CUDA histogram grid 超过 u32")?;
+        .context("CUDA histogram grid exceeds u32")?;
     let tail_rows = u32::try_from(n_selected - full_rows).unwrap();
     let row_launches_per_feature_tile = usize::from(full_blocks > 0) + usize::from(tail_rows > 0);
     let start = stream
         .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-        .context("记录 shared histogram 起始 event")?;
+        .context("record shared histogram start event")?;
     let mut feature_tiles = 0usize;
     let mut active_blocks_per_sm = u32::MAX;
     let mut feat_begin = 0usize;
@@ -742,13 +744,13 @@ pub fn build_histogram_shared_with_config(
         if feat_end == feat_begin {
             let bins = feat_offsets[feat_begin + 1] - feat_offsets[feat_begin];
             bail!(
-                "特征 {feat_begin} 的 {bins} 个 bin 超过 shared-memory tile 上限 {max_bins_per_tile}"
+                "feature {feat_begin} has {bins} bins, exceeding the shared-memory tile limit {max_bins_per_tile}"
             );
         }
 
         let tile_bins = feat_offsets[feat_end] as usize - hist_begin;
-        let shared_mem_bytes =
-            u32::try_from(tile_bins * bytes_per_bin).context("shared-memory tile 大小超过 u32")?;
+        let shared_mem_bytes = u32::try_from(tile_bins * bytes_per_bin)
+            .context("shared-memory tile size exceeds u32")?;
         active_blocks_per_sm = active_blocks_per_sm.min(
             function
                 .occupancy_max_active_blocks_per_multiprocessor(
@@ -756,7 +758,7 @@ pub fn build_histogram_shared_with_config(
                     shared_mem_bytes as usize,
                     None,
                 )
-                .context("计算 shared histogram occupancy")?,
+                .context("compute shared histogram occupancy")?,
         );
         let tile_n_feats = u32::try_from(feat_end - feat_begin).unwrap();
         let bins_view = bins_dev.slice(feat_begin * block_n_rows..feat_end * block_n_rows);
@@ -806,10 +808,10 @@ pub fn build_histogram_shared_with_config(
 
     let end = stream
         .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-        .context("记录 shared histogram 结束 event")?;
+        .context("record shared histogram end event")?;
     let kernel_ms = start
         .elapsed_ms(&end)
-        .context("计算 shared histogram kernel 时间")?;
+        .context("compute shared histogram kernel time")?;
 
     let d2h_start = std::time::Instant::now();
     let words = stream.clone_dtoh(&out_dev).context("histogram D2H")?;
@@ -849,20 +851,20 @@ fn validate_inputs(
     row_idx: Option<&[RowId]>,
 ) -> Result<()> {
     if block_data.len() != n_feats.saturating_mul(block_n_rows) {
-        bail!("bins 长度与 n_feats × n_rows 不符");
+        bail!("bins length does not match n_feats × n_rows");
     }
     if feat_offsets.len() != n_feats + 1 || feat_offsets.first() != Some(&0) {
-        bail!("feat_offsets 必须从 0 开始且长度为 n_feats + 1");
+        bail!("feat_offsets must start at 0 and have length n_feats + 1");
     }
     if feat_offsets.windows(2).any(|pair| pair[0] > pair[1]) {
-        bail!("feat_offsets 必须单调不减");
+        bail!("feat_offsets must be non-decreasing");
     }
     if gpair.len() != block_n_rows {
-        bail!("gpair 长度与 block_n_rows 不符");
+        bail!("gpair length does not match block_n_rows");
     }
     if let Some(rows) = row_idx {
         if rows.iter().any(|&row| row as usize >= block_n_rows) {
-            bail!("row_idx 含越界行");
+            bail!("row_idx contains an out-of-range row");
         }
     }
 
@@ -880,7 +882,7 @@ fn validate_inputs(
             let bin = col[row];
             bin != MISSING_BIN && u32::from(bin) >= n_bins
         }) {
-            bail!("特征 {feat} 含超出 feat_offsets 宽度的 bin");
+            bail!("feature {feat} has a bin beyond its feat_offsets width");
         }
     }
     Ok(())

@@ -373,10 +373,10 @@ impl CompactInferenceModel {
     pub(crate) fn new(canonical: &Model) -> Result<Self> {
         // 单输出预测器:多分类模型要先拆成 `Model::class_view`。
         if canonical.num_outputs() > 1 {
-            bail!("prediction 预测器只接单输出模型;多分类请按类拆成 class_view");
+            bail!("the prediction predictor accepts only single-output models; split multiclass models per class with class_view");
         }
         if canonical.n_features == 0 {
-            bail!("prediction 模型必须至少有一个 feature");
+            bail!("prediction model must contain at least one feature");
         }
 
         let mut canonical_features = canonical
@@ -390,7 +390,7 @@ impl CompactInferenceModel {
         canonical_features.dedup();
         for &feature in &canonical_features {
             if feature >= canonical.n_features {
-                bail!("prediction 模型含越界 feature {feature}");
+                bail!("prediction model contains out-of-range feature {feature}");
             }
         }
 
@@ -412,7 +412,7 @@ impl CompactInferenceModel {
                     continue;
                 }
                 let compact = canonical_to_compact[node.feat as usize];
-                node.feat = u32::try_from(compact).context("compact feature id 超过 u32")?;
+                node.feat = u32::try_from(compact).context("compact feature id exceeds u32")?;
             }
         }
         model.n_features = canonical_features.len();

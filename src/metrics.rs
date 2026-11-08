@@ -27,7 +27,7 @@ pub trait Metric: Send + Sync {
     fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
         match weight {
             None => self.eval(pred, label),
-            Some(_) => panic!("metric {:?} 不支持样本权重", self.name()),
+            Some(_) => panic!("metric {:?} does not support sample weights", self.name()),
         }
     }
 
@@ -63,8 +63,12 @@ impl Metric for Rmse {
     }
 
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
-        assert_eq!(pred.len(), label.len(), "rmse 的预测和标签长度必须一致");
-        assert!(!pred.is_empty(), "rmse 不能评估空数据");
+        assert_eq!(
+            pred.len(),
+            label.len(),
+            "rmse predictions and labels must have the same length"
+        );
+        assert!(!pred.is_empty(), "rmse cannot evaluate empty data");
         let sum: f64 = pred
             .iter()
             .zip(label)
@@ -84,7 +88,11 @@ impl Metric for Rmse {
         let Some(w) = weight else {
             return self.eval(pred, label);
         };
-        assert_eq!(pred.len(), w.len(), "rmse 的预测和权重长度必须一致");
+        assert_eq!(
+            pred.len(),
+            w.len(),
+            "rmse predictions and weights must have the same length"
+        );
         let (sum, wsum) = weighted_sums(pred, label, w, |p, y| {
             let d = (p - y) as f64;
             d * d
@@ -110,8 +118,12 @@ fn weighted_sums(
     weight: &[f32],
     loss: impl Fn(f32, f32) -> f64,
 ) -> (f64, f64) {
-    assert_eq!(pred.len(), label.len(), "预测和标签长度必须一致");
-    assert!(!pred.is_empty(), "不能评估空数据");
+    assert_eq!(
+        pred.len(),
+        label.len(),
+        "predictions and labels must have the same length"
+    );
+    assert!(!pred.is_empty(), "cannot evaluate empty data");
     pred.iter()
         .zip(label)
         .zip(weight)
@@ -128,8 +140,12 @@ impl Metric for LogLoss {
     }
 
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
-        assert_eq!(pred.len(), label.len(), "logloss 的预测和标签长度必须一致");
-        assert!(!pred.is_empty(), "logloss 不能评估空数据");
+        assert_eq!(
+            pred.len(),
+            label.len(),
+            "logloss predictions and labels must have the same length"
+        );
+        assert!(!pred.is_empty(), "logloss cannot evaluate empty data");
         const EPS: f64 = 1e-15;
         let sum: f64 = pred
             .iter()
@@ -152,7 +168,11 @@ impl Metric for LogLoss {
         let Some(w) = weight else {
             return self.eval(pred, label);
         };
-        assert_eq!(pred.len(), w.len(), "logloss 的预测和权重长度必须一致");
+        assert_eq!(
+            pred.len(),
+            w.len(),
+            "logloss predictions and weights must have the same length"
+        );
         let (sum, wsum) = weighted_sums(pred, label, w, logloss_row);
         final_ratio(sum, wsum) as f32
     }
@@ -196,7 +216,11 @@ impl Metric for ProbRmse {
                 &ones
             }
         };
-        assert_eq!(pred.len(), w.len(), "rmse 的预测和权重长度必须一致");
+        assert_eq!(
+            pred.len(),
+            w.len(),
+            "rmse predictions and weights must have the same length"
+        );
         let (sum, wsum) = weighted_sums(pred, label, w, |raw, y| {
             let d = (y - sigmoid_f32(raw)) as f64;
             d * d
@@ -230,7 +254,11 @@ impl Metric for ClassError {
                 &ones
             }
         };
-        assert_eq!(pred.len(), w.len(), "error 的预测和权重长度必须一致");
+        assert_eq!(
+            pred.len(),
+            w.len(),
+            "error predictions and weights must have the same length"
+        );
         let (sum, wsum) = weighted_sums(pred, label, w, |raw, y| {
             (if sigmoid_f32(raw) > 0.5 { 1.0 - y } else { y }) as f64
         });
@@ -275,9 +303,17 @@ impl Metric for Auc {
     }
 
     fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
-        assert_eq!(pred.len(), label.len(), "auc 的预测和标签长度必须一致");
+        assert_eq!(
+            pred.len(),
+            label.len(),
+            "auc predictions and labels must have the same length"
+        );
         if let Some(w) = weight {
-            assert_eq!(pred.len(), w.len(), "auc 的预测和权重长度必须一致");
+            assert_eq!(
+                pred.len(),
+                w.len(),
+                "auc predictions and weights must have the same length"
+            );
         }
         if pred.is_empty() {
             return f32::NAN;
@@ -372,9 +408,17 @@ impl Metric for AucPr {
     }
 
     fn eval_weighted(&self, pred: &[f32], label: &[f32], weight: Option<&[f32]>) -> f32 {
-        assert_eq!(pred.len(), label.len(), "aucpr 的预测和标签长度必须一致");
+        assert_eq!(
+            pred.len(),
+            label.len(),
+            "aucpr predictions and labels must have the same length"
+        );
         if let Some(w) = weight {
-            assert_eq!(pred.len(), w.len(), "aucpr 的预测和权重长度必须一致");
+            assert_eq!(
+                pred.len(),
+                w.len(),
+                "aucpr predictions and weights must have the same length"
+            );
         }
         if pred.is_empty() {
             return f32::NAN;
@@ -485,8 +529,8 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
     }
     if crate::rank::is_rank_metric_name(name) {
         return Err(format!(
-            "eval_metric {name:?} 不支持:它是排序指标,需要排序 objective \
-             (rank:ndcg / rank:pairwise / rank:map)和 query groups"
+            "eval_metric {name:?} is not supported here: it is a ranking metric and needs a ranking \
+             objective (rank:ndcg / rank:pairwise / rank:map) and query groups"
         ));
     }
     // 多分位数(多目标)只接 quantile:XGBoost 的其它逐行指标要求预测和标签等长。
@@ -495,8 +539,8 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
             return match name {
                 "quantile" => Ok(Box::new(MultiQuantile::new(alphas.as_slice()))),
                 _ => Err(format!(
-                    "eval_metric {name:?} 不能用于多个 quantile_alpha 的 reg:quantileerror:\
-                     预测是 n × {} 而标签是 n;多输出模型只支持 \"quantile\"",
+                    "eval_metric {name:?} cannot be used with reg:quantileerror with multiple quantile_alpha: \
+                     predictions are n × {} but labels are n; multi-output models support only \"quantile\"",
                     alphas.len()
                 )),
             };
@@ -509,14 +553,14 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
             "mlogloss" => Ok(Box::new(MultiClass::new(MultiKind::LogLoss, k))),
             "merror" => Ok(Box::new(MultiClass::new(MultiKind::Error, k))),
             _ => Err(format!(
-                "eval_metric {name:?} 不能用于 {};多分类支持 mlogloss / merror",
+                "eval_metric {name:?} cannot be used with {}; multiclass supports mlogloss / merror",
                 obj.name()
             )),
         };
     }
     if matches!(name, "mlogloss" | "merror") {
         return Err(format!(
-            "eval_metric {name:?} 是多分类指标,需要 objective=\"multi:softprob\" 或 \"multi:softmax\""
+            "eval_metric {name:?} is a multiclass metric and requires objective=\"multi:softprob\" or \"multi:softmax\""
         ));
     }
     let binary = matches!(obj, Objective::Logistic);
@@ -524,7 +568,7 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
     if let Some(kind) = Ew::parse(name, obj)? {
         if matches!(kind, Ew::Error(_)) && !binary {
             return Err(format!(
-                "eval_metric {name:?} 是二分类指标,需要 objective=\"binary:logistic\""
+                "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\""
             ));
         }
         return Ok(Box::new(Elementwise::new(kind, obj)));
@@ -538,10 +582,10 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
         ("auc", Objective::Logistic) => Ok(Box::new(Auc)),
         ("aucpr", Objective::Logistic) => Ok(Box::new(AucPr)),
         ("logloss" | "error" | "auc" | "aucpr", _) => Err(format!(
-            "eval_metric {name:?} 是二分类指标,需要 objective=\"binary:logistic\""
+            "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\""
         )),
         _ => Err(format!(
-            "eval_metric {name:?} 不支持,现在有 {SUPPORTED_METRICS}"
+            "eval_metric {name:?} is not supported; supported metrics: {SUPPORTED_METRICS}"
         )),
     }
 }
@@ -606,12 +650,16 @@ impl Ew {
                 .parse::<f32>()
                 .ok()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| format!("eval_metric {name:?} 的参数 {p:?} 不是有限数"))
+                .ok_or_else(|| {
+                    format!("eval_metric {name:?} parameter {p:?} is not a finite number")
+                })
         };
         let no_param = |kind: Ew| -> Result<Option<Ew>, String> {
             match param {
                 None => Ok(Some(kind)),
-                Some(_) => Err(format!("eval_metric {name:?} 不接受 @ 参数")),
+                Some(_) => Err(format!(
+                    "eval_metric {name:?} does not accept an @ parameter"
+                )),
             }
         };
         match base {
@@ -624,8 +672,8 @@ impl Ew {
             "quantile" => match obj {
                 Objective::Quantile { alphas } => no_param(Ew::Quantile(alphas.as_slice()[0])),
                 _ => Err(
-                    "eval_metric \"quantile\" 需要 objective=\"reg:quantileerror\"(它的 alpha \
-                     来自 quantile_alpha)"
+                    "eval_metric \"quantile\" requires objective=\"reg:quantileerror\" (its alpha \
+                     comes from quantile_alpha)"
                         .into(),
                 ),
             },
@@ -637,12 +685,12 @@ impl Ew {
                     match param {
                         Some(p) => num(p)?,
                         None => return Err(
-                            "tweedie-nloglik 要写成 tweedie-nloglik@rho,比如 tweedie-nloglik@1.5"
+                            "tweedie-nloglik must be written as tweedie-nloglik@rho, e.g. tweedie-nloglik@1.5"
                                 .into(),
                         ),
                     };
                 if !(1.0..2.0).contains(&rho) {
-                    return Err(format!("tweedie-nloglik 的 rho 必须在 [1, 2),给的是 {rho}"));
+                    return Err(format!("tweedie-nloglik rho must be in [1, 2), got {rho}"));
                 }
                 Ok(Some(Ew::TweedieNll(rho)))
             }
@@ -773,10 +821,10 @@ impl Elementwise {
         assert_eq!(
             pred.len(),
             label.len(),
-            "{} 的预测和标签长度必须一致",
+            "{} predictions and labels must have the same length",
             self.name
         );
-        assert!(!pred.is_empty(), "{} 不能评估空数据", self.name);
+        assert!(!pred.is_empty(), "{} cannot evaluate empty data", self.name);
         let (mut esum, mut wsum) = (0.0f64, 0.0f64);
         for (i, (&m, &y)) in pred.iter().zip(label).enumerate() {
             let wt = weight.map_or(1.0f32, |w| w[i]);
@@ -806,7 +854,7 @@ impl Metric for Elementwise {
             assert_eq!(
                 pred.len(),
                 w.len(),
-                "{} 的预测和权重长度必须一致",
+                "{} predictions and weights must have the same length",
                 self.name
             );
         }
@@ -852,9 +900,9 @@ impl Metric for MultiQuantile {
         assert_eq!(
             pred.len(),
             label.len() * k,
-            "quantile 的预测长度必须是 n × quantile_alpha 个数"
+            "quantile prediction length must be n × the number of quantile_alpha values"
         );
-        assert!(!label.is_empty(), "quantile 不能评估空数据");
+        assert!(!label.is_empty(), "quantile cannot evaluate empty data");
         let mut row = vec![0.0f32; k];
         let (mut esum, mut wsum) = (0.0f64, 0.0f64);
         for (i, &y) in label.iter().enumerate() {
@@ -922,10 +970,14 @@ impl Metric for MultiClass {
         assert_eq!(
             pred.len(),
             label.len() * k,
-            "{} 的预测长度必须是 n × num_class",
+            "{} prediction length must be n × num_class",
             self.name()
         );
-        assert!(!label.is_empty(), "{} 不能评估空数据", self.name());
+        assert!(
+            !label.is_empty(),
+            "{} cannot evaluate empty data",
+            self.name()
+        );
         let mut row = vec![0.0f32; k];
         let (mut esum, mut wsum) = (0.0f64, 0.0f64);
         for (i, &y) in label.iter().enumerate() {
@@ -1001,7 +1053,10 @@ mod tests {
             "{got} vs {}",
             num / den
         );
-        assert!(Auc.eval(&raw[..1], &y[..1]).is_nan(), "单一类别返回 NaN");
+        assert!(
+            Auc.eval(&raw[..1], &y[..1]).is_nan(),
+            "a single class returns NaN"
+        );
         assert!(!Auc.lower_is_better());
     }
 

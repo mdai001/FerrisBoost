@@ -28,17 +28,17 @@ pub mod prof {
             pub fn report(rounds: usize) {
                 let all: &[(&str, &AtomicU64)] = &[$((stringify!($name), &$name)),*];
                 let total: u64 = all.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
-                eprintln!("\n=== 耗时分布({rounds} 轮)===");
+                eprintln!("\n=== time breakdown ({rounds} rounds) ===");
                 eprintln!(
-                    "⚠️ 口径:HIST / ENUM / SUBTRACT / GPU_* 是**各块 worker 累加**,\n                     　 段和可以大于整轮,**不能当墙钟占比或收益上限**读。\n                     　 同一段的真实墙钟见 HIST_PHASE_WALL;GRAD / QUANTIZE /\n                     　 UPDATE_PRED 每轮一次,本来就是墙钟。"
+                    "note: HIST / ENUM / SUBTRACT / GPU_* are **summed across block workers**,\n      so a stage can exceed the whole round; **do not read them as wall-clock share or as an upper bound on savings**.\n      For the real wall clock of the same stage see HIST_PHASE_WALL; GRAD / QUANTIZE /\n      UPDATE_PRED run once per round and are already wall clock."
                 );
                 for (name, c) in all {
                     let ns = c.load(Ordering::Relaxed);
-                    eprintln!("{name:<22}{:>9.2} s{:>8.1}%{:>10.1} ms/轮",
+                    eprintln!("{name:<22}{:>9.2} s{:>8.1}%{:>10.1} ms/round",
                         ns as f64 / 1e9, ns as f64 / total as f64 * 100.0,
                         ns as f64 / 1e6 / rounds as f64);
                 }
-                eprintln!("{:<22}{:>9.2} s", "合计", total as f64 / 1e9);
+                eprintln!("{:<22}{:>9.2} s", "total", total as f64 / 1e9);
             }
         };
     }
@@ -195,13 +195,13 @@ pub mod prof {
         let ns = PART_FETCH.load(Ordering::Relaxed)
             + PART_BITS.load(Ordering::Relaxed)
             + PART_SPLIT.load(Ordering::Relaxed);
-        eprintln!("\n=== 行重分区 ===");
-        eprintln!("取列次数        {:>12.1} 次/轮", c as f64 / rounds as f64);
+        eprintln!("\n=== row repartition ===");
+        eprintln!("column fetches  {:>12.1} /round", c as f64 / rounds as f64);
         eprintln!(
-            "处理的行        {:>12.1} 亿/轮",
+            "rows processed  {:>12.1} x1e8/round",
             r as f64 / 1e8 / rounds as f64
         );
-        eprintln!("每行            {:>12.2} ns", ns as f64 / r as f64);
+        eprintln!("per row         {:>12.2} ns", ns as f64 / r as f64);
     }
 
     /// 直方图累加的次数(不是时间):每「行 × 特征」一次。
@@ -214,16 +214,16 @@ pub mod prof {
         if n == 0 {
             return;
         }
-        eprintln!("\n=== 直方图累加 ===");
+        eprintln!("\n=== histogram accumulation ===");
         eprintln!(
-            "累加次数        {:>12.1} 亿/轮",
+            "accumulations   {:>12.1} x1e8/round",
             n as f64 / 1e8 / rounds as f64
         );
-        eprintln!("每次累加        {:>12.2} ns", ns as f64 / n as f64);
+        eprintln!("per accumulate  {:>12.2} ns", ns as f64 / n as f64);
         // 每次累加要读 1 字节 bin + 16 字节梯度,读写 16 字节直方图槽位
         let bytes = n as f64 * (1.0 + 16.0);
         eprintln!(
-            "流过的数据      {:>12.2} GB/轮  → {:.1} GB/s",
+            "data streamed   {:>12.2} GB/round  -> {:.1} GB/s",
             bytes / 1e9 / rounds as f64,
             bytes / 1e9 / (ns as f64 / 1e9)
         );
@@ -231,31 +231,31 @@ pub mod prof {
 
     pub fn report_gpu(rounds: usize) {
         let names: [(&str, &AtomicU64); 15] = [
-            ("H2D:gpair(每轮一次)", &GPU_GPAIR_H2D),
-            ("H2D:量化列块", &GPU_HIST_BLOCK_H2D),
-            ("H2D:histogram 行索引", &GPU_HIST_ROWS_H2D),
+            ("H2D:gpair (once per round)", &GPU_GPAIR_H2D),
+            ("H2D:quantized col blocks", &GPU_HIST_BLOCK_H2D),
+            ("H2D:histogram row index", &GPU_HIST_ROWS_H2D),
             ("hist_build kernels", &GPU_HIST_KERNEL),
             ("GPU split metadata H2D", &GPU_SPLIT_METADATA_H2D),
             ("GPU split kernels", &GPU_SPLIT_KERNEL),
             ("GPU split D2H", &GPU_SPLIT_D2H),
             ("D2H:histogram remainder", &GPU_HIST_D2H),
-            ("histogram wrapper 残差", &GPU_HIST_HOST),
-            ("H2D:partition 取列", &GPU_PART_COL_H2D),
-            ("H2D:partition 行索引", &GPU_PART_ROWS_H2D),
+            ("histogram wrapper residual", &GPU_HIST_HOST),
+            ("H2D:partition col fetch", &GPU_PART_COL_H2D),
+            ("H2D:partition row index", &GPU_PART_ROWS_H2D),
             ("partition kernel", &GPU_PART_KERNEL),
             ("D2H:partition offsets", &GPU_PART_D2H),
-            ("partition wrapper 残差", &GPU_PART_HOST),
+            ("partition wrapper residual", &GPU_PART_HOST),
             ("D2H:leaf prediction", &GPU_PRED_D2H),
         ];
         if names.iter().all(|(_, c)| c.load(Ordering::Relaxed) == 0) {
             return;
         }
         let total: u64 = names.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
-        eprintln!("\n=== GPU 分段({rounds} 轮)===");
+        eprintln!("\n=== GPU stages ({rounds} rounds) ===");
         for (name, c) in names {
             let ns = c.load(Ordering::Relaxed);
             eprintln!(
-                "{name:<28}{:>9.2} ms/轮{:>8.1}%",
+                "{name:<28}{:>9.2} ms/round{:>8.1}%",
                 ns as f64 / 1e6 / rounds as f64,
                 ns as f64 / total as f64 * 100.0
             );
@@ -330,7 +330,7 @@ pub mod prof {
                 &GPU_PRED_D2H_BYTES,
             ),
         ];
-        eprintln!("\n=== GPU transfer volume({rounds} 轮) ===");
+        eprintln!("\n=== GPU transfer volume ({rounds} rounds) ===");
         let mut h2d_bytes = 0u64;
         let mut d2h_bytes = 0u64;
         for (name, calls, bytes) in transfer_rows {
@@ -342,25 +342,25 @@ pub mod prof {
                 d2h_bytes += bytes;
             }
             eprintln!(
-                "{name:<28}{:>8.1} calls/轮{:>10.3} GB/轮",
+                "{name:<28}{:>8.1} calls/round{:>10.3} GB/round",
                 calls as f64 / rounds as f64,
                 bytes as f64 / 1e9 / rounds as f64
             );
         }
         eprintln!(
-            "H2D total{:>25.3} GB/轮",
+            "H2D total{:>25.3} GB/round",
             h2d_bytes as f64 / 1e9 / rounds as f64
         );
         eprintln!(
-            "D2H total{:>25.3} GB/轮",
+            "D2H total{:>25.3} GB/round",
             d2h_bytes as f64 / 1e9 / rounds as f64
         );
         eprintln!(
-            "Histogram/split/partition kernels{:>5.1} launches/轮",
+            "Histogram/split/partition kernels{:>5.1} launches/round",
             GPU_KERNEL_CALLS.load(Ordering::Relaxed) as f64 / rounds as f64
         );
         eprintln!(
-            "  split kernel subset{:>18.1} launches/轮",
+            "  split kernel subset{:>18.1} launches/round",
             GPU_SPLIT_KERNEL_CALLS.load(Ordering::Relaxed) as f64 / rounds as f64
         );
         let cache_parent_hits = GPU_SPLIT_CACHE_PARENT_HITS.load(Ordering::Relaxed);
@@ -468,21 +468,21 @@ pub mod prof {
         if v == 0.0 {
             return;
         }
-        eprintln!("\n=== 沿树下降的扫描量 ===");
-        eprintln!("行访问次数      {:>12.0} M", v / 1e6);
+        eprintln!("\n=== tree descent scan volume ===");
+        eprintln!("row visits      {:>12.0} M", v / 1e6);
         eprintln!(
-            "其中真的推进了  {:>12.0} M  ({:.1}%)",
+            "  advanced      {:>12.0} M  ({:.1}%)",
             a / 1e6,
             a / v * 100.0
         );
         eprintln!(
-            "白扫的行访问    {:>12.0} M  ({:.1}%)",
+            "wasted visits   {:>12.0} M  ({:.1}%)",
             (v - a) / 1e6,
             (v - a) / v * 100.0
         );
-        eprintln!("块 × 趟         {:>12}", b);
+        eprintln!("blocks x passes {:>12}", b);
         eprintln!(
-            "其中整块白扫    {:>12}  ({:.1}%)",
+            "  fully wasted  {:>12}  ({:.1}%)",
             e,
             e as f64 / b as f64 * 100.0
         );
@@ -729,20 +729,24 @@ pub trait BlockSourceExt: BlockSource {
         let mut slot = None;
         let mut f = Some(f);
         self.with_block_cols(i, cols, &mut |block| {
-            let f = f.take().expect("with_block_cols 的实现必须恰好调用一次 f");
+            let f = f
+                .take()
+                .expect("with_block_cols implementations must call f exactly once");
             slot = Some(f(block));
         })?;
-        Ok(slot.expect("with_block_cols 的实现必须恰好调用一次 f"))
+        Ok(slot.expect("with_block_cols implementations must call f exactly once"))
     }
 
     fn with_block_ret<R>(&self, i: usize, f: impl FnOnce(&ColumnBlock) -> R) -> anyhow::Result<R> {
         let mut slot = None;
         let mut f = Some(f);
         self.with_block(i, &mut |block| {
-            let f = f.take().expect("with_block 的实现必须恰好调用一次 f");
+            let f = f
+                .take()
+                .expect("with_block implementations must call f exactly once");
             slot = Some(f(block));
         })?;
-        Ok(slot.expect("with_block 的实现必须恰好调用一次 f"))
+        Ok(slot.expect("with_block implementations must call f exactly once"))
     }
 }
 
@@ -942,48 +946,57 @@ pub fn train_gpu_weighted(
 fn validate_weights(weights: &[f32], n: usize, name: &str) -> anyhow::Result<()> {
     crate::ensure_input!(
         weights.len() == n,
-        "{name}的权重有 {} 行,数据有 {n} 行",
+        "{name}: weights have {} rows, but the data has {n} rows",
         weights.len()
     );
     crate::ensure_input!(
         weights.iter().all(|w| w.is_finite() && *w >= 0.0),
-        "{name}的权重必须全部是有限的非负值"
+        "{name}: weights must all be finite and non-negative"
     );
     // 单个权重有限,加起来(以及乘上梯度后)仍可能溢出 f32,
     // 训练会悄悄变成 inf / NaN。总和超出 f32 范围直接拒绝。
     let total: f64 = weights.iter().map(|&w| f64::from(w)).sum();
     crate::ensure_input!(
         total <= f64::from(f32::MAX),
-        "{name}的权重总和是 {total:e},超出了 f32 范围;请把权重整体缩小"
+        "{name}: weights sum to {total:e}, which exceeds the f32 range; scale the weights down"
     );
     Ok(())
 }
 
 fn validate_source_metadata(source: &dyn BlockSource, name: &str) -> anyhow::Result<()> {
     let n_features = source.n_features();
-    anyhow::ensure!(source.n_blocks() > 0, "{name} 没有列块");
+    anyhow::ensure!(source.n_blocks() > 0, "{name} has no column blocks");
     anyhow::ensure!(
         source.cuts().n_feats() == n_features,
-        "{name} 的 cuts 有 {} 个特征,数据源声明 {n_features} 个",
+        "{name}: cuts have {} features, but the source declares {n_features}",
         source.cuts().n_feats()
     );
     let mut seen = vec![false; n_features];
     for block in 0..source.n_blocks() {
         let feats = source.block_features(block)?;
-        anyhow::ensure!(!feats.is_empty(), "{name} 的列块 {block} 没有特征");
+        anyhow::ensure!(
+            !feats.is_empty(),
+            "{name}: column block {block} has no features"
+        );
         anyhow::ensure!(
             feats.windows(2).all(|w| w[0] < w[1]),
-            "{name} 的列块 {block} 特征必须严格递增且不能重复"
+            "{name}: column block {block} features must be strictly increasing with no duplicates"
         );
         for feat in feats {
             let feat = feat as usize;
-            anyhow::ensure!(feat < n_features, "{name} 的列块 {block} 含越界特征 {feat}");
-            anyhow::ensure!(!seen[feat], "{name} 的特征 {feat} 出现在多个列块");
+            anyhow::ensure!(
+                feat < n_features,
+                "{name}: column block {block} contains out-of-range feature {feat}"
+            );
+            anyhow::ensure!(
+                !seen[feat],
+                "{name}: feature {feat} appears in more than one column block"
+            );
             seen[feat] = true;
         }
     }
     if let Some(feat) = seen.iter().position(|&present| !present) {
-        anyhow::bail!("{name} 的特征 {feat} 不在任何列块中");
+        anyhow::bail!("{name}: feature {feat} is not in any column block");
     }
     Ok(())
 }
@@ -1000,28 +1013,32 @@ fn validate_start_margins(
     let check = |margin: &[f32], rows: usize, what: &str| -> anyhow::Result<()> {
         crate::ensure_input!(
             margin.len() == rows * k,
-            "{what}的 base_margin 有 {} 个值,应为 {rows} 行 × {k} 个输出 = {}",
+            "{what}: base_margin has {} values, expected {rows} rows × {k} outputs = {}",
             margin.len(),
             rows * k
         );
         crate::ensure_input!(
             margin.iter().all(|v| v.is_finite()),
-            "{what}的 base_margin 必须全部是有限值"
+            "{what}: base_margin values must all be finite"
         );
         Ok(())
     };
     if let Some(m) = &cfg.base_margin {
-        check(m, source.n_rows(), "训练集")?;
+        check(m, source.n_rows(), "training set")?;
     }
     crate::ensure_input!(
         cfg.eval_base_margins.len() <= evals.len(),
-        "eval_base_margins 有 {} 项,但只有 {} 个验证集",
+        "eval_base_margins has {} entries, but there are only {} validation sets",
         cfg.eval_base_margins.len(),
         evals.len()
     );
     for (i, ev) in evals.iter().enumerate() {
         if let Some(m) = cfg.eval_margin(i) {
-            check(m, ev.source.n_rows(), &format!("验证集 {:?} ", ev.name))?;
+            check(
+                m,
+                ev.source.n_rows(),
+                &format!("validation set {:?}", ev.name),
+            )?;
         }
     }
     let Some(prior) = &cfg.prior_model else {
@@ -1033,11 +1050,11 @@ fn validate_start_margins(
     let unbiased = |o: &Objective| matches!(o, Objective::Rank { params, .. } if params.unbiased);
     crate::ensure_input!(
         !unbiased(&cfg.objective) && prior.rank_bias.is_none(),
-        "lambdarank_unbiased 模型不能续训(和 XGBoost 一样);请从头训练"
+        "lambdarank_unbiased models cannot be trained further (same as XGBoost); train from scratch"
     );
     crate::ensure_input!(
         prior.objective.name() == cfg.objective.name(),
-        "续训的 objective 是 {:?},已有模型的是 {:?}",
+        "continued training uses objective {:?}, but the existing model uses {:?}",
         cfg.objective.name(),
         prior.objective.name()
     );
@@ -1045,7 +1062,7 @@ fn validate_start_margins(
     // quantiles would silently mix two different targets.
     crate::ensure_input!(
         prior.objective.quantile_alphas() == cfg.objective.quantile_alphas(),
-        "续训的 quantile_alpha 是 {:?},已有模型的是 {:?}:续训必须使用相同的分位数",
+        "continued training uses quantile_alpha {:?}, but the existing model uses {:?}; continued training must use the same quantiles",
         cfg.objective
             .quantile_alphas()
             .map(|a| a.as_slice().to_vec()),
@@ -1056,18 +1073,18 @@ fn validate_start_margins(
     );
     crate::ensure_input!(
         prior.num_outputs() == k,
-        "续训的输出数是 {k}(num_class),已有模型的是 {}",
+        "continued training has {k} outputs (num_class), but the existing model has {}",
         prior.num_outputs()
     );
     crate::ensure_input!(
         prior.n_features == source.n_features(),
-        "续训的数据有 {} 个特征,已有模型有 {} 个",
+        "continued training data has {} features, but the existing model has {}",
         source.n_features(),
         prior.n_features
     );
     crate::ensure_input!(
         prior.trees.len() % k == 0,
-        "已有模型有 {} 棵树,不是 {k} 个输出的整数轮",
+        "the existing model has {} trees, which is not a whole number of rounds for {k} outputs",
         prior.trees.len()
     );
     // An empty `feature_types` means every feature is numeric.
@@ -1082,7 +1099,7 @@ fn validate_start_margins(
     crate::ensure_input!(
         flags(&prior.feature_types, n_features)
             == flags(source.cuts().categorical_flags(), n_features),
-        "续训数据的类别特征(feature_types)和已有模型不一致"
+        "categorical features (feature_types) of the continued training data do not match the existing model"
     );
     // The new trees can only split on codes the current training supports
     // (`MAX_CAT_CODE`); refuse a model that already splits on larger ones rather
@@ -1095,7 +1112,7 @@ fn validate_start_margins(
                 .find(|&&c| c > crate::categorical::MAX_CAT_CODE)
             {
                 crate::bail_input!(
-                    "已有模型的第 {t} 棵树在类别特征 {} 上分裂到类别码 {big},超过当前训练支持的上限 {}(MAX_CAT_CODE);无法续训",
+                    "tree {t} of the existing model splits categorical feature {} on category code {big}, above the training limit {} (MAX_CAT_CODE); cannot continue training",
                     node.feat,
                     crate::categorical::MAX_CAT_CODE
                 );
@@ -1110,18 +1127,18 @@ fn validate_start_margins(
         };
         crate::ensure_input!(
             k > 1 || b.to_bits() == model_b.to_bits(),
-            "续训时 base_score 沿用已有模型的 {model_b},不能改成 {b}"
+            "continued training keeps the existing model's base_score {model_b}; it cannot be changed to {b}"
         );
     }
     if !prior.trees.is_empty() {
         crate::ensure_input!(
             cfg.base_margin.is_some(),
-            "续训必须带已有模型在训练集上的 raw margin 作为 base_margin"
+            "continued training requires the existing model's raw margin on the training set as base_margin"
         );
         for (i, ev) in evals.iter().enumerate() {
             crate::ensure_input!(
                 cfg.eval_margin(i).is_some(),
-                "续训必须带已有模型在验证集 {:?} 上的 raw margin 作为 base_margin",
+                "continued training requires the existing model's raw margin on validation set {:?} as base_margin",
                 ev.name
             );
         }
@@ -1155,21 +1172,27 @@ fn train_with_backend(
     gpu_device: Option<usize>,
 ) -> anyhow::Result<Model> {
     let n = source.n_rows();
-    crate::ensure_input!(n > 0, "训练数据必须至少有一行");
+    crate::ensure_input!(n > 0, "training data must have at least one row");
     // 行号是 u32(`RowId`):超过就会静默截断成错的行。
     crate::ensure_input!(
         n <= crate::types::RowId::MAX as usize,
-        "训练数据有 {n} 行,超过了支持的上限 {}",
+        "training data has {n} rows, above the supported limit {}",
         crate::types::RowId::MAX
     );
-    crate::ensure_input!(source.n_features() > 0, "训练数据必须至少有一个特征");
-    validate_source_metadata(source, "训练集")?;
+    crate::ensure_input!(
+        source.n_features() > 0,
+        "training data must have at least one feature"
+    );
+    validate_source_metadata(source, "training set")?;
     crate::ensure_input!(
         labels.len() == n,
-        "标签有 {} 行,训练数据有 {n} 行",
+        "labels have {} rows, but the training data has {n} rows",
         labels.len()
     );
-    crate::ensure_input!(labels.iter().all(|v| v.is_finite()), "标签必须全部是有限值");
+    crate::ensure_input!(
+        labels.iter().all(|v| v.is_finite()),
+        "labels must all be finite"
+    );
     let ranking = cfg.objective.rank();
     match (ranking.is_some(), cfg.group_ptr.as_deref()) {
         (true, None) => crate::bail_input!(
@@ -1179,7 +1202,7 @@ fn train_with_backend(
         // Without a ranking objective the groups do not change training (the
         // training set only keeps them if it is also evaluated); they are checked all
         // the same.
-        (_, Some(g)) => crate::rank::validate_group_ptr(g, n, "训练集")?,
+        (_, Some(g)) => crate::rank::validate_group_ptr(g, n, "training set")?,
         (false, None) => {}
     }
     // Ranking weights are per query group (XGBoost): they never reach the per-row
@@ -1189,14 +1212,14 @@ fn train_with_backend(
         _ => n,
     };
     if let Some(w) = weights {
-        validate_weights(w, n_weights, "训练集")?;
+        validate_weights(w, n_weights, "training set")?;
     }
     let (group_weights, weights) = if ranking.is_some() {
         (weights, None)
     } else {
         (None, weights)
     };
-    cfg.objective.validate_labels(labels, "训练集")?;
+    cfg.objective.validate_labels(labels, "training set")?;
     cfg.objective.validate_params()?;
     let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
     let rank_grad = match (ranking, cfg.group_ptr.as_deref()) {
@@ -1229,7 +1252,7 @@ fn train_with_backend(
     // (XGBoost 把标量复制成 K 份),否则按类别频率估计。
     // 续训:截距永远是已有模型的(XGBoost 同样保留模型的 base_score)。
     let class_margins: Vec<f32> = if num_class > 1 {
-        cfg.objective.validate_labels(labels, "训练集")?;
+        cfg.objective.validate_labels(labels, "training set")?;
         match (&cfg.prior_model, cfg.base_score) {
             (Some(prior), _) => prior.class_base_margins.clone(),
             (None, Some(b)) => vec![b; num_class],
@@ -1262,14 +1285,14 @@ fn train_with_backend(
     // spw == 1 时不复制(乘 1 是恒等,结果逐位相同)。
     let spw_weights = gradient_weights(cfg.objective, labels, weights, cfg.params.scale_pos_weight);
     let grad_weights: Option<&[f32]> = spw_weights.as_deref().or(weights);
-    crate::ensure_input!(base_score.is_finite(), "base_score 必须是有限值");
+    crate::ensure_input!(base_score.is_finite(), "base_score must be finite");
     cfg.objective.validate_base_score(base_score)?;
     let source_bytes_start = source.source_bytes_read();
     let source_reads_start = source.source_block_reads();
     let p = &cfg.params;
     crate::ensure_input!(
         (1..=crate::types::MAX_BIN_LIMIT).contains(&p.max_bin),
-        "max_bin 要在 1..=255"
+        "max_bin must be in 1..=255"
     );
     // ⚠️ **必须在共享路径上校验**,不能只在 GPU 里。以前完全没有校验:
     // CPU 会安静地接受 depth 16,GPU 则在训练深处报
@@ -1279,101 +1302,105 @@ fn train_with_backend(
     // 有专门的测试钉着它的语义(`root_only_tree_updates_the_next_round_predictions`)。
     crate::ensure_input!(
         p.max_depth <= crate::types::MAX_DEPTH_LIMIT,
-        "max_depth 要在 0..={}(收到 {});0 表示只有根节点,上限由 GPU 的\
-         每层 partition 节点 buffer 决定,见 types::MAX_DEPTH_LIMIT",
+        "max_depth must be in 0..={}, got {}; 0 means a root-only tree, and the upper bound \
+         is set by the GPU per-level partition node buffer (see types::MAX_DEPTH_LIMIT)",
         crate::types::MAX_DEPTH_LIMIT,
         p.max_depth
     );
-    crate::ensure_input!(p.cols_per_block > 0, "cols_per_block 必须 > 0");
+    crate::ensure_input!(p.cols_per_block > 0, "cols_per_block must be > 0");
     // XGBoost:约束比特征多是错误;比特征少的部分视为 0。
     crate::ensure_input!(
         p.monotone_constraints.len() <= source.n_features(),
-        "monotone_constraints 有 {} 个,但只有 {} 个特征",
+        "monotone_constraints has {} entries, but there are only {} features",
         p.monotone_constraints.len(),
         source.n_features()
     );
     crate::ensure_input!(
         p.monotone_constraints.iter().all(|c| (-1..=1).contains(c)),
-        "monotone_constraints 只接受 -1 / 0 / 1(按符号归一后)"
+        "monotone_constraints accepts only -1 / 0 / 1 (after sign normalization)"
     );
     crate::ensure_input!(
         p.learning_rate.is_finite() && p.learning_rate >= 0.0,
-        "learning_rate 必须是非负有限值"
+        "learning_rate must be finite and non-negative"
     );
     crate::ensure_input!(
         p.lambda.is_finite() && p.lambda >= 0.0,
-        "lambda 必须是非负有限值"
+        "lambda must be finite and non-negative"
     );
     crate::ensure_input!(
         p.gamma.is_finite() && p.gamma >= 0.0,
-        "gamma 必须是非负有限值"
+        "gamma must be finite and non-negative"
     );
     crate::ensure_input!(
         p.min_child_weight.is_finite() && p.min_child_weight >= 0.0,
-        "min_child_weight 必须是非负有限值"
+        "min_child_weight must be finite and non-negative"
     );
     crate::ensure_input!(
         p.alpha.is_finite() && p.alpha >= 0.0,
-        "alpha 必须是非负有限值"
+        "alpha must be finite and non-negative"
     );
     crate::ensure_input!(
         p.max_delta_step.is_finite() && p.max_delta_step >= 0.0,
-        "max_delta_step 必须是非负有限值"
+        "max_delta_step must be finite and non-negative"
     );
     crate::ensure_input!(
         p.scale_pos_weight.is_finite() && p.scale_pos_weight >= 0.0,
-        "scale_pos_weight 必须是非负有限值"
+        "scale_pos_weight must be finite and non-negative"
     );
     crate::ensure_input!(
         p.subsample > 0.0 && p.subsample <= 1.0 && p.subsample.is_finite(),
-        "subsample 必须在 (0, 1],收到 {}",
+        "subsample must be in (0, 1], got {}",
         p.subsample
     );
     crate::ensure_input!(
         p.colsample_bytree > 0.0 && p.colsample_bytree <= 1.0 && p.colsample_bytree.is_finite(),
-        "colsample_bytree 必须在 (0, 1],收到 {}",
+        "colsample_bytree must be in (0, 1], got {}",
         p.colsample_bytree
     );
     crate::ensure_input!(
         p.colsample_bylevel > 0.0 && p.colsample_bylevel <= 1.0 && p.colsample_bylevel.is_finite(),
-        "colsample_bylevel 必须在 (0, 1],收到 {}",
+        "colsample_bylevel must be in (0, 1], got {}",
         p.colsample_bylevel
     );
     crate::ensure_input!(
         p.colsample_bynode > 0.0 && p.colsample_bynode <= 1.0 && p.colsample_bynode.is_finite(),
-        "colsample_bynode 必须在 (0, 1],收到 {}",
+        "colsample_bynode must be in (0, 1], got {}",
         p.colsample_bynode
     );
     for ev in evals {
-        crate::ensure_input!(ev.source.n_rows() > 0, "验证集 {:?} 是空的", ev.name);
+        crate::ensure_input!(
+            ev.source.n_rows() > 0,
+            "validation set {:?} is empty",
+            ev.name
+        );
         crate::ensure_input!(
             ev.source.n_rows() <= crate::types::RowId::MAX as usize,
-            "验证集 {:?} 有 {} 行,超过了支持的上限 {}",
+            "validation set {:?} has {} rows, above the supported limit {}",
             ev.name,
             ev.source.n_rows(),
             crate::types::RowId::MAX
         );
         crate::ensure_input!(
             ev.labels.len() == ev.source.n_rows(),
-            "验证集 {:?} 的标签有 {} 行,数据有 {} 行",
+            "validation set {:?}: labels have {} rows, but the data has {} rows",
             ev.name,
             ev.labels.len(),
             ev.source.n_rows()
         );
         crate::ensure_input!(
             ev.source.n_features() == source.n_features(),
-            "验证集 {:?} 有 {} 个特征,训练集有 {} 个",
+            "validation set {:?} has {} features, but the training set has {}",
             ev.name,
             ev.source.n_features(),
             source.n_features()
         );
         crate::ensure_input!(
             ev.labels.iter().all(|v| v.is_finite()),
-            "验证集 {:?} 的标签必须全部是有限值",
+            "validation set {:?}: labels must all be finite",
             ev.name
         );
         cfg.objective
-            .validate_labels(ev.labels, &format!("验证集 {:?} ", ev.name))?;
+            .validate_labels(ev.labels, &format!("validation set {:?}", ev.name))?;
         match (ranking.is_some(), ev.group_ptr) {
             (true, None) => crate::bail_input!(
                 "validation set {:?} needs query groups (eval qid / group) for {}",
@@ -1418,22 +1445,22 @@ fn train_with_backend(
                     );
                 }
             }
-            validate_weights(w, n_ev_weights, &format!("验证集 {:?} ", ev.name))?;
+            validate_weights(w, n_ev_weights, &format!("validation set {:?}", ev.name))?;
             for m in &cfg.eval_metrics {
                 crate::ensure_input!(
                     m.supports_weights(),
-                    "metric {:?} 不支持加权评估,但验证集 {:?} 带了权重",
+                    "metric {:?} does not support weighted evaluation, but validation set {:?} has weights",
                     m.name(),
                     ev.name
                 );
             }
         }
-        validate_source_metadata(ev.source, &format!("验证集 {:?}", ev.name))?;
+        validate_source_metadata(ev.source, &format!("validation set {:?}", ev.name))?;
         crate::ensure_input!(
             ev.source.cuts().offsets == source.cuts().offsets
                 && ev.source.cuts().values == source.cuts().values
                 && ev.source.cuts().categorical_flags() == source.cuts().categorical_flags(),
-            "验证集 {:?} 没有复用训练集的 cuts",
+            "validation set {:?} does not reuse the training set cuts",
             ev.name
         );
     }
@@ -1550,11 +1577,11 @@ fn train_with_backend(
                 prof::enabled(),
             )?;
             if prof::enabled() {
-                eprintln!("\n=== GPU 显存预算 ===\n{}", ctx.budget().report());
+                eprintln!("\n=== GPU memory budget ===\n{}", ctx.budget().report());
                 eprintln!("{}", ctx.host_budget().report());
                 if let Ok((used, total)) = ctx.device_mem_used() {
                     eprintln!(
-                        "分配后 device 已用 {:.1} MB / {:.1} MB(含 driver/context 固定开销)",
+                        "device memory used after allocation {:.1} MB / {:.1} MB (including fixed driver/context overhead)",
                         used as f64 / 1048576.0,
                         total as f64 / 1048576.0
                     );
@@ -1592,7 +1619,7 @@ fn train_with_backend(
         };
     }
     if fast_math {
-        let ctx = gpu.as_ref().expect("fast_math 蕴含 gpu 存在");
+        let ctx = gpu.as_ref().expect("fast_math implies a GPU context");
         match &cfg.base_margin {
             // device prediction 直接从逐行 margin 起步(class-major,K × n):
             // 缓冲区本来就按 K × n 分配,规划器不用多记一项。
@@ -1613,7 +1640,7 @@ fn train_with_backend(
     // fast ranking: static per-group inputs go to the device once
     if let (true, Some(rg)) = (fast_math, rank_grad.as_ref()) {
         gpu.as_ref()
-            .expect("fast_math 蕴含 gpu 存在")
+            .expect("fast_math implies a GPU context")
             .init_fast_rank(&rg.device_inputs())?;
     }
 
@@ -1684,7 +1711,7 @@ fn train_with_backend(
         let gpair_f32 = if fast_math {
             Vec::new()
         } else if fuse {
-            let ctx = gpu.as_ref().expect("pending_delta 蕴含 gpu 存在");
+            let ctx = gpu.as_ref().expect("pending_delta implies a GPU context");
             let obj = cfg.objective;
             let mut out: Vec<GradPair> = Vec::new();
             pool.install(|| -> anyhow::Result<()> {
@@ -1784,7 +1811,7 @@ fn train_with_backend(
         let (quantizer, fixed, known_root_sum, host_nonzero) = if fast_math {
             // prediction D2H、host 按行 gradient、gpair H2D —— 三项都不存在。
             // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
-            let ctx = gpu.as_ref().expect("fast_math 蕴含 gpu 存在");
+            let ctx = gpu.as_ref().expect("fast_math implies a GPU context");
             let _t = prof::Timer::new(&prof::QUANTIZE);
             // 行采样在 device 上完成:阈值 host 折算,device 只比整数。
             // ⚠️ kernel 里 prediction 更新是**无条件**的,只有 gpair 被置零 ——
@@ -1808,7 +1835,7 @@ fn train_with_backend(
             pending_delta = false;
             (q, Vec::new(), Some(root), None)
         } else if device_quant {
-            let ctx = gpu.as_ref().expect("device_quant 蕴含 gpu 存在");
+            let ctx = gpu.as_ref().expect("device_quant implies a GPU context");
             let _t = prof::Timer::new(&prof::QUANTIZE);
             let (q, root, ms) = ctx.upload_and_quantize_gpair_sampled(
                 &gpair_f32,
@@ -1986,7 +2013,7 @@ fn train_with_backend(
         if let Some(ctx) = gpu.as_ref() {
             if let Ok((used, total)) = ctx.device_mem_used() {
                 eprintln!(
-                    "\n训练结束时 device 已用 {:.1} MB / {:.1} MB;其中本进程预分配 {:.1} MB",
+                    "\ndevice memory used at end of training {:.1} MB / {:.1} MB; preallocated by this process {:.1} MB",
                     used as f64 / 1048576.0,
                     total as f64 / 1048576.0,
                     ctx.budget().total() as f64 / 1048576.0
@@ -1995,7 +2022,7 @@ fn train_with_backend(
         }
         prof::report(completed_rounds);
         eprintln!(
-            "实际整轮 wall{:>19.2} ms/轮",
+            "actual round wall{:>15.2} ms/round",
             prof::ROUND_WALL.load(std::sync::atomic::Ordering::Relaxed) as f64
                 / 1e6
                 / completed_rounds as f64
@@ -2055,7 +2082,7 @@ pub fn train_gpu_one_tree(
 ) -> anyhow::Result<Model> {
     use crate::backend::cuda::build_histogram_shared;
     if labels.len() != source.n_rows() {
-        anyhow::bail!("labels 长度与 source 行数不符");
+        anyhow::bail!("labels length does not match the source row count");
     }
     let base_score = cfg.resolve_base_score(labels, None);
     let margin = base_margin(cfg.objective, base_score);
@@ -2257,7 +2284,7 @@ fn train_multiclass_rounds(
             // 多分位数没有每轮的行统计量:每个目标的 scale 在它自己的 kernel 里归约。
             if !multi_quantile {
                 let _t = prof::Timer::new(&prof::GRAD);
-                gpu.expect("fast_math 蕴含 gpu 存在")
+                gpu.expect("fast_math implies a GPU context")
                     .fast_multiclass_begin_round()?;
             }
         } else {
@@ -2291,7 +2318,7 @@ fn train_multiclass_rounds(
                 // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
                 // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
                 // kernel、无条件执行 —— 采样掩码不是预测掩码。
-                let ctx = gpu.expect("fast_math 蕴含 gpu 存在");
+                let ctx = gpu.expect("fast_math implies a GPU context");
                 let _t = prof::Timer::new(&prof::QUANTIZE);
                 let (q, root, _ms) = if multi_quantile {
                     ctx.fast_multiquantile_gradient_and_quantize(
@@ -2314,7 +2341,7 @@ fn train_multiclass_rounds(
                 };
                 (q, Vec::new(), Some(root), None)
             } else if device_quant {
-                let ctx = gpu.expect("device_quant 蕴含 gpu 存在");
+                let ctx = gpu.expect("device_quant implies a GPU context");
                 let _t = prof::Timer::new(&prof::QUANTIZE);
                 let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
                     &gpair_f32,
@@ -2388,10 +2415,10 @@ fn train_multiclass_rounds(
             // fast:delta 在 device 上直接加到第 `class` 列,没有任何 D2H。
             if fast_math && multi_quantile {
                 // 下一棵树(下一个目标)会覆盖 delta buffer:立刻并进这个目标的列。
-                gpu.expect("fast_math 蕴含 gpu 存在")
+                gpu.expect("fast_math implies a GPU context")
                     .fast_multiquantile_apply_delta(class)?;
             } else if fast_math {
-                gpu.expect("fast_math 蕴含 gpu 存在")
+                gpu.expect("fast_math implies a GPU context")
                     .fast_multiclass_apply_delta(class)?;
             }
             // GPU 路径的叶子增量还在 device 回传的 buffer 里:立即施加到这一类。
@@ -2627,16 +2654,16 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
             source.with_block_ret(b, |block| -> anyhow::Result<()> {
                 anyhow::ensure!(
                     block.n_rows == n_rows,
-                    "预测时列块 {b} 有 {} 行,数据源声明 {n_rows} 行",
+                    "prediction: column block {b} has {} rows, but the source declares {n_rows}",
                     block.n_rows
                 );
                 anyhow::ensure!(
                     block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
-                    "预测时列块 {b} 数据长度与行数 × 特征数不一致"
+                    "prediction: column block {b} data length does not match rows × features"
                 );
                 anyhow::ensure!(
                     block.feat_ids == block_feats[b],
-                    "预测时列块 {b} 的实际特征与 block_features 元数据不一致"
+                    "prediction: column block {b} features do not match the block_features metadata"
                 );
                 let mut local_of = vec![usize::MAX; source.n_features()];
                 for (local, &f) in block.feat_ids.iter().enumerate() {
@@ -2674,7 +2701,10 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         }
         done = at.iter().all(|&n| t.nodes[n as usize].is_leaf);
     }
-    anyhow::ensure!(done, "有行没走到叶子,树的结构不对");
+    anyhow::ensure!(
+        done,
+        "some rows did not reach a leaf; the tree structure is invalid"
+    );
 
     Ok(at.iter().map(|&n| t.nodes[n as usize].leaf_value).collect())
 }
@@ -2709,14 +2739,14 @@ impl NodeRows {
     fn host<'a>(&self, buf: &'a [RowId]) -> &'a [RowId] {
         match self {
             Self::Host(span) => span.of(buf),
-            Self::Device(_) => panic!("device rows 被送进 CPU 路径"),
+            Self::Device(_) => panic!("device rows were sent to the CPU path"),
         }
     }
 
     fn device(&self) -> crate::backend::cuda::GpuRowSpan {
         match self {
             Self::Device(span) => *span,
-            Self::Host(_) => panic!("host rows 被送进 GPU 路径"),
+            Self::Host(_) => panic!("host rows were sent to the GPU path"),
         }
     }
 }
@@ -2996,17 +3026,17 @@ fn build_tree(
                     if let Some(block) = block {
                         anyhow::ensure!(
                             block.n_rows == source.n_rows(),
-                            "列块 {phys} 有 {} 行,数据源声明 {} 行",
+                            "column block {phys} has {} rows, but the source declares {}",
                             block.n_rows,
                             source.n_rows()
                         );
                         anyhow::ensure!(
                             block.feat_ids == plan.handed_feats,
-                            "列块 {phys} 交回的特征与 plan 不一致"
+                            "column block {phys} returned features that do not match the plan"
                         );
                         anyhow::ensure!(
                             block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
-                            "列块 {b} 数据长度与行数 × 特征数不一致"
+                            "column block {b} data length does not match rows × features"
                         );
                     }
                     let width = *plan.hist_offsets.last().unwrap() as usize;
@@ -3207,7 +3237,7 @@ fn build_tree(
                         if let HistFrom::Subtract { parent, sibling } = level[i].hist_from {
                             let ph = parent_hist
                                 .as_mut()
-                                .expect("第一层没有父亲,不该走到相减这条路");
+                                .expect("the first level has no parent and must not take the subtraction path");
                             let _t = prof::Timer::new(&prof::SUBTRACT);
                             // 父的存储**搬**给大 child,原地减去兄弟。
                             //
@@ -3221,7 +3251,7 @@ fn build_tree(
                             assert_eq!(
                                 out.len(),
                                 width,
-                                "父直方图 {parent} 被认领了不止一次(或宽度不符)"
+                                "parent histogram {parent} was claimed more than once (or has the wrong width)"
                             );
                             hist::subtract_in_place(&mut out, &per_node[sibling]);
                             per_node[i] = out;
@@ -3428,7 +3458,9 @@ fn build_tree(
                 let mut spans = spans.into_iter();
                 for (i, c) in chosen.iter().enumerate() {
                     if c.is_some() {
-                        let (left, right) = spans.next().expect("每个分裂节点一对孩子");
+                        let (left, right) = spans
+                            .next()
+                            .expect("each split node has a pair of children");
                         partitions[i] = Some((NodeRows::Host(left), NodeRows::Host(right)));
                     }
                 }
@@ -3467,13 +3499,13 @@ fn build_tree(
                 );
             }
             {
-                let ctx = gpu.expect("CPU 分区已在上面整层完成");
+                let ctx = gpu.expect("CPU partitioning was already done for the whole level above");
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
                 let mut session = ctx.partition_session(col)?;
                 for i in node_idxs {
-                    let c = chosen[i].expect("by_feat 里只放了有候选的节点");
+                    let c = chosen[i].expect("by_feat only holds nodes with a candidate");
                     part_tokens[i] = Some(match &c.cats {
                         Some(cats) => session.partition_categorical(
                             level[i].rows.device(),
@@ -3566,7 +3598,7 @@ fn build_tree(
                     cats: c.cats,
                 };
             }
-            let (left_rows, right_rows) = partitions[i].take().expect("上面按块分好了");
+            let (left_rows, right_rows) = partitions[i].take().expect("partitioned by block above");
 
             // 行少的那个真算,另一个用父 - 兄弟。省下来的是整个训练
             // 里最大的一块常数。
@@ -3725,7 +3757,7 @@ fn apply_dropped_rows(
     } else {
         source
             .resident_feature_column(t.nodes[0].feat)
-            .context("零梯度行下降需要驻留的列")?
+            .context("zero-gradient row descent needs resident columns")?
     };
     let mut steps: Vec<Step<'_>> = Vec::with_capacity(t.nodes.len());
     for (i, n) in t.nodes.iter().enumerate() {
@@ -3743,7 +3775,7 @@ fn apply_dropped_rows(
             steps.push(Step {
                 col: source
                     .resident_feature_column(sp.feat)
-                    .context("零梯度行下降需要驻留的列")?,
+                    .context("zero-gradient row descent needs resident columns")?,
                 bound: sp.bin,
                 missing_left: sp.missing_left,
                 cats: sp.cats,
@@ -4608,18 +4640,18 @@ mod tests {
         p.cols_per_block = n_feats;
         let cfg = TrainConfig::new(p, Objective::SquaredError);
         let src = DenseSource::from_row_major(&x, n_rows, n_feats, 32, n_feats);
-        train(&src, &y, &[], &cfg, &mut [], &Local).expect("max_depth=0 是合法的根节点树");
+        train(&src, &y, &[], &cfg, &mut [], &Local).expect("max_depth=0 is a valid root-only tree");
         // 上限就是那个 buffer 装得下的最深一层。
         let deepest_partitioned_level = crate::types::MAX_DEPTH_LIMIT - 1;
         assert_eq!(
             1usize << deepest_partitioned_level,
             8192,
-            "depth 14 正好用满 8192 个槽位"
+            "depth 14 uses exactly 8192 slots"
         );
         assert_eq!(
             1usize << crate::types::MAX_DEPTH_LIMIT,
             16384,
-            "depth 15 需要 16384 个槽位"
+            "depth 15 needs 16384 slots"
         );
     }
 
@@ -4641,10 +4673,10 @@ mod tests {
             let cfg = TrainConfig::new(p, Objective::SquaredError);
             let src = DenseSource::from_row_major(&x, n_rows, n_feats, 32, n_feats);
             let err = train(&src, &y, &[], &cfg, &mut [], &Local)
-                .expect_err(&format!("max_depth={bad} 应当被拒"));
+                .expect_err(&format!("max_depth={bad} should be rejected"));
             assert!(
                 err.to_string().contains("max_depth"),
-                "错误信息要指出是 max_depth 的问题,收到:{err}"
+                "the error should mention max_depth, got: {err}"
             );
         }
     }
@@ -4661,7 +4693,7 @@ mod tests {
         p.cols_per_block = n_feats;
         let cfg = TrainConfig::new(p, Objective::SquaredError);
         let src = DenseSource::from_row_major(&x, n_rows, n_feats, 32, n_feats);
-        train(&src, &y, &[], &cfg, &mut [], &Local).expect("depth 14 必须能训");
+        train(&src, &y, &[], &cfg, &mut [], &Local).expect("depth 14 must train");
     }
 
     /// 小夹具:行少所以深树会自然剪枝,这几条测的是**校验**不是性能。
@@ -4740,7 +4772,7 @@ mod tests {
             assert_eq!(
                 got.to_bits(),
                 by_floats.to_bits(),
-                "行 {row} {raw:?}:量化下降 {got} != 浮点下降 {by_floats}"
+                "row {row} {raw:?}: quantized descent {got} != float descent {by_floats}"
             );
         }
     }
@@ -4879,10 +4911,17 @@ mod tests {
         let pred = predict_on(&model, &src).unwrap();
 
         let ll = crate::metrics::LogLoss.eval(&pred, &y);
-        assert!(ll < 0.2, "30 轮之后 logloss 应该很小,实际 {ll}");
+        assert!(
+            ll < 0.2,
+            "logloss should be small after 30 rounds, got {ll}"
+        );
         for (i, (&p, &label)) in pred.iter().zip(&y).enumerate() {
             let prob = 1.0 / (1.0 + (-p).exp());
-            assert_eq!(prob > 0.5, label > 0.5, "第 {i} 行分错了(prob {prob})");
+            assert_eq!(
+                prob > 0.5,
+                label > 0.5,
+                "row {i} misclassified (prob {prob})"
+            );
         }
     }
 
@@ -4896,7 +4935,7 @@ mod tests {
             let rmse = crate::metrics::Rmse.eval(&pred, &y);
             assert!(
                 rmse < last,
-                "{rounds} 轮的 rmse {rmse} 没比上一档 {last} 小"
+                "rmse {rmse} at {rounds} rounds is not smaller than the previous {last}"
             );
             last = rmse;
         }
@@ -4919,7 +4958,7 @@ mod tests {
                 .sum();
             assert!(
                 (leaves - root).abs() < 1e-3 * root.max(1.0),
-                "第 {k} 棵树:叶子 hess 之和 {leaves} != 根 {root}"
+                "tree {k}: sum of leaf hess {leaves} != root {root}"
             );
         }
     }
@@ -4930,7 +4969,10 @@ mod tests {
         for max_depth in [0u32, 1, 2, 4] {
             let (model, _) = train_on(&x, &y, nf, params(max_depth, 2), Objective::Logistic);
             for t in &model.trees {
-                assert!(depth_of(t, 0) <= max_depth, "max_depth {max_depth} 被突破");
+                assert!(
+                    depth_of(t, 0) <= max_depth,
+                    "max_depth {max_depth} exceeded"
+                );
             }
         }
     }
@@ -5025,7 +5067,7 @@ mod tests {
         let second = model.trees[1].nodes[0].leaf_value;
         assert!(
             second > 0.0 && second < first,
-            "第二轮应该看到已更新的预测:{first} → {second}"
+            "the second round should see the updated predictions: {first} -> {second}"
         );
     }
 
@@ -5036,8 +5078,8 @@ mod tests {
         let cfg = TrainConfig::new(params(2, 2), Objective::Logistic);
 
         let err = train(&src, &y[..19], &[], &cfg, &mut [], &Local)
-            .expect_err("训练标签长度不一致必须报错");
-        assert!(err.to_string().contains("标签有 19 行"), "{err:#}");
+            .expect_err("mismatched training label length must error");
+        assert!(err.to_string().contains("labels have 19 rows"), "{err:#}");
 
         let eval = EvalSet {
             name: "valid".into(),
@@ -5047,8 +5089,11 @@ mod tests {
             group_ptr: None,
         };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local)
-            .expect_err("验证标签长度不一致必须报错");
-        assert!(err.to_string().contains("验证集 \"valid\""), "{err:#}");
+            .expect_err("mismatched validation label length must error");
+        assert!(
+            err.to_string().contains("validation set \"valid\""),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -5194,7 +5239,10 @@ mod tests {
             };
             let one = run(1);
             let eight = run(8);
-            assert_eq!(one, eight, "1/8 线程的行索引必须逐字节相同");
+            assert_eq!(
+                one, eight,
+                "row indices must be byte-identical with 1 and 8 threads"
+            );
 
             let (out, next) = one;
             for ((span, c), (left, right)) in nodes.iter().zip(&out) {
@@ -5256,7 +5304,7 @@ mod tests {
         };
         let model = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
 
-        assert_eq!(model.trees[0].len(), 1, "不该分裂");
+        assert_eq!(model.trees[0].len(), 1, "should not split");
         assert!(model.trees[0].nodes[0].is_leaf);
     }
 
@@ -5270,7 +5318,11 @@ mod tests {
         let pa = predict_on(&a, &src).unwrap();
         let pb = predict_on(&b, &src).unwrap();
         for (i, (x, y)) in pa.iter().zip(&pb).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "第 {i} 行两次训练结果不同");
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "row {i} differs between two training runs"
+            );
         }
     }
 
@@ -5312,10 +5364,20 @@ mod tests {
     fn early_stopping_stops_and_records_the_best_round() {
         let (model, n_trees) = run_early_stopping(3, 50);
         // 指标一路变差,best 停在第 0 轮,再数 3 轮没改善 → 一共 4 棵树
-        assert_eq!(model.best_iteration, Some(0), "最佳轮次应该是第一轮");
-        assert_eq!(n_trees, 4, "best(1 棵) + 连续 3 轮没改善 = 4 棵树");
+        assert_eq!(
+            model.best_iteration,
+            Some(0),
+            "the best iteration should be the first round"
+        );
+        assert_eq!(
+            n_trees, 4,
+            "best (1 tree) + 3 rounds without improvement = 4 trees"
+        );
         assert!(model.best_score.is_some());
-        assert!(n_trees < 50, "早停没生效,跑满了 50 轮");
+        assert!(
+            n_trees < 50,
+            "early stopping did not trigger, ran all 50 rounds"
+        );
     }
 
     #[test]
@@ -5325,7 +5387,7 @@ mod tests {
             assert_eq!(
                 n_trees,
                 rounds + 1,
-                "耐心 {rounds} 轮应该留下 {} 棵树",
+                "patience of {rounds} rounds should leave {} trees",
                 rounds + 1
             );
         }
@@ -5389,7 +5451,7 @@ mod tests {
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),
-                "第 {round} 轮的增量指标和全量重算不一致"
+                "round {round}: incremental metric differs from full recomputation"
             );
         }
     }
@@ -5409,7 +5471,7 @@ mod tests {
         };
         assert_eq!(m.watched().unwrap().1, "rmse");
         assert_eq!(m.watched().unwrap().2, 4.0);
-        assert_eq!(m.last().unwrap().2, 4.0, "last() 是最后一个 metric");
+        assert_eq!(m.last().unwrap().2, 4.0, "last() is the last metric");
     }
 
     #[test]
@@ -5444,10 +5506,14 @@ mod tests {
         let recorded = history.lock().unwrap();
         assert_eq!(recorded.len(), 3);
         for m in recorded.iter() {
-            assert_eq!(m.entries.len(), 2, "一个 eval × 两个 metric");
+            assert_eq!(m.entries.len(), 2, "one eval × two metrics");
             assert_eq!(m.entries[0].1, "logloss");
             assert_eq!(m.entries[1].1, "rmse");
-            assert_eq!(m.watched().unwrap().1, "rmse", "盯的必须是最后一个");
+            assert_eq!(
+                m.watched().unwrap().1,
+                "rmse",
+                "the watched metric must be the last one"
+            );
             assert_eq!(m.watched().unwrap().2, m.entries[1].2);
         }
     }
@@ -5614,20 +5680,20 @@ mod tests {
         // 这条测试有意义的前提:节点数确实比块数多
         assert!(
             internal > n_blocks,
-            "内部节点才 {internal} 个、块 {n_blocks} 个 —— 数据太简单,测不出按节点加载"
+            "only {internal} internal nodes and {n_blocks} blocks: data is too simple to test per-node loading"
         );
         // 训练预测直接用 build_tree 留下的叶子行分区,不再加载块下降。
         // 所以整块加载只剩建直方图:每层每块一次。
         let ceiling = n_blocks * depth * rounds;
         assert!(
             blocks <= ceiling,
-            "block() 调了 {blocks} 次,上限 {n_blocks} 块 × {depth} 层 × {rounds} 轮 \
-             = {ceiling}(只剩建直方图)"
+            "block() was called {blocks} times, limit {n_blocks} blocks × {depth} levels × {rounds} rounds \
+             = {ceiling} (histogram building only)"
         );
         assert!(
             cols <= nf * depth * rounds,
-            "feature_column() 调了 {cols} 次,上限 {nf} 列 × {depth} 层 × {rounds} 轮 = {}。\
-             超了说明同一层里同一个特征被重复读了(去重没生效)",
+            "feature_column() was called {cols} times, limit {nf} columns × {depth} levels × {rounds} rounds = {}. \
+             Exceeding it means a feature was read twice within a level (dedup did not work)",
             nf * depth * rounds
         );
     }
@@ -5660,7 +5726,7 @@ mod tests {
         let a = predict_on(&model, &train_src).unwrap();
         let b = predict_on(&model, &valid_src).unwrap();
         for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "第 {i} 行");
+            assert_eq!(x.to_bits(), y.to_bits(), "row {i}");
         }
     }
 
@@ -5972,7 +6038,11 @@ mod tests {
         let cfg = TrainConfig::new(p.clone(), Objective::Logistic);
         let plain = train(&src, &y, &[], &cfg, &mut [], &Local).unwrap();
         let weighted = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local).unwrap();
-        assert_ne!(json(&plain), json(&weighted), "权重必须真的生效");
+        assert_ne!(
+            json(&plain),
+            json(&weighted),
+            "weights must actually take effect"
+        );
         for nthread in [1, 3] {
             for cols_per_block in [1, 4] {
                 let mut q = p.clone();
@@ -6042,14 +6112,14 @@ mod tests {
         let src = DenseSource::from_row_major(&x, 20, nf, 16, 2);
         let cfg = TrainConfig::new(params(2, 2), Objective::Logistic);
         for (w, msg) in [
-            (vec![1.0f32; 19], "权重有 19 行"),
+            (vec![1.0f32; 19], "weights have 19 rows"),
             (
                 {
                     let mut v = vec![1.0f32; 20];
                     v[3] = -0.5;
                     v
                 },
-                "非负",
+                "non-negative",
             ),
             (
                 {
@@ -6057,7 +6127,7 @@ mod tests {
                     v[4] = f32::NAN;
                     v
                 },
-                "非负",
+                "non-negative",
             ),
             (
                 {
@@ -6065,11 +6135,11 @@ mod tests {
                     v[5] = f32::INFINITY;
                     v
                 },
-                "非负",
+                "non-negative",
             ),
         ] {
             let err = train_weighted(&src, &y, Some(&w), &[], &cfg, &mut [], &Local)
-                .expect_err("非法权重必须报错");
+                .expect_err("invalid weights must error");
             assert!(err.to_string().contains(msg), "{err:#}");
         }
         let bad = vec![-1.0f32; 20];
@@ -6080,8 +6150,12 @@ mod tests {
             weights: Some(&bad),
             group_ptr: None,
         };
-        let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).expect_err("验证集权重也要校验");
-        assert!(err.to_string().contains("验证集 \"valid\""), "{err:#}");
+        let err = train(&src, &y, &[eval], &cfg, &mut [], &Local)
+            .expect_err("validation weights must be checked too");
+        assert!(
+            err.to_string().contains("validation set \"valid\""),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -6095,7 +6169,7 @@ mod tests {
             assert_eq!(
                 m.eval_weighted(&pred, &label, Some(&ones)).to_bits(),
                 m.eval(&pred, &label).to_bits(),
-                "{} 全 1 权重必须等于不加权",
+                "{} all-ones weights must equal unweighted",
                 m.name()
             );
         }
@@ -6137,7 +6211,11 @@ mod tests {
             let (a, src) = train_on(&x, &y, nf, p.clone(), obj);
             p.nthread = 3;
             let (b, _) = train_on(&x, &y, nf, p, obj);
-            assert_eq!(json(&a), json(&b), "alpha={alpha}: 线程数不能改变模型");
+            assert_eq!(
+                json(&a),
+                json(&b),
+                "alpha={alpha}: thread count must not change the model"
+            );
             let pred = predict_on(&a, &src).unwrap();
             let below = y.iter().zip(&pred).filter(|(y, p)| *y <= *p).count();
             let frac = below as f32 / y.len() as f32;
@@ -6206,7 +6284,10 @@ mod tests {
                 let (m, _) = train_on(&x, &y, nf, p.clone(), Objective::SquaredError);
                 json(&m)
             };
-            assert_ne!(reference, full, "({bylevel}, {bynode}) 应该改变模型");
+            assert_ne!(
+                reference, full,
+                "({bylevel}, {bynode}) should change the model"
+            );
             for (threads, cols) in [(4usize, 2usize), (2, 1), (3, 5)] {
                 let mut q = p.clone();
                 q.nthread = threads;
@@ -6325,7 +6406,11 @@ mod tests {
                     &Local,
                 )
                 .unwrap();
-                assert_eq!(json(&plain), json(&m), "{obj:?}: 全 0 约束必须等价于不约束");
+                assert_eq!(
+                    json(&plain),
+                    json(&m),
+                    "{obj:?}: all-zero constraints must equal no constraints"
+                );
             }
         }
     }
@@ -6374,7 +6459,11 @@ mod tests {
                         &Local,
                     )
                     .unwrap();
-                    assert_eq!(json(&m), json(&m2), "{what}: 线程数/块宽不能改变约束模型");
+                    assert_eq!(
+                        json(&m),
+                        json(&m2),
+                        "{what}: thread count / block width must not change the constrained model"
+                    );
                 }
             }
         }
@@ -6398,7 +6487,10 @@ mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_monotone(&m, &x, nf, &[1, -1, 0, 0, 0], "unconstrained");
         }));
-        assert!(caught.is_err(), "夹具必须在不加约束时违反单调性");
+        assert!(
+            caught.is_err(),
+            "the fixture must violate monotonicity without constraints"
+        );
     }
 
     #[test]
@@ -6688,7 +6780,7 @@ mod tests {
         assert!(bad(vec![0.0; 19]).contains("base_margin"));
         let mut nan = vec![0.0; 20];
         nan[3] = f32::NAN;
-        assert!(bad(nan).contains("有限"));
+        assert!(bad(nan).contains("finite"));
         let eval = EvalSet {
             name: "v".into(),
             source: &src,
@@ -6701,7 +6793,7 @@ mod tests {
             ..TrainConfig::new(p.clone(), Objective::SquaredError)
         };
         let err = train(&src, &y, &[eval], &cfg, &mut [], &Local).unwrap_err();
-        assert!(err.to_string().contains("验证集"), "{err:#}");
+        assert!(err.to_string().contains("validation set"), "{err:#}");
     }
 
     /// Multiclass margins are class-major `K x n`: class `k` of row `i` starts at
@@ -6900,7 +6992,7 @@ mod tests {
             ..TrainConfig::new(p, Objective::SquaredError)
         };
         let err = train(&narrow, &y2, &[], &cfg, &mut [], &Local).unwrap_err();
-        assert!(err.to_string().contains("特征"), "{err:#}");
+        assert!(err.to_string().contains("features"), "{err:#}");
     }
 
     /// A multi-quantile model continues like a multiclass one (K margins per row, the

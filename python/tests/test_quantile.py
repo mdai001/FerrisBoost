@@ -308,7 +308,7 @@ def test_multi_quantile_rejects_other_metrics_and_unsorted_alpha():
     with pytest.raises(ValueError, match="quantile"):
         fb.train({**ok, "eval_metric": "mae"}, x, label=y, evals=[(x, y, "t")],
                  num_boost_round=1, quiet=True)
-    with pytest.raises(ValueError, match="升序|ascending"):
+    with pytest.raises(ValueError, match="ascending"):
         fb.train({**ok, "quantile_alpha": [0.9, 0.1]}, x, label=y, num_boost_round=1, quiet=True)
     with pytest.raises(ValueError, match="quantile_alpha"):
         fb.train({**ok, "quantile_alpha": [0.5] * 65}, x, label=y, num_boost_round=1, quiet=True)
@@ -354,7 +354,7 @@ def test_multi_quantile_model_interchange_with_xgboost(tmp_path, weighted):
                                    "reg_loss_param": {"scale_pos_weight": "1"}}
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps(doc))
-    with pytest.raises(ValueError, match="num_target|多目标|objective"):
+    with pytest.raises(ValueError, match="num_target|multi-target|objective"):
         fb.Model.load_model(str(bad), quiet=True)
 
 

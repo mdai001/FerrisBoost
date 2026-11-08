@@ -58,21 +58,21 @@ impl Dataset {
         use crate::train::BlockSource as _;
         crate::ensure_input!(
             labels.len() == source.n_rows(),
-            "标签有 {} 行,特征有 {} 行",
+            "labels have {} rows, features have {} rows",
             labels.len(),
             source.n_rows()
         );
         crate::ensure_input!(
             !labels.iter().any(|v| v.is_nan()),
-            "标签列 {label_name:?} 里有缺失值。缺失的标签得在上游处理掉 —— \
-             填 0 会被当成一个真实标签学进去"
+            "label column {label_name:?} has missing values; handle missing labels upstream, \
+             since filling them with 0 would train on 0 as a real label"
         );
         let weights = match weights {
             None => None,
             Some((w, name)) => {
                 crate::ensure_input!(
                     w.len() == source.n_rows(),
-                    "权重有 {} 行,特征有 {} 行",
+                    "weights have {} rows, features have {} rows",
                     w.len(),
                     source.n_rows()
                 );
@@ -94,7 +94,8 @@ fn batch_reader(
     columns: &[usize],
     batch_size: usize,
 ) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
-    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
+    let file =
+        File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
     let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
     if coalesced_projection(&metadata, columns) {
         let input = crate::source::parquet_io::CoalescedFile::new(file)?;
@@ -121,7 +122,7 @@ fn coalesced_row_group_reader(
     batch_size: usize,
 ) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
     let n_groups = metadata.metadata().num_row_groups();
-    anyhow::ensure!(n_groups > 0, "Parquet 文件没有 row group");
+    anyhow::ensure!(n_groups > 0, "Parquet file has no row groups");
     let columns = columns.to_vec();
     let mut current = build_projected_reader(
         input.clone(),
@@ -178,7 +179,8 @@ fn projected_reader(
     batch_size: usize,
     row_group: Option<usize>,
 ) -> anyhow::Result<ProjectedReader> {
-    let file = File::open(path).map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.display()))?;
+    let file =
+        File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
     let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
     // Sparse projections (especially labels and streaming feature tiles) must
     // not read unrelated columns just to fill a large lookahead window.
@@ -341,7 +343,7 @@ fn column_index(path: &Path, name: &str) -> anyhow::Result<usize> {
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect();
-            crate::input_err!("文件里没有列 {name:?},只有 {have:?}")
+            crate::input_err!("file has no column {name:?}; available columns: {have:?}")
         })
 }
 
@@ -362,7 +364,7 @@ pub fn peek_n_features<'a>(
 /// 文件里**全部**列名(含标签列),顺序即物理顺序。预测绑定要用它。
 pub fn all_column_names(path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
     let file = File::open(path.as_ref())
-        .map_err(|e| anyhow::anyhow!("打不开 {}:{e}", path.as_ref().display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.as_ref().display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     Ok(builder
         .schema()
@@ -414,7 +416,7 @@ pub fn peek_n_rows(path: impl AsRef<Path>) -> anyhow::Result<u64> {
     let file = File::open(path.as_ref())?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let n = builder.metadata().file_metadata().num_rows();
-    anyhow::ensure!(n >= 0, "parquet footer 里的行数是负数:{n}");
+    anyhow::ensure!(n >= 0, "negative row count in the parquet footer: {n}");
     Ok(n as u64)
 }
 
@@ -674,7 +676,7 @@ pub(crate) fn open_many_observed<'a>(
     nthread: usize,
     mut observe: impl FnMut(&'static str, usize, usize),
 ) -> anyhow::Result<Dataset> {
-    anyhow::ensure!(!paths.is_empty(), "没有输入文件");
+    anyhow::ensure!(!paths.is_empty(), "no input files");
     let targets = targets.into();
     let label = targets.label;
     let metadata_profile = crate::source::openprof::start("multi metadata");
@@ -692,7 +694,7 @@ pub(crate) fn open_many_observed<'a>(
         let (cols, names) = feature_columns(p, targets)?;
         crate::ensure_input!(
             names.len() == feature_names.len(),
-            "多文件 schema 不一致:{} 有 {} 个特征列,{} 有 {} 个",
+            "schemas differ across files: {} has {} feature columns, {} has {}",
             paths[0].display(),
             feature_names.len(),
             p.display(),
@@ -702,7 +704,10 @@ pub(crate) fn open_many_observed<'a>(
         let mut mapped = Vec::with_capacity(feature_names.len());
         for want in &feature_names {
             let at = names.iter().position(|n| n == want).ok_or_else(|| {
-                crate::input_err!("多文件 schema 不一致:{} 里没有特征列 {want:?}", p.display())
+                crate::input_err!(
+                    "schemas differ across files: {} has no feature column {want:?}",
+                    p.display()
+                )
             })?;
             mapped.push(cols[at]);
         }
@@ -990,7 +995,12 @@ impl ParquetBlockSource {
         let feat_ids = self
             .groups
             .get(i)
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,一共 {} 个", self.groups.len()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "column block {i} does not exist ({} blocks)",
+                    self.groups.len()
+                )
+            })?
             .clone();
         // 只投影这一组列,别的 column chunk 根本不读
         let cols: Vec<usize> = feat_ids
@@ -1140,7 +1150,7 @@ impl ParquetBlockSource {
             }
             crate::ensure_input!(
                 !cache_path.exists() || std::fs::read_dir(cache_path)?.next().is_none(),
-                "缓存路径 {} 已存在且不是有效的 ferrisboost 缓存",
+                "cache path {} exists and is not a valid ferrisboost cache",
                 cache_path.display()
             );
         }
@@ -1240,9 +1250,9 @@ impl ParquetBlockSource {
                 // manifest 自身被改坏。
                 crate::ensure_input!(
                     cuts.values == src.cuts().values && cuts.offsets == src.cuts().offsets,
-                    "给定的 cuts 和缓存里的不一致:拒绝使用旧量化数据。\
-                     验证集要用训练集的 cuts,但**不能和训练集共用 cache_path** —— \
-                     它们的量化结果不同,共用会互相覆盖"
+                    "the given cuts differ from the cached ones; refusing to use stale quantized data; \
+                     a validation set must use the training cuts but must **not share cache_path** with the training set: \
+                     their quantized data differ and would overwrite each other"
                 );
                 return Ok((src, labels));
             }
@@ -1278,7 +1288,7 @@ impl ParquetBlockSource {
         let n_features = feat_cols.len();
         crate::ensure_input!(
             cuts.n_feats() == n_features,
-            "cuts 是按 {} 个特征建的,文件里有 {n_features} 个",
+            "cuts were built for {} features, the file has {n_features}",
             cuts.n_feats()
         );
 
@@ -1295,13 +1305,13 @@ impl ParquetBlockSource {
         }
         crate::ensure_input!(
             !labels.iter().any(|v| v.is_nan()),
-            "标签列 {label:?} 里有缺失值"
+            "label column {label:?} has missing values"
         );
 
         let groups = crate::columns::partition_features(n_features, cols_per_block);
         let cache_bytes = n_rows
             .checked_mul(n_features)
-            .ok_or_else(|| anyhow::anyhow!("量化缓存大小溢出"))?;
+            .ok_or_else(|| anyhow::anyhow!("quantized cache size overflows"))?;
         let mut source = Self {
             path,
             cuts,
@@ -1330,8 +1340,9 @@ impl ParquetBlockSource {
         nthread: usize,
     ) -> anyhow::Result<()> {
         let budget = options.budget_bytes.unwrap_or_else(default_cache_budget);
-        let pool = crate::threading::build_pool(nthread)
-            .map_err(|e| anyhow::anyhow!("Parquet quantize 线程池创建失败:{e}"))?;
+        let pool = crate::threading::build_pool(nthread).map_err(|e| {
+            anyhow::anyhow!("failed to create the Parquet quantize thread pool: {e}")
+        })?;
         if options.path.is_none() && self.cache_bytes <= budget {
             let blocks = {
                 let _p = crate::source::openprof::start("quantize");
@@ -1444,7 +1455,7 @@ impl ParquetBlockSource {
         let manifest: CacheManifest = serde_json::from_slice(&raw)?;
         crate::ensure_input!(
             manifest.version == 2,
-            "不支持的量化缓存版本 {}（payload checksum 从版本 2 开始；请重建旧缓存）",
+            "unsupported quantized cache version {} (payload checksums start at version 2; rebuild the old cache)",
             manifest.version
         );
         let identity = source_identity(&path)?;
@@ -1454,18 +1465,18 @@ impl ParquetBlockSource {
                 manifest.source_len,
                 manifest.source_mtime_ns
             ) == (identity.0.as_str(), identity.1, identity.2),
-            "缓存对应的 Parquet 文件已经变化或不是当前文件"
+            "the cache's Parquet file has changed or is not the current file"
         );
-        crate::ensure_input!(manifest.label == label, "缓存标签列不一致");
+        crate::ensure_input!(manifest.label == label, "cache label column differs");
         crate::ensure_input!(
             manifest.weight.as_deref() == targets.weight,
-            "缓存权重列不一致(缓存 {:?},本次 {:?})",
+            "cache weight column differs (cached {:?}, current {:?})",
             manifest.weight,
             targets.weight
         );
         crate::ensure_input!(
             manifest.base_margin.as_slice() == targets.base_margin.unwrap_or(&[]),
-            "缓存 base_margin 列不一致(缓存 {:?},本次 {:?})",
+            "cache base_margin column differs (cached {:?}, current {:?})",
             manifest.base_margin,
             targets.base_margin
         );
@@ -1477,21 +1488,24 @@ impl ParquetBlockSource {
         );
         crate::ensure_input!(
             manifest.cols_per_block == cols_per_block,
-            "缓存列块宽度不一致"
+            "cache column block width differs"
         );
         if max_bins != 0 {
-            crate::ensure_input!(manifest.max_bins == max_bins, "缓存 max_bin 不一致");
+            crate::ensure_input!(manifest.max_bins == max_bins, "cache max_bin differs");
         }
-        crate::ensure_input!(manifest.n_features == feat_cols.len(), "缓存特征数不一致");
+        crate::ensure_input!(
+            manifest.n_features == feat_cols.len(),
+            "cache feature count differs"
+        );
         let expected_groups =
             crate::columns::partition_features(manifest.n_features, cols_per_block);
         anyhow::ensure!(
             manifest.groups == expected_groups,
-            "缓存列块映射损坏:groups 没有按 cols_per_block 覆盖全部特征"
+            "cache column block map is corrupt: groups do not cover all features by cols_per_block"
         );
         anyhow::ensure!(
             manifest.block_hashes.len() == manifest.groups.len(),
-            "缓存 block checksum 数量不一致"
+            "cache block checksum count differs"
         );
         anyhow::ensure!(
             manifest.cuts_offsets.len() == manifest.n_features + 1
@@ -1499,14 +1513,14 @@ impl ParquetBlockSource {
                 && manifest.cuts_offsets.last().copied()
                     == Some(manifest.cuts_values_bits.len() as u32)
                 && manifest.cuts_offsets.windows(2).all(|w| w[0] <= w[1]),
-            "缓存 cuts offsets 损坏"
+            "cache cuts offsets are corrupt"
         );
         // The sentinel decides which values are missing, so cached bins are only
         // valid for the same `missing` (a stale cache would silently bin
         // sentinel values as ordinary numbers or vice versa).
         crate::ensure_input!(
             manifest.missing_bits == missing_bits(targets.missing),
-            "缓存是用不同的 missing 参数建的(缓存 {},本次 {});请换一个 cache_path 或重建缓存",
+            "cache was built with a different missing value (cached {}, current {}); use another cache_path or rebuild the cache",
             describe_missing(manifest.missing_bits),
             describe_missing(missing_bits(targets.missing))
         );
@@ -1520,8 +1534,8 @@ impl ParquetBlockSource {
         let cached = |f: usize| manifest.categorical.get(f).copied().unwrap_or(false);
         crate::ensure_input!(
             (0..manifest.n_features).all(|f| resolved[f] == cached(f)),
-            "缓存的特征类型(categorical)和本次解析出的特征类型不一致\
-             (feature_types 参数或文件里的字典列变了);请换一个 cache_path 或重建缓存"
+            "cached feature types (categorical) differ from the resolved feature types \
+             (feature_types or the file's dictionary columns changed); use another cache_path or rebuild the cache"
         );
         let cuts = BinCuts::new(
             manifest
@@ -1532,21 +1546,21 @@ impl ParquetBlockSource {
             manifest.cuts_offsets.clone(),
         )
         .with_categorical(&manifest.categorical)
-        .map_err(|e| anyhow::anyhow!("缓存的类别特征元数据损坏:{e}"))?;
+        .map_err(|e| anyhow::anyhow!("cached categorical feature metadata is corrupt: {e}"))?;
         anyhow::ensure!(
             cuts_hash(&cuts) == manifest.cuts_hash,
-            "缓存 cuts 哈希不一致"
+            "cache cuts hash differs"
         );
 
         let mut labels = Vec::new();
         for batch in batch_reader(&path, &[label_col], BATCH_SIZE)? {
             labels.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
         }
-        anyhow::ensure!(labels.len() == manifest.n_rows, "缓存行数不一致");
+        anyhow::ensure!(labels.len() == manifest.n_rows, "cache row count differs");
         for (i, group) in manifest.groups.iter().enumerate() {
             let expected = group.len().saturating_mul(manifest.n_rows) as u64;
             let actual = std::fs::metadata(cache_path.join(format!("block-{i}.bin")))?.len();
-            anyhow::ensure!(actual == expected, "缓存块 {i} 长度不一致");
+            anyhow::ensure!(actual == expected, "cache block {i} length differs");
         }
         Ok((
             Self {
@@ -1666,7 +1680,7 @@ impl BlockSource for ParquetBlockSource {
         let feat_ids = self
             .groups
             .get(i)
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在"))?;
+            .ok_or_else(|| anyhow::anyhow!("column block {i} does not exist"))?;
         // 全选(或空)就走原路,别为一个退化情况多写一条路径。
         if cols.is_empty() || cols.len() == feat_ids.len() {
             return self.with_block(i, f);
@@ -1675,7 +1689,7 @@ impl BlockSource for ParquetBlockSource {
             QuantizedCache::Disk { dir, verified, .. } => {
                 let already_verified = verified
                     .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("缓存块 {i} 缺少 checksum 状态"))?
+                    .ok_or_else(|| anyhow::anyhow!("cache block {i} has no checksum state"))?
                     .load(Ordering::Acquire);
                 if !already_verified {
                     // 第一次碰这个块:整块读 + 校验(付一次全量代价,
@@ -1689,10 +1703,14 @@ impl BlockSource for ParquetBlockSource {
                     self.with_block(i, &mut |b| {
                         whole = Some((b.data.clone(), b.feat_ids.clone()));
                     })?;
-                    let (whole_data, whole_feats) = whole.expect("with_block 必须恰好调用一次 f");
+                    let (whole_data, whole_feats) =
+                        whole.expect("with_block must call f exactly once");
                     let mut data = vec![0u8; cols.len() * self.n_rows];
                     for (slot, &l) in cols.iter().enumerate() {
-                        anyhow::ensure!(l < whole_feats.len(), "列块 {i} 没有局部特征 {l}");
+                        anyhow::ensure!(
+                            l < whole_feats.len(),
+                            "column block {i} has no local feature {l}"
+                        );
                         data[slot * self.n_rows..(slot + 1) * self.n_rows]
                             .copy_from_slice(&whole_data[l * self.n_rows..(l + 1) * self.n_rows]);
                     }
@@ -1708,7 +1726,10 @@ impl BlockSource for ParquetBlockSource {
                 let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
                 let mut data = vec![0u8; cols.len() * self.n_rows];
                 for (slot, &l) in cols.iter().enumerate() {
-                    anyhow::ensure!(l < feat_ids.len(), "列块 {i} 没有局部特征 {l}");
+                    anyhow::ensure!(
+                        l < feat_ids.len(),
+                        "column block {i} has no local feature {l}"
+                    );
                     file.seek(SeekFrom::Start((l * self.n_rows) as u64))?;
                     file.read_exact(&mut data[slot * self.n_rows..(slot + 1) * self.n_rows])?;
                 }
@@ -1749,7 +1770,7 @@ impl BlockSource for ParquetBlockSource {
             QuantizedCache::Memory(blocks) => {
                 let block = blocks
                     .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在"))?;
+                    .ok_or_else(|| anyhow::anyhow!("column block {i} does not exist"))?;
                 f(block);
             }
             QuantizedCache::Disk {
@@ -1761,13 +1782,13 @@ impl BlockSource for ParquetBlockSource {
                 let feat_ids = self
                     .groups
                     .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在"))?
+                    .ok_or_else(|| anyhow::anyhow!("column block {i} does not exist"))?
                     .clone();
                 let mut data = Vec::new();
                 File::open(dir.join(format!("block-{i}.bin")))?.read_to_end(&mut data)?;
                 anyhow::ensure!(
                     data.len() == feat_ids.len() * self.n_rows,
-                    "缓存块 {i} 长度不一致"
+                    "cache block {i} length differs"
                 );
                 // 整块读也如实计数 —— 只有把「读了多少」和「传了多少」
                 // 分开记,才看得出省的到底是哪一段。
@@ -1775,15 +1796,15 @@ impl BlockSource for ParquetBlockSource {
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 let is_verified = verified
                     .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("缓存块 {i} 缺少 checksum 状态"))?;
+                    .ok_or_else(|| anyhow::anyhow!("cache block {i} has no checksum state"))?;
                 if !is_verified.load(Ordering::Acquire) {
                     let expected = block_hashes
                         .get(i)
-                        .ok_or_else(|| anyhow::anyhow!("缓存块 {i} 缺少 checksum"))?;
+                        .ok_or_else(|| anyhow::anyhow!("cache block {i} has no checksum"))?;
                     let actual = block_hash(&data);
                     anyhow::ensure!(
                         &actual == expected,
-                        "缓存块 {i} payload checksum 不一致:期望 {expected},实际 {actual}"
+                        "cache block {i} payload checksum mismatch: expected {expected}, got {actual}"
                     );
                     is_verified.store(true, Ordering::Release);
                 }
@@ -1813,10 +1834,12 @@ impl BlockSource for ParquetBlockSource {
     /// 纯元数据,不碰文件。默认实现会加载整块来读这个,那对按需加载
     /// 是灾难 —— 建树前问一遍每块有哪些列,就等于把数据集读一遍。
     fn block_features(&self, i: usize) -> anyhow::Result<Vec<FeatId>> {
-        self.groups
-            .get(i)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("列块 {i} 不存在,一共 {} 个", self.groups.len()))
+        self.groups.get(i).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "column block {i} does not exist ({} blocks)",
+                self.groups.len()
+            )
+        })
     }
 
     fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>> {
@@ -1825,7 +1848,12 @@ impl BlockSource for ParquetBlockSource {
             .iter()
             .enumerate()
             .find_map(|(b, group)| group.iter().position(|&f| f == feat).map(|l| (b, l)))
-            .ok_or_else(|| anyhow::anyhow!("特征 {feat} 越界,共 {} 列", self.n_features))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "feature {feat} is out of range ({} columns)",
+                    self.n_features
+                )
+            })?;
         // ⚠️ **选择性特征 I/O 必须同时覆盖直方图物化和 split-feature 取列。**
         // 这里以前走 `with_block` —— 为了一列把整块读回来,而 partition 每层
         // 对每个 split feature 都调一次。上游 colsample 省下的字节会在这条
@@ -1900,7 +1928,10 @@ impl ParquetBlockSource {
             }
             row_base += n;
         }
-        anyhow::ensure!(row_base == n_rows, "读到 {row_base} 行,元数据说 {n_rows}");
+        anyhow::ensure!(
+            row_base == n_rows,
+            "read {row_base} rows, metadata says {n_rows}"
+        );
         Ok(())
     }
 }
@@ -1968,7 +1999,11 @@ mod tests {
         let ds = open(&path, "target", 16, 2).unwrap();
 
         assert_eq!(ds.source.n_rows(), 6);
-        assert_eq!(ds.source.n_features(), 3, "标签列不能算进特征");
+        assert_eq!(
+            ds.source.n_features(),
+            3,
+            "the label column must not count as a feature"
+        );
         assert_eq!(ds.feature_names, vec!["f0", "f1", "f2"]);
         assert_eq!(ds.labels, vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
 
@@ -1987,7 +2022,7 @@ mod tests {
                 assert_eq!(
                     ds.source.bin_at(row, f),
                     dense.bin_at(row, f),
-                    "行 {row} 特征 {f}"
+                    "row {row} feature {f}"
                 );
             }
         }
@@ -2036,7 +2071,7 @@ mod tests {
             assert_eq!(
                 from_parquet.predict_margin(x).to_bits(),
                 from_dense.predict_margin(x).to_bits(),
-                "第 {row} 行:Parquet 训的和 Dense 训的对不上"
+                "row {row}: Parquet-trained and Dense-trained results differ"
             );
         }
         std::fs::remove_file(&path).ok();
@@ -2062,9 +2097,9 @@ mod tests {
                 eager
                     .source
                     .with_block(b, &mut |e| {
-                        assert_eq!(a.feat_ids, e.feat_ids, "块 {b} 的特征列表");
+                        assert_eq!(a.feat_ids, e.feat_ids, "block {b} feature list");
                         assert_eq!(a.n_rows, e.n_rows);
-                        assert_eq!(a.data, e.data, "块 {b} 的 bin 数据");
+                        assert_eq!(a.data, e.data, "block {b} bin data");
                     })
                     .unwrap();
             })
@@ -2639,18 +2674,18 @@ mod tests {
                         assert_eq!(
                             src.feature_column(f).unwrap(),
                             block.column(local),
-                            "{rows} 行 {cols} 列 cpb={cpb},特征 {f}:单列读和整块读不一致"
+                            "{rows} rows {cols} cols cpb={cpb}, feature {f}: column read and block read differ"
                         );
                         // 内存 cache 借出的列同样必须逐字节一致(落盘 cache 返回 None)。
                         if let Some(borrowed) = src.resident_feature_column(f) {
-                            assert_eq!(borrowed, block.column(local), "特征 {f}:借出的列不一致");
+                            assert_eq!(borrowed, block.column(local), "feature {f}: borrowed column differs");
                         }
                         checked += 1;
                     }
                 })
                 .unwrap();
             }
-            assert_eq!(checked, cols, "每一列都要比到");
+            assert_eq!(checked, cols, "every column must be compared");
             std::fs::remove_file(&path).ok();
         }
     }
@@ -2704,16 +2739,16 @@ mod tests {
             assert_eq!(
                 src.parquet_load_count(),
                 src.n_blocks(),
-                "nthread={threads}:每个块必须且只能量化一次"
+                "nthread={threads}: each block must be quantized exactly once"
             );
         }
         for b in 0..one.n_blocks() {
             one.with_block(b, &mut |a| {
                 eight
-                    .with_block(b, &mut |e| assert_eq!(a.data, e.data, "块 {b}:1 vs 8"))
+                    .with_block(b, &mut |e| assert_eq!(a.data, e.data, "block {b}: 1 vs 8"))
                     .unwrap();
                 rayon_default
-                    .with_block(b, &mut |d| assert_eq!(a.data, d.data, "块 {b}:1 vs 0"))
+                    .with_block(b, &mut |d| assert_eq!(a.data, d.data, "block {b}: 1 vs 0"))
                     .unwrap();
             })
             .unwrap();
@@ -2744,7 +2779,11 @@ mod tests {
         let path = write_fixture("memory_cache");
         let (src, _) = ParquetBlockSource::open(&path, "target", 16, 2).unwrap();
         assert_eq!(src.cache_kind(), "memory");
-        assert_eq!(src.parquet_load_count(), src.n_blocks(), "每块只量化一次");
+        assert_eq!(
+            src.parquet_load_count(),
+            src.n_blocks(),
+            "each block is quantized only once"
+        );
         assert_eq!(src.cache_read_count(), 0);
 
         let mut seen = Vec::new();
@@ -2755,8 +2794,12 @@ mod tests {
         src.with_block(0, &mut |b| seen.push(b.data.clone()))
             .unwrap();
         assert_eq!(src.cache_read_count(), 2);
-        assert_eq!(src.parquet_load_count(), src.n_blocks(), "重复访问不能回源");
-        assert_eq!(seen[0], seen[1], "两次读出来的内容当然要一样");
+        assert_eq!(
+            src.parquet_load_count(),
+            src.n_blocks(),
+            "repeated access must not reload from source"
+        );
+        assert_eq!(seen[0], seen[1], "two reads must return the same content");
 
         // 训练里每层每块一次:两层两块 = 4 次
         for _ in 0..2 {
@@ -2810,7 +2853,11 @@ mod tests {
         assert_eq!(first.parquet_load_count(), first.n_blocks());
         let (second, labels_b) =
             ParquetBlockSource::open_with_cache(&path, "target", 16, 2, options()).unwrap();
-        assert_eq!(second.parquet_load_count(), 0, "第二次不能重新量化");
+        assert_eq!(
+            second.parquet_load_count(),
+            0,
+            "the second open must not re-quantize"
+        );
         assert_eq!(labels_a, labels_b);
         for b in 0..first.n_blocks() {
             first
@@ -2826,9 +2873,13 @@ mod tests {
         different.values[0] = f32::from_bits(different.values[0].to_bits() ^ 1);
         let err = ParquetBlockSource::with_cuts_and_cache(&path, "target", different, 2, options())
             .err()
-            .expect("不同 cuts 必须拒绝");
+            .expect("different cuts must be rejected");
         // 现在是**逐值**比较,不再只比哈希,所以报错措辞也换了
-        assert!(err.to_string().contains("拒绝使用旧量化数据"), "{err:#}");
+        assert!(
+            err.to_string()
+                .contains("refusing to use stale quantized data"),
+            "{err:#}"
+        );
         std::fs::remove_dir_all(cache).ok();
         std::fs::remove_file(path).ok();
     }
@@ -2890,11 +2941,11 @@ mod tests {
             path: Some(dir.clone()),
         };
         let Err(e) = ParquetBlockSource::open_with_cache(&path, "target", 16, 2, opts) else {
-            panic!("半成品缓存目录必须报错");
+            panic!("a partial cache directory must be an error");
         };
         assert!(
-            e.to_string().contains("不是有效的 ferrisboost 缓存"),
-            "报错要说清楚是缓存目录的问题,实际是:{e}"
+            e.to_string().contains("is not a valid ferrisboost cache"),
+            "error should say the cache directory is the problem, got: {e}"
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&path).ok();
@@ -2924,9 +2975,9 @@ mod tests {
             ParquetBlockSource::open_with_cache(&path, "target", 16, 2, opts()).unwrap();
         let err = reused
             .with_block(0, &mut |_| {})
-            .expect_err("同长度 payload 损坏必须被 checksum 抓住");
+            .expect_err("same-length payload corruption must be caught by the checksum");
         assert!(
-            err.to_string().contains("payload checksum 不一致"),
+            err.to_string().contains("payload checksum mismatch"),
             "{err:#}"
         );
 
@@ -2954,9 +3005,13 @@ mod tests {
         other.values[0] += 1.0;
         let Err(e) = ParquetBlockSource::with_cuts_and_cache(&path, "target", other, 2, opts(&dir))
         else {
-            panic!("cuts 不一致却共用 cache_path,必须报错");
+            panic!("sharing cache_path with different cuts must fail");
         };
-        assert!(e.to_string().contains("拒绝使用旧量化数据"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("refusing to use stale quantized data"),
+            "{e}"
+        );
 
         // 同一套 cuts 则可以复用,而且不再回源量化
         let (again, _) = ParquetBlockSource::with_cuts_and_cache(
@@ -2967,7 +3022,11 @@ mod tests {
             opts(&dir),
         )
         .unwrap();
-        assert_eq!(again.parquet_load_count(), 0, "复用时不该再量化");
+        assert_eq!(
+            again.parquet_load_count(),
+            0,
+            "reuse must not quantize again"
+        );
 
         drop(train);
         drop(again);
@@ -3012,7 +3071,7 @@ mod tests {
             assert_eq!(
                 a.predict_margin(r).to_bits(),
                 b.predict_margin(r).to_bits(),
-                "第 {i} 行:按需加载和全量加载训出来的不一样"
+                "row {i}: on-demand and full loading trained differently"
             );
         }
         std::fs::remove_file(&path).ok();
@@ -3022,12 +3081,12 @@ mod tests {
     fn missing_label_column_says_what_is_available() {
         let path = write_fixture("missing_label");
         let Err(e) = open(&path, "nope", 16, 2) else {
-            panic!("应该报错")
+            panic!("should fail")
         };
         let msg = e.to_string();
         assert!(
             msg.contains("nope") && msg.contains("f0"),
-            "报错要列出有哪些列:{msg}"
+            "error should list the available columns: {msg}"
         );
         std::fs::remove_file(&path).ok();
     }

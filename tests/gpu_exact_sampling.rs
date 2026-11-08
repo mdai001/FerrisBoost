@@ -401,7 +401,7 @@ fn sampled_upload_rejects_length_mismatch() {
         Ok(_) => panic!("length mismatch should be rejected"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("长度"));
+    assert!(error.to_string().contains("length"));
 }
 
 #[test]

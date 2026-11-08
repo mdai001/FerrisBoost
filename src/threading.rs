@@ -231,11 +231,11 @@ mod tests {
     #[test]
     fn auto_resolves_to_something_sane() {
         let auto = effective_threads(0);
-        assert!(auto >= 1, "自动解析不能返回 0");
+        assert!(auto >= 1, "auto resolution must not return 0");
         // 物理核不会比逻辑 CPU 多;探测失败时退回逻辑数,所以取等也合法。
         assert!(
             auto <= fallback_parallelism(),
-            "物理核 {auto} 不该超过逻辑 CPU {}",
+            "physical cores {auto} should not exceed logical CPUs {}",
             fallback_parallelism()
         );
     }
@@ -247,7 +247,11 @@ mod tests {
         if let Some(phys) = physical_cores() {
             let logical = fallback_parallelism();
             assert!(phys <= logical);
-            assert_eq!(logical % phys, 0, "逻辑 {logical} / 物理 {phys} 不整除");
+            assert_eq!(
+                logical % phys,
+                0,
+                "logical {logical} is not divisible by physical {phys}"
+            );
         }
     }
 
@@ -257,13 +261,21 @@ mod tests {
     fn resolver_never_overrides_an_explicit_thread_count() {
         assert_eq!(resolve(1, Some(8), 16), 1);
         assert_eq!(resolve(3, Some(8), 16), 3);
-        assert_eq!(resolve(64, Some(8), 16), 64, "显式值高于机器能力也照给");
+        assert_eq!(
+            resolve(64, Some(8), 16),
+            64,
+            "an explicit value above the machine capacity is honored"
+        );
     }
 
     /// 默认策略不变:优先物理核,不是逻辑 CPU。
     #[test]
     fn auto_prefers_physical_cores_over_logical() {
-        assert_eq!(resolve(0, Some(8), 16), 8, "8 物理 / 16 逻辑要选 8");
+        assert_eq!(
+            resolve(0, Some(8), 16),
+            8,
+            "8 physical / 16 logical should pick 8"
+        );
     }
 
     /// ⚠️ 这条是本次修的 bug:cgroup quota / taskset 把进程限死之后,
@@ -273,16 +285,24 @@ mod tests {
         assert_eq!(
             resolve(0, Some(8), 4),
             4,
-            "taskset 限 4 核时不能起 8 个 worker"
+            "must not start 8 workers when taskset limits to 4 cores"
         );
-        assert_eq!(resolve(0, Some(16), 2), 2, "容器限 2 CPU 时不能起 16 个");
+        assert_eq!(
+            resolve(0, Some(16), 2),
+            2,
+            "must not start 16 workers when the container limits to 2 CPUs"
+        );
     }
 
     /// 读不到拓扑(非 Linux / WSL / 容器里 sysfs 缺失)就退回可用并行度。
     #[test]
     fn missing_topology_falls_back_to_available_parallelism() {
         assert_eq!(resolve(0, None, 12), 12);
-        assert_eq!(resolve(0, Some(0), 12), 12, "探测出 0 视同探测失败");
+        assert_eq!(
+            resolve(0, Some(0), 12),
+            12,
+            "detecting 0 is treated as detection failure"
+        );
     }
 
     /// 永远至少一个线程 —— 0 个 worker 的线程池跑不了任何东西。

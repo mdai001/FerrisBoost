@@ -63,14 +63,14 @@ pub struct ResolvedInput {
 /// 把一组 spec 展开成确定顺序的文件列表。
 pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
     if specs.is_empty() {
-        crate::bail_input!("没有给任何输入路径");
+        crate::bail_input!("no input paths given");
     }
     // BTreeSet 同时负责去重和排序 —— 顺序确定这条不能靠调用方自觉。
     let mut found: BTreeSet<PathBuf> = BTreeSet::new();
     for spec in specs {
         let expanded = expand_one(spec)?;
         if expanded.is_empty() {
-            crate::bail_input!("{spec:?} 没有匹配到任何 .parquet / .csv / .csv.gz 文件");
+            crate::bail_input!("{spec:?} matched no .parquet / .csv / .csv.gz files");
         }
         found.extend(expanded);
     }
@@ -81,14 +81,14 @@ pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
     for p in &paths {
         let f = InputFormat::of(p).with_context(|| {
             format!(
-                "认不出 {} 的格式,支持 .parquet / .csv / .csv.gz",
+                "cannot detect the format of {}; supported: .parquet / .csv / .csv.gz",
                 p.display()
             )
         })?;
         match format {
             None => format = Some(f),
             Some(prev) if prev != f => crate::bail_input!(
-                "一次训练不能混用不同格式:同时出现了 {} 和 {}",
+                "cannot mix input formats in one training run: found both {} and {}",
                 prev.label(),
                 f.label()
             ),
@@ -97,7 +97,7 @@ pub fn resolve(specs: &[String]) -> Result<ResolvedInput> {
     }
     Ok(ResolvedInput {
         paths,
-        format: format.expect("非空"),
+        format: format.expect("non-empty"),
     })
 }
 
@@ -111,11 +111,12 @@ fn expand_one(spec: &str) -> Result<Vec<PathBuf>> {
         return list_dir(path);
     }
     if !path.exists() {
-        crate::bail_input!("输入文件不存在:{spec}");
+        crate::bail_input!("input file does not exist: {spec}");
     }
     // 显式给出的单文件必须是认识的格式 —— 这里不静默跳过。
-    InputFormat::of(path)
-        .with_context(|| format!("认不出 {spec} 的格式,支持 .parquet / .csv / .csv.gz"))?;
+    InputFormat::of(path).with_context(|| {
+        format!("cannot detect the format of {spec}; supported: .parquet / .csv / .csv.gz")
+    })?;
     Ok(vec![path.to_path_buf()])
 }
 
@@ -125,7 +126,8 @@ fn expand_one(spec: &str) -> Result<Vec<PathBuf>> {
 /// 而那需要一套分区语义,不属于 v0.0.1。
 fn list_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))?
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory {}", dir.display()))?
     {
         let p = entry?.path();
         if p.is_file() && InputFormat::of(&p).is_some() {
@@ -142,19 +144,20 @@ fn expand_glob(spec: &str) -> Result<Vec<PathBuf>> {
     let pattern = path
         .file_name()
         .and_then(|n| n.to_str())
-        .context("glob 的最后一段为空")?;
+        .context("the last glob component is empty")?;
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     if dir.to_string_lossy().contains('*') || dir.to_string_lossy().contains('?') {
-        crate::bail_input!("只支持文件名部分带 glob(如 data/*.parquet),目录部分不支持:{spec}");
+        crate::bail_input!("glob is only supported in the file name (e.g. data/*.parquet), not in the directory part: {spec}");
     }
     if !dir.is_dir() {
-        crate::bail_input!("glob 的目录部分不存在:{}", dir.display());
+        crate::bail_input!("glob directory does not exist: {}", dir.display());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("读不了目录 {}", dir.display()))?
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory {}", dir.display()))?
     {
         let p = entry?.path();
         let name = match p.file_name().and_then(|n| n.to_str()) {
@@ -210,7 +213,11 @@ pub fn projection_and_order(proj: &[usize]) -> (Vec<usize>, Vec<usize>) {
     // order[i] = 模型第 i 个特征在投影结果里的位置。
     let order = proj
         .iter()
-        .map(|c| mask.iter().position(|m| m == c).expect("mask 由 proj 构造"))
+        .map(|c| {
+            mask.iter()
+                .position(|m| m == c)
+                .expect("mask is built from proj")
+        })
         .collect();
     (mask, order)
 }
@@ -223,7 +230,8 @@ pub fn reorder(batch: &RecordBatch, order: &[usize]) -> RecordBatch {
         .map(|&i| batch.schema().field(i).clone())
         .collect();
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-    RecordBatch::try_new(schema, cols).expect("重排只是换列顺序,长度和类型都不变")
+    RecordBatch::try_new(schema, cols)
+        .expect("reordering only permutes columns; lengths and types are unchanged")
 }
 #[cfg(test)]
 mod tests {
@@ -265,7 +273,7 @@ mod tests {
     #[test]
     fn missing_input_is_an_error_not_an_empty_dataset() {
         let err = resolve(&["/nonexistent/nope.parquet".into()]).unwrap_err();
-        assert!(err.to_string().contains("不存在"), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]

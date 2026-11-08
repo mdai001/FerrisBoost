@@ -113,7 +113,7 @@ def test_explicit_cuda_training_without_driver_is_catchable_and_cpu_recovers(
     lowered_output = combined_output.casefold()
     assert "panicked" not in lowered_output
     assert "panicexception" not in lowered_output
-    assert "ferrisboost 内部错误" not in lowered_output
+    assert "ferrisboost internal error" not in lowered_output
 
     recovered = _train(kind, base_params, features, labels, csv_path, parquet_path)
     recovered_path = tmp_path / "recovered.json"
