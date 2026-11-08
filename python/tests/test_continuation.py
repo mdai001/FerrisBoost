@@ -14,6 +14,10 @@ What holds, and is pinned here:
 * On other data the cuts are sketched afresh while the existing trees keep their
   float thresholds, so the old trees are scored on the raw values; lossless data
   still matches XGBoost bit for bit.
+* That includes categorical splits: an old tree's category set may hold codes the
+  new training cuts do not cover (binned as "unseen" for the NEW trees); the old
+  trees still score the training and validation starting predictions on the raw
+  codes, so trees, predictions and evals_result match XGBoost's continuation.
 """
 import json
 
@@ -283,6 +287,91 @@ def test_categorical_features_continue_and_mismatched_types_are_rejected(tmp_pat
     assert len(res["v"]["logloss"]) == 2
 
 
+# A categorical feature whose codes 0..20 occur in the first run but only 0..10 in
+# the continued run: the old trees hold category sets with codes the new training
+# cuts do not cover, and the validation set still contains those codes.
+CAT_FT = ["c", "q", "q"]
+
+
+def make_cat(n, hi, seed):
+    rng = np.random.default_rng(seed)
+    effect = np.random.default_rng(0).normal(0, 1.5, 21)
+    cat = rng.integers(0, hi + 1, n)
+    q = rng.integers(0, 16, size=(n, 2))
+    x = np.column_stack([cat, q]).astype(np.float32)
+    y = (effect[cat] + 0.2 * (q[:, 0] - 8) + rng.normal(0, 0.7, n) > 0).astype(np.float32)
+    return x, y
+
+
+def cat_trees(model, tmp_path, name):
+    path = tmp_path / f"{name}.json"
+    model.save_model(str(path)) if isinstance(model, xgb.Booster) \
+        else model.save_model(str(path), quiet=True)
+    out = []
+    for t in json.loads(path.read_text())["learner"]["gradient_booster"]["model"]["trees"]:
+        keep = {k: t[k] for k in ("left_children", "right_children", "split_indices", "split_type",
+                                  "default_left", "categories", "categories_nodes",
+                                  "categories_segments", "categories_sizes", "sum_hessian")}
+        keep["leaves"] = [c for c, l in zip(t["split_conditions"], t["left_children"]) if l == -1]
+        out.append(keep)
+    return out
+
+
+def cat_continuation(device="cpu"):
+    x1, y1 = make_cat(1500, 20, 1)
+    x2, y2 = make_cat(1200, 10, 2)
+    xv, yv = make_cat(600, 20, 3)
+    p = params("binary:logistic", max_cat_to_onehot=1, eval_metric=["logloss", "auc"],
+               device=device, **({"gpu_math": "exact"} if device == "cuda" else {}))
+    m1 = fb.train(p, x1, label=y1, num_boost_round=4, feature_types=CAT_FT, quiet=True)
+    res = {}
+    m2 = fb.train(p, x2, label=y2, num_boost_round=5, init_model=m1, feature_types=CAT_FT,
+                  evals=[(x2, y2, "t"), (xv, yv, "v")], evals_result=res, quiet=True)
+    return (x1, y1, x2, y2, xv, yv), m1, m2, res
+
+
+def test_categorical_continuation_with_codes_outside_the_new_cuts_matches_xgboost(tmp_path):
+    """The old trees score the starting predictions of the training and validation
+    sets on the raw category values (category membership, as predict does), never
+    on codes binned with the new cuts, where code 17 would be "unseen" (left)."""
+    (x1, y1, x2, y2, xv, yv), m1, m2, res = cat_continuation()
+    first = cat_trees(m1, tmp_path, "m1")
+    assert any(17 in t["categories"] for t in first), "an old tree must send code 17 right"
+    assert (xv[:, 0] == 17).any() and not (x2[:, 0] > 10).any()
+
+    def d(x, y=None):
+        return xgb.DMatrix(x, y, feature_types=CAT_FT, enable_categorical=True)
+
+    xp = xparams("binary:logistic", max_cat_to_onehot=1, eval_metric=["logloss", "auc"])
+    b1 = xgb.train(xp, d(x1, y1), 4)
+    xres = {}
+    b2 = xgb.train(xp, d(x2, y2), 5, xgb_model=b1, evals=[(d(x2, y2), "t"), (d(xv, yv), "v")],
+                   evals_result=xres, verbose_eval=False)
+    assert cat_trees(m1, tmp_path, "a") == cat_trees(b1, tmp_path, "b")
+    assert cat_trees(m2, tmp_path, "c") == cat_trees(b2, tmp_path, "d")
+    for x in (x1, x2, xv):
+        np.testing.assert_array_equal(raw(m2, x), b2.predict(d(x), output_margin=True))
+    for name in ("t", "v"):
+        for metric in ("logloss", "auc"):
+            np.testing.assert_allclose(res[name][metric], xres[name][metric], rtol=1e-6)
+
+    # The validation history is the metric of the final model's own predictions
+    # round by round; scoring the old trees with code 17 sent left would be off by
+    # orders of magnitude more than the tolerance.
+    def logloss(margin):
+        prob = np.clip(1 / (1 + np.exp(-margin.astype(np.float64))), 1e-16, 1 - 1e-16)
+        return -np.mean(yv * np.log(prob) + (1 - yv) * np.log(1 - prob))
+
+    want = [logloss(raw(m2, xv, iteration_range=(0, 4 + r))) for r in range(1, 6)]
+    np.testing.assert_allclose(res["v"]["logloss"], want, rtol=1e-6)
+    unseen = xv.copy()
+    unseen[unseen[:, 0] == 17, 0] = -1.0  # invalid code: left at every node
+    shift = raw(m1, unseen) - raw(m1, xv)
+    assert np.count_nonzero(shift) > 0
+    wrong = [logloss(raw(m2, xv, iteration_range=(0, 4 + r)) + shift) for r in range(1, 6)]
+    assert np.max(np.abs(np.subtract(wrong, want))) > 1e-3
+
+
 def write_parquet(tmp_path, x, y, name):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -386,6 +475,15 @@ def test_gpu_exact_continuation_equals_cpu_and_uninterrupted(objective, tmp_path
     a, b, c = (saved(m, tmp_path, n).read_bytes() for m, n in
                ((cpu, "cpu"), (gpu, "gpu"), (full, "full")))
     assert a == b == c
+
+
+@cuda
+def test_gpu_exact_categorical_continuation_with_codes_outside_the_new_cuts_equals_cpu(tmp_path):
+    _, c1, c2, cres = cat_continuation("cpu")
+    _, g1, g2, gres = cat_continuation("cuda")
+    for (c, g), n in (((c1, g1), "1"), ((c2, g2), "2")):
+        assert saved(c, tmp_path, "c" + n).read_bytes() == saved(g, tmp_path, "g" + n).read_bytes()
+    assert cres == gres
 
 
 @cuda
