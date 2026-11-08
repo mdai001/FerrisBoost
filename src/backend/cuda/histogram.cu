@@ -1114,8 +1114,14 @@ extern "C" __global__ void quantile_gradient_rows(
     float* gpair_out,
     unsigned long long subsample_threshold,
     unsigned long long subsample_seed,
-    unsigned long long subsample_tree) {
+    unsigned long long subsample_tree,
+    // 每个 block 一对 (max|g|, max|h|),和 `apply_delta_and_gradient` 一样融合进来,
+    // 省掉单独的 `gpair_max_abs` 一趟和它的 host 往返。launch 几何因此就是归约几何
+    // (grid-stride,block 数 = max 槽位数)。
+    double* max_out) {
     const float scale = (float)scratch[(uint64_t)n_partials * 2];
+    double mg = 0.0;
+    double mh = 0.0;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
          i += (uint32_t)blockDim.x * gridDim.x) {
         float g = 0.0f;
@@ -1148,7 +1154,11 @@ extern "C" __global__ void quantile_gradient_rows(
         }
         gpair_out[(uint64_t)i * 2] = g;
         gpair_out[(uint64_t)i * 2 + 1] = h;
+        // 采样置零之后的值进 max(和单独的 gpair_max_abs 看到的一样)。
+        mg = fmax(mg, fb_bound(g));
+        mh = fmax(mh, fb_bound(h));
     }
+    fb_block_max_pair(mg, mh, max_out);
 }
 
 extern "C" __global__ void gpair_max_abs(

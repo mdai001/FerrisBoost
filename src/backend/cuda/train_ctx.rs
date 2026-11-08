@@ -2206,8 +2206,8 @@ impl GpuTrainCtx {
                 subsample_seed,
                 subsample_tree,
             )?;
-            // The quantile gradient kernel already masked this pair.
-            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false);
+            // The quantile gradient kernel already masked this pair and reduced its max.
+            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true);
         }
         {
             // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
@@ -2297,6 +2297,8 @@ impl GpuTrainCtx {
             weight_resident,
             prediction_delta,
             gpair_f32,
+            gpair_max,
+            gpair_max_host,
             qt_scratch,
             ..
         } = &mut *buf;
@@ -2308,6 +2310,13 @@ impl GpuTrainCtx {
         let scratch = qt_scratch
             .as_mut()
             .context("fast quantile 归约暂存未分配")?;
+        let max_out = gpair_max
+            .as_mut()
+            .context("gpair max buffer not allocated")?;
+        // 梯度 kernel 顺带出每 block 的 max|g| / max|h|,所以它的 launch 几何就是
+        // 归约几何(和 `apply_delta_and_gradient` 一样)。
+        let max_blocks = u32::try_from(gpair_max_host.len() / 2)
+            .context("gpair max reduction block count exceeds u32")?;
         let has_weight: u32 = weight_resident.is_some().into();
         let weight = weight_resident.as_ref().unwrap_or(label);
         {
@@ -2363,8 +2372,8 @@ impl GpuTrainCtx {
         }
         {
             let cfg = LaunchConfig {
-                grid_dim: (n_rows_u32.div_ceil(THREADS).min(65535), 1, 1),
-                block_dim: (THREADS, 1, 1),
+                grid_dim: (max_blocks, 1, 1),
+                block_dim: (GPAIR_THREADS as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut launch = self.stream.launch_builder(grad_fn);
@@ -2384,7 +2393,8 @@ impl GpuTrainCtx {
                 .arg(out)
                 .arg(&subsample_threshold)
                 .arg(&subsample_seed)
-                .arg(&subsample_tree);
+                .arg(&subsample_tree)
+                .arg(max_out);
             unsafe { launch.launch(cfg) }.context("launch quantile_gradient_rows")?;
         }
         Ok(())
@@ -2569,8 +2579,8 @@ impl GpuTrainCtx {
             subsample_seed,
             subsample_tree,
         )?;
-        // 梯度 kernel 已经采样置零;和单 alpha 一样重扫 max。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false)
+        // 梯度 kernel 已经采样置零并归约出每 block 的 max;和单 alpha 一样不再重扫。
+        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
     }
 
     /// 多个 `quantile_alpha`:刚建完的第 `target` 棵树的叶子增量立刻并进它那一列。
