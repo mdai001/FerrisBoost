@@ -243,7 +243,7 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
     // session, and parent-cache seed are created for every invocation.
     session.begin_split_level(0).unwrap();
     let roots_result = session
-        .split_cached_batch(&roots, &feats, sampled, &q, &params, true)
+        .split_cached_batch(&roots, &feats, sampled, None, None, &q, &params, true)
         .unwrap();
     assert_eq!(roots_result.len(), parent_spans.len());
     for (parent, span) in parent_spans.iter().copied().enumerate() {
@@ -316,7 +316,7 @@ fn run_cached_feature_tie_case(sampled: Option<&[FeatId]>, expected_feature: Fea
 
     let before = session.timing;
     let children = session
-        .split_cached_batch(&groups, &feats, sampled, &q, &params, false)
+        .split_cached_batch(&groups, &feats, sampled, None, None, &q, &params, false)
         .unwrap();
     assert_eq!(
         session.timing.split_d2h_calls - before.split_d2h_calls,
@@ -410,7 +410,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
         })
         .collect();
     let root_results = session
-        .split_cached_batch(&roots, &feats, None, &q, &params, true)
+        .split_cached_batch(&roots, &feats, None, None, None, &q, &params, true)
         .unwrap();
     assert_eq!(root_results.len(), 3);
     session.finish_split_level(0);
@@ -464,7 +464,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
 
     let before_empty = session.timing;
     let empty_before = session
-        .split_cached_batch(&[], &feats, None, &q, &params, false)
+        .split_cached_batch(&[], &feats, None, None, None, &q, &params, false)
         .unwrap();
     assert!(empty_before.is_empty());
     assert_eq!(session.timing.d2h_calls, before_empty.d2h_calls);
@@ -488,7 +488,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
 
     let before = session.timing;
     let results = session
-        .split_cached_batch(&groups, &feats, None, &q, &params, false)
+        .split_cached_batch(&groups, &feats, None, None, None, &q, &params, false)
         .unwrap();
     assert_eq!(
         session.timing.split_d2h_calls - before.split_d2h_calls,
@@ -533,7 +533,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
     }
     let before_empty_after = session.timing;
     let empty_after = session
-        .split_cached_batch(&[], &feats, None, &q, &params, false)
+        .split_cached_batch(&[], &feats, None, None, None, &q, &params, false)
         .unwrap();
     assert!(empty_after.is_empty());
     assert_eq!(session.timing.d2h_calls, before_empty_after.d2h_calls);
@@ -574,7 +574,7 @@ fn split_packet_window_collects_two_batches_then_tail_in_stable_order() {
     session.begin_split_level(1).unwrap();
     let before_spill = session.timing;
     let spilled = session
-        .split_cached_batch(&groups, &feats, None, &q, &params, true)
+        .split_cached_batch(&groups, &feats, None, None, None, &q, &params, true)
         .unwrap();
     assert_eq!(spilled.len(), 6);
     assert_eq!(
@@ -684,7 +684,7 @@ fn constrained_kernel_matches_cpu_evaluator() {
                 .collect();
             session.begin_split_level(0).unwrap();
             let got = session
-                .split_cached_batch(&groups, &feats, None, &q, &params, false)
+                .split_cached_batch(&groups, &feats, None, None, None, &q, &params, false)
                 .unwrap();
             session.finish_split_level(0);
             for (node, span) in spans.iter().copied().enumerate() {

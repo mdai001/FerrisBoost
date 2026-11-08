@@ -1,6 +1,6 @@
 //! Bounded, per-resident-block split state. No device allocations occur at a level.
 use super::*;
-use crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES;
+use crate::gpu_mem_plan::{CAT_SET_WORDS, SPLIT_PACKET_BYTES, SPLIT_PACKET_WINDOW_BATCHES};
 use crate::split::SplitCandidate;
 use crate::types::{FeatId, TrainParams};
 
@@ -21,6 +21,21 @@ pub(super) struct ResidentSplitBuffers {
     /// 只在有约束时上传和读取。
     bounds: CudaSlice<f32>,
     monotone: CudaSlice<i32>,
+    /// Categorical path (allocated only when the data has categorical
+    /// features): per block-local feature `0` = ordered, else `1 + ordinal`
+    /// among the block's categorical features; per-(node, categorical feature)
+    /// winning category sets (8 words each).
+    cat_info: CudaSlice<u32>,
+    cat_sets: CudaSlice<u32>,
+    cat_enabled: bool,
+    /// Per-(node, block-local feature) enable bytes for bylevel / bynode column
+    /// sampling (a one-byte dummy otherwise).
+    node_enabled: CudaSlice<u8>,
+    node_masks: bool,
+    /// Bytes between consecutive node packets: `SPLIT_PACKET_BYTES`, plus a
+    /// category set on the categorical path.
+    packet_stride: usize,
+    n_cat: u32,
     stride: usize,
     capacity: usize,
     previous_ids: Vec<(usize, usize)>,
@@ -36,18 +51,36 @@ impl ResidentSplitBuffers {
         bins: usize,
         feats: usize,
         cap: usize,
+        categorical: bool,
+        node_masks: bool,
     ) -> Result<Self> {
+        let packet_stride = SPLIT_PACKET_BYTES + if categorical { CAT_SET_WORDS * 4 } else { 0 };
         Ok(Self {
             previous: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             next: stream.alloc_zeros::<i64>((bins * 2 * cap).max(1))?,
             candidates: stream.alloc_zeros::<u8>((feats * cap * 64).max(1))?,
-            packets: stream.alloc_zeros::<u8>(cap * 64 * SPLIT_PACKET_WINDOW_BATCHES)?,
+            packets: stream.alloc_zeros::<u8>(cap * packet_stride * SPLIT_PACKET_WINDOW_BATCHES)?,
             sums: stream.alloc_zeros::<i64>(cap * 2)?,
             metadata: stream.alloc_zeros::<u32>(cap * 4)?,
             feats: stream.alloc_zeros::<u32>(feats.max(1))?,
             enabled: stream.alloc_zeros::<u32>(feats.max(1))?,
             bounds: stream.alloc_zeros::<f32>(cap * 2)?,
             monotone: stream.alloc_zeros::<i32>(feats.max(1))?,
+            cat_info: stream.alloc_zeros::<u32>(if categorical { feats.max(1) } else { 1 })?,
+            cat_sets: stream.alloc_zeros::<u32>(if categorical {
+                (cap * feats * CAT_SET_WORDS).max(1)
+            } else {
+                1
+            })?,
+            cat_enabled: categorical,
+            node_enabled: stream.alloc_zeros::<u8>(if node_masks {
+                (cap * feats).max(1)
+            } else {
+                1
+            })?,
+            node_masks,
+            packet_stride,
+            n_cat: 0,
             stride: bins,
             capacity: cap,
             previous_ids: Vec::with_capacity(cap),
@@ -146,6 +179,8 @@ impl GpuBlockSession<'_> {
         groups: &[GpuSplitGroup],
         feats: &[FeatId],
         sampled: Option<&[FeatId]>,
+        categorical: Option<&[bool]>,
+        node_enabled: Option<&dyn Fn(usize, FeatId) -> bool>,
         q: &GradQuantizer,
         p: &TrainParams,
         keep_next: bool,
@@ -176,6 +211,8 @@ impl GpuBlockSession<'_> {
                 chunk,
                 feats,
                 sampled,
+                categorical,
+                node_enabled,
                 q,
                 p,
                 keep_next,
@@ -200,6 +237,8 @@ impl GpuBlockSession<'_> {
         groups: &[GpuSplitGroup],
         feats: &[FeatId],
         sampled: Option<&[FeatId]>,
+        categorical: Option<&[bool]>,
+        node_enabled: Option<&dyn Fn(usize, FeatId) -> bool>,
         q: &GradQuantizer,
         p: &TrainParams,
         keep_next: bool,
@@ -295,6 +334,35 @@ impl GpuBlockSession<'_> {
             stream.memcpy_htod(&enabled, &mut cache.enabled.slice_mut(..enabled.len()))?;
             self.timing.split_metadata_h2d_calls += 2;
             self.timing.split_metadata_h2d_bytes += (feats.len() * 8) as u64;
+            if cache.cat_enabled {
+                let is_cat = |f: &FeatId| {
+                    categorical.is_some_and(|c| c.get(*f as usize).copied().unwrap_or(false))
+                };
+                let mut ordinal = 0u32;
+                let info: Vec<u32> = feats
+                    .iter()
+                    .map(|f| {
+                        if is_cat(f) {
+                            ordinal += 1;
+                            ordinal
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                cache.n_cat = ordinal;
+                stream.memcpy_htod(&info, &mut cache.cat_info.slice_mut(..info.len()))?;
+                self.timing.split_metadata_h2d_calls += 1;
+                self.timing.split_metadata_h2d_bytes += (info.len() * 4) as u64;
+            } else {
+                anyhow::ensure!(
+                    !categorical.is_some_and(|c| feats
+                        .iter()
+                        .any(|f| c.get(*f as usize).copied().unwrap_or(false))),
+                    "categorical features need the categorical GPU split cache \
+                     (SharedHistogramConfig::has_categorical)"
+                );
+            }
             if p.has_monotone() {
                 let monotone: Vec<i32> = feats.iter().map(|&f| p.monotone_of(f) as i32).collect();
                 stream.memcpy_htod(&monotone, &mut cache.monotone.slice_mut(..monotone.len()))?;
@@ -310,6 +378,20 @@ impl GpuBlockSession<'_> {
             stream.memcpy_htod(&bounds, &mut cache.bounds.slice_mut(..bounds.len()))?;
             self.timing.split_metadata_h2d_calls += 1;
             self.timing.split_metadata_h2d_bytes += (bounds.len() * 4) as u64;
+        }
+        if let Some(is_enabled) = node_enabled {
+            anyhow::ensure!(
+                cache.node_masks,
+                "nested column sampling needs the per-node feature masks \
+                 (SharedHistogramConfig::node_feature_masks)"
+            );
+            let mut mask = Vec::with_capacity(indices.len() * feats.len());
+            for &index in &indices {
+                mask.extend(feats.iter().map(|&f| u8::from(is_enabled(index, f))));
+            }
+            stream.memcpy_htod(&mask, &mut cache.node_enabled.slice_mut(..mask.len()))?;
+            self.timing.split_metadata_h2d_calls += 1;
+            self.timing.split_metadata_h2d_bytes += mask.len() as u64;
         }
         stream.memcpy_htod(&sums, &mut cache.sums.slice_mut(..sums.len()))?;
         stream.memcpy_htod(&metadata, &mut cache.metadata.slice_mut(..metadata.len()))?;
@@ -332,12 +414,18 @@ impl GpuBlockSession<'_> {
         if self.ctx.timing {
             start_event.record(&stream)?;
         }
-        let mut launch = stream.launch_builder(
-            self.ctx
-                .split_features_fn
-                .as_ref()
-                .context("GPU split kernel unavailable")?,
-        );
+        // Without nested sampling a null mask makes the tree-level `enabled`
+        // words decide.
+        let no_node_mask = 0u64;
+        let n_cat = cache.n_cat;
+        let max_onehot = p.max_cat_to_onehot;
+        let max_threshold = p.max_cat_threshold;
+        let split_fn = if cache.cat_enabled {
+            self.ctx.split_features_cat_fn.as_ref()
+        } else {
+            self.ctx.split_features_fn.as_ref()
+        };
+        let mut launch = stream.launch_builder(split_fn.context("GPU split kernel unavailable")?);
         launch
             .arg(&mut *hist_out)
             .arg(&cache.previous)
@@ -361,6 +449,19 @@ impl GpuBlockSession<'_> {
             .arg(&cache.monotone)
             .arg(&has_monotone)
             .arg(&mut cache.candidates);
+        if node_enabled.is_some() {
+            launch.arg(&cache.node_enabled);
+        } else {
+            launch.arg(&no_node_mask);
+        }
+        if cache.cat_enabled {
+            launch
+                .arg(&cache.cat_info)
+                .arg(&n_cat)
+                .arg(&max_onehot)
+                .arg(&max_threshold)
+                .arg(&mut cache.cat_sets);
+        }
         // Bounds above cover all CTA loads/stores; previous/next/work allocations
         // are disjoint and feature CTAs own disjoint histogram ranges.
         unsafe {
@@ -371,22 +472,32 @@ impl GpuBlockSession<'_> {
             })
         }?;
         let _submit_phase = crate::diagnostic::Phase::new(b"fb.host.packet_submit\0");
-        let mut packet_output = cache
-            .packets
-            .slice_mut(packet_offset * 64..(packet_offset + nodes) * 64);
-        let mut launch = stream.launch_builder(
-            self.ctx
-                .split_nodes_fn
-                .as_ref()
-                .context("GPU split reduction unavailable")?,
+        let packet_stride = cache.packet_stride;
+        let stride_arg = packet_stride as u32;
+        let mut packet_output = cache.packets.slice_mut(
+            packet_offset * packet_stride..(packet_offset + nodes) * packet_stride,
         );
-        launch
-            .arg(&cache.candidates)
-            .arg(&features)
-            .arg(&ig)
-            .arg(&ih)
-            .arg(&p.lambda)
-            .arg(&mut packet_output);
+        let nodes_fn = if cache.cat_enabled {
+            self.ctx.split_nodes_cat_fn.as_ref()
+        } else {
+            self.ctx.split_nodes_fn.as_ref()
+        };
+        let mut launch =
+            stream.launch_builder(nodes_fn.context("GPU split reduction unavailable")?);
+        launch.arg(&cache.candidates).arg(&features);
+        if cache.cat_enabled {
+            launch
+                .arg(&cache.cat_sets)
+                .arg(&n_cat)
+                .arg(&mut packet_output)
+                .arg(&stride_arg);
+        } else {
+            launch
+                .arg(&ig)
+                .arg(&ih)
+                .arg(&p.lambda)
+                .arg(&mut packet_output);
+        }
         unsafe {
             launch.launch(LaunchConfig {
                 grid_dim: (nodes as u32, 1, 1),
@@ -396,6 +507,7 @@ impl GpuBlockSession<'_> {
         }?;
         self.timing.kernel_calls += 2;
         self.timing.split_kernel_calls += 2;
+        self.timing.split_cat_evaluated += (nodes * n_cat as usize) as u64;
         if self.ctx.timing {
             end_event.record(&stream)?;
             stream.synchronize()?;
@@ -441,7 +553,8 @@ impl GpuBlockSession<'_> {
         );
         let start = std::time::Instant::now();
         let packet_ready_phase = crate::diagnostic::Phase::new(b"fb.host.packet_ready\0");
-        let mut packets = vec![0u8; nodes * 64];
+        let stride = cache.packet_stride;
+        let mut packets = vec![0u8; nodes * stride];
         stream.memcpy_dtoh(
             &cache.packets.slice(..packets.len()),
             packets.as_mut_slice(),
@@ -462,7 +575,7 @@ impl GpuBlockSession<'_> {
         let mut n = 0;
         for batch in pending {
             for local in 0..batch.indices.len() {
-                let packet = &packets[n * 64..(n + 1) * 64];
+                let packet = &packets[n * stride..(n + 1) * stride];
                 let u32_at = |i| u32::from_ne_bytes(packet[i..i + 4].try_into().unwrap());
                 let i64_at = |i| i64::from_ne_bytes(packet[i..i + 8].try_into().unwrap());
                 let flags = u32_at(12);
@@ -479,7 +592,13 @@ impl GpuBlockSession<'_> {
                         hess: i64_at(40),
                     },
                     missing_left: flags & 2 != 0,
-                    cats: None,
+                    cats: (flags & 4 != 0).then(|| {
+                        let words: [u32; CAT_SET_WORDS] =
+                            std::array::from_fn(|w| u32_at(SPLIT_PACKET_BYTES + w * 4));
+                        crate::categorical::CatBits(std::array::from_fn(|i| {
+                            u64::from(words[2 * i]) | u64::from(words[2 * i + 1]) << 32
+                        }))
+                    }),
                 });
                 let hist = if keep_next && !batch.cached[local] {
                     let _fallback_phase =

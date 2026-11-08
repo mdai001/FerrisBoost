@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned. On GPU, categorical features train more slowly than numeric ones, and prediction from a categorical model runs on the CPU.
+* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned. Prediction from a categorical model runs on the CPU.
 * **Explanations:** SHAP values, interactions, and leaf indices are always computed on the CPU.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -251,6 +251,7 @@ logging, and the complete parameter reference.
 - Added `base_margin`.
 - Added training continuation (`xgb_model`).
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`), the ranking metrics `ndcg`, `map` and `pre`, query groups (`qid`, `group`) and `FerrisBoostRanker`.
+- GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
 
 ### 0.0.6 (unreleased)
 

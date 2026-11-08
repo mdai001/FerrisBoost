@@ -20,6 +20,40 @@ pub(crate) const PARTITION_BATCH_CAPACITY: usize = 32;
 pub(crate) const PARTITION_DESCRIPTOR_WORDS: usize = 10;
 /// Fixed packet staging window; independent of level width and dataset rows.
 pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
+/// 32-bit words in one categorical winner's category set (a bitset over the
+/// feature's bins). Must equal `CAT_SET_WORDS` in `histogram.cu` (unit-tested).
+/// 16-bit categorical bins would raise this together with the kernel constant.
+pub(crate) const CAT_SET_WORDS: usize = 8;
+/// One categorical winner's category set, in bytes.
+pub(crate) const CAT_SET_BYTES: u64 = CAT_SET_WORDS as u64 * 4;
+/// Bytes of one split packet without a category set.
+pub(crate) const SPLIT_PACKET_BYTES: usize = 64;
+
+/// Per-column bytes the categorical device split path adds to one resident slot:
+/// the categorical-ordinal word (4 B) and one category-set output per cache node.
+pub(crate) fn categorical_split_cache_col_bytes(hist_nodes_per_batch: u64) -> u64 {
+    4 + hist_nodes_per_batch * CAT_SET_BYTES
+}
+
+/// Per-slot bytes that do not scale with columns: each packet-window slot also
+/// holds the winner's category set (packets are 96 B instead of 64 B).
+pub(crate) fn categorical_split_cache_fixed_bytes(hist_nodes_per_batch: u64) -> u64 {
+    hist_nodes_per_batch * CAT_SET_BYTES * SPLIT_PACKET_WINDOW_BATCHES as u64
+}
+
+/// Per-(node, column) feature-mask bytes of nested column sampling (one byte
+/// per cache node and column).
+pub(crate) fn node_feature_mask_bytes(cols: u64, hist_nodes_per_batch: u64) -> u64 {
+    cols * hist_nodes_per_batch
+}
+
+/// Total categorical-path bytes of one resident slot with `cols` columns. The
+/// runtime budget (`GpuMemoryBudget::split_cache_bytes`) and the planner price
+/// the allocation with this one function.
+pub(crate) fn categorical_split_cache_bytes(cols: u64, hist_nodes_per_batch: u64) -> u64 {
+    cols * categorical_split_cache_col_bytes(hist_nodes_per_batch)
+        + categorical_split_cache_fixed_bytes(hist_nodes_per_batch)
+}
 
 pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usize, usize) {
     // Disjoint nonempty spans: sum ceil(len/T) <= ceil(N/T) + K - 1,
@@ -233,6 +267,40 @@ impl StreamingMemModel {
         // packet collection window.
         self.resident_extra_fixed_bytes =
             cap.saturating_mul(40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
+        self
+    }
+
+    /// Add the categorical device split buffers (category-set outputs, 96 B
+    /// packets, ordinal words) on top of [`Self::with_resident_split_cache`].
+    ///
+    /// The runtime allocates them only when the data has categorical features;
+    /// the planner cannot always know that before opening the input (Arrow
+    /// dictionary columns), so it reserves them whenever the cache is on. The
+    /// reservation is ~0.5 KB per column per resident slot at the default
+    /// capacity, so over-reserving costs a negligible fraction of the cache.
+    pub fn with_categorical_split_cache(mut self, hist_nodes_per_batch: u64) -> Self {
+        if hist_nodes_per_batch < 2 {
+            return self;
+        }
+        self.resident_extra_col_bytes = self
+            .resident_extra_col_bytes
+            .saturating_add(categorical_split_cache_col_bytes(hist_nodes_per_batch));
+        self.resident_extra_fixed_bytes = self
+            .resident_extra_fixed_bytes
+            .saturating_add(categorical_split_cache_fixed_bytes(hist_nodes_per_batch));
+        self
+    }
+
+    /// Add the per-(node, column) feature masks that bylevel / bynode column
+    /// sampling uploads to the resident split cache (1 B per cache node per
+    /// column). Not charged when neither rate is below 1.
+    pub fn with_node_feature_masks(mut self, hist_nodes_per_batch: u64) -> Self {
+        if hist_nodes_per_batch < 2 {
+            return self;
+        }
+        self.resident_extra_col_bytes = self
+            .resident_extra_col_bytes
+            .saturating_add(node_feature_mask_bytes(1, hist_nodes_per_batch));
         self
     }
 
@@ -818,6 +886,46 @@ mod tests {
         assert_eq!(
             sixteen.resident_extra_fixed_bytes,
             16 * (40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64)
+        );
+    }
+
+    #[test]
+    fn category_set_capacity_matches_the_kernel_and_the_host_bitset() {
+        let kernel = include_str!("backend/cuda/histogram.cu");
+        let defined = kernel
+            .lines()
+            .find_map(|l| l.strip_prefix("#define CAT_SET_WORDS "))
+            .expect("histogram.cu defines CAT_SET_WORDS")
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(defined, CAT_SET_WORDS);
+        assert_eq!(
+            std::mem::size_of::<crate::categorical::CatBits>(),
+            CAT_SET_WORDS * 4
+        );
+    }
+
+    #[test]
+    fn categorical_split_cache_prices_set_outputs_and_wide_packets() {
+        let base = higgs_model();
+        assert_eq!(
+            base.with_categorical_split_cache(1).resident_extra_col_bytes,
+            0
+        );
+        let plain = base.with_resident_split_cache(255, 16);
+        let cat = plain.with_categorical_split_cache(16);
+        assert_eq!(
+            cat.resident_extra_col_bytes - plain.resident_extra_col_bytes,
+            4 + 16 * 32
+        );
+        assert_eq!(
+            cat.resident_extra_fixed_bytes - plain.resident_extra_fixed_bytes,
+            16 * 32 * SPLIT_PACKET_WINDOW_BATCHES as u64
+        );
+        assert_eq!(
+            categorical_split_cache_bytes(7, 16),
+            7 * (4 + 16 * 32) + 16 * 32 * SPLIT_PACKET_WINDOW_BATCHES as u64
         );
     }
 

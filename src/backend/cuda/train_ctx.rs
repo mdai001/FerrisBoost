@@ -254,6 +254,8 @@ pub struct GpuSegmentTiming {
     pub cache_admitted_nodes: u64,
     pub cache_spilled_nodes: u64,
     pub split_evaluated_nodes: u64,
+    /// (node, categorical feature) pairs enumerated by the device split cache.
+    pub split_cat_evaluated: u64,
 }
 
 /// 一个已经 launch、但 totals 还没取回的 partition。
@@ -361,6 +363,7 @@ impl GpuSegmentTiming {
         self.cache_admitted_nodes += other.cache_admitted_nodes;
         self.cache_spilled_nodes += other.cache_spilled_nodes;
         self.split_evaluated_nodes += other.split_evaluated_nodes;
+        self.split_cat_evaluated += other.split_cat_evaluated;
     }
 }
 
@@ -551,6 +554,10 @@ enum FastInit<'a> {
 pub struct GpuTrainCtx {
     split_features_fn: Option<CudaFunction>,
     split_nodes_fn: Option<CudaFunction>,
+    /// Categorical variants of the two split kernels (present only when the
+    /// resident split cache is on and the data has categorical features).
+    split_features_cat_fn: Option<CudaFunction>,
+    split_nodes_cat_fn: Option<CudaFunction>,
     #[allow(dead_code)]
     state: Arc<DeviceState>,
     stream: Arc<CudaStream>,
@@ -747,6 +754,17 @@ impl GpuTrainCtx {
         };
         let split_nodes_fn = if split_cache_enabled {
             Some(state.module.load_function("split_cached_nodes")?)
+        } else {
+            None
+        };
+        let split_cat_enabled = split_cache_enabled && config.has_categorical;
+        let split_features_cat_fn = if split_cat_enabled {
+            Some(state.module.load_function("split_cached_features_cat")?)
+        } else {
+            None
+        };
+        let split_nodes_cat_fn = if split_cat_enabled {
+            Some(state.module.load_function("split_cached_nodes_cat")?)
         } else {
             None
         };
@@ -1355,6 +1373,8 @@ impl GpuTrainCtx {
                         max_hist_bins,
                         max_block_feats,
                         hist_nodes_per_batch,
+                        split_cat_enabled,
+                        config.node_feature_masks,
                     )?)
                 } else {
                     None
@@ -1508,7 +1528,26 @@ impl GpuTrainCtx {
                         + max_block_feats.max(1) * 12
                         // sums 16 + metadata 16 + bounds 8,再加 packet 窗口
                         + hist_nodes_per_batch
-                            * (40 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES))
+                            * (40 + 64 * crate::gpu_mem_plan::SPLIT_PACKET_WINDOW_BATCHES)
+                        // categorical: info (4 B per column), per-(node, column)
+                        // category-set output (32 B) and 32 B set per packet slot,
+                        // priced by the same helper the planner uses.
+                        + if config.node_feature_masks {
+                            crate::gpu_mem_plan::node_feature_mask_bytes(
+                                max_block_feats as u64,
+                                hist_nodes_per_batch as u64,
+                            ) as usize
+                        } else {
+                            0
+                        }
+                        + if split_cat_enabled {
+                            crate::gpu_mem_plan::categorical_split_cache_bytes(
+                                max_block_feats as u64,
+                                hist_nodes_per_batch as u64,
+                            ) as usize
+                        } else {
+                            0
+                        })
             } else {
                 0
             },
@@ -1556,6 +1595,8 @@ impl GpuTrainCtx {
         let ctx = Self {
             split_features_fn,
             split_nodes_fn,
+            split_features_cat_fn,
+            split_nodes_cat_fn,
             rm_transpose_fn,
             rm_hist_fn,
             rm_count_fn,
@@ -1749,6 +1790,8 @@ impl GpuTrainCtx {
                 self.rm_chunk_rows,
             )
             + &format!(" max_bins_per_tile={}", self.max_bins_per_tile)
+            + &format!(" categorical_split={}",
+                if self.split_features_cat_fn.is_some() { "device_cache" } else { "none" })
             + &format!(" split={} split_cache_capacity={} split_cache_bytes={}",
                 if self.budget.split_cache_bytes > 0 { "gpu_resident_cache" } else { "cpu" },
                 if self.budget.split_cache_bytes > 0 { self.hist_nodes_per_batch } else { 0 },

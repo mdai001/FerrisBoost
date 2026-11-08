@@ -802,11 +802,12 @@ model may use category ids above 254; prediction follows its sets, with
 unknown or invalid values going left.
 
 On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
-CPU) and `"fast"`. The device split kernels only know ordered bins, so a
-categorical run enumerates splits on the host from downloaded histograms (the
-same exact fallback used for streaming) and does not use the resident GPU split
-cache; histogram building, row partitioning, and gradients stay on the device.
-Expect categorical GPU training to be slower than numeric GPU training.
+CPU) and `"fast"`. The resident GPU split cache enumerates categorical features
+on the device (one-hot and sorted partition, with the same tie-breaking and
+missing-value direction as the CPU), so histogram building, split search, row
+partitioning, and gradients all stay on the device. Cache overflow and pure
+streaming (`resident_blocks=0`) fall back to the exact host enumeration over
+downloaded histograms.
 
 ## Learning to rank
 
@@ -1339,16 +1340,16 @@ memory budget, without manual chunk or batch tuning:
   prediction column per class plus two per-row softmax statistics.
   `reg:quantileerror` adds a small fixed scratch buffer that does not depend
   on the row count. The memory planner accounts for all of these.
-- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. They use the host split search on downloaded histograms instead of the device split cache, so expect them to be slower on the GPU than `colsample_bytree` alone.
+- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. The per-level and per-node feature sets are drawn on the host exactly as on the CPU and applied by the device split cache.
 - **Categorical features**: supported with both `gpu_math` modes. Split search
-  for them runs on the host (see [Categorical features](#categorical-features)).
+  for them runs in the device split cache (see
+  [Categorical features](#categorical-features)).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
 - **Bounded split cache**: A bounded resident histogram/split cache is enabled
-  by default and included in the GPU memory plan. Unsupported cases
-  (`colsample_bylevel` / `colsample_bynode`, categorical features) and cache
-  overflow use the exact host fallback. This is managed internally and is not
+  by default and included in the GPU memory plan. Cache overflow and pure
+  streaming use the exact host fallback. This is managed internally and is not
   a public Python parameter.
 - **`hist_streams`**: Defaults to automatic (`None`), resolved by the GPU planner based on execution path, block width, and VRAM budget (selects 2 streams for chunked row-major streaming when memory allows, and 1 stream for resident or column-major paths); can be explicitly set to `1` or `2`.
 - **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU scaling is in progress (WIP).
@@ -1359,7 +1360,7 @@ memory budget, without manual chunk or batch tuning:
 | Step | Where it runs |
 |---|---|
 | Histograms, row partition, gradients | GPU, for every supported objective and both `gpu_math` modes |
-| Split search | GPU (resident cache) by default; on the host from downloaded histograms for `colsample_bylevel` / `colsample_bynode`, categorical features, and cache overflow |
+| Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
 | Feature binning and file ingest | Host |
 | Prediction (`use_gpu=True`) | GPU 0 when worthwhile; CPU for small batches, models with categorical splits, `predict_to_parquet`, and the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`) |
 
