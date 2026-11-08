@@ -894,7 +894,9 @@ def train(
     `base_score` 和 objective,`num_boost_round` 棵**新**树接在它后面;objective / num_class /
     特征数 / 特征名 / 类别特征不一致会报错。分箱边界按新数据重新采样(旧树用的是浮点阈值,
     所以旧树的预测不依赖新边界)。`evals_result` 只含新的轮次;早停的 `best_iteration` 是
-    整个模型里的绝对轮次。
+    整个模型里的绝对轮次。文件入口按**列名**绑定到模型的特征名(列序随意),所以模型要有
+    特征名(带 `feature_names` 的 XGBoost 模型也行);没有特征名的 XGBoost 模型只能用数组继续,
+    文件入口会报 `ValueError`。
     """
     prior = _load_prior(xgb_model)
     if prior is not None:

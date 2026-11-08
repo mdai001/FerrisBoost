@@ -1135,8 +1135,6 @@ fn predict_files_to_parquet(
     missing: f32,
     init: Option<&[f32]>,
 ) -> PyResult<usize> {
-    use crate::tree::SchemaMode;
-
     if prediction_column.trim().is_empty() {
         return Err(PyValueError::new_err(
             "prediction_column 不能为空或只包含空白",
@@ -1157,34 +1155,7 @@ fn predict_files_to_parquet(
 
     let resolved = crate::source::input::resolve(&path_specs)
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-    let mode = model.inner.schema_mode.ok_or_else(|| {
-        PyValueError::new_err(
-            "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
-             空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
-             二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
-        )
-    })?;
-    if mode == SchemaMode::Named && model.inner.feature_names.is_empty() {
-        return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
-    }
-    if resolved.format == crate::source::input::InputFormat::Parquet && !header {
-        return Err(PyValueError::new_err("header=False 只适用于 CSV"));
-    }
-    if resolved.format == crate::source::input::InputFormat::Csv {
-        match (mode, header) {
-            (SchemaMode::Named, false) => {
-                return Err(PyValueError::new_err(
-                    "命名模式模型不能用 header=False 的位置 CSV 预测",
-                ))
-            }
-            (SchemaMode::Positional, true) => {
-                return Err(PyValueError::new_err(
-                    "位置模式模型预测 CSV 时必须显式传 header=False",
-                ))
-            }
-            _ => {}
-        }
-    }
+    model.check_file_schema(&resolved, header)?;
 
     let names = model.inner.feature_names.clone();
     let canonical_n_features = model.inner.n_features;
@@ -2122,7 +2093,6 @@ impl PyModel {
         missing: f32,
         init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use crate::tree::SchemaMode;
         if init.is_some() && use_gpu {
             return Err(PyValueError::new_err(
                 "base_margin is not supported with use_gpu=True (the device predictor has no per-row \
@@ -2135,37 +2105,7 @@ impl PyModel {
         let resolved = crate::source::input::resolve(&path_specs)
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
 
-        // ⚠️ 老模型没记过绑定模式,而空名单既可能是"真·位置模式",也可能是
-        // "命名模式但当时没存名字" —— 从 JSON 里分不出来。**猜错会静默算错**,
-        // 所以这里直接拒,并说清楚怎么办。
-        let mode = self.inner.schema_mode.ok_or_else(|| {
-            PyValueError::new_err(
-                "这个模型是在记录 schema 之前保存的,无法安全地按文件预测:\
-                 空的特征名单既可能是位置模式,也可能是命名模式没存名字,\
-                 二者无法区分。请用当前版本重新训练,或改用 numpy 数组预测。",
-            )
-        })?;
-        if mode == SchemaMode::Named && self.inner.feature_names.is_empty() {
-            return Err(PyValueError::new_err("模型标为命名模式但没有特征名单"));
-        }
-        if resolved.format == crate::source::input::InputFormat::Parquet && !header {
-            return Err(PyValueError::new_err("header=False 只适用于 CSV"));
-        }
-        if resolved.format == crate::source::input::InputFormat::Csv {
-            match (mode, header) {
-                (SchemaMode::Named, false) => {
-                    return Err(PyValueError::new_err(
-                        "命名模式模型不能用 header=False 的位置 CSV 预测",
-                    ))
-                }
-                (SchemaMode::Positional, true) => {
-                    return Err(PyValueError::new_err(
-                        "位置模式模型预测 CSV 时必须显式传 header=False",
-                    ))
-                }
-                _ => {}
-            }
-        }
+        self.check_file_schema(&resolved, header)?;
 
         let names = self.inner.feature_names.clone();
         let canonical_n_features = self.inner.n_features;
@@ -3991,7 +3931,14 @@ fn train_file(
             )));
         }
     }
-    let targets = crate::source::Targets::new(label, weight_owned.as_deref())
+    // A continued model with feature names indexes its features by those names:
+    // bind the training (and eval) files' columns by name, in the model's order
+    // (file column order is free; a missing or surplus column is an error).
+    let prior_names: Vec<String> = match (&prior_model, header) {
+        (Some(prior), true) => prior.inner.feature_names.clone(),
+        _ => Vec::new(),
+    };
+    let mut targets = crate::source::Targets::new(label, weight_owned.as_deref())
         .map_err(|e| PyValueError::new_err(format!("{e}")))?
         .with_qid(qid_owned.as_deref())
         .with_base_margin(&margin_names);
@@ -4015,6 +3962,9 @@ fn train_file(
             "feature_types 有 {} 项,文件有 {n_features} 个特征列(不含标签/权重列)",
             cfg.categorical.len()
         )));
+    if !prior_names.is_empty() {
+        targets = targets.with_features(&prior_names);
+    }
     }
     let categorical_flags = cfg.categorical.clone();
     let targets = targets
