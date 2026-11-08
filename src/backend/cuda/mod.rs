@@ -20,11 +20,11 @@ mod inference;
 mod train_ctx;
 pub use explain::GpuExplainModel;
 pub use inference::GpuInferenceModel;
-pub(crate) use train_ctx::GpuSplitGroup;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
     GpuSegmentTiming, GpuTrainCtx, RankDeviceInputs,
 };
+pub(crate) use train_ctx::{GpuSplitGroup, GpuSplitResult};
 
 const HISTOGRAM_PTX: &str = include_str!("histogram.ptx");
 

@@ -103,6 +103,15 @@ pub(crate) struct GpuSplitGroup {
 }
 pub(crate) type GpuSplitResult = (usize, Option<SplitCandidate>, Option<Vec<GradPairFixed>>);
 
+/// A level whose last packet window is queued but not yet collected
+/// ([`GpuBlockSession::split_cached_submit`]).
+pub(crate) struct GpuSplitLevel {
+    pending: Vec<PendingSplitBatch>,
+    packet_nodes: usize,
+    results: Vec<GpuSplitResult>,
+    keep_next: bool,
+}
+
 struct PendingSplitBatch {
     indices: Vec<usize>,
     working_slots: Vec<usize>,
@@ -174,6 +183,7 @@ impl GpuBlockSession<'_> {
     /// Build only small children, subtract cached parents on device, and return
     /// compact winners. Uncached histograms are downloaded only if another
     /// level can consume them; this is the exact bounded-capacity fallback.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_cached_batch(
         &mut self,
         groups: &[GpuSplitGroup],
@@ -185,6 +195,36 @@ impl GpuBlockSession<'_> {
         p: &TrainParams,
         keep_next: bool,
     ) -> Result<Vec<GpuSplitResult>> {
+        let level = self.split_cached_submit(
+            groups,
+            feats,
+            sampled,
+            categorical,
+            node_enabled,
+            q,
+            p,
+            keep_next,
+        )?;
+        self.split_cached_finish(level)
+    }
+
+    /// First half of [`Self::split_cached_batch`]: queue every batch of the
+    /// level, collecting only packet windows that must be drained before the
+    /// next producer (full window or an uncached spill). The last window stays
+    /// queued, so the caller can submit other blocks' levels before waiting in
+    /// [`Self::split_cached_finish`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_cached_submit(
+        &mut self,
+        groups: &[GpuSplitGroup],
+        feats: &[FeatId],
+        sampled: Option<&[FeatId]>,
+        categorical: Option<&[bool]>,
+        node_enabled: Option<&dyn Fn(usize, FeatId) -> bool>,
+        q: &GradQuantizer,
+        p: &TrainParams,
+        keep_next: bool,
+    ) -> Result<GpuSplitLevel> {
         let cap = self.ctx.hist_nodes_per_batch;
         let mut pending = Vec::with_capacity(SPLIT_PACKET_WINDOW_BATCHES);
         let mut packet_nodes = 0;
@@ -225,6 +265,26 @@ impl GpuBlockSession<'_> {
                 packet_nodes = 0;
             }
         }
+        Ok(GpuSplitLevel {
+            pending,
+            packet_nodes,
+            results,
+            keep_next,
+        })
+    }
+
+    /// Second half of [`Self::split_cached_batch`]: drain the last packet
+    /// window and return all of the level's winners in submission order.
+    pub(crate) fn split_cached_finish(
+        &mut self,
+        level: GpuSplitLevel,
+    ) -> Result<Vec<GpuSplitResult>> {
+        let GpuSplitLevel {
+            pending,
+            packet_nodes,
+            mut results,
+            keep_next,
+        } = level;
         if !pending.is_empty() {
             results.extend(self.collect_split_packets(&pending, packet_nodes, keep_next)?);
         }

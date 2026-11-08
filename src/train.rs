@@ -2763,6 +2763,12 @@ enum HistFrom {
 }
 
 #[allow(clippy::too_many_arguments)] // Keep the established source/backend ownership interface explicit.
+/// Split results a two-phase GPU level submission hands to the per-block pass.
+#[cfg(feature = "cuda")]
+type PreSplit = Vec<crate::backend::cuda::GpuSplitResult>;
+#[cfg(not(feature = "cuda"))]
+type PreSplit = std::convert::Infallible;
+
 fn build_tree(
     source: &dyn BlockSource,
     gpair: &[GradPairFixed],
@@ -3004,313 +3010,409 @@ fn build_tree(
         // 真实墙钟:整个块级并行段进出各一次。**不要**用累加计时器去推它。
         let _phase = prof::Timer::new(&prof::HIST_PHASE_WALL);
         let hist_phase = crate::diagnostic::Phase::new(b"fb.host.hist_phase\0");
-        #[allow(clippy::type_complexity)]
-        // Paired histogram and split results retain per-block ownership.
-        let per_block: anyhow::Result<Vec<(Vec<Histogram>, Vec<Option<SplitCandidate>>)>> = parents
-            .into_par_iter()
-            .enumerate()
-            .map(|(b, mut parent_hist)| {
-                // `b` 只是 plan 数组里的位置,**不承载任何身份**。
-                // 物理块号、原始局部下标、压实后的 offsets 全部从 plan 里取。
-                // `b` 只是 plan 数组里的位置,**不承载任何身份**。
-                // 物理块号、原始局部下标、offsets 全部从 plan 里显式取。
-                let plan = &plans[b];
-                let phys = plan.physical;
-                let selected_local = match sampled {
-                    Some(_) if !plan.compact => Some(plan.orig_local.as_slice()),
-                    _ => None,
-                };
-                let mut run = |block: Option<&ColumnBlock>,
-                               resident: Option<crate::backend::cuda::GpuBlockSession<'_>>|
-                 -> anyhow::Result<_> {
-                    if let Some(block) = block {
-                        anyhow::ensure!(
-                            block.n_rows == source.n_rows(),
-                            "column block {phys} has {} rows, but the source declares {}",
-                            block.n_rows,
-                            source.n_rows()
-                        );
-                        anyhow::ensure!(
-                            block.feat_ids == plan.handed_feats,
-                            "column block {phys} returned features that do not match the plan"
-                        );
-                        anyhow::ensure!(
-                            block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
-                            "column block {b} data length does not match rows × features"
-                        );
+
+        // 本层要交给 device split cache 的 (small, large) 组。两阶段提交和
+        // 逐块路径共用它。
+        #[cfg(feature = "cuda")]
+        let gpu_split_groups = |session: &mut crate::backend::cuda::GpuBlockSession<'_>| {
+            use crate::backend::cuda::GpuSplitGroup;
+            let mut groups = Vec::new();
+            if depth == 0 {
+                groups.push(GpuSplitGroup {
+                    small: 0,
+                    span: level[0].rows.device(),
+                    sum: level[0].sum,
+                    bounds: level[0].bounds,
+                    large: None,
+                });
+            } else {
+                for (i, ln) in level.iter().enumerate() {
+                    if let HistFrom::Subtract { parent, sibling } = ln.hist_from {
+                        if let Some(cache_slot) = session.cached_parent_slot(parent) {
+                            groups.push(GpuSplitGroup {
+                                small: sibling,
+                                span: level[sibling].rows.device(),
+                                sum: level[sibling].sum,
+                                bounds: level[sibling].bounds,
+                                large: Some((i, cache_slot, ln.sum, ln.bounds)),
+                            });
+                        }
                     }
-                    let width = *plan.hist_offsets.last().unwrap() as usize;
-                    // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
-                    // 原来这里给每个槽位都分配 + 清零一个完整直方图,相减节点
-                    // 那一半分配完立刻被扔掉。
-                    //
-                    // 老实说:实测**量不出差别**(这台机器上噪声比效果大)。
-                    // 留着是因为它确实少干一份活,不是因为它更快。
-                    let mut per_node: Vec<Histogram> = level
+                }
+            }
+            groups
+        };
+        #[cfg(feature = "cuda")]
+        let node_enabled = |node: usize, feat: FeatId| {
+            enum_features(node).is_none_or(|s| s.binary_search(&feat).is_ok())
+        };
+
+        // Two-phase GPU submission when every block is device resident: queue
+        // all blocks' histogram + split kernels from this thread first, then
+        // collect their packets. Per-block worker threads submitted (and
+        // waited) one block after another as they woke up, leaving the device
+        // idle between blocks; the remaining per-block host work is trivial, so
+        // the level then runs sequentially. Results are the same packets.
+        #[allow(unused_mut)] // filled only by the CUDA two-phase path
+        let mut pre_split: Vec<Option<PreSplit>> = (0..n_blocks).map(|_| None).collect();
+        #[cfg(feature = "cuda")]
+        let two_phase = gpu.is_some_and(|ctx| {
+            n_blocks > 1
+                && plans
+                    .iter()
+                    .all(|pl| !pl.compact && pl.physical < ctx.resident_block_count())
+        });
+        #[cfg(not(feature = "cuda"))]
+        let two_phase = false;
+        #[cfg(feature = "cuda")]
+        if two_phase {
+            let ctx = gpu.expect("two-phase submission implies a GPU context");
+            let started = std::time::Instant::now();
+            let mut submitted = Vec::with_capacity(n_blocks);
+            for (b, plan) in plans.iter().enumerate() {
+                let selected_local = sampled.map(|_| plan.orig_local.as_slice());
+                let Some(mut session) = ctx.block_session_resident(
+                    plan.physical,
+                    source.n_rows(),
+                    plan.handed_feats.len(),
+                    &plan.hist_offsets,
+                    selected_local,
+                )?
+                else {
+                    continue; // not resident yet: the per-block path uploads it
+                };
+                if !session.begin_split_level(depth)? {
+                    continue;
+                }
+                let groups = gpu_split_groups(&mut session);
+                let pending = session.split_cached_submit(
+                    &groups,
+                    &plan.hist_feats,
+                    sampled,
+                    cuts.has_categorical().then(|| cuts.categorical_flags()),
+                    nested
+                        .is_some()
+                        .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
+                    q,
+                    p,
+                    depth + 1 < p.max_depth,
+                )?;
+                submitted.push((b, session, pending));
+            }
+            for (b, mut session, pending) in submitted {
+                pre_split[b] = Some(session.split_cached_finish(pending)?);
+                session.finish_split_level(depth);
+                let timing = session.timing();
+                drop(session);
+                prof::record_gpu(
+                    &timing,
+                    started.elapsed().as_nanos() as u64,
+                    &prof::GPU_HIST_BLOCK_H2D,
+                    &prof::GPU_HIST_ROWS_H2D,
+                    &prof::GPU_HIST_KERNEL,
+                    &prof::GPU_HIST_D2H,
+                    &prof::GPU_HIST_HOST,
+                );
+            }
+        }
+
+        let items: Vec<_> = parents.into_iter().zip(pre_split).enumerate().collect();
+        #[allow(clippy::type_complexity)]
+        let block_fn = |(b, (mut parent_hist, pre)): (
+            usize,
+            (Option<Vec<Histogram>>, Option<PreSplit>),
+        )|
+         -> anyhow::Result<(Vec<Histogram>, Vec<Option<SplitCandidate>>)> {
+            #[cfg(feature = "cuda")]
+            let mut pre = pre;
+            #[cfg(not(feature = "cuda"))]
+            let _ = pre;
+            // `b` 只是 plan 数组里的位置,**不承载任何身份**。
+            // 物理块号、原始局部下标、压实后的 offsets 全部从 plan 里取。
+            // `b` 只是 plan 数组里的位置,**不承载任何身份**。
+            // 物理块号、原始局部下标、offsets 全部从 plan 里显式取。
+            let plan = &plans[b];
+            let phys = plan.physical;
+            let selected_local = match sampled {
+                Some(_) if !plan.compact => Some(plan.orig_local.as_slice()),
+                _ => None,
+            };
+            let mut run = |block: Option<&ColumnBlock>,
+                           resident: Option<crate::backend::cuda::GpuBlockSession<'_>>|
+             -> anyhow::Result<_> {
+                if let Some(block) = block {
+                    anyhow::ensure!(
+                        block.n_rows == source.n_rows(),
+                        "column block {phys} has {} rows, but the source declares {}",
+                        block.n_rows,
+                        source.n_rows()
+                    );
+                    anyhow::ensure!(
+                        block.feat_ids == plan.handed_feats,
+                        "column block {phys} returned features that do not match the plan"
+                    );
+                    anyhow::ensure!(
+                        block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
+                        "column block {b} data length does not match rows × features"
+                    );
+                }
+                let width = *plan.hist_offsets.last().unwrap() as usize;
+                // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
+                // 原来这里给每个槽位都分配 + 清零一个完整直方图,相减节点
+                // 那一半分配完立刻被扔掉。
+                //
+                // 老实说:实测**量不出差别**(这台机器上噪声比效果大)。
+                // 留着是因为它确实少干一份活,不是因为它更快。
+                let mut per_node: Vec<Histogram> = level
+                    .iter()
+                    .map(|ln| match ln.hist_from {
+                        // CPU builds accumulate in place; GPU downloads
+                        // supply complete values and allocate their outputs.
+                        HistFrom::Accumulate if gpu.is_none() => Histogram::zeros(width),
+                        _ => Histogram::zeros(0),
+                    })
+                    .collect();
+
+                let mut gpu_done = vec![false; level.len()];
+                let mut gpu_candidates = vec![None; level.len()];
+
+                // 先算要实际累加的那些
+                if let Some(ctx) = gpu {
+                    // 量化列块 H2D **一次**,本块里所有活跃节点共用它。
+                    // 早期版本是每个节点重新上传一遍整块,那是纯浪费。
+                    let _t = prof::Timer::new(&prof::HIST);
+                    let started = std::time::Instant::now();
+                    // Physical identity and original-local feature identity
+                    // come from this plan; neither is inferred from its
+                    // colsample-filtered position. Partition lookup uses
+                    // the same plan mapping.
+                    let mut session = match resident {
+                        Some(session) => session,
+                        None => {
+                            let block = block.context("GPU cache miss requires source payload")?;
+                            ctx.block_session(
+                                phys,
+                                &block.data,
+                                block.n_rows,
+                                block.n_feats(),
+                                &plan.hist_offsets,
+                                selected_local,
+                            )?
+                        }
+                    };
+                    // 整层的 Accumulate 节点按容量分批合并 launch。
+                    // 容量 1 就是原来的逐节点路径,一个字都没变。
+                    let cap = session.hist_nodes_batch_capacity();
+                    // 行主序 kernel 只有 batched 一个入口,批里只有一个
+                    // 节点也必须走它。
+                    let must_batch = session.requires_batched_hist();
+                    #[cfg(feature = "cuda")]
+                    if let Some(results) = pre.take() {
+                        // Already submitted and collected by the two-phase path.
+                        for (i, candidate, histogram) in results {
+                            gpu_done[i] = true;
+                            gpu_candidates[i] = candidate;
+                            if let Some(bins) = histogram {
+                                per_node[i].bins = bins;
+                            }
+                        }
+                    } else if session.begin_split_level(depth)? {
+                        let groups = gpu_split_groups(&mut session);
+                        for (i, candidate, histogram) in session.split_cached_batch(
+                            &groups,
+                            &plan.hist_feats,
+                            sampled,
+                            cuts.has_categorical().then(|| cuts.categorical_flags()),
+                            // bylevel / bynode: the level node's feature set is
+                            // the host's `enum_features`, uploaded as a byte mask.
+                            nested
+                                .is_some()
+                                .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
+                            q,
+                            p,
+                            depth + 1 < p.max_depth,
+                        )? {
+                            gpu_done[i] = true;
+                            gpu_candidates[i] = candidate;
+                            if let Some(bins) = histogram {
+                                per_node[i].bins = bins;
+                            }
+                        }
+                        session.finish_split_level(depth);
+                    }
+                    let todo: Vec<usize> = level
                         .iter()
-                        .map(|ln| match ln.hist_from {
-                            // CPU builds accumulate in place; GPU downloads
-                            // supply complete values and allocate their outputs.
-                            HistFrom::Accumulate if gpu.is_none() => Histogram::zeros(width),
-                            _ => Histogram::zeros(0),
+                        .enumerate()
+                        .filter(|(i, ln)| {
+                            !gpu_done[*i] && matches!(ln.hist_from, HistFrom::Accumulate)
                         })
+                        .map(|(i, _)| i)
                         .collect();
-
-                    let mut gpu_done = vec![false; level.len()];
-                    let mut gpu_candidates = vec![None; level.len()];
-
-                    // 先算要实际累加的那些
-                    if let Some(ctx) = gpu {
-                        // 量化列块 H2D **一次**,本块里所有活跃节点共用它。
-                        // 早期版本是每个节点重新上传一遍整块,那是纯浪费。
-                        let _t = prof::Timer::new(&prof::HIST);
-                        let started = std::time::Instant::now();
-                        // Physical identity and original-local feature identity
-                        // come from this plan; neither is inferred from its
-                        // colsample-filtered position. Partition lookup uses
-                        // the same plan mapping.
-                        let mut session = match resident {
-                            Some(session) => session,
-                            None => {
-                                let block =
-                                    block.context("GPU cache miss requires source payload")?;
-                                ctx.block_session(
-                                    phys,
-                                    &block.data,
-                                    block.n_rows,
-                                    block.n_feats(),
-                                    &plan.hist_offsets,
-                                    selected_local,
-                                )?
-                            }
-                        };
-                        // 整层的 Accumulate 节点按容量分批合并 launch。
-                        // 容量 1 就是原来的逐节点路径,一个字都没变。
-                        let cap = session.hist_nodes_batch_capacity();
-                        // 行主序 kernel 只有 batched 一个入口,批里只有一个
-                        // 节点也必须走它。
-                        let must_batch = session.requires_batched_hist();
-                        #[cfg(feature = "cuda")]
-                        if session.begin_split_level(depth)? {
-                            let node_enabled = |node: usize, feat: FeatId| {
-                                enum_features(node).is_none_or(|s| s.binary_search(&feat).is_ok())
-                            };
-                            use crate::backend::cuda::GpuSplitGroup;
-                            let mut groups = Vec::new();
-                            if depth == 0 {
-                                groups.push(GpuSplitGroup {
-                                    small: 0,
-                                    span: level[0].rows.device(),
-                                    sum: level[0].sum,
-                                    bounds: level[0].bounds,
-                                    large: None,
-                                });
-                            } else {
-                                for (i, ln) in level.iter().enumerate() {
-                                    if let HistFrom::Subtract { parent, sibling } = ln.hist_from {
-                                        if let Some(cache_slot) = session.cached_parent_slot(parent)
-                                        {
-                                            groups.push(GpuSplitGroup {
-                                                small: sibling,
-                                                span: level[sibling].rows.device(),
-                                                sum: level[sibling].sum,
-                                                bounds: level[sibling].bounds,
-                                                large: Some((i, cache_slot, ln.sum, ln.bounds)),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            for (i, candidate, histogram) in session.split_cached_batch(
-                                &groups,
-                                &plan.hist_feats,
-                                sampled,
-                                cuts.has_categorical().then(|| cuts.categorical_flags()),
-                                // bylevel / bynode: the level node's feature set is
-                                // the host's `enum_features`, uploaded as a byte mask.
-                                nested
-                                    .is_some()
-                                    .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
-                                q,
-                                p,
-                                depth + 1 < p.max_depth,
-                            )? {
-                                gpu_done[i] = true;
-                                gpu_candidates[i] = candidate;
-                                if let Some(bins) = histogram {
-                                    per_node[i].bins = bins;
-                                }
-                            }
-                            session.finish_split_level(depth);
+                    if cap <= 1 && !must_batch {
+                        for &i in &todo {
+                            session.histogram_device_at_depth(
+                                level[i].rows.device(),
+                                &mut per_node[i].bins,
+                                depth,
+                                i,
+                            )?;
                         }
-                        let todo: Vec<usize> = level
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, ln)| {
-                                !gpu_done[*i] && matches!(ln.hist_from, HistFrom::Accumulate)
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
-                        if cap <= 1 && !must_batch {
-                            for &i in &todo {
-                                session.histogram_device_at_depth(
-                                    level[i].rows.device(),
-                                    &mut per_node[i].bins,
-                                    depth,
-                                    i,
-                                )?;
+                    } else {
+                        for chunk in todo.chunks(cap.max(1)) {
+                            let spans: Vec<_> =
+                                chunk.iter().map(|&i| level[i].rows.device()).collect();
+                            // 借出这一批的输出槽位。`per_node` 的其它
+                            // 元素不参与,所以按下标取可变引用是安全的,
+                            // 但借用检查器看不出来 —— 用 split 逐个取。
+                            let mut outs: Vec<&mut Vec<GradPairFixed>> =
+                                Vec::with_capacity(chunk.len());
+                            let mut rest = &mut per_node[..];
+                            let mut taken = 0usize;
+                            for &i in chunk {
+                                let (_, tail) = rest.split_at_mut(i - taken);
+                                let (head, tail) = tail.split_at_mut(1);
+                                outs.push(&mut head[0].bins);
+                                rest = tail;
+                                taken = i + 1;
                             }
-                        } else {
-                            for chunk in todo.chunks(cap.max(1)) {
-                                let spans: Vec<_> =
-                                    chunk.iter().map(|&i| level[i].rows.device()).collect();
-                                // 借出这一批的输出槽位。`per_node` 的其它
-                                // 元素不参与,所以按下标取可变引用是安全的,
-                                // 但借用检查器看不出来 —— 用 split 逐个取。
-                                let mut outs: Vec<&mut Vec<GradPairFixed>> =
-                                    Vec::with_capacity(chunk.len());
-                                let mut rest = &mut per_node[..];
-                                let mut taken = 0usize;
-                                for &i in chunk {
-                                    let (_, tail) = rest.split_at_mut(i - taken);
-                                    let (head, tail) = tail.split_at_mut(1);
-                                    outs.push(&mut head[0].bins);
-                                    rest = tail;
-                                    taken = i + 1;
-                                }
-                                session.histogram_device_batch(&spans, &mut outs)?;
-                            }
+                            session.histogram_device_batch(&spans, &mut outs)?;
                         }
-                        let timing = session.timing();
-                        drop(session);
-                        prof::record_gpu(
-                            &timing,
-                            started.elapsed().as_nanos() as u64,
-                            &prof::GPU_HIST_BLOCK_H2D,
-                            &prof::GPU_HIST_ROWS_H2D,
-                            &prof::GPU_HIST_KERNEL,
-                            &prof::GPU_HIST_D2H,
-                            &prof::GPU_HIST_HOST,
+                    }
+                    let timing = session.timing();
+                    drop(session);
+                    prof::record_gpu(
+                        &timing,
+                        started.elapsed().as_nanos() as u64,
+                        &prof::GPU_HIST_BLOCK_H2D,
+                        &prof::GPU_HIST_ROWS_H2D,
+                        &prof::GPU_HIST_KERNEL,
+                        &prof::GPU_HIST_D2H,
+                        &prof::GPU_HIST_HOST,
+                    );
+                } else {
+                    let block = block.context("CPU histogram requires source payload")?;
+                    let _t = prof::Timer::new(&prof::HIST);
+                    // `hist_feats` 的每一列在交回块里的位置:整块交回时是
+                    // 采样列的原始局部下标,压实块或不采样时就是全部列。
+                    let all_cols = hist::block_columns(&block.data, block.n_rows, block.n_feats());
+                    let cols: Vec<&[Bin]> = match selected_local {
+                        Some(sel) => sel.iter().map(|&l| all_cols[l]).collect(),
+                        None => all_cols,
+                    };
+                    debug_assert_eq!(cols.len(), plan.hist_feats.len());
+                    if depth == 0 && !drop_zero_rows {
+                        // 根节点走 None 那条路:少一层行下标的间接寻址,
+                        // 结果和传全部行完全一样(hist.rs 有断言钉着)。
+                        hist::build_cols(
+                            &cols,
+                            &plan.hist_offsets,
+                            gpair,
+                            None,
+                            &mut per_node[0].bins,
                         );
                     } else {
-                        let block = block.context("CPU histogram requires source payload")?;
-                        let _t = prof::Timer::new(&prof::HIST);
-                        // `hist_feats` 的每一列在交回块里的位置:整块交回时是
-                        // 采样列的原始局部下标,压实块或不采样时就是全部列。
-                        let all_cols =
-                            hist::block_columns(&block.data, block.n_rows, block.n_feats());
-                        let cols: Vec<&[Bin]> = match selected_local {
-                            Some(sel) => sel.iter().map(|&l| all_cols[l]).collect(),
-                            None => all_cols,
-                        };
-                        debug_assert_eq!(cols.len(), plan.hist_feats.len());
-                        if depth == 0 && !drop_zero_rows {
-                            // 根节点走 None 那条路:少一层行下标的间接寻址,
-                            // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                            hist::build_cols(
-                                &cols,
-                                &plan.hist_offsets,
-                                gpair,
-                                None,
-                                &mut per_node[0].bins,
-                            );
-                        } else {
-                            // 本层所有要实际累加的节点一起走:行 id 区间在外、
-                            // 节点在内,同一段 bin/gpair 被所有节点复用
-                            // (见 `hist::build_nodes`)。逐位结果与逐节点
-                            // 调 `build` 相同。
-                            let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
-                                .iter()
-                                .zip(per_node.iter_mut())
-                                .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
-                                .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
-                                .collect();
-                            hist::build_nodes_cols(&cols, &plan.hist_offsets, gpair, &mut targets);
-                        }
+                        // 本层所有要实际累加的节点一起走:行 id 区间在外、
+                        // 节点在内,同一段 bin/gpair 被所有节点复用
+                        // (见 `hist::build_nodes`)。逐位结果与逐节点
+                        // 调 `build` 相同。
+                        let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
+                            .iter()
+                            .zip(per_node.iter_mut())
+                            .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
+                            .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
+                            .collect();
+                        hist::build_nodes_cols(&cols, &plan.hist_offsets, gpair, &mut targets);
                     }
-                    // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
-                    // 里的先后顺序。
-                    for i in 0..level.len() {
-                        if gpu_done[i] {
-                            continue;
-                        }
-                        if let HistFrom::Subtract { parent, sibling } = level[i].hist_from {
-                            let ph = parent_hist
-                                .as_mut()
-                                .expect("the first level has no parent and must not take the subtraction path");
-                            let _t = prof::Timer::new(&prof::SUBTRACT);
-                            // 父的存储**搬**给大 child,原地减去兄弟。
-                            //
-                            // 这个线程通过 `into_par_iter` **拥有**本块的父
-                            // 直方图,而一个父只会被它唯一的 `Subtract` 子节点
-                            // 认领一次,所以可以直接取走 —— 不再分配一份新的
-                            // 再清零(那份清零紧接着就被整份覆写,是纯白写)。
-                            let mut out = std::mem::replace(&mut ph[parent], Histogram::zeros(0));
-                            // ⚠️ 认领两次会在这里当场炸,而不是悄悄返回零直方图:
-                            // 取走之后原位留下的是长度 0 的壳。
-                            assert_eq!(
+                }
+                // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
+                // 里的先后顺序。
+                for i in 0..level.len() {
+                    if gpu_done[i] {
+                        continue;
+                    }
+                    if let HistFrom::Subtract { parent, sibling } = level[i].hist_from {
+                        let ph = parent_hist.as_mut().expect(
+                            "the first level has no parent and must not take the subtraction path",
+                        );
+                        let _t = prof::Timer::new(&prof::SUBTRACT);
+                        // 父的存储**搬**给大 child,原地减去兄弟。
+                        //
+                        // 这个线程通过 `into_par_iter` **拥有**本块的父
+                        // 直方图,而一个父只会被它唯一的 `Subtract` 子节点
+                        // 认领一次,所以可以直接取走 —— 不再分配一份新的
+                        // 再清零(那份清零紧接着就被整份覆写,是纯白写)。
+                        let mut out = std::mem::replace(&mut ph[parent], Histogram::zeros(0));
+                        // ⚠️ 认领两次会在这里当场炸,而不是悄悄返回零直方图:
+                        // 取走之后原位留下的是长度 0 的壳。
+                        assert_eq!(
                                 out.len(),
                                 width,
                                 "parent histogram {parent} was claimed more than once (or has the wrong width)"
                             );
-                            hist::subtract_in_place(&mut out, &per_node[sibling]);
-                            per_node[i] = out;
-                        }
+                        hist::subtract_in_place(&mut out, &per_node[sibling]);
+                        per_node[i] = out;
                     }
+                }
 
-                    let _t = prof::Timer::new(&prof::ENUM);
-                    let cands: Vec<Option<SplitCandidate>> = level
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ln)| {
-                            if gpu_done[i] {
-                                return gpu_candidates[i];
-                            }
-                            split::best_split_in_block_typed(
-                                &per_node[i],
-                                &plan.hist_feats,
-                                &plan.hist_offsets,
-                                ln.sum,
-                                q,
-                                p,
-                                enum_features(i),
-                                monotone_at(p, ln.bounds),
-                                cuts.has_categorical().then(|| cuts.categorical_flags()),
-                            )
-                        })
-                        .collect();
-                    Ok((per_node, cands))
-                };
-                // Check the dedicated resident slot before asking the source to
-                // materialize bins. Its payload passed source/shape validation
-                // on first upload; current tree metadata still goes through the
-                // same GPU session validation. Physical identity is never a
-                // filtered plan position. Streaming and cold misses keep the
-                // source read/checksum path.
-                if !plan.compact {
-                    if let Some(ctx) = gpu {
-                        if let Some(session) = ctx.block_session_resident(
-                            phys,
-                            source.n_rows(),
-                            plan.handed_feats.len(),
-                            &plan.hist_offsets,
-                            selected_local,
-                        )? {
-                            return run(None, Some(session));
+                let _t = prof::Timer::new(&prof::ENUM);
+                let cands: Vec<Option<SplitCandidate>> = level
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ln)| {
+                        if gpu_done[i] {
+                            return gpu_candidates[i];
                         }
+                        split::best_split_in_block_typed(
+                            &per_node[i],
+                            &plan.hist_feats,
+                            &plan.hist_offsets,
+                            ln.sum,
+                            q,
+                            p,
+                            enum_features(i),
+                            monotone_at(p, ln.bounds),
+                            cuts.has_categorical().then(|| cuts.categorical_flags()),
+                        )
+                    })
+                    .collect();
+                Ok((per_node, cands))
+            };
+            // Check the dedicated resident slot before asking the source to
+            // materialize bins. Its payload passed source/shape validation
+            // on first upload; current tree metadata still goes through the
+            // same GPU session validation. Physical identity is never a
+            // filtered plan position. Streaming and cold misses keep the
+            // source read/checksum path.
+            if !plan.compact {
+                if let Some(ctx) = gpu {
+                    if let Some(session) = ctx.block_session_resident(
+                        phys,
+                        source.n_rows(),
+                        plan.handed_feats.len(),
+                        &plan.hist_offsets,
+                        selected_local,
+                    )? {
+                        return run(None, Some(session));
                     }
                 }
-                if plan.compact {
-                    source.with_block_cols_ret(phys, &plan.orig_local, |block| {
-                        run(Some(block), None)
-                    })?
-                } else {
-                    source.with_block_ret(phys, |block| run(Some(block), None))?
-                }
-                // 本块的父直方图到此为止 —— 闭包一结束,它和刚借来的
-                // 块一起释放,这一层内存最紧的时候正好都不在手上。
-            })
-            .collect();
+            }
+            if plan.compact {
+                source
+                    .with_block_cols_ret(phys, &plan.orig_local, |block| run(Some(block), None))?
+            } else {
+                source.with_block_ret(phys, |block| run(Some(block), None))?
+            }
+            // 本块的父直方图到此为止 —— 闭包一结束,它和刚借来的
+            // 块一起释放,这一层内存最紧的时候正好都不在手上。
+        };
+        // Paired histogram and split results retain per-block ownership.
+        #[allow(clippy::type_complexity)]
+        let per_block: anyhow::Result<Vec<(Vec<Histogram>, Vec<Option<SplitCandidate>>)>> =
+            if two_phase {
+                items.into_iter().map(&block_fn).collect()
+            } else {
+                items.into_par_iter().map(&block_fn).collect()
+            };
         let per_block = per_block?;
         drop(hist_phase);
         drop(_phase);

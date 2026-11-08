@@ -462,7 +462,7 @@ mod rank_ctx;
 pub use rank_ctx::RankDeviceInputs;
 #[path = "split_ctx.rs"]
 mod split_ctx;
-pub(crate) use split_ctx::GpuSplitGroup;
+pub(crate) use split_ctx::{GpuSplitGroup, GpuSplitResult};
 
 struct GpuHistBuffers {
     split_cache: Option<split_ctx::ResidentSplitBuffers>,
