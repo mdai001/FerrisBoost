@@ -142,7 +142,7 @@ def test_positional_models_still_need_the_exact_width(tmp_path):
     model = fb.train({**BASE, **extra}, X, label=y, num_boost_round=3, quiet=True)
     wide = tmp_path / "wide.csv"
     pd.DataFrame(np.hstack([X, X[:, :1]])).to_csv(wide, index=False, header=False)
-    with pytest.raises(ValueError, match="位置模式"):
+    with pytest.raises(ValueError, match="positional mode"):
         model.predict(str(wide), header=False)
     exact = tmp_path / "exact.csv"
     pd.DataFrame(X).to_csv(exact, index=False, header=False)

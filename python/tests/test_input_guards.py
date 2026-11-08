@@ -74,7 +74,7 @@ def test_eval_file_with_different_columns_is_rejected(tmp_path, fmt):
     write = WRITERS[fmt]
     write(tmp_path / f"t.{fmt}", x, y)
     write(tmp_path / f"renamed.{fmt}", x, y, rename={"f2": "zz"})
-    with pytest.raises(Exception, match="对不上"):
+    with pytest.raises(Exception, match="do not match"):
         fb.train(BASE, str(tmp_path / f"t.{fmt}"), label="label", num_boost_round=2,
                  evals=[(str(tmp_path / f"renamed.{fmt}"), "v")], quiet=True)
 
@@ -84,7 +84,7 @@ def test_duplicate_column_names_are_rejected(tmp_path, fmt):
     x, y = data()
     write = WRITERS[fmt]
     write(tmp_path / f"dup.{fmt}", x, y, rename={"f2": "f1"})
-    with pytest.raises(Exception, match="重复"):
+    with pytest.raises(Exception, match="duplicate column name"):
         fb.train(BASE, str(tmp_path / f"dup.{fmt}"), label="label",
                  num_boost_round=1, quiet=True)
 
@@ -104,7 +104,7 @@ def test_pyarrow_eval_binds_columns_by_name():
                  evals_result=res, quiet=True)
         out[tag] = res["v"]
     assert out["same"] == out["shuffled"]
-    with pytest.raises(ValueError, match="对不上"):
+    with pytest.raises(ValueError, match="do not match"):
         fb.train(BASE, train, label=y, num_boost_round=1,
                  evals=[(same.rename_columns(["f0", "f1", "f2", "zz"]), ey, "v")], quiet=True)
 
@@ -234,7 +234,7 @@ def test_exact_float32_max_feature_is_rejected_from_numpy_eval():
 
 def test_empty_eval_set_is_rejected():
     x, y = data()
-    with pytest.raises(Exception, match="空"):
+    with pytest.raises(Exception, match="is empty"):
         fb.train(BASE, x, label=y, num_boost_round=1,
                  evals=[(x[:0], y[:0], "v")], quiet=True)
 
@@ -249,7 +249,7 @@ def test_all_zero_weights_with_zero_lambda_give_no_nan():
 def test_weight_sum_overflowing_f32_is_rejected():
     x, y = data()
     w = np.full(len(y), 1e36, np.float32)
-    with pytest.raises(Exception, match="权重总和"):
+    with pytest.raises(Exception, match="weights sum to"):
         fb.train(BASE, x, label=y, weight=w, num_boost_round=1, quiet=True)
 
 
@@ -263,7 +263,7 @@ def test_float32_max_is_rejected_at_numpy_prediction():
     m, x = _max_model()
     bad = x.copy()
     bad[7, 2] = np.finfo(np.float32).max
-    with pytest.raises(ValueError, match=r"第 7 行第 2 列.*f32::MAX"):
+    with pytest.raises(ValueError, match=r"row 7, column 2 is f32::MAX"):
         m.predict(bad)
     with pytest.raises(ValueError, match="f32::MAX"):
         m.predict(np.asfortranarray(bad))  # 非 C 连续路径

@@ -296,7 +296,7 @@ def test_argument_errors():
         model.predict(x, pred_contribs=True, output_margin=True)
     with pytest.raises(ValueError, match="approx_contribs"):
         model.predict(x, pred_interactions=True, approx_contribs=True)
-    with pytest.raises(ValueError, match="特征|features"):
+    with pytest.raises(ValueError, match="features"):
         model.predict(x[:, :3], pred_contribs=True)
     bad = x.copy()
     bad[0, 1] = np.finfo(np.float32).max

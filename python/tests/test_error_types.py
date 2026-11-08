@@ -170,7 +170,7 @@ def test_a_persistent_cache_that_does_not_match_is_a_value_error(tmp_path, files
     cache = str(tmp_path / "cache")
     fb.train({**p("binary:logistic"), "max_bin": 32, "cache_path": cache}, files["good"],
              label="label", num_boost_round=1, quiet=True)
-    with pytest.raises(ValueError, match="max_bin|缓存"):
+    with pytest.raises(ValueError, match="max_bin|cache"):
         fb.train({**p("binary:logistic"), "max_bin": 64, "cache_path": cache}, files["good"],
                  label="label", num_boost_round=1, quiet=True)
 
