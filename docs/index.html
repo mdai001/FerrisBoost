@@ -100,19 +100,20 @@ prediction = model.predict("test.parquet")</code></pre>
       <h3>0.0.7 (unreleased)</h3>
       <ul>
         <li>Added <code>base_margin</code>.</li>
-        <li>Added training continuation (<code>init_model</code>).</li>
+        <li>Added training continuation (<code>init_model</code>; <code>xgb_model</code> also accepted).</li>
         <li>Added learning to rank (<code>rank:ndcg</code>, <code>rank:pairwise</code>, <code>rank:map</code>) and <code>FerrisBoostRanker</code>.</li>
         <li>Added unbiased learning to rank.</li>
         <li>Added ranking <code>auc</code> and <code>aucpr</code>.</li>
         <li>Added multiple quantiles in one model (<code>quantile_alpha</code> list).</li>
-        <li>GPU prediction for categorical models and with <code>base_margin</code>.</li>
-        <li>Multiclass <code>predict_to_parquet</code> now streams.</li>
         <li>Added <code>strict_shape</code>.</li>
+        <li>GPU prediction for categorical models and with <code>base_margin</code>.</li>
         <li>SHAP values on GPU.</li>
         <li>Continue training from XGBoost models with file input.</li>
+        <li>Multiclass and multi-quantile <code>predict_to_parquet</code> now stream.</li>
         <li>Faster file prediction for wide data.</li>
         <li>Changed: input validation errors that surfaced as <code>RuntimeError</code> are now <code>ValueError</code>.</li>
-        <li>GPU speed optimizations for categorical features and for <code>colsample_bylevel</code> / <code>colsample_bynode</code>.</li>
+        <li>Faster CPU training.</li>
+        <li>GPU speed optimizations.</li>
       </ul>
       <h3>0.0.6</h3>
       <ul>

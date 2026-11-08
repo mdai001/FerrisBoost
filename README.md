@@ -201,7 +201,7 @@ model = fb.train(
 )
 ```
 
-For scikit-learn pipelines, use `FerrisBoostClassifier` and `FerrisBoostRegressor`, which follow the `XGBClassifier` / `XGBRegressor` interface. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) work on any model, including models loaded from XGBoost.
+For scikit-learn pipelines, use `FerrisBoostClassifier`, `FerrisBoostRegressor` and `FerrisBoostRanker`, which follow the `XGBClassifier` / `XGBRegressor` / `XGBRanker` interface. Feature importance (`model.get_score()`) and SHAP values (`model.predict(X, pred_contribs=True)`) work on any model, including models loaded from XGBoost.
 
 ### XGBoost Interchange
 
@@ -215,11 +215,11 @@ Because FerrisBoost models are serialized to standard XGBoost-compatible JSON:
   preds = booster.predict(xgb.DMatrix(X))
   ```
 
-- Similarly, FerrisBoost can load models originally trained by XGBoost (`fb.Model.load_model("xgb_model.json")`) and predict using FerrisBoost's CPU engine.
+- Similarly, FerrisBoost can load models originally trained by XGBoost (`fb.Model.load_model("xgb_model.json")`), predict with them on CPU or GPU, and continue training them (`init_model=`).
 
 FerrisBoost prediction is independent of the training backend. CPU prediction parallelizes deterministic row ranges with `predict_threads=0` by default. CUDA-enabled builds can opt into single-GPU prediction with `use_gpu=True`; repeated calls reuse a lazy compact device model. File prediction validates the complete model schema, then materializes only features used by the trees. The canonical model feature IDs are never rewritten: compact IDs exist only in the cached inference representation, preserving save/load and XGBoost compatibility. A transfer-aware selector keeps small or transfer-heavy batches on CPU. CPU single-thread, CPU multi-thread, and GPU outputs preserve the same row order and prediction bits for the same model.
 
-File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes one `float32` prediction column without collecting the complete result in Python memory.
+File-to-file CPU scoring is also available through `Model.predict_to_parquet()`; it uses bounded batches, preserves canonical input order, and writes `float32` prediction columns (one per class or quantile for multi-output models) without collecting the complete result in Python memory.
 
 ### Objectives and metrics
 
@@ -249,19 +249,20 @@ logging, and the complete parameter reference.
 ### 0.0.7 (unreleased)
 
 - Added `base_margin`.
-- Added training continuation (`init_model`).
+- Added training continuation (`init_model`; `xgb_model` also accepted).
 - Added learning to rank (`rank:ndcg`, `rank:pairwise`, `rank:map`) and `FerrisBoostRanker`.
 - Added unbiased learning to rank.
 - Added ranking `auc` and `aucpr`.
 - Added multiple quantiles in one model (`quantile_alpha` list).
-- GPU prediction for categorical models and with `base_margin`.
-- Multiclass `predict_to_parquet` now streams.
 - Added `strict_shape`.
+- GPU prediction for categorical models and with `base_margin`.
 - SHAP values on GPU.
 - Continue training from XGBoost models with file input.
+- Multiclass and multi-quantile `predict_to_parquet` now stream.
 - Faster file prediction for wide data.
 - Changed: input validation errors that surfaced as `RuntimeError` are now `ValueError`.
-- GPU speed optimizations for categorical features and for `colsample_bylevel` / `colsample_bynode`.
+- Faster CPU training.
+- GPU speed optimizations.
 
 ### 0.0.6
 
