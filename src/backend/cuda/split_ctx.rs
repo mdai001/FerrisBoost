@@ -606,7 +606,7 @@ impl GpuBlockSession<'_> {
             }
             cache.features_ready = true;
         }
-        // 「给定权重」模式:单调约束、alpha、max_delta_step 任一开启。
+        // Given-weight mode (always on, see `TrainParams::uses_given_weight`).
         // 没有单调约束时 monotone 缓冲区保持全 0、界是 ±f32::MAX。
         let has_monotone = u32::from(p.uses_given_weight());
         if has_monotone != 0 {
