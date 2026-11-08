@@ -848,7 +848,7 @@ def train(
     * 无表头 `.csv` 路径传 `header=False`,`label` 给从 0 开始的列下标
     * pyarrow Table / RecordBatchReader,`label` 给 numpy 一维数组
     * pandas DataFrame(`category` 列需要 `params["enable_categorical"] = True`),
-      `label` 给一维数组;和 numpy 一样,模型里不记录特征名
+      `label` 给一维数组;列名记录为模型的特征名(和 pyarrow 一样),预测时按列名绑定
 
     `weight` 是每行样本权重(XGBoost 的 DMatrix `weight`):数组入口给
     一维数组,文件入口给**列名**(无表头 CSV 给列下标),该列不进特征。
