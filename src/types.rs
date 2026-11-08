@@ -609,6 +609,12 @@ pub enum Objective {
     Quantile {
         alpha: f32,
     },
+    /// `rank:ndcg` / `rank:pairwise` / `rank:map` (LambdaMART). Gradients are per
+    /// query group, not per row (see `crate::rank`); the scores are raw margins.
+    Rank {
+        kind: crate::rank::RankKind,
+        params: crate::rank::RankParams,
+    },
 }
 
 #[cfg(test)]

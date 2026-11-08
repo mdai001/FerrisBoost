@@ -31,7 +31,7 @@ from ._core import Model
 __all__ = ["train", "Model", "__version__"]
 __version__ = _core.__version__
 
-_SKLEARN_NAMES = ("FerrisBoostClassifier", "FerrisBoostRegressor")
+_SKLEARN_NAMES = ("FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker")
 
 
 def __getattr__(name: str) -> Any:
@@ -114,7 +114,7 @@ _DEFAULTS: dict[str, Any] = {
     # `category` columns and PyArrow dictionary columns be detected as
     # categorical; `feature_types` ("c" / "q" per feature) declares them
     # explicitly for numpy and file inputs. Categories are integer codes in
-    # 0..=254. `max_cat_to_onehot`: features with fewer categories than this are
+    # 0..=253. `max_cat_to_onehot`: features with fewer categories than this are
     # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
     # bounds the partition scan.
     "enable_categorical": False,
@@ -125,6 +125,16 @@ _DEFAULTS: dict[str, Any] = {
     "missing": float("nan"),
     "max_cat_to_onehot": 4,
     "max_cat_threshold": 64,
+    # Learning to rank (rank:ndcg / rank:pairwise / rank:map), XGBoost parameter
+    # names and defaults. `lambdarank_num_pair_per_sample` None = XGBoost's
+    # default (32 for "topk", 1 for "mean").
+    "lambdarank_pair_method": "topk",
+    "lambdarank_num_pair_per_sample": None,
+    "lambdarank_normalization": True,
+    "lambdarank_score_normalization": True,
+    "lambdarank_unbiased": False,
+    "lambdarank_bias_norm": 1.0,
+    "ndcg_exp_gain": True,
     # Private wire field set by `train` from `feature_types` / the frame dtypes:
     # one bool per feature, or None.
     "_feature_types": None,
@@ -142,7 +152,7 @@ _ALIASES = {
 
 _OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
                "reg:tweedie", "reg:pseudohubererror", "reg:quantileerror", "multi:softprob",
-               "multi:softmax")
+               "multi:softmax", "rank:ndcg", "rank:pairwise", "rank:map")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
@@ -279,6 +289,7 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
         out["eval_metric"] = names
     out["monotone_constraints"] = _normalize_monotone(out["monotone_constraints"])
+    _normalize_lambdarank(out)
     out["enable_categorical"] = bool(out["enable_categorical"])
     out["missing"] = _normalize_missing(out["missing"])
     for key in ("max_cat_to_onehot", "max_cat_threshold"):
@@ -288,6 +299,28 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         if out[key] < 1:
             raise ValueError(f"{key} 要 >= 1,给的是 {out[key]}")
     return out
+
+
+def _normalize_lambdarank(out: dict[str, Any]) -> None:
+    """Validate the XGBoost `lambdarank_*` / `ndcg_exp_gain` parameters in place."""
+    if out["lambdarank_pair_method"] not in ("topk", "mean"):
+        raise ValueError(
+            "lambdarank_pair_method must be \"topk\" or \"mean\", "
+            f"got {out['lambdarank_pair_method']!r}"
+        )
+    k = out["lambdarank_num_pair_per_sample"]
+    if k is not None:
+        if isinstance(k, bool) or int(k) != k or int(k) < 1:
+            raise ValueError(
+                f"lambdarank_num_pair_per_sample must be an integer >= 1, got {k!r}"
+            )
+        out["lambdarank_num_pair_per_sample"] = int(k)
+    for key in ("lambdarank_normalization", "lambdarank_score_normalization",
+                "lambdarank_unbiased", "ndcg_exp_gain"):
+        out[key] = bool(out[key])
+    out["lambdarank_bias_norm"] = float(out["lambdarank_bias_norm"])
+    if not out["lambdarank_bias_norm"] >= 0.0:
+        raise ValueError("lambdarank_bias_norm must be >= 0")
 
 
 def _normalize_missing(value: Any) -> float:
@@ -395,16 +428,37 @@ def _as_labels(y: Any, n_rows: int) -> np.ndarray:
     return arr
 
 
-def _as_weights(w: Any, n_rows: int, name: str = "weight") -> np.ndarray:
-    """样本权重 -> C 连续 f32 一维数组。规则和 XGBoost 一致:有限、非负。"""
+def _as_weights(w: Any, n_rows: int | None, name: str = "weight") -> np.ndarray:
+    """样本权重 -> C 连续 f32 一维数组。规则和 XGBoost 一致:有限、非负。
+
+    `n_rows=None` skips the length check: ranking weights are one per query
+    group, and the group count is checked against them in Rust.
+    """
     arr = np.ascontiguousarray(np.asarray(w, dtype=np.float32).ravel())
-    if arr.size != n_rows:
+    if n_rows is not None and arr.size != n_rows:
         raise ValueError(f"{name} 有 {arr.size} 个,数据有 {n_rows} 行")
     if not np.isfinite(arr).all():
         raise ValueError(f"{name} 里有 NaN 或 inf;样本权重必须是有限值")
     if (arr < 0).any():
         raise ValueError(f"{name} 里有负数;样本权重必须非负")
     return arr
+
+
+def _as_query_array(v: Any, what: str, n_rows: int | None = None) -> np.ndarray:
+    """`qid` / `group` -> contiguous uint64 1-D array (integers >= 0, no NaN)."""
+    arr = np.asarray(v)
+    if arr.ndim != 1:
+        arr = arr.ravel()
+    if arr.dtype.kind == "f":
+        if not np.isfinite(arr).all() or (arr != np.floor(arr)).any():
+            raise ValueError(f"{what} must hold integers (no NaN / fractions)")
+    elif arr.dtype.kind not in "iub":
+        raise ValueError(f"{what} must hold integers, got dtype {arr.dtype}")
+    if (arr < 0).any():
+        raise ValueError(f"{what} must be non-negative")
+    if n_rows is not None and arr.size != n_rows:
+        raise ValueError(f"{what} has {arr.size} entries, the data has {n_rows} rows")
+    return np.ascontiguousarray(arr, dtype=np.uint64)
 
 
 def _as_path_specs(data: Any) -> list[str] | None:
@@ -629,6 +683,11 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
         return _frame_matrix(data, True, what="predict data")[0]
     table = _arrow_table(data)
     if table is not None:
+        if names:
+            absent = [n for n in names if n not in table.column_names]
+            if absent:
+                raise ValueError(f"predict data 缺少模型的特征列 {absent}")
+            table = table.select(list(names))
         return _table_matrix(table, list(names) if names else None, True, what="predict data")[0]
     raise ValueError(
         "predict 只接受文件路径(单个 / 列表 / 目录 / glob)、二维 f32 numpy 数组、"
@@ -650,6 +709,10 @@ def train(
     quiet: bool = False,
     weight: Any = None,
     feature_types: Sequence[str] | None = None,
+    qid: Any = None,
+    group: Any = None,
+    eval_qid: Sequence[Any] | None = None,
+    eval_group: Sequence[Any] | None = None,
 ) -> Model:
     """训一个模型。
 
@@ -679,12 +742,25 @@ def train(
     的 float32 值,±inf 和保留的 f32::MAX 会报错。**模型里不保存 `missing`**(XGBoost
     也不存),预测时要传同一个 `missing`。类别列的整数码同样受它影响。
 
+    Learning to rank (`rank:ndcg` / `rank:pairwise` / `rank:map`): give the query
+    groups with `qid` (one query id per row, rows sorted by it) or `group` (the size
+    of every group, array inputs only); for Parquet / CSV files `qid` is a **column
+    name** (a column index for a headerless CSV), excluded from the features like
+    `label`. Ranking weights are **per query group** (array inputs: one value per
+    group), as in XGBoost; for files the weight column holds the group weight on
+    every row of the group. Validation sets take `eval_qid` / `eval_group`, lists
+    parallel to `evals` (file validation sets reuse the training `qid` column).
+    The default metric is `ndcg@32` (or `map@32`), as in XGBoost.
+
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
-    为 True 时自动识别。类别值是 0..=254 的整数码(缺失用 NaN / null),超出范围、
-    负数或非整数会报错;每个特征最多 255 个类别。
+    为 True 时自动识别。类别值是 0..=253 的整数码(缺失用 NaN / null),超出范围、
+    负数或非整数会报错;每个特征最多 254 个类别。
     """
     p = _normalize_params(params, num_boost_round)
+    ranking = p["objective"].startswith("rank:")
+    if qid is not None and group is not None:
+        raise ValueError("Either one of `group` or `qid` should be None.")
     # Private wire field: quiet is a public call option, not a tree parameter.
     p["_quiet"] = bool(quiet)
     explicit_types = _feature_flags(feature_types, None)
@@ -708,6 +784,22 @@ def train(
                 raise ValueError("文件入口的 weight 要给列名字符串(header=True)")
             if not header and (not isinstance(weight, int) or isinstance(weight, bool)):
                 raise ValueError("header=False 时文件 weight 要给从 0 开始的列下标")
+        if group is not None or eval_group is not None or eval_qid is not None:
+            raise ValueError(
+                "file inputs take the query groups as a qid column name (qid=\"query_id\"); "
+                "group= / eval_group= / eval_qid= are for array inputs"
+            )
+        if qid is not None:
+            if not ranking:
+                raise ValueError(f"qid is only used by the rank:* objectives, not {p['objective']}")
+            if header and not isinstance(qid, str):
+                raise ValueError("header=True 时文件 qid 要给列名字符串")
+            if not header and (not isinstance(qid, int) or isinstance(qid, bool)):
+                raise ValueError("header=False 时文件 qid 要给从 0 开始的列下标")
+        elif ranking:
+            raise ValueError(
+                f"{p['objective']} needs query groups: pass qid=<column name> for file inputs"
+            )
         eval_specs = []
         for item in evals:
             if len(item) != 2:
@@ -724,7 +816,7 @@ def train(
         # 文件系统判断(目录/glob 展开、排序、schema 一致性全在 Rust)。
         model = _core.train_file(specs, label, p, header, eval_specs,
                                  early_stopping_rounds, verbose, cb_list,
-                                 weight=weight)
+                                 weight=weight, qid=qid)
     else:
         table = _arrow_table(data)
         frame = data if _is_pandas_frame(data) else None
@@ -748,9 +840,25 @@ def train(
         y = _as_labels(label, x.shape[0])
         if isinstance(weight, str):
             raise ValueError("数组入口的 weight 要给一维数组;列名只用于文件入口")
-        w = None if weight is None else _as_weights(weight, x.shape[0])
+        if (qid is not None or group is not None) and not ranking:
+            raise ValueError(
+                f"qid / group are only used by the rank:* objectives, not {p['objective']}"
+            )
+        if ranking and qid is None and group is None:
+            raise ValueError(
+                f"{p['objective']} needs query groups: pass qid= (one id per row) or group= "
+                "(the size of every group)"
+            )
+        q = None if qid is None else _as_query_array(qid, "qid", x.shape[0])
+        g = None if group is None else _as_query_array(group, "group")
+        # Ranking weights are per query group; Rust checks their count.
+        w = None if weight is None else _as_weights(weight, None if ranking else x.shape[0])
+        if eval_qid is not None and len(eval_qid) != len(evals):
+            raise ValueError("eval_qid must have one entry per evals element")
+        if eval_group is not None and len(eval_group) != len(evals):
+            raise ValueError("eval_group must have one entry per evals element")
         eval_specs = []
-        for item in evals:
+        for n_eval, item in enumerate(evals):
             if len(item) == 3:
                 ed, el, name = item
                 ew = None
@@ -773,11 +881,24 @@ def train(
                 ed = _frame_matrix(ed, enable_cat, levels, f"evals[{name}]")[0]
             ex = _as_matrix(ed, f"evals[{name}]")
             if ew is not None:
-                ew = _as_weights(ew, ex.shape[0], f"evals[{name}] 的 weight")
-            eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name)))
+                ew = _as_weights(ew, None if ranking else ex.shape[0],
+                                 f"evals[{name}] 的 weight")
+            eq = None if eval_qid is None or eval_qid[n_eval] is None else _as_query_array(
+                eval_qid[n_eval], f"eval_qid[{n_eval}]", ex.shape[0])
+            eg = None if eval_group is None or eval_group[n_eval] is None else _as_query_array(
+                eval_group[n_eval], f"eval_group[{n_eval}]")
+            if eq is not None and eg is not None:
+                raise ValueError("Only one of the eval_qid or eval_group for each evaluation "
+                                 "dataset should be provided.")
+            if ranking and eq is None and eg is None:
+                raise ValueError(
+                    f"validation set {name!r} needs query groups: pass eval_qid / eval_group"
+                )
+            eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name), eq, eg))
         model = _core.train_dense(x, y, p, eval_specs, early_stopping_rounds,
                                   verbose, cb_list, weight=w,
-                                  feature_names=None if names is None else [str(n) for n in names])
+                                  feature_names=None if names is None else [str(n) for n in names],
+                                  qid=q, group=g)
 
     if evals_result is not None:
         evals_result.clear()

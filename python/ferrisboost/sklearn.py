@@ -48,6 +48,12 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
   重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
 * `apply(X, iteration_range=None)` 返回每棵树的叶子节点号,形状 `(n_samples, n_trees)`,
   float32,与 `XGBModel.apply` 相同;有早停时默认用到 best_iteration。
+
+Learning to rank: `FerrisBoostRanker` (`XGBRanker`), default `rank:ndcg`.
+`fit(X, y, qid=..., eval_set=..., eval_qid=...)` takes a per-row query id (rows sorted by
+it) or `group=` sizes; a pandas `qid` column in `X` works too. Weights are per query
+group. `predict` returns raw scores; `score(X, y)` is the ranking metric (ndcg@32 by
+default, or the last `eval_metric`) and needs the query ids as a `qid` column of `X`.
 """
 
 from __future__ import annotations
@@ -75,7 +81,7 @@ except ImportError:  # pragma: no cover
 
 from . import Model, _frame_matrix, _is_pandas_frame, train
 
-__all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor"]
+__all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 
 # sklearn 构造参数 -> `ferrisboost.train` 的参数名。值为 None 的一律不传,
 # 让 FerrisBoost 自己的默认值生效(和 XGBoost 的 `None = 用库默认` 一致)。
@@ -107,6 +113,13 @@ _PARAM_MAP = {
     "enable_categorical": "enable_categorical",
     "max_cat_to_onehot": "max_cat_to_onehot",
     "max_cat_threshold": "max_cat_threshold",
+    "lambdarank_pair_method": "lambdarank_pair_method",
+    "lambdarank_num_pair_per_sample": "lambdarank_num_pair_per_sample",
+    "lambdarank_normalization": "lambdarank_normalization",
+    "lambdarank_score_normalization": "lambdarank_score_normalization",
+    "lambdarank_unbiased": "lambdarank_unbiased",
+    "lambdarank_bias_norm": "lambdarank_bias_norm",
+    "ndcg_exp_gain": "ndcg_exp_gain",
 }
 
 _IMPORTANCE_TYPES = ("weight", "gain", "cover", "total_gain", "total_cover")
@@ -183,6 +196,13 @@ class _FerrisBoostBase(BaseEstimator):
         feature_types: Any = None,
         max_cat_to_onehot: int | None = None,
         max_cat_threshold: int | None = None,
+        lambdarank_pair_method: str | None = None,
+        lambdarank_num_pair_per_sample: int | None = None,
+        lambdarank_normalization: bool | None = None,
+        lambdarank_score_normalization: bool | None = None,
+        lambdarank_unbiased: bool | None = None,
+        lambdarank_bias_norm: float | None = None,
+        ndcg_exp_gain: bool | None = None,
     ) -> None:
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -218,6 +238,13 @@ class _FerrisBoostBase(BaseEstimator):
         self.feature_types = feature_types
         self.max_cat_to_onehot = max_cat_to_onehot
         self.max_cat_threshold = max_cat_threshold
+        self.lambdarank_pair_method = lambdarank_pair_method
+        self.lambdarank_num_pair_per_sample = lambdarank_num_pair_per_sample
+        self.lambdarank_normalization = lambdarank_normalization
+        self.lambdarank_score_normalization = lambdarank_score_normalization
+        self.lambdarank_unbiased = lambdarank_unbiased
+        self.lambdarank_bias_norm = lambdarank_bias_norm
+        self.ndcg_exp_gain = ndcg_exp_gain
 
     # ------------------------------------------------------------------ tags
     def __sklearn_tags__(self):
@@ -244,7 +271,9 @@ class _FerrisBoostBase(BaseEstimator):
         seed = _seed_of(self.random_state)
         if seed is not None:
             params["seed"] = seed
-        if isinstance(params.get("n_jobs"), int) and params.get("nthread", 0) < 0:
+        # sklearn's n_jobs=-1 (and any negative value) means "all cores", which is
+        # nthread=0 here; Rust takes an unsigned thread count.
+        if isinstance(params.get("nthread"), int) and params["nthread"] < 0:
             params["nthread"] = 0
         return params
 
@@ -295,9 +324,16 @@ class _FerrisBoostBase(BaseEstimator):
         verbose: Any,
         eval_labels: Any,
         feature_types: Any = None,
+        ranking: dict | None = None,
     ) -> None:
+        # Ranking: `ranking` carries qid / group, the validation sets' query ids and
+        # tells that sample weights are per query group (not per row).
+        per_group = ranking is not None
         if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X, dtype=np.float32)
+            if per_group:
+                sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+            else:
+                sample_weight = _check_sample_weight(sample_weight, X, dtype=np.float32)
         evals = []
         if eval_set:
             if sample_weight_eval_set is not None and len(sample_weight_eval_set) != len(eval_set):
@@ -315,7 +351,10 @@ class _FerrisBoostBase(BaseEstimator):
                 if ew is None:
                     evals.append((ex, ey, f"validation_{i}"))
                 else:
-                    ew = _check_sample_weight(ew, ex, dtype=np.float32)
+                    if per_group:
+                        ew = np.asarray(ew, dtype=np.float32).ravel()
+                    else:
+                        ew = _check_sample_weight(ew, ex, dtype=np.float32)
                     evals.append((ex, ey, ew, f"validation_{i}"))
         elif sample_weight_eval_set is not None:
             raise ValueError("sample_weight_eval_set was given without eval_set")
@@ -341,6 +380,7 @@ class _FerrisBoostBase(BaseEstimator):
             quiet=not verbose,
             weight=None if sample_weight is None else np.asarray(sample_weight, dtype=np.float32),
             feature_types=feature_types if self.feature_types is None else self.feature_types,
+            **({} if ranking is None else ranking),
         )
         self.evals_result_ = result
 
@@ -655,6 +695,181 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
 
     @classmethod
     def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostClassifier:
+        est = cls(**params)
+        est.load_model(fname)
+        return est
+
+
+def _split_qid(X: Any, qid: Any) -> tuple[Any, Any]:
+    """The special `qid` column of a pandas DataFrame (XGBoost convention)."""
+    if _is_pandas_frame(X) and "qid" in list(X.columns):
+        if qid is not None:
+            raise ValueError(
+                "Found both the special column `qid` in `X` and the `qid` from the `fit` "
+                "method. Please remove one of them."
+            )
+        return X.drop(columns="qid"), X["qid"].to_numpy()
+    return X, qid
+
+
+class FerrisBoostRanker(_FerrisBoostBase):
+    """Learning-to-rank estimator (`xgboost.XGBRanker`), default objective `rank:ndcg`.
+
+    `rank:ndcg`, `rank:pairwise` and `rank:map` with XGBoost's `lambdarank_pair_method`,
+    `lambdarank_num_pair_per_sample`, `lambdarank_normalization`,
+    `lambdarank_score_normalization` and `ndcg_exp_gain`.
+
+    `fit(X, y, qid=...)` needs the query groups: `qid` (one id per row, rows sorted by it) or
+    `group` (the size of every group). A pandas `qid` column in `X` is used like the `qid`
+    argument (also for `eval_set` and `score`). `sample_weight` is **per query group**. The
+    default metric is `ndcg@32` (`map@32` for `rank:map`), as in XGBoost. `predict` returns
+    the raw ranking scores.
+    """
+
+    def _default_objective(self) -> str:
+        return "rank:ndcg"
+
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        qid: Any = None,
+        group: Any = None,
+        sample_weight: Any = None,
+        eval_set: Any = None,
+        eval_qid: Any = None,
+        eval_group: Any = None,
+        sample_weight_eval_set: Any = None,
+        verbose: bool | int | None = False,
+    ) -> FerrisBoostRanker:
+        if y is None:
+            raise ValueError("This FerrisBoostRanker estimator requires y to be passed, but the target y is None.")
+        objective = self.objective if self.objective is not None else self._default_objective()
+        if callable(objective) or "rank:" not in str(objective):
+            raise ValueError("please use FerrisBoostRegressor / FerrisBoostClassifier for a non-ranking objective")
+        X, qid = _split_qid(X, qid)
+        if qid is None and group is None:
+            raise ValueError("Either `group` or `qid` is required for ranking task")
+        if qid is not None and group is not None:
+            raise ValueError("Either one of `group` or `qid` should be None.")
+        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
+        eval_set = list(eval_set) if eval_set else None
+        eq_list: list = []
+        eg_list: list = []
+        if eval_set:
+            if eval_qid is not None and len(eval_qid) != len(eval_set):
+                raise ValueError("eval_qid must have the same length as eval_set")
+            if eval_group is not None and len(eval_group) != len(eval_set):
+                raise ValueError("eval_group must have the same length as eval_set")
+            for i, pair in enumerate(eval_set):
+                if len(pair) != 2:
+                    raise ValueError("Each eval_set element must be an (X, y) pair")
+                ex, ey = pair
+                ex, eq = _split_qid(ex, None if eval_qid is None else eval_qid[i])
+                eg = None if eval_group is None else eval_group[i]
+                if eq is not None and eg is not None:
+                    raise ValueError(
+                        "Only one of the eval_qid or eval_group for each evaluation dataset should be provided."
+                    )
+                if eq is None and eg is None:
+                    raise ValueError(
+                        f"eval_set[{i}] needs query groups: pass eval_qid / eval_group "
+                        "or a `qid` column in its X"
+                    )
+                eval_set[i] = (ex, ey)
+                eq_list.append(eq)
+                eg_list.append(eg)
+        elif eval_qid is not None or eval_group is not None:
+            raise ValueError("eval_qid / eval_group were given without eval_set")
+        params = self.get_ferrisboost_params()
+        self._fit_booster(
+            X,
+            np.asarray(y, dtype=np.float32),
+            params,
+            sample_weight,
+            eval_set,
+            sample_weight_eval_set,
+            verbose,
+            eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
+            feature_types=flags,
+            ranking={
+                "qid": qid,
+                "group": group,
+                "eval_qid": eq_list if eval_set else None,
+                "eval_group": eg_list if eval_set else None,
+            },
+        )
+        return self
+
+    def predict(
+        self,
+        X: Any,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        X, _ = _split_qid(X, None)
+        return self._raw_predict(X, output_margin, iteration_range)
+
+    def apply(self, X: Any, iteration_range: tuple[int, int] | None = None) -> np.ndarray:
+        X, _ = _split_qid(X, None)
+        return super().apply(X, iteration_range)
+
+    def _score_metric(self) -> str:
+        """The metric `score` evaluates: the last `eval_metric`, else XGBoost's default."""
+        if self.eval_metric is not None:
+            names = [self.eval_metric] if isinstance(self.eval_metric, str) else list(self.eval_metric)
+            return str(names[-1])
+        objective = self.objective if self.objective is not None else self._default_objective()
+        base = "map" if objective == "rank:map" else "ndcg"
+        method = self.lambdarank_pair_method or "topk"
+        if method == "mean":
+            # whole-list ndcg; XGBoost's default `map` for `mean` is map@32
+            return "ndcg@4294967295" if base == "ndcg" else "map"
+        k = self.lambdarank_num_pair_per_sample or 32
+        return f"{base}@{int(k)}"
+
+    def score(self, X: Any, y: Any) -> float:
+        """The ranking metric (last `eval_metric`, default ndcg@32) of the model on `X`.
+
+        The query ids must be the `qid` column of the DataFrame `X`. With early stopping the
+        model is evaluated up to `best_iteration`. Higher is better.
+        """
+        from . import _core
+
+        check_is_fitted(self, "_Booster")
+        X, qid = _split_qid(X, None)
+        if qid is None:
+            raise ValueError("The special column `qid` is required in `X` for ranking task.")
+        scores = np.ascontiguousarray(self._raw_predict(X), dtype=np.float32)
+        labels = np.ascontiguousarray(np.asarray(y, dtype=np.float32).ravel())
+        from . import _as_query_array
+
+        gain = True if self.ndcg_exp_gain is None else bool(self.ndcg_exp_gain)
+        return float(
+            _core.rank_score(
+                self._score_metric(), scores, labels,
+                _as_query_array(qid, "qid", labels.size), None, gain,
+            )
+        )
+
+    def load_model(self, fname: str | os.PathLike) -> FerrisBoostRanker:
+        """Read an XGBoost-compatible JSON (also an XGBoost `rank:*` model)."""
+        booster = self._load_booster(fname)
+        if not str(booster.objective).startswith("rank:"):
+            raise ValueError(
+                f"{booster.objective} is not a ranking model; use FerrisBoostRegressor / "
+                "FerrisBoostClassifier.load_model"
+            )
+        self._Booster = booster
+        self.n_features_in_ = booster.n_features
+        self.evals_result_ = {}
+        self.__dict__.pop("_cat_levels_", None)
+        return self
+
+    @classmethod
+    def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostRanker:
         est = cls(**params)
         est.load_model(fname)
         return est

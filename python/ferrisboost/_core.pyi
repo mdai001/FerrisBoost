@@ -71,15 +71,17 @@ class Model:
         reserved f32::MAX are rejected). It also applies to the integer codes of
         categorical columns.
 
-        pandas DataFrames and PyArrow tables are accepted too; categorical
-        columns are scored through their category codes, so they must carry the
+        pandas DataFrames and PyArrow tables are accepted too. For a model
+        trained on named columns they are matched to the model's features by
+        name (any order; extra columns ignored; a missing one is an error).
+        Categorical columns are scored through their category codes, so they must carry the
         training categories in the training order. Models with categorical
         splits always score on the CPU, even with use_gpu=True.
 
         Explanations (XGBoost 3.4.1 semantics; at most one per call, not
         combinable with output_margin; always computed on the CPU, use_gpu is
-        ignored; n_trees and predict_threads apply; float32 array and file inputs
-        only, not DataFrames or tables):
+        ignored; n_trees and predict_threads apply; same inputs as plain
+        prediction):
 
         * pred_contribs=True: exact TreeSHAP in margin space, shape
           (n, n_features + 1) with the bias last, or (n, num_class,
@@ -156,11 +158,26 @@ def train_dense(
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
     weight: NDArray[np.float32] | None = ...,
     feature_names: Sequence[str] | None = ...,
+    qid: NDArray[np.uint64] | None = ...,
+    group: NDArray[np.uint64] | None = ...,
 ) -> Model:
     """Train a dense model; early stopping needs evals and retains all trained trees.
 
     params["_feature_types"] is an optional list of bools (True = categorical,
     one per feature); ferrisboost.train fills it from feature_types and dtypes.
+    """
+    ...
+def rank_score(
+    metric: str,
+    pred: NDArray[np.float32],
+    label: NDArray[np.float32],
+    qid: NDArray[np.uint64],
+    weight: NDArray[np.float32] | None = ...,
+    ndcg_exp_gain: bool = ...,
+) -> float:
+    """A ranking metric (ndcg, ndcg@k, ndcg@k-, map, map@k, pre@k) with XGBoost's semantics.
+
+    qid gives the query groups (sorted); weight is one value per group.
     """
     ...
 def train_file(
@@ -173,6 +190,7 @@ def train_file(
     verbose_eval: int | None = ...,
     callbacks: Sequence[Callable[[int, dict], bool]] | None = ...,
     weight: str | int | None = ...,
+    qid: str | int | None = ...,
 ) -> Model:
     """Train from files; early stopping needs evals and retains all trained trees."""
     ...

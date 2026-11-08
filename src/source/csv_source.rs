@@ -139,6 +139,31 @@ struct ColumnRoles {
     names: Vec<String>,
 }
 
+/// Read a whole query-id column from every file (in the given order, which is the
+/// order the dataset concatenates them in). A second pass over the text with a
+/// one-column projection; the features are not parsed again.
+pub(crate) fn read_u64_column(
+    paths: &[PathBuf],
+    has_header: bool,
+    name: &str,
+) -> anyhow::Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let schema = infer_schema(path, has_header)?;
+        let col = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} 里没有列 {name:?}", path.display())
+            })?;
+        for batch in batch_reader(path, schema, has_header, vec![col])? {
+            out.extend(crate::source::arrow_source::column_as_u64(&batch?, 0, name)?);
+        }
+    }
+    Ok(out)
+}
+
 fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let find = |want: &str| {
@@ -147,6 +172,9 @@ fn columns(schema: &Schema, targets: Targets<'_>) -> anyhow::Result<ColumnRoles>
             .position(|n| *n == want)
             .ok_or_else(|| anyhow::anyhow!("文件里没有列 {want:?},只有 {names:?}"))
     };
+    if let Some(q) = targets.qid {
+        find(q)?;
+    }
     let label_col = find(targets.label)?;
     let weight_col = targets.weight.map(find).transpose()?;
     let (feat_cols, feat_names) = targets.select_features(&names)?;

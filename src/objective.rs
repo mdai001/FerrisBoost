@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::rank::{PairMethod, RankKind, RankParams, NOT_SET};
 use crate::types::{GradPair, Objective};
 
 /// XGBoost `kRtEps`。
@@ -109,6 +110,7 @@ impl Objective {
             Objective::Softprob { .. } => "multi:softprob",
             Objective::Softmax { .. } => "multi:softmax",
             Objective::Quantile { .. } => "reg:quantileerror",
+            Objective::Rank { kind, .. } => kind.name(),
         }
     }
 
@@ -120,6 +122,17 @@ impl Objective {
             // num_class 由 `with_params` / 模型 JSON 填
             "multi:softprob" => return Some(Objective::Softprob { num_class: 0 }),
             "multi:softmax" => return Some(Objective::Softmax { num_class: 0 }),
+            "rank:ndcg" | "rank:pairwise" | "rank:map" => {
+                let kind = match name {
+                    "rank:ndcg" => RankKind::Ndcg,
+                    "rank:pairwise" => RankKind::Pairwise,
+                    _ => RankKind::Map,
+                };
+                return Some(Objective::Rank {
+                    kind,
+                    params: RankParams::default(),
+                });
+            }
             _ => {}
         }
         Self::ALL.into_iter().find(|o| o.name() == name)
@@ -130,7 +143,13 @@ impl Objective {
         Self::ALL
             .iter()
             .map(|o| o.name())
-            .chain(["multi:softprob", "multi:softmax"])
+            .chain([
+                "multi:softprob",
+                "multi:softmax",
+                "rank:ndcg",
+                "rank:pairwise",
+                "rank:map",
+            ])
             .collect::<Vec<_>>()
             .join("、")
     }
@@ -153,6 +172,19 @@ impl Objective {
     /// `reg:quantileerror`:梯度依赖每轮全体行预测归约出的标量 scale。
     pub fn is_quantile(self) -> bool {
         matches!(self, Objective::Quantile { .. })
+    }
+
+    /// `rank:*`: gradients are computed per query group (`crate::rank`).
+    pub fn is_ranking(self) -> bool {
+        matches!(self, Objective::Rank { .. })
+    }
+
+    /// The ranking kind and parameters, if this is a ranking objective.
+    pub fn rank(self) -> Option<(RankKind, RankParams)> {
+        match self {
+            Objective::Rank { kind, params } => Some((kind, params)),
+            _ => None,
+        }
     }
 
     /// 带上 `quantile_alpha`(只对 `reg:quantileerror` 生效)。
@@ -227,6 +259,7 @@ impl Objective {
                     self.name()
                 )
             }
+            Objective::Rank { params, .. } => params.validate()?,
             _ => {}
         }
         Ok(())
@@ -253,6 +286,7 @@ impl Objective {
             Objective::SquaredError
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. }
+            | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => base_score,
             // logit(0.5) = 0.0
@@ -285,6 +319,11 @@ impl Objective {
         grad_weights: Option<&[f32]>,
         scale_pos_weight: f32,
     ) -> f32 {
+        if self.is_ranking() {
+            unreachable!(
+                "ranking base score needs the query groups: use crate::rank::estimate_base_score"
+            );
+        }
         if let Objective::Quantile { alpha } = self {
             // XGBoost `QuantileRegression::InitEstimation`:标签的 alpha 分位数
             // (无权重:线性插值;有权重:阶梯函数)。权重是样本权重本身。
@@ -375,6 +414,9 @@ impl Objective {
             Objective::Quantile { .. } => {
                 unreachable!("quantile 梯度依赖每轮的全局 scale,走 Objective::quantile_gradient")
             }
+            Objective::Rank { .. } => {
+                unreachable!("ranking gradients are per query group: use crate::rank::RankGradient")
+            }
             // PseudoHuberRegression::GetGradient
             Objective::PseudoHuber { slope } => {
                 let z = pred - label;
@@ -398,6 +440,7 @@ impl Objective {
             Objective::SquaredError
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. }
+            | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => margin,
             Objective::Logistic => sigmoid(margin),
@@ -414,6 +457,7 @@ impl Objective {
             Objective::SquaredError
                 | Objective::PseudoHuber { .. }
                 | Objective::Quantile { .. }
+                | Objective::Rank { .. }
                 | Objective::Softprob { .. }
                 | Objective::Softmax { .. }
         )
@@ -426,6 +470,13 @@ impl Objective {
             Objective::SquaredError
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. } => {}
+            Objective::Rank { kind, params } => match kind {
+                RankKind::Ndcg => {
+                    crate::rank::check_ndcg_labels(params.ndcg_exp_gain, labels, what)?
+                }
+                RankKind::Map => crate::rank::check_binary_labels(name, labels, what)?,
+                RankKind::Pairwise => {}
+            },
             Objective::Logistic => anyhow::ensure!(
                 labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
                 "{what}的 {name} 标签必须在 [0, 1]"
@@ -455,7 +506,10 @@ impl Objective {
         let name = self.name();
         match self {
             Objective::SquaredError | Objective::PseudoHuber { .. } => {}
-            Objective::Quantile { .. } | Objective::Softprob { .. } | Objective::Softmax { .. } => {
+            Objective::Quantile { .. }
+            | Objective::Rank { .. }
+            | Objective::Softprob { .. }
+            | Objective::Softmax { .. } => {
                 anyhow::ensure!(base_score.is_finite(), "{name} 的 base_score 必须是有限值")
             }
             // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
@@ -492,6 +546,8 @@ impl Objective {
             // `quantile_reduce_scale` → `quantile_gradient_rows`,alpha 经
             // `device_param` 传入)。这个编号只用来在 host 侧分派,kernel 不读它。
             Objective::Quantile { .. } => 6,
+            // Ranking has its own device path (or none): never the single-output kernel.
+            Objective::Rank { .. } => u32::MAX,
         }
     }
 
@@ -542,6 +598,7 @@ impl Objective {
                 "num_class",
                 num_class.to_string(),
             ),
+            Objective::Rank { params, .. } => rank_json_params(&params),
         }
     }
 
@@ -577,9 +634,93 @@ impl Objective {
             Objective::Softmax { .. } => Objective::Softmax {
                 num_class: json_param(rest, "softmax_multiclass_param", "num_class")? as u32,
             },
+            Objective::Rank { kind, .. } => Objective::Rank {
+                kind,
+                params: rank_params_from_json(rest)?,
+            },
             other => other,
         })
     }
+}
+
+// ---------------------------------------------------------------- ranking
+//
+// `lambdarank_param` block of the objective JSON (XGBoost `ToJson(LambdaRankParam)`):
+// every value is a string; an unset `lambdarank_num_pair_per_sample` is 4294967295.
+
+fn bool_str(v: bool) -> String {
+    (v as u8).to_string()
+}
+
+fn rank_json_params(p: &RankParams) -> BTreeMap<String, serde_json::Value> {
+    let mut inner = serde_json::Map::new();
+    let mut put = |k: &str, v: String| {
+        inner.insert(k.into(), serde_json::Value::String(v));
+    };
+    put("lambdarank_bias_norm", p.bias_norm.to_string());
+    put("lambdarank_normalization", bool_str(p.normalization));
+    put(
+        "lambdarank_num_pair_per_sample",
+        p.num_pair_per_sample.unwrap_or(NOT_SET).to_string(),
+    );
+    put("lambdarank_pair_method", p.pair_method.name().to_string());
+    put(
+        "lambdarank_score_normalization",
+        bool_str(p.score_normalization),
+    );
+    put("lambdarank_unbiased", bool_str(p.unbiased));
+    put("ndcg_exp_gain", bool_str(p.ndcg_exp_gain));
+    let mut rest = BTreeMap::new();
+    rest.insert(
+        "lambdarank_param".to_string(),
+        serde_json::Value::Object(inner),
+    );
+    rest
+}
+
+fn rank_params_from_json(rest: &BTreeMap<String, serde_json::Value>) -> Option<RankParams> {
+    let mut p = RankParams::default();
+    let Some(block) = rest.get("lambdarank_param") else {
+        return Some(p);
+    };
+    let text = |k: &str| -> Option<String> {
+        match block.get(k)? {
+            serde_json::Value::String(s) => Some(s.trim().to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(bool_str(*b)),
+            _ => None,
+        }
+    };
+    let flag = |k: &str, default: bool| -> Option<bool> {
+        match text(k) {
+            None => Some(default),
+            Some(t) => match t.as_str() {
+                "1" | "true" | "True" => Some(true),
+                "0" | "false" | "False" => Some(false),
+                _ => None,
+            },
+        }
+    };
+    if let Some(m) = text("lambdarank_pair_method") {
+        p.pair_method = match m.as_str() {
+            "topk" => PairMethod::TopK,
+            "mean" => PairMethod::Mean,
+            _ => return None,
+        };
+    }
+    if let Some(n) = text("lambdarank_num_pair_per_sample") {
+        let k: u64 = n.parse().ok()?;
+        p.num_pair_per_sample =
+            (k != u64::from(NOT_SET)).then(|| k.min(u64::from(u32::MAX - 1)) as u32);
+    }
+    p.normalization = flag("lambdarank_normalization", true)?;
+    p.score_normalization = flag("lambdarank_score_normalization", true)?;
+    p.ndcg_exp_gain = flag("ndcg_exp_gain", true)?;
+    p.unbiased = flag("lambdarank_unbiased", false)?;
+    if let Some(b) = text("lambdarank_bias_norm") {
+        p.bias_norm = b.parse().ok()?;
+    }
+    Some(p)
 }
 
 // ---------------------------------------------------------------- quantile
@@ -852,7 +993,8 @@ mod tests {
             Objective::from_name("reg:linear"),
             Some(Objective::SquaredError)
         );
-        assert_eq!(Objective::from_name("rank:pairwise"), None);
+        assert!(Objective::from_name("rank:pairwise").unwrap().is_ranking());
+        assert_eq!(Objective::from_name("rank:bogus"), None);
         let t = Objective::Tweedie {
             variance_power: 1.25,
         };

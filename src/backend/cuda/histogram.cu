@@ -2383,3 +2383,302 @@ extern "C" __global__ void predict_margin_soa(
     }
     output[row] = margin;
 }
+
+// ---------------------------------------------------------------- learning to rank fast
+//
+// `gpu_math = "fast"` for rank:ndcg / rank:pairwise / rank:map (LambdaMART).
+// Per round, all on the device and on one stream:
+//   1. `rank_apply_delta`   pred += delta (every row; sampling never masks predictions)
+//   2. `rank_sort_groups`   stable descending sort of every query group's scores
+//                           (one block per group, bottom-up merge sort by rank:
+//                           ties keep the lower index, so the order is a pure
+//                           function of the scores)
+//   3. `rank_map_stat`      rank:map only: relevant counts / sum l_k/k along the list
+//   4. memset of the fixed-point accumulators
+//   5. `rank_pairs`         one thread per pair initiator; every pair adds its lambda
+//                           to both rows as a fixed-point INTEGER (atomicAdd on int64).
+//                           Integer addition is exact and order independent, so the
+//                           result is identical run to run; there are no float atomics.
+//   6. `rank_finalize`      fixed point -> f32, lambdarank normalization, group weight,
+//                           row sampling -> interleaved f32 gpair (then the usual
+//                           max / scale / quantize tail)
+// Pair enumeration: topk = every (i, j > i) with i < k on the rank list; mean = each
+// document samples `num_pair` partners outside its label bucket with a counter based
+// hash of (seed, group, document, sample). The pairs, the arithmetic order and the
+// fixed-point rounding differ from the host path, which is why this mode is fast-only
+// (the host `gpu_math="exact"` path stays byte-identical to the CPU).
+#define RANK_SORT_THREADS 256u
+#define RANK_PAIR_THREADS 256u
+
+extern "C" __global__ void rank_apply_delta(float* pred, const float* delta, uint32_t n_rows) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        pred[i] = __fadd_rn(pred[i], delta[i]);
+    }
+}
+
+// Largest group index g with ptr[g] <= v (ptr has n + 1 non-decreasing entries, v < ptr[n]).
+__device__ __forceinline__ uint32_t rank_group_of(const uint32_t* ptr, uint32_t n, uint32_t v) {
+    uint32_t lo = 0, hi = n;  // answer in [lo, hi)
+    while (hi - lo > 1u) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (ptr[mid] <= v) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+extern "C" __global__ void rank_sort_groups(
+    const float* __restrict__ pred,
+    const uint32_t* __restrict__ group_ptr,
+    uint32_t n_groups,
+    uint32_t* __restrict__ idx_a,
+    uint32_t* __restrict__ idx_b,
+    uint32_t* __restrict__ rank_pos) {
+    for (uint32_t g = blockIdx.x; g < n_groups; g += gridDim.x) {
+        const uint32_t base = group_ptr[g];
+        const uint32_t cnt = group_ptr[g + 1] - base;
+        const float* p = pred + base;
+        uint32_t* src = idx_a + base;
+        uint32_t* dst = idx_b + base;
+        for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) src[i] = i;
+        __syncthreads();
+        for (uint32_t width = 1; width < cnt; width <<= 1) {
+            for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+                const uint32_t lo = (i / (2u * width)) * (2u * width);
+                const uint32_t mid = min(lo + width, cnt);
+                const uint32_t hi = min(lo + 2u * width, cnt);
+                const uint32_t doc = src[i];
+                const float key = p[doc];
+                uint32_t pos;
+                if (i < mid) {
+                    // From run A: the elements of B strictly greater go first.
+                    uint32_t l = mid, h = hi;
+                    while (l < h) {
+                        const uint32_t m = (l + h) >> 1;
+                        if (p[src[m]] > key) l = m + 1u; else h = m;
+                    }
+                    pos = lo + (i - lo) + (l - mid);
+                } else {
+                    // From run B: the elements of A greater or equal go first (stable).
+                    uint32_t l = lo, h = mid;
+                    while (l < h) {
+                        const uint32_t m = (l + h) >> 1;
+                        if (p[src[m]] >= key) l = m + 1u; else h = m;
+                    }
+                    pos = lo + (i - mid) + (l - lo);
+                }
+                dst[pos] = doc;
+            }
+            __syncthreads();
+            uint32_t* t = src; src = dst; dst = t;
+        }
+        for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+            const uint32_t doc = src[i];
+            rank_pos[base + doc] = i;
+            idx_a[base + i] = doc;
+        }
+        __syncthreads();
+    }
+}
+
+// rank:map statistics along the rank list; one thread per group, sequential f64 scan.
+extern "C" __global__ void rank_map_stat(
+    const float* __restrict__ label,
+    const uint32_t* __restrict__ group_ptr,
+    uint32_t n_groups,
+    const uint32_t* __restrict__ rank_idx,
+    double* __restrict__ n_rel,
+    double* __restrict__ acc) {
+    for (uint32_t g = blockIdx.x * blockDim.x + threadIdx.x; g < n_groups;
+         g += (uint32_t)blockDim.x * gridDim.x) {
+        const uint32_t base = group_ptr[g];
+        const uint32_t cnt = group_ptr[g + 1] - base;
+        double nr = 0.0, ac = 0.0;
+        for (uint32_t k = 0; k < cnt; ++k) {
+            const double y = (double)label[base + rank_idx[base + k]];
+            nr += y;
+            ac += y / (double)(k + 1u);
+            n_rel[base + k] = nr;
+            acc[base + k] = ac;
+        }
+    }
+}
+
+// One pair (rank positions ra, rb): the lambda of the higher-labelled document is added to
+// it, the negative to the other, both Hessians; all as fixed-point integers.
+__device__ __forceinline__ void rank_pair(
+    uint32_t ra, uint32_t rb, uint32_t base, uint32_t cnt,
+    const float* __restrict__ pred, const float* __restrict__ label,
+    const uint32_t* __restrict__ rank_idx,
+    uint32_t kind, uint32_t exp_gain, uint32_t norm_by_diff, bool best_ne_worst,
+    double inv_idcg, const double* __restrict__ n_rel, const double* __restrict__ acc,
+    double scale,
+    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
+    long long* __restrict__ group_sum) {
+    const uint32_t da = rank_idx[base + ra];
+    const uint32_t db = rank_idx[base + rb];
+    const float ya = label[base + da];
+    const float yb = label[base + db];
+    if (ya == yb) return;
+    uint32_t rh = ra, rl = rb, dh = da, dl = db;
+    float yh = ya, yl = yb;
+    if (ya < yb) { rh = rb; rl = ra; dh = db; dl = da; yh = yb; yl = ya; }
+    const float sh = pred[base + dh];
+    const float sl = pred[base + dl];
+    const float diff = __fsub_rn(sh, sl);
+    const double delta_score = (double)fabsf(diff);
+    const float x = fminf(-diff, 88.7f);
+    const float denom = __fadd_rn(__fadd_rn(expf(x), 1.0f), 1e-16f);
+    const double sig = (double)__fdiv_rn(1.0f, denom);
+    double raw;
+    if (kind == 1u) {
+        raw = 1.0;
+    } else if (kind == 0u) {
+        const double gh = exp_gain ? (double)((1u << (uint32_t)yh) - 1u) : (double)yh;
+        const double gl = exp_gain ? (double)((1u << (uint32_t)yl) - 1u) : (double)yl;
+        const double dh_ = 1.0 / log2((double)rh + 2.0);
+        const double dl_ = 1.0 / log2((double)rl + 2.0);
+        raw = ((gh * dh_ + gl * dl_) - (gl * dh_ + gh * dl_)) * inv_idcg;
+    } else {
+        uint32_t r1 = rh, r2 = rl;
+        float y1 = yh, y2 = yl;
+        if (r1 > r2) { const uint32_t t = r1; r1 = r2; r2 = t; const float ty = y1; y1 = y2; y2 = ty; }
+        const double r_h = (double)r1 + 1.0;
+        const double r_l = (double)r2 + 1.0;
+        const double n_total = n_rel[cnt - 1u];
+        const double m = n_rel[r2];
+        const double n = n_rel[r1];
+        const double b = acc[r2 - 1u] - acc[r1];
+        if (y1 < y2) {
+            raw = ((m / r_l - (n + 1.0) / r_h) - b) / n_total;
+        } else {
+            raw = ((n / r_h - m / r_l) + b) / n_total;
+        }
+    }
+    double dm = fabs(raw);
+    if (norm_by_diff && best_ne_worst) dm = dm / (delta_score + 0.01);
+    const double lambda_ij = (sig - 1.0) * dm;
+    const double hessian_ij = fmax(sig * (1.0 - sig), 1e-16) * dm * 2.0;
+    const float pg = (float)lambda_ij;
+    const float ph = (float)hessian_ij;
+    const long long qg = __double2ll_rn((double)pg * scale);
+    const long long qh = __double2ll_rn((double)ph * scale);
+    const long long qs = __double2ll_rn(-2.0 * (double)pg * scale);
+    atomicAdd((unsigned long long*)&acc_g[base + dh], (unsigned long long)qg);
+    atomicAdd((unsigned long long*)&acc_g[base + dl], (unsigned long long)(-qg));
+    atomicAdd((unsigned long long*)&acc_h[base + dh], (unsigned long long)qh);
+    atomicAdd((unsigned long long*)&acc_h[base + dl], (unsigned long long)qh);
+    atomicAdd((unsigned long long*)group_sum, (unsigned long long)qs);
+}
+
+extern "C" __global__ void rank_pairs(
+    const float* __restrict__ pred,
+    const float* __restrict__ label,
+    const uint32_t* __restrict__ group_ptr,
+    const uint32_t* __restrict__ init_ptr,
+    uint32_t n_groups,
+    uint32_t total_slots,
+    const uint32_t* __restrict__ rank_idx,
+    const uint32_t* __restrict__ rank_pos,
+    const double* __restrict__ inv_idcg,
+    const double* __restrict__ n_rel,
+    const double* __restrict__ acc,
+    const uint32_t* __restrict__ y_order,
+    const uint32_t* __restrict__ bucket_lo,
+    const uint32_t* __restrict__ bucket_hi,
+    uint32_t kind, uint32_t is_topk, uint32_t num_pair, uint32_t exp_gain, uint32_t norm_by_diff,
+    unsigned long long seed, double scale,
+    long long* __restrict__ acc_g, long long* __restrict__ acc_h,
+    long long* __restrict__ group_sum) {
+    for (uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < total_slots;
+         t += (uint32_t)blockDim.x * gridDim.x) {
+        const uint32_t g = rank_group_of(init_ptr, n_groups, t);
+        const uint32_t s = t - init_ptr[g];
+        const uint32_t base = group_ptr[g];
+        const uint32_t cnt = group_ptr[g + 1] - base;
+        const bool best_ne_worst =
+            pred[base + rank_idx[base]] != pred[base + rank_idx[base + cnt - 1u]];
+        const double inv = (kind == 0u) ? inv_idcg[g] : 0.0;
+        const double* nr = (kind == 2u) ? n_rel + base : n_rel;
+        const double* ac = (kind == 2u) ? acc + base : acc;
+        if (is_topk) {
+            for (uint32_t j = s + 1u; j < cnt; ++j) {
+                rank_pair(s, j, base, cnt, pred, label, rank_idx, kind, exp_gain, norm_by_diff,
+                          best_ne_worst, inv, nr, ac, scale, acc_g, acc_h, group_sum + g);
+            }
+        } else {
+            const uint32_t doc = y_order[base + s];
+            const uint32_t lo = bucket_lo[base + s];
+            const uint32_t hi = bucket_hi[base + s];
+            const uint32_t n_lefts = lo;
+            const uint32_t n_rights = cnt - hi;
+            if (n_lefts + n_rights == 0u) continue;
+            for (uint32_t q = 0; q < num_pair; ++q) {
+                const unsigned long long h = fb_mix(
+                    seed ^ ((unsigned long long)g * 0x9E3779B97F4A7C15ULL)
+                    ^ ((unsigned long long)s * 0xD6E8FEB86659FD93ULL)
+                    ^ ((unsigned long long)(q + 1u) * 0xBF58476D1CE4E5B9ULL));
+                uint32_t r = (uint32_t)(h % (unsigned long long)(n_lefts + n_rights));
+                if (r >= n_lefts) r = r - lo + hi;
+                const uint32_t pdoc = y_order[base + r];
+                rank_pair(rank_pos[base + doc], rank_pos[base + pdoc], base, cnt, pred, label,
+                          rank_idx, kind, exp_gain, norm_by_diff, best_ne_worst, inv, nr, ac,
+                          scale, acc_g, acc_h, group_sum + g);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void rank_finalize(
+    const uint32_t* __restrict__ group_ptr,
+    uint32_t n_groups,
+    uint32_t n_rows,
+    const long long* __restrict__ acc_g,
+    const long long* __restrict__ acc_h,
+    const long long* __restrict__ group_sum,
+    const float* __restrict__ group_weight,
+    uint32_t has_group_weight,
+    float weight_norm,
+    uint32_t is_topk, uint32_t num_pair, uint32_t normalization,
+    double scale,
+    float* __restrict__ gpair_out,
+    unsigned long long subsample_threshold,
+    unsigned long long subsample_seed,
+    unsigned long long subsample_tree) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_rows;
+         i += (uint32_t)blockDim.x * gridDim.x) {
+        const uint32_t g = rank_group_of(group_ptr, n_groups, i);
+        float gr = (float)((double)acc_g[i] / scale);
+        float he = (float)((double)acc_h[i] / scale);
+        if (normalization) {
+            double norm = 1.0;
+            if (!is_topk) {
+                norm = 1.0 / (double)num_pair;
+            } else {
+                const double sum = (double)group_sum[g] / scale;
+                if (sum > 0.0) norm = log2(1.0 + sum) / sum;
+            }
+            if (norm != 1.0) {
+                const float n = (float)norm;
+                gr = __fmul_rn(gr, n);
+                he = __fmul_rn(he, n);
+            }
+        }
+        const float w = has_group_weight ? group_weight[g] : 1.0f;
+        gr = __fmul_rn(__fmul_rn(gr, w), weight_norm);
+        he = __fmul_rn(__fmul_rn(he, w), weight_norm);
+        if (subsample_threshold != ~0ULL) {
+            const unsigned long long hsh = fb_mix(
+                subsample_seed
+                ^ ((subsample_tree * 0x9E3779B97F4A7C15ULL) << 23
+                   | (subsample_tree * 0x9E3779B97F4A7C15ULL) >> 41)
+                ^ ((unsigned long long)i * 0xD6E8FEB86659FD93ULL));
+            if ((hsh >> 11) >= subsample_threshold) {
+                gr = 0.0f;
+                he = 0.0f;
+            }
+        }
+        gpair_out[(uint64_t)i * 2] = gr;
+        gpair_out[(uint64_t)i * 2 + 1] = he;
+    }
+}

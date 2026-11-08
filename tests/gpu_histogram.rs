@@ -1295,6 +1295,7 @@ fn shared_histogram_tiles_features_and_rows() {
             n_outputs: 1,
             has_categorical: false,
             node_feature_masks: false,
+            fast_rank: None,
             threads_per_block: 64,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -1381,6 +1382,7 @@ fn atomic32_layout_is_bit_exact_when_low_word_overflows() {
             n_outputs: 1,
             has_categorical: false,
             node_feature_masks: false,
+            fast_rank: None,
             threads_per_block: 256,
             shared_memory_budget_bytes: Some(16 * 1024),
             layout,
@@ -2741,6 +2743,7 @@ fn gpu_multiclass_fast_gradient_matches_host_softmax() {
         gpu_math: ferrisboost::types::GpuMath::Fast,
         fast_weights: true,
         n_outputs: k,
+        fast_rank: None,
         ..Default::default()
     };
     let ctx = GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
@@ -2821,6 +2824,7 @@ fn gpu_fast_device_scale_matches_host_quantizer_across_magnitudes() {
             gpu_math: ferrisboost::types::GpuMath::Fast,
             fast_weights: true,
             n_outputs: k,
+            fast_rank: None,
             ..Default::default()
         };
         let ctx = GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap();
@@ -2971,6 +2975,7 @@ fn gpu_multiclass_fast_budget_matches_planner_and_echo() {
             runtime_log: false,
             gpu_math: math,
             n_outputs: k,
+            fast_rank: None,
             ..Default::default()
         };
         GpuTrainCtx::new(0, n_rows, 4, 19, 2, 8, config, false).unwrap()

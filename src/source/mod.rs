@@ -24,6 +24,9 @@ pub use dense::DenseSource;
 pub struct Targets<'a> {
     pub label: &'a str,
     pub weight: Option<&'a str>,
+    /// Optional query-id column (ranking). Excluded from the features like
+    /// `label` and `weight`; read separately, never binned.
+    pub qid: Option<&'a str>,
     /// 给了就**按列名**取特征,并排成这个顺序(验证集要和训练集的
     /// 特征一一对上)。`None` 时按文件里的物理顺序。
     pub features: Option<&'a [String]>,
@@ -46,10 +49,16 @@ impl<'a> Targets<'a> {
         Ok(Self {
             label,
             weight,
+            qid: None,
             features: None,
             categorical: None,
             missing: f32::NAN,
         })
+    }
+
+    /// Exclude `qid` (a query-id column) from the features.
+    pub fn with_qid(self, qid: Option<&'a str>) -> Self {
+        Self { qid, ..self }
     }
 
     /// Treat feature values equal to `missing` as missing (see the field docs).
@@ -123,9 +132,9 @@ impl<'a> Targets<'a> {
         Ok((idx, want.to_vec()))
     }
 
-    /// 这一列是标签或权重(不进特征)。
+    /// 这一列是标签、权重或 query id(不进特征)。
     pub fn excludes(&self, name: &str) -> bool {
-        name == self.label || self.weight == Some(name)
+        name == self.label || self.weight == Some(name) || self.qid == Some(name)
     }
 }
 
@@ -134,6 +143,7 @@ impl<'a> From<&'a str> for Targets<'a> {
         Self {
             label,
             weight: None,
+            qid: None,
             features: None,
             categorical: None,
             missing: f32::NAN,
@@ -146,6 +156,7 @@ impl<'a> From<&'a String> for Targets<'a> {
         Self {
             label: label.as_str(),
             weight: None,
+            qid: None,
             features: None,
             categorical: None,
             missing: f32::NAN,
@@ -349,6 +360,12 @@ mod targets_tests {
     fn select_features_binds_by_name_and_rejects_mismatch() {
         let cols = ["label", "b", "w", "a", "c"];
         let t = Targets::new("label", Some("w")).unwrap();
+        // a qid column is excluded from the features too
+        let q = Targets::new("label", Some("w")).unwrap().with_qid(Some("b"));
+        assert_eq!(
+            q.select_features(&cols).unwrap(),
+            (vec![3, 4], vec!["a".into(), "c".into()])
+        );
         assert_eq!(
             t.select_features(&cols).unwrap(),
             (vec![1, 3, 4], vec!["b".into(), "a".into(), "c".into()])

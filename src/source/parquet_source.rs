@@ -449,6 +449,9 @@ fn feature_columns<'a>(
         // 权重列找不到要报错,不能静默当成「没给权重」。
         column_index(path, w)?;
     }
+    if let Some(q) = targets.qid {
+        column_index(path, q)?;
+    }
     let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     targets.select_features(&columns)
 }
@@ -461,6 +464,20 @@ pub(crate) fn read_f32_column(path: impl AsRef<Path>, name: &str) -> anyhow::Res
     let mut out = Vec::new();
     for batch in batch_reader(path, &[col], BATCH_SIZE)? {
         out.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+    }
+    Ok(out)
+}
+
+/// Read a whole query-id column from every file, in the given order (the order the
+/// dataset concatenates the files in). Integer columns of any width, or floating
+/// point columns holding integral values.
+pub(crate) fn read_u64_columns(paths: &[PathBuf], name: &str) -> anyhow::Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let col = column_index(path, name)?;
+        for batch in batch_reader(path, &[col], BATCH_SIZE)? {
+            out.extend(crate::source::arrow_source::column_as_u64(&batch?, 0, name)?);
+        }
     }
     Ok(out)
 }
@@ -851,6 +868,9 @@ struct CacheManifest {
     /// 必须进身份校验:换一个权重列,特征集合就变了,而特征**数**可能不变。
     #[serde(default)]
     weight: Option<String>,
+    /// Excluded query-id column (ranking); absent in older caches = none.
+    #[serde(default)]
+    qid: Option<String>,
     max_bins: u32,
     cols_per_block: usize,
     n_rows: usize,
@@ -1357,6 +1377,7 @@ impl ParquetBlockSource {
             source_mtime_ns,
             label: targets.label.to_string(),
             weight: targets.weight.map(str::to_string),
+            qid: targets.qid.map(str::to_string),
             max_bins,
             cols_per_block,
             n_rows: self.n_rows,
@@ -1403,6 +1424,12 @@ impl ParquetBlockSource {
             "缓存权重列不一致(缓存 {:?},本次 {:?})",
             manifest.weight,
             targets.weight
+        );
+        anyhow::ensure!(
+            manifest.qid.as_deref() == targets.qid,
+            "cache query-id column differs (cache {:?}, this run {:?})",
+            manifest.qid,
+            targets.qid
         );
         anyhow::ensure!(
             manifest.cols_per_block == cols_per_block,

@@ -16,6 +16,44 @@ use crate::columns::{partition_features, BinCuts, ColumnBlock};
 use crate::sketch::SketchSet;
 use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
 
+/// A query-id column as u64. Integer columns of any width, and floating point
+/// columns holding integral values; nulls and negative values are errors.
+pub(crate) fn column_as_u64(batch: &RecordBatch, col: usize, name: &str) -> anyhow::Result<Vec<u64>> {
+    use arrow::array::{cast::AsArray, ArrayRef};
+    use arrow::compute::cast;
+    use arrow::datatypes::{Float64Type, UInt64Type};
+
+    let array: &ArrayRef = batch.column(col);
+    anyhow::ensure!(
+        array.null_count() == 0,
+        "query-id column {name:?} has missing values"
+    );
+    let ty = array.data_type();
+    if matches!(ty, DataType::Float32 | DataType::Float64) {
+        let as_f64 = cast(array, &DataType::Float64)?;
+        let values = as_f64.as_primitive::<Float64Type>();
+        let mut out = Vec::with_capacity(values.len());
+        for &v in values.values().iter() {
+            anyhow::ensure!(
+                v.is_finite() && v >= 0.0 && v.fract() == 0.0,
+                "query-id column {name:?} must hold non-negative integers, found {v}"
+            );
+            out.push(v as u64);
+        }
+        return Ok(out);
+    }
+    anyhow::ensure!(
+        ty.is_integer(),
+        "query-id column {name:?} must be an integer column, found {ty:?}"
+    );
+    let as_u64 = cast(array, &DataType::UInt64)?;
+    anyhow::ensure!(
+        as_u64.null_count() == 0,
+        "query-id column {name:?} must hold non-negative integers"
+    );
+    Ok(as_u64.as_primitive::<UInt64Type>().values().to_vec())
+}
+
 /// 把一列取成 f32,null 变 NaN。
 ///
 /// 只认数值列。**null 和 NaN 走同一条路**(都变成 MISSING_BIN),
@@ -147,7 +185,7 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int64 => visit_values!(Int64Array),
         other => anyhow::bail!(
             "第 {col} 列是 {other:?},只支持数值列。\\
-             类别特征要先在上游编码成整数类别码(0..=254),再用 feature_types=\"c\" 声明"
+             类别特征要先在上游编码成整数类别码(0..=253),再用 feature_types=\"c\" 声明"
         ),
     }
     Ok(())

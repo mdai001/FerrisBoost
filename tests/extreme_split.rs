@@ -116,6 +116,7 @@ fn multiround_eval_uses_training_cuts_for_extreme_finite_values() {
         source: &evaluation,
         labels: &LABELS,
         weights: None,
+        group_ptr: None,
     };
     let model = train(
         &training,

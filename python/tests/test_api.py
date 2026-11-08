@@ -50,7 +50,7 @@ def test_unimplemented_param_is_explicit():
 def test_bad_objective_lists_the_supported_ones():
     x, y = toy()
     with pytest.raises(ValueError) as e:
-        fb.train({**BASE, "objective": "rank:pairwise"}, x, label=y, num_boost_round=2)
+        fb.train({**BASE, "objective": "survival:cox"}, x, label=y, num_boost_round=2)
     assert "binary:logistic" in str(e.value)
 
 

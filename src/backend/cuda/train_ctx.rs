@@ -92,6 +92,9 @@ pub struct GpuMemoryBudget {
     /// prediction + 每行 softmax 的 wmax/wsum。单输出或 exact 下为 0。
     /// 公式见 `gpu_mem_plan::fast_multiclass_extra_bytes`(规划器同用)。
     pub multiclass_bytes: usize,
+    /// `gpu_math = "fast"` ranking: the device LambdaMART buffers
+    /// (`gpu_mem_plan::fast_rank_bytes`). Zero otherwise.
+    pub rank_bytes: usize,
     /// 行主序原型的转置暂存区(一块,不随 resident 块数增长)。关闭时为 0。
     pub rm_stage_bytes: usize,
     pub offsets_bytes: usize,
@@ -153,6 +156,7 @@ impl GpuMemoryBudget {
             + self.hist_nodes_batch_idx_bytes
             + self.fast_math_bytes
             + self.multiclass_bytes
+            + self.rank_bytes
             + self.rm_stage_bytes
             + self.hist_feature_select_bytes
     }
@@ -168,6 +172,7 @@ impl GpuMemoryBudget {
             + self.gpair_f32_bytes
             + self.fast_math_bytes
             + self.multiclass_bytes
+            + self.rank_bytes
     }
 
     pub fn report(&self) -> String {
@@ -175,7 +180,7 @@ impl GpuMemoryBudget {
         format!(
             "预分配显存 {:.1} MB({} 条 histogram stream) = gpair {:.1} + row_idx {:.1} + partition 输出 {:.1} \
              + partition 临时 {:.1} + partition 取列 {:.1} + 列块 buffer {:.1} \
-             + 直方图 {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + multiclass {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
+             + 直方图 {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample 选择 {:.3} + prediction {:.1} + device-quant {:.1} + batch 索引 {:.3} + fast-math {:.1} + multiclass {:.1} + rank {:.1} + rm-stage {:.1};其中 O(行数) 部分 {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -193,6 +198,7 @@ impl GpuMemoryBudget {
             mb(self.hist_nodes_batch_idx_bytes),
             mb(self.fast_math_bytes),
             mb(self.multiclass_bytes),
+            mb(self.rank_bytes),
             mb(self.rm_stage_bytes),
             mb(self.per_row_bytes()),
         )
@@ -393,6 +399,8 @@ struct GpuBuffers {
     /// fast quantile:`QUANTILE_REDUCE_BLOCKS` 对 f64 per-block partial + 末尾 1 个 f64 scale。
     /// 训练级一次分配、每轮复用(没有 per-round 分配)。
     qt_scratch: Option<CudaSlice<f64>>,
+    /// fast ranking: the device LambdaMART buffers (see `rank_ctx`).
+    rank: Option<rank_ctx::RankDevice>,
     /// 当前节点的行索引。
     rows: CudaSlice<u32>,
     part_col: CudaSlice<u8>,
@@ -418,6 +426,9 @@ struct GpuBuffers {
 
 /// 每条 histogram stream 独占的一整套可覆写资源。共享这些 buffer 会让
 /// 下一块的 H2D 覆盖仍在被上一块 kernel 读取的数据，形成低概率竞态。
+#[path = "rank_ctx.rs"]
+mod rank_ctx;
+pub use rank_ctx::RankDeviceInputs;
 #[path = "split_ctx.rs"]
 mod split_ctx;
 pub(crate) use split_ctx::GpuSplitGroup;
@@ -1432,6 +1443,19 @@ impl GpuTrainCtx {
         } else {
             0
         };
+        // fast ranking: allocated here, once, from the shape the planner charged.
+        let (rank, rank_bytes) = match (fast_math, config.fast_rank) {
+            (true, Some(shape)) => (
+                Some(rank_ctx::RankDevice::alloc(
+                    &stream,
+                    &state.module,
+                    n_rows,
+                    shape,
+                )?),
+                crate::gpu_mem_plan::fast_rank_bytes(n_rows as u64, &shape) as usize,
+            ),
+            _ => (None, 0),
+        };
         let fast_weight_bytes = if fast_math && config.fast_weights {
             n_rows * 4
         } else {
@@ -1454,6 +1478,7 @@ impl GpuTrainCtx {
                 0
             } + fast_weight_bytes,
             multiclass_bytes,
+            rank_bytes,
             rm_stage_bytes: if row_major {
                 rm_stage_len * rm_bufs * rm_slot_count
             } else {
@@ -1617,6 +1642,7 @@ impl GpuTrainCtx {
                 mc_wsum,
                 mc_pending_class: None,
                 qt_scratch,
+                rank,
                 gpair,
                 rows,
                 part_col,

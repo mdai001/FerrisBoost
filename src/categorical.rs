@@ -10,14 +10,21 @@
 //! * training bins for a categorical feature are the category codes
 //!   themselves, so `n_bins = max_code + 1`, including codes that never occur.
 //!
-//! Training codes are limited to `0..=MAX_CAT_CODE` because bin 255 is the
-//! missing sentinel. Loaded XGBoost models may hold larger category ids; the
+//! Training codes are limited to `0..=MAX_CAT_CODE` (253): bin 255 is the
+//! missing sentinel and bin 254 (`UNSEEN_CAT_BIN`) is kept free so that a
+//! category unseen in training always has a bin that is in no category set. Loaded XGBoost models may hold larger category ids; the
 //! prediction paths use arbitrary-width `u32` bitsets for those.
 
 use crate::types::MISSING_BIN;
 
-/// Largest category code a training bin can represent (`MISSING_BIN - 1`).
-pub const MAX_CAT_CODE: u32 = MISSING_BIN as u32 - 1;
+/// Largest category code a training bin can represent (`MISSING_BIN - 2`).
+pub const MAX_CAT_CODE: u32 = MISSING_BIN as u32 - 2;
+
+/// The bin a category unseen in training maps to. It is above every trained
+/// code, so it is in no category set and goes left at every categorical node,
+/// exactly as prediction from the float value does (XGBoost semantics). It is
+/// never a missing value, so the node's default direction never applies.
+pub const UNSEEN_CAT_BIN: u8 = (MISSING_BIN as u32 - 1) as u8;
 
 /// XGBoost `OutOfRangeCat()`: category values at or above this are invalid.
 const OUT_OF_RANGE_CAT: f32 = 16_777_216.0;
@@ -119,22 +126,18 @@ pub fn goes_left(words: &[u32], value: f32) -> bool {
 /// The bin of a categorical value under the training cuts of a feature with
 /// `n_bins` bins (`n_bins - 1` is the largest known code).
 ///
-/// Codes outside the trained range (or invalid values) are "unseen": they must
-/// go left at every categorical node. A bin above the last trained code is in
-/// no set, so the spare bin `254` is used when one exists; a feature that uses
-/// all 255 bins has none, and the value falls back to the missing sentinel
-/// (default direction). Only validation sets quantized with the training cuts
-/// can reach this: training data is validated while the cuts are built.
+/// Codes outside the trained range (or invalid values) are "unseen": they go
+/// left at every categorical node, so they map to `UNSEEN_CAT_BIN`, which no
+/// trained category set contains (training codes stop at `MAX_CAT_CODE`).
+/// Only validation sets quantized with the training cuts can reach this:
+/// training data is validated while the cuts are built.
 #[inline]
 pub fn code_to_bin(value: f32, n_bins: usize) -> u8 {
+    debug_assert!(n_bins <= MAX_CAT_CODE as usize + 1);
     if value >= 0.0 && value < n_bins as f32 && value == value.trunc() {
         return value as u8;
     }
-    if n_bins <= MAX_CAT_CODE as usize {
-        MAX_CAT_CODE as u8
-    } else {
-        MISSING_BIN
-    }
+    UNSEEN_CAT_BIN
 }
 
 /// Whether a non-missing training category value is not a valid code.
@@ -147,7 +150,7 @@ pub fn invalid_code(value: f32) -> bool {
 pub fn invalid_code_message(feature: &str, value: f32) -> String {
     format!(
         "categorical feature {feature} contains the value {value}: categories must be integer \
-         codes in 0..={MAX_CAT_CODE} (the largest bin is reserved for missing values), \
+         codes in 0..={MAX_CAT_CODE} (the two largest bins are reserved for missing values and unseen categories), \
          so at most {} distinct categories are supported per feature. Missing values \
          must be NaN or null",
         MAX_CAT_CODE + 1
@@ -201,7 +204,10 @@ mod tests {
         assert_eq!(code_to_bin(6.0, 6), 254);
         assert_eq!(code_to_bin(-1.0, 6), 254);
         assert_eq!(code_to_bin(2.5, 6), 254);
-        assert_eq!(code_to_bin(300.0, 255), MISSING_BIN);
-        assert_eq!(code_to_bin(254.0, 255), 254);
+        assert_eq!(code_to_bin(300.0, 254), UNSEEN_CAT_BIN);
+        assert_eq!(code_to_bin(253.0, 254), 253);
+        assert_eq!(code_to_bin(254.0, 254), UNSEEN_CAT_BIN);
+        assert!(invalid_code(254.0));
+        assert!(!invalid_code(253.0));
     }
 }

@@ -21,7 +21,7 @@ pub use inference::GpuInferenceModel;
 pub(crate) use train_ctx::GpuSplitGroup;
 pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
-    GpuSegmentTiming, GpuTrainCtx,
+    GpuSegmentTiming, GpuTrainCtx, RankDeviceInputs,
 };
 
 const HISTOGRAM_PTX: &str = include_str!("histogram.ptx");
@@ -165,6 +165,10 @@ pub struct SharedHistogramConfig {
     /// then also allocates a per-(node, column) feature mask
     /// (`gpu_mem_plan::with_node_feature_masks` prices it).
     pub node_feature_masks: bool,
+    /// `gpu_math = Fast` with a ranking objective: the shape of the device LambdaMART
+    /// buffers (allocated once, charged by the planner with the same
+    /// `gpu_mem_plan::fast_rank_bytes`). `None` for every other training.
+    pub fast_rank: Option<crate::gpu_mem_plan::FastRankShape>,
 }
 
 impl Default for SharedHistogramConfig {
@@ -187,6 +191,7 @@ impl Default for SharedHistogramConfig {
             n_outputs: 1,
             has_categorical: false,
             node_feature_masks: false,
+            fast_rank: None,
         }
     }
 }
