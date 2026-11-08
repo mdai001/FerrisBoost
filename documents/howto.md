@@ -793,7 +793,7 @@ How a feature is declared:
   A category becomes its integer code (its position in the dictionary);
   missing values stay missing. An explicit `feature_types` overrides detection.
 - **Parquet dictionary columns** are categorical automatically if their values
-  are integers. Dictionaries of strings are rejected in files, because the
+  are integers, unless an explicit `feature_types` says otherwise. Dictionaries of strings are rejected in files, because the
   codes of a string dictionary differ between row groups; encode the categories
   as integers upstream, or train from an in-memory pandas or PyArrow table.
 
@@ -1301,8 +1301,9 @@ second = fb.train(params, "train.parquet", label="target", num_boost_round=100)
 ```
 
 The second call can reuse cuts and quantized blocks. Cache metadata is checked;
-incompatible settings such as a different `max_bin` are rejected rather than
-silently reused.
+incompatible settings such as a different `max_bin`, `missing`, or set of
+categorical features (from `feature_types` or dictionary columns) are rejected
+rather than silently reused.
 
 `cache_path` applies only to the training set. Validation sets reuse the
 training cuts but do not share the training cache directory.

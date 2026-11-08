@@ -638,7 +638,9 @@ def _table_matrix(
                 arr[null] = np.nan
                 levels[i] = ref
             else:
-                indices = pa.chunked_array([c.indices for c in chunks], pa.int32()) \
+                # Dictionary indices may be any integer width (pandas categories
+                # convert to int8 indices), so widen each chunk to int32 first.
+                indices = pa.chunked_array([c.indices.cast(pa.int32()) for c in chunks], pa.int32()) \
                     if chunks else pa.chunked_array([], pa.int32())
                 arr = indices.cast(pa.float32()).to_numpy(zero_copy_only=False).astype(np.float32)
                 levels[i] = dictionary
