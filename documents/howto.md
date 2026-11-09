@@ -863,9 +863,12 @@ layout, and every later read re-codes by **value**:
   and CSV files with the stored lists, so their categories may be listed in any
   order or be a subset. String and integer categories do not mix: the category
   data type must match the training data. NumPy input is taken as integer
-  codes. A feature without a stored list (trained on integer codes) takes
-  integer values as its codes, including an Arrow table's integer dictionary
-  values, and a pandas category or Arrow string dictionary by its codes. The
+  codes. A feature with integer categories looks up plain integer columns by
+  value, from files, DataFrames and Arrow tables alike. A feature without a
+  stored list (trained on integer codes) takes integer values as its codes,
+  including the values of a pandas integer category or an Arrow integer
+  dictionary, and a pandas string category or Arrow string dictionary by its
+  codes. The
   full rules per input type are in
   [How categorical input is coded](#how-categorical-input-is-coded).
 - **Unseen categories raise `ValueError`**, as in XGBoost: a validation or
@@ -1268,7 +1271,8 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   with `feature_names_in_` set as for any frame, and are coded as
   `ferrisboost.train` and `Model.predict` code them (see
   [How categorical input is coded](#how-categorical-input-is-coded); a model
-  fitted on plain arrays reads an Arrow integer dictionary by its values);
+  fitted on plain arrays reads a pandas integer category or an Arrow integer
+  dictionary by its values);
   with `enable_categorical=False` such a column in `fit` raises
   `ValueError`. The training categories are stored in the booster and later
   frames are re-coded by value, so a different category order is harmless; a
@@ -1737,29 +1741,32 @@ the model stores a category list for the feature (`Model.get_categories()`):
 | Input for a categorical feature | Feature with string categories | Feature with integer categories | Feature without a list |
 |---|---|---|---|
 | NumPy array | codes as given | codes as given | codes as given |
-| pandas `category` column | re-coded by value | re-coded by value | the column's codes (positions in its categories), string or integer categories |
-| PyArrow string dictionary | re-coded by value | `ValueError` (type mismatch) | the dictionary indices |
-| PyArrow integer dictionary | `ValueError` (type mismatch) | re-coded by value | the dictionary **values** as codes |
-| pandas / PyArrow numeric column | codes as given | codes as given | codes as given |
+| pandas string `category` column, PyArrow string dictionary | re-coded by value | `ValueError` (type mismatch) | the column's codes (positions in its categories, dictionary indices) |
 | Parquet string dictionary or string column | re-coded by value | `ValueError` (type mismatch) | `ValueError` |
-| Parquet integer dictionary | `ValueError` (type mismatch) | re-coded by value | the dictionary **values** as codes |
-| Parquet plain integer column | codes as given | looked up **by value** | codes as given |
-| CSV column | read as text and re-coded by value (`1` is the category `"1"`) | integers looked up **by value** | integers as codes; text raises `ValueError` |
+| pandas integer `category` column, PyArrow or Parquet integer dictionary | `ValueError` (type mismatch) | re-coded by value | the **values** as codes |
+| pandas / PyArrow / Parquet plain integer column | codes as given | looked up **by value** | codes as given |
+| pandas / PyArrow / Parquet float column | codes as given | codes as given | codes as given |
+| CSV column | read as text and re-coded by value (`1` is the category `"1"`) | integers looked up **by value**; a decimal column is codes as given | integers as codes; text raises `ValueError` |
 
 - **Re-coded / looked up by value**: the value's position in the model's list
   is the code, so input may list its categories in any order or a subset. A
   category not in the list raises `ValueError`, as in XGBoost; a missing value
-  (null, `NaN`, an empty CSV field) stays missing.
+  (null, `NaN`, `pd.NA`, an empty CSV field) stays missing.
 - **Codes**: integers `0..` taken as the category codes the model was trained
   on. A null or `NaN` is missing; a negative value, a value the feature never
   had in training, or a value at or above 2^24 goes left at a categorical
-  split, and a fractional value is truncated toward zero. An Arrow integer
-  dictionary on a feature without a list is read exactly like the same column
-  in a Parquet file, so dictionary order and chunking do not matter.
-- The `missing` sentinel applies to the codes (after decoding a dictionary).
-- A model with integer categories looks up plain integers **in files** by
-  value (CSV integers, plain Parquet integer columns), not as codes; numeric
-  columns of an in-memory DataFrame or table and NumPy arrays are codes.
+  split, and a fractional value is truncated toward zero. An integer
+  `category` column or dictionary on a feature without a list is read by its
+  values exactly like the same column in a Parquet file, so category order
+  and chunking do not matter.
+- A column means the same whether it comes from a file, a pandas DataFrame or
+  a PyArrow table: the column's type decides, not its source. Only NumPy
+  arrays, which carry no column types, are always codes (as in XGBoost).
+- A float column is codes as given even when its values are whole numbers
+  (`10.0`), in files and in memory. A pandas integer column with a `NaN` is
+  `float64`; use the nullable `Int64` dtype to have it looked up by value.
+- The `missing` sentinel applies to the codes (after decoding a dictionary or
+  looking up a value).
 
 ## Feature importance, SHAP values, and leaf indices
 

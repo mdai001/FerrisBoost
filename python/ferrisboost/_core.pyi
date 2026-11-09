@@ -101,11 +101,12 @@ class Model:
         with a list re-codes pandas categories, Arrow and Parquet dictionaries
         and CSV text by value (any order, a subset; an unseen category raises
         ValueError), and a feature with integer categories looks up plain
-        integer file columns (CSV, Parquet) by value too. A feature without a
-        list takes integer values as the codes (NumPy, CSV and Parquet
-        integers, Arrow and Parquet integer dictionaries), and pandas
-        categories and Arrow string dictionaries by their codes / indices.
-        NumPy input is always codes. use_gpu=True scores
+        integer columns (CSV, Parquet, pandas, Arrow) by value too. A feature
+        without a list takes integer values as the codes (CSV, Parquet, pandas
+        and Arrow integers, integer categories and dictionaries by their
+        values), and pandas string categories and Arrow string dictionaries by
+        their codes / indices. A column means the same from a file, pandas or
+        Arrow; NumPy input is always codes. use_gpu=True scores
         models with categorical splits on the GPU too (bit-identical to the CPU).
 
         strict_shape=True (XGBoost's strict_shape) makes the shape independent

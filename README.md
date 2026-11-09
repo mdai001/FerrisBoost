@@ -257,6 +257,7 @@ logging, and the complete parameter reference.
 - CSV text columns declared categorical train as named categories.
 - Changed: models with integer categories now look up plain integer input by value, not as codes.
 - Changed: Arrow integer dictionaries are read by value for models without category lists, as Parquet files are.
+- Changed: pandas and Arrow integer columns are read by value like files (NumPy stays codes).
 - Fixed: sklearn estimators handle Arrow dictionary columns like `train` (nulls are missing).
 - Fixed: `cache_path` / `cache_budget_bytes` with unsupported input (such as several Parquet files) now raise instead of being ignored.
 

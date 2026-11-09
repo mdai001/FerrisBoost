@@ -88,8 +88,8 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import (Model, _arrow_table, _categories_wire, _frame_matrix, _is_pandas_frame,
-               _load_prior, _model_refs, _table_matrix, train)
+from . import (Model, _arrow_table, _as_ref, _categories_wire, _frame_matrix, _is_pandas_frame,
+               _load_prior, _model_refs, _table_matrix, _value_ref, train)
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 
@@ -314,31 +314,56 @@ class _FerrisBoostBase(BaseEstimator):
         own categories. PyArrow tables with dictionary columns are coded as
         `ferrisboost.train` and `Model.predict` code them (an integer
         dictionary of a feature without categories is read by its values).
+        Prediction and eval sets read frames and tables as files are read: a
+        plain integer column of a feature with integer categories is looked
+        up by value, and an integer `category` column of a feature without
+        categories yields its values. NumPy input is codes.
         """
         flags = None
         table = _dictionary_table(X)
-        if table is not None or (_is_pandas_frame(X) and _has_category_column(X)):
+        frame = _is_pandas_frame(X) and _has_category_column(X)
+        categorical = levels = None
+        if not reset:
+            # This fit's categories first (eval sets are prepared before the
+            # booster exists); a loaded model brings its own.
+            levels = getattr(self, "_cat_levels_", None)
+            if levels is None:
+                levels = _model_refs(getattr(self, "_Booster", None))
+            if self.feature_types is not None:
+                categorical = [t == "c" for t in self.feature_types]
+            if table is None and not frame:
+                if _is_pandas_frame(X):
+                    # Plain integer columns may be category values. An empty
+                    # _cat_levels_ is meaningful: this fit has no category
+                    # lists, even if the estimator still holds an older booster.
+                    frame = any(
+                        _value_ref(_as_ref(lv), i, categorical) is not None
+                        for i, lv in (levels or {}).items()
+                    )
+                elif hasattr(X, "column_names"):
+                    # sklearn's validation sets may be Arrow tables with only
+                    # numeric columns too; route them through the same dtype-
+                    # aware adapter, which preserves integer codes without refs.
+                    table = _arrow_table(X)
+        if table is not None or frame:
             if reset:
                 if hasattr(prior, "get_booster"):
                     prior = prior.get_booster()
                 levels = _model_refs(_load_prior(prior)) if prior is not None else None
-            else:
-                # This fit's categories first (eval sets are prepared before the
-                # booster exists); a loaded model brings its own.
-                levels = getattr(self, "_cat_levels_", None) or _model_refs(
-                    getattr(self, "_Booster", None))
             if table is not None:
                 import pyarrow as pa
 
                 matrix, names, flag_list, new_levels = _table_matrix(
-                    table, None, bool(self.enable_categorical), levels, "X", scoring=not reset
+                    table, None, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    categorical=categorical,
                 )
                 X = pa.table({n: matrix[:, i] for i, n in enumerate(names)})
             else:
                 import pandas as pd
 
                 matrix, _, flag_list, new_levels = _frame_matrix(
-                    X, bool(self.enable_categorical), levels, "X"
+                    X, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    categorical=categorical,
                 )
                 # A numeric stand-in with the same labels: sklearn then sets
                 # `n_features_in_` / `feature_names_in_` exactly as for any frame.
