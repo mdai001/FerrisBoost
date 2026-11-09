@@ -275,23 +275,17 @@ fn run_plan(
 }
 
 #[test]
-fn packed_index_batch_histograms_match_cpu_across_layouts_and_reused_slots() {
+fn packed_index_batch_histograms_match_cpu_with_compact_selection_and_reused_slots() {
     let (bins, gpair) = fixture();
 
-    // The environment-controlled runner exercises the default column-major
-    // ABI and the internal FB_ROW_MAJOR=1 row-major ABI in separate processes.
     let probe = make_context(0, false);
     let path = probe.path_summary();
-    let row_major = path.contains("layout_gpu=row_major");
     let compact_column = probe.supports_compact_column_histogram();
     assert!(
-        row_major || compact_column,
-        "expected a production batched ABI: {path}"
+        compact_column,
+        "expected the production compact column-major ABI: {path}"
     );
-    assert_eq!(
-        row_major, !compact_column,
-        "test expects exactly one active layout ABI: {path}"
-    );
+    assert!(path.contains("layout_gpu=col_major"), "{path}");
     drop(probe);
 
     // Streaming reuses its single temporary slot across all node counts and

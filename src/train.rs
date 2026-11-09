@@ -3197,8 +3197,8 @@ fn build_tree(
                     // 整层的 Accumulate 节点按容量分批合并 launch。
                     // 容量 1 就是原来的逐节点路径,一个字都没变。
                     let cap = session.hist_nodes_batch_capacity();
-                    // 行主序 kernel 只有 batched 一个入口,批里只有一个
-                    // 节点也必须走它。
+                    // Compact selected-feature maps require the batched ABI
+                    // even when a batch contains only one node.
                     let must_batch = session.requires_batched_hist();
                     #[cfg(feature = "cuda")]
                     if let Some(results) = pre.take() {

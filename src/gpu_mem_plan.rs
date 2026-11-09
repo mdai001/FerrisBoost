@@ -167,28 +167,11 @@ pub(crate) const QUANTILE_REDUCE_BLOCKS: u32 = 256;
 /// `GpuTrainCtx::new` 用同一个常量计费。
 pub(crate) const FAST_QUANTILE_SCRATCH_BYTES: u64 = (QUANTILE_REDUCE_BLOCKS as u64 * 2 + 1) * 8;
 
-/// Shared row-major staging policy for planning and runtime allocation.
-pub(crate) const RM_STAGE_BYTES: u64 = 32 * 1024 * 1024;
-const RM_STAGE_MIN_PER_SLOT: u64 = 4 * 1024 * 1024;
-
-pub(crate) fn row_major_stage_rows(
-    rows: u64,
-    cols: u64,
-    slots: u64,
-    buffers: u64,
-    budget: u64,
-) -> u64 {
-    let per_slot = (budget / slots.max(1)).max(RM_STAGE_MIN_PER_SLOT);
-    (per_slot / buffers.max(1) / cols.max(1))
-        .max(1)
-        .min(rows.max(1))
-}
-
 /// 一次训练的 streaming 显存模型。所有单位都是字节。
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
     /// 和列块宽度无关的部分:gpair、row index、partition、prediction、
-    /// device-quant、fast-math、行主序暂存等。
+    /// device-quant、fast-math 等。
     pub fixed_bytes: u64,
     /// 每多一列要多付的字节:量化列块本身(n_rows)+ 该列的直方图切片。
     pub per_col_bytes: u64,
@@ -199,13 +182,6 @@ pub struct StreamingMemModel {
     pub resident_extra_col_bytes: u64,
     /// Resident-only per-block scratch that does not scale with block width.
     pub resident_extra_fixed_bytes: u64,
-    /// Training row count for the bounded row-major staging allocation.
-    pub staging_rows: u64,
-    /// Nominal row-major staging charge already included in fixed_bytes; zero
-    /// (the column-major default) disables it. Only the `FB_ROW_MAJOR=1` opt-in
-    /// sets it, and [`Self::peak_for_layout`] drops it for blocks wider than
-    /// [`ROW_MAJOR_MAX_FEATS`], which run column-major.
-    pub staging_budget: u64,
 }
 
 impl StreamingMemModel {
@@ -221,8 +197,6 @@ impl StreamingMemModel {
         hist_nodes_per_batch: u64,
         device_quantize: bool,
         fast_math: bool,
-        row_major: bool,
-        rm_stage_bytes: u64,
     ) -> Self {
         let gpair = n_rows * 2 * 8; // 定点 [grad, hess]
         let row_idx = n_rows * 4;
@@ -245,7 +219,6 @@ impl StreamingMemModel {
         } else {
             0
         };
-        let stage = if row_major { rm_stage_bytes } else { 0 };
 
         let fixed_bytes = gpair
             + row_idx
@@ -254,8 +227,7 @@ impl StreamingMemModel {
             + partition_scratch
             + prediction
             + gpair_f32
-            + fast
-            + stage;
+            + fast;
 
         // 每列:量化数据本身,加上它在直方图里的切片。
         // 直方图切片要乘 batch 和并发 slot 数。
@@ -270,8 +242,6 @@ impl StreamingMemModel {
             slot_col_bytes,
             resident_extra_col_bytes: 0,
             resident_extra_fixed_bytes: 0,
-            staging_rows: n_rows,
-            staging_budget: stage,
         }
     }
 
@@ -412,44 +382,7 @@ impl StreamingMemModel {
 
     /// `cols` 宽、`streams` 条流、`resident` 个常驻块时的峰值。
     pub fn peak_for_layout(&self, cols: u64, streams: u64, resident: u64) -> u64 {
-        let slots = streams.saturating_add(resident);
-        // Keep the original conservative fixed allowance for small layouts.
-        // The row cap can make two pinned buffers larger than one pageable
-        // buffer, so plan the maximum of both supported buffering modes.
-        //
-        // Blocks wider than ROW_MAJOR_MAX_FEATS run column-major even under the
-        // row-major opt-in, and allocate no staging: drop the nominal charge.
-        if self.staging_budget > 0 && cols > ROW_MAJOR_MAX_FEATS {
-            return Self {
-                fixed_bytes: self.fixed_bytes.saturating_sub(self.staging_budget),
-                staging_budget: 0,
-                ..*self
-            }
-            .peak_for_layout(cols, streams, resident);
-        }
-        let extra_stage = if self.staging_budget > 0 {
-            [1, 2]
-                .into_iter()
-                .map(|buffers| {
-                    row_major_stage_rows(
-                        self.staging_rows,
-                        cols,
-                        slots,
-                        buffers,
-                        self.staging_budget,
-                    )
-                    .saturating_mul(cols)
-                    .saturating_mul(buffers)
-                    .saturating_mul(slots)
-                })
-                .max()
-                .unwrap_or(0)
-                .saturating_sub(self.staging_budget)
-        } else {
-            0
-        };
         self.fixed_bytes
-            .saturating_add(extra_stage)
             .saturating_add(
                 cols.saturating_mul(self.slot_col_bytes)
                     .saturating_mul(streams),
@@ -632,74 +565,17 @@ pub fn resolve_gpu_streaming_cols_per_block(
     })
 }
 
-/// 行主序 histogram kernel 一行能覆盖的最大特征数。
-///
-/// ⚠️ **规划器和运行时必须用同一个值。** 运行时用它决定走不走行主序
-/// (`GpuTrainCtx::new` 里的 `max_block_feats <= ROW_MAJOR_MAX_FEATS`),
-/// 规划器用它预测运行时会不会开第二条流。两边各写一个 32 就会悄悄漂移 ——
-/// 规划器按双流算了预算,运行时却跑单流(或者反过来,直接 OOM)。
-pub const ROW_MAJOR_MAX_FEATS: u64 = 32;
+/// Preserve the measured column-major streaming policy: narrow blocks use two
+/// streams only when doing so does not narrow the selected width. This is the
+/// policy used by the accepted 0.0.7 A/B; stream tuning is separate work.
+/// GPU row-major was removed after balanced HIGGS A/B regressed 12–29% with
+/// identical models (partial Epsilon agreed): transpose/staging/sync overhead.
+/// U16 row-major was never implemented. See internal-docs/history.md.
+pub const NARROW_STREAMING_MAX_FEATS: u64 = 32;
 
-/// Whether the GPU-local 8-bit row-major layout was explicitly requested.
-///
-/// **Column-major is the default on every GPU path** (resident, hybrid, pure
-/// streaming; exact and fast; every objective, ranking included). Row-major is
-/// an internal, undocumented opt-in kept only for future benchmarking:
-///
-/// - `FB_ROW_MAJOR=1` / `true`: try row-major (it still falls back to
-///   column-major when a block is wider than [`ROW_MAJOR_MAX_FEATS`] or the
-///   fused kernel is unavailable);
-/// - unset, `FB_ROW_MAJOR=0` / `false`: column-major.
-///
-/// Why it is off by default (decided 2026-11-08 from the 0.0.7 release
-/// benchmark A/B; models were byte-identical between the layouts in every
-/// arm): column-major was faster in **every** arm. Row-major cost on HIGGS 1M
-/// (4 runs each) +12% exact resident, +13% exact streaming, +30% fast
-/// resident, +15% fast streaming; on Epsilon at `cols_per_block=32` +15%
-/// exact resident, +33% exact streaming, +17% fast resident, +33% fast
-/// streaming. It also needs a device transpose plus 32 MiB+ of row-major
-/// staging, and it goes against the column-first design (a block is columns
-/// end to end: host cache, upload, device). The 16-bit row-major layout was
-/// dropped for the same reasons and is not implemented.
-///
-/// The Python planner (`StreamingMemModel::new`'s `row_major`) and the runtime
-/// (`GpuTrainCtx::new`) both read this one function, so a column-major plan
-/// never reserves row-major staging.
-pub fn gpu_row_major_opt_in() -> anyhow::Result<bool> {
-    match std::env::var("FB_ROW_MAJOR") {
-        Ok(v) => match v.trim() {
-            "0" | "false" => Ok(false),
-            "1" | "true" => Ok(true),
-            other => anyhow::bail!("FB_ROW_MAJOR accepts only 0/1/true/false, got {other:?}"),
-        },
-        Err(_) => Ok(false),
-    }
-}
-
-/// GPU streaming 的**完整**计划:块宽 + stream 数一起解。
-///
-/// stream 数**按执行路径分派**,不是按 resident/streaming 分派:
-///
-/// ```text
-/// 行主序分块 streaming(宽度 ≤ ROW_MAJOR_MAX_FEATS) → 2
-/// 列主序 streaming                                  → 1
-/// resident                                          → 1(不走这里)
-/// ```
-///
-/// 机制:**行主序是分块上传的** —— 每块被切成多个 chunk 依次
-/// 上传 / 转置 / 建直方图,所以独立的 slot 之间有东西可以流水起来,
-/// 第二条流让**本来就要做的传输**真正并发(而不是为了 overlap 再复制一遍
-/// 数据 —— 那正是 pinned 那条路被否掉的原因)。收益随 chunk 数走:
-/// c=8 **−28%**、c=28 −17%、c=32 −13%。
-/// **列主序一块一次大 memcpy,没有 chunk 可以交错,实测打平**
-/// (wide c=64:3.237 vs 3.230),那一档 +307 MB 买到的接近 0。
-///
-/// ⚠️ **拐点优先。** 第二条流让 `per_col_bytes` 翻倍,显存紧的机器上可能把
-/// 块宽夹到拐点以下 —— 而**拐点值 −42.6%,第二条流只值 −13~28%**。所以
-/// 只有当开第二条流**不会让解出来的块宽变窄**时才用 2,否则降回 1。
-///
-/// `make_model` 按 stream 数造模型 —— stream 数进 `per_col_bytes`,
-/// 所以两档必须各算各的,不能拿一个模型套两次。
+/// Resolve block width, stream count and residency together. Explicit streams
+/// are respected; automatic streams retain the measured narrow-block policy.
+/// `make_model` must price each stream count independently.
 pub fn resolve_gpu_streaming_plan(
     explicit_cols: Option<usize>,
     explicit_streams: Option<usize>,
@@ -742,15 +618,11 @@ pub fn resolve_gpu_streaming_plan(
         total_vram,
         make_model(2),
     ) {
-        // 双流只在**行主序分块**那条路上有收益,而走不走行主序由块宽决定。
-        // 宽度必须两档都 ≤ 上界:双流解出来的那个宽度才是运行时真正用的。
-        // Since column-major became the default (2026-11-08) this width rule
-        // still selects two streams for narrow column-major blocks: that is the
-        // configuration the 0.0.7 column-major A/B arms ran (and won) with.
-        // Whether one stream is enough there has not been measured yet.
+        // Retain the accepted column-major policy; changing stream defaults
+        // requires a separate balanced comparison.
         Ok(mut two)
             if two.resolved_cols_per_block >= one.resolved_cols_per_block
-                && two.resolved_cols_per_block <= ROW_MAJOR_MAX_FEATS =>
+                && two.resolved_cols_per_block <= NARROW_STREAMING_MAX_FEATS =>
         {
             two.resolved_hist_streams = 2;
             fill_residency(&mut two, explicit_resident, &make_model(2));
@@ -910,7 +782,7 @@ mod tests {
         let rows = u32::MAX as usize;
         let (blocks, offsets) = super::partition_batch_capacities(rows, 512);
         let scratch = rows as u64 + (blocks + 2 * offsets + 320) as u64 * 4 + 8192 * 2 * 4;
-        let model = super::StreamingMemModel::new(rows as u64, 255, 1, 16, false, false, false, 0);
+        let model = super::StreamingMemModel::new(rows as u64, 255, 1, 16, false, false);
         let other_fixed = rows as u64 * (16 + 4 + 4 + 1 + 4);
         assert!(model.fixed_bytes >= other_fixed + scratch);
     }
@@ -935,19 +807,9 @@ mod tests {
     }
     use super::*;
 
-    /// 用**实测数字**校准模型,而不是让模型自说自话。
-    ///
-    /// 实测(HIGGS 10.5M 行、max_bin=255、单流、batch=16、device-quant 开、
-    /// fast 开、行主序开、rm-stage 32 MiB,`FB_CUDA_RESIDENT_BLOCKS=0`):
-    ///
-    /// | cols | 预分配 |
-    /// |---:|---:|
-    /// | 4 | 533.3 MiB |
-    /// | 7 | 563.5 MiB |
-    /// | 14 | 633.9 MiB |
-    /// | 28 | 774.8 MiB |
+    /// HIGGS shape with the column-major allocation contract.
     fn higgs_model() -> StreamingMemModel {
-        StreamingMemModel::new(10_500_000, 255, 1, 16, true, true, true, 32 * 1024 * 1024)
+        StreamingMemModel::new(10_500_000, 255, 1, 16, true, true)
     }
 
     #[test]
@@ -1046,8 +908,6 @@ mod tests {
             slot_col_bytes: 10,
             resident_extra_col_bytes: 5,
             resident_extra_fixed_bytes: 20,
-            staging_rows: 0,
-            staging_budget: 0,
         };
         // Base = fixed + 2 columns * one stream * 10 = 120.
         // A resident costs 2 * (10 + 5) + 20 = 50.
@@ -1068,7 +928,7 @@ mod tests {
     fn cached_resident_capacity_transitions_at_exact_budget_boundaries() {
         // A moderate real shape keeps the byte arithmetic representative while
         // remaining a fast CPU-only planner test.
-        let model = StreamingMemModel::new(20_000, 255, 1, 16, true, false, false, 0)
+        let model = StreamingMemModel::new(20_000, 255, 1, 16, true, false)
             .with_resident_split_cache(255, 16);
         let cols = 64;
         let streams = 1;
@@ -1113,8 +973,6 @@ mod tests {
             slot_col_bytes: 10,
             resident_extra_col_bytes: 5,
             resident_extra_fixed_bytes: 20,
-            staging_rows: 0,
-            staging_budget: 0,
         };
         let budget = 170;
         let free_vram = budget + default_safety_reserve(budget * 2);
@@ -1137,10 +995,13 @@ mod tests {
     }
 
     #[test]
-    fn model_matches_measured_preallocation_within_a_few_percent() {
+    fn model_matches_historical_preallocation_after_retired_stage_is_removed() {
         let m = higgs_model();
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
         for (cols, measured) in [(4u64, 533.3), (7.0 as u64, 563.5), (14, 633.9), (28, 774.8)] {
+            // Historical measurements included 32 MiB of retired layout
+            // staging; compare only the allocations retained by column-major.
+            let measured = measured - 32.0;
             let est = mib(m.peak_for(cols));
             let err = (est - measured).abs() / measured;
             assert!(
@@ -1233,24 +1094,15 @@ mod resolve_tests {
     use super::*;
 
     fn higgs() -> StreamingMemModel {
-        StreamingMemModel::new(10_500_000, 255, 1, 16, true, true, true, 32 * 1024 * 1024)
+        StreamingMemModel::new(10_500_000, 255, 1, 16, true, true)
     }
     fn wide() -> StreamingMemModel {
-        StreamingMemModel::new(10_000_000, 255, 1, 16, true, true, true, 32 * 1024 * 1024)
+        StreamingMemModel::new(10_000_000, 255, 1, 16, true, true)
     }
     const GB: u64 = 1024 * 1024 * 1024;
 
     fn wide_model(streams: u64) -> StreamingMemModel {
-        StreamingMemModel::new(
-            10_000_000,
-            255,
-            streams,
-            16,
-            true,
-            false,
-            true,
-            32 * 1024 * 1024,
-        )
+        StreamingMemModel::new(10_000_000, 255, streams, 16, true, false)
     }
 
     /// 空闲显存要**换成常驻块**,而不是就这么闲着。
@@ -1362,8 +1214,8 @@ mod resolve_tests {
     #[test]
     fn fast_mode_charges_the_quantile_reduction_scratch() {
         let rows = 1_000_000u64;
-        let exact = StreamingMemModel::new(rows, 255, 1, 16, true, false, true, 0);
-        let fast = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let exact = StreamingMemModel::new(rows, 255, 1, 16, true, false);
+        let fast = StreamingMemModel::new(rows, 255, 1, 16, true, true);
         // 8 B/行 常驻 prediction + label,外加与行数无关的固定归约暂存。
         assert_eq!(
             fast.fixed_bytes - exact.fixed_bytes,
@@ -1454,7 +1306,7 @@ mod resolve_tests {
             fast_rank_bytes(rows, &unbiased) - fast_rank_bytes(rows, &shape),
             32 * 8 * (2 + 2 * 64) + 8 * 8
         );
-        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true);
         assert_eq!(
             base.with_fast_rank(rows, &shape).fixed_bytes,
             base.fixed_bytes + fast_rank_bytes(rows, &shape)
@@ -1476,7 +1328,7 @@ mod resolve_tests {
 
     #[test]
     fn fast_weights_add_exactly_four_bytes_per_row() {
-        let base = StreamingMemModel::new(1_000_000, 255, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(1_000_000, 255, 1, 16, true, true);
         let weighted = base.with_fast_weights(1_000_000);
         assert_eq!(weighted.fixed_bytes, base.fixed_bytes + 4_000_000);
         assert_eq!(weighted.per_col_bytes, base.per_col_bytes);
@@ -1486,7 +1338,7 @@ mod resolve_tests {
     #[test]
     fn fast_multi_quantile_adds_only_the_extra_prediction_columns() {
         let rows = 1_000_000u64;
-        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true);
         assert_eq!(
             base.with_fast_multi_quantile(rows, 1).fixed_bytes,
             base.fixed_bytes
@@ -1505,7 +1357,7 @@ mod resolve_tests {
     #[test]
     fn fast_multiclass_adds_k_minus_one_predictions_plus_softmax_stats() {
         let rows = 1_000_000u64;
-        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true);
         // 单输出:不收任何费用。
         assert_eq!(
             base.with_fast_multiclass(rows, 1).fixed_bytes,
@@ -1538,7 +1390,7 @@ mod resolve_tests {
     fn fast_multiclass_cost_can_make_the_planner_fail_loudly() {
         // 同一预算下:单输出放得下,K 很大的 fast 多分类放不下 -> 报错,不静默回退。
         let rows = 50_000_000u64;
-        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(rows, 255, 1, 16, true, true);
         let free = base.peak_for(1) + 64 * 1024 * 1024;
         assert!(base.solve_cols(free, 28).is_some());
         let mc = base.with_fast_multiclass(rows, 20);
@@ -1564,18 +1416,8 @@ mod resolve_tests {
         // Epsilon shape:显式 128 只固定物理几何,不能让完整 planner 提前返回。
         // 约 5 GiB 空闲足够让 16 个块全常驻;这正是 CSV deferred-open 路径
         // 必须在拿到真实行数后恢复的计划。
-        let epsilon_model = |streams| {
-            StreamingMemModel::new(
-                400_000,
-                255,
-                streams,
-                16,
-                true,
-                false,
-                true,
-                32 * 1024 * 1024,
-            )
-        };
+        let epsilon_model =
+            |streams| StreamingMemModel::new(400_000, 255, streams, 16, true, false);
         let p = resolve_gpu_streaming_plan(
             Some(128),
             None,

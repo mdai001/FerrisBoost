@@ -273,15 +273,6 @@ fn resolve_blocking(
                 }
                 _ => &[],
             };
-            // Row-major staging is charged only when the runtime will use it:
-            // the internal `FB_ROW_MAJOR=1` opt-in, and never under the bucket
-            // profile (no fused kernel, so the runtime stays column-major).
-            // Column-major, the default, reserves none of it.
-            let row_major = crate::gpu_mem_plan::gpu_row_major_opt_in().map_err(to_py_err)?
-                && !matches!(
-                    std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
-                    Ok("1") | Ok("true")
-                );
             let p = resolve_gpu_streaming_plan(
                 cfg.requested_cols_per_block,
                 cfg.params.hist_streams,
@@ -299,8 +290,6 @@ fn resolve_blocking(
                         cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
                         cfg.params.device_quantize.unwrap_or(true),
                         fast,
-                        row_major,
-                        crate::gpu_mem_plan::RM_STAGE_BYTES,
                     );
                     // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
                     // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——

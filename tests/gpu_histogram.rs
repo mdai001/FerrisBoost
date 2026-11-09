@@ -386,8 +386,7 @@ fn resident_block_session_reuses_exact_metadata_and_refreshes_selected_mapping()
     ctx.upload_gpair(&gpair).unwrap();
     let rows = ctx.begin_tree_rows().unwrap();
     let compact_column = ctx.supports_compact_column_histogram();
-    let row_major = ctx.path_summary().contains("layout_gpu=row_major");
-    let use_batched = compact_column || row_major;
+    let use_batched = compact_column;
 
     let run = |selected: Option<&[usize]>, offsets: &[u32]| {
         let mut histogram = Vec::new();
@@ -508,25 +507,6 @@ fn resident_block_session_reuses_exact_metadata_and_refreshes_selected_mapping()
         );
         expected
     };
-    let expected_row_major_mask = |selected: &[usize]| {
-        let mut expected = vec![GradPairFixed::default(); offsets[n_feats] as usize];
-        for &feat in selected {
-            let feature_bins = &bins[feat * n_rows..(feat + 1) * n_rows];
-            let feature_offsets = [0u32, 2];
-            let mut feature_hist = vec![GradPairFixed::default(); 2];
-            hist::build(
-                feature_bins,
-                n_rows,
-                1,
-                &feature_offsets,
-                &gpair,
-                None,
-                &mut feature_hist,
-            );
-            expected[feat * 2..feat * 2 + 2].copy_from_slice(&feature_hist);
-        }
-        expected
-    };
 
     if compact_column {
         // First use uploads compact offsets and the selected-local map.
@@ -564,39 +544,6 @@ fn resident_block_session_reuses_exact_metadata_and_refreshes_selected_mapping()
         assert_eq!(sampled_timing.block_h2d_calls, 2);
         assert_eq!(sampled_timing.block_h2d_bytes, 3 * 4 + 2 * 4);
         assert_eq!(sampled_again, remapped);
-    } else if row_major {
-        // Row-major consumes sampling as a per-call mask and keeps full-width
-        // offsets. Changing selected IDs changes the result without an index
-        // array upload.
-        let (first, first_timing) = run(Some(&selected_a), &offsets);
-        assert_eq!(first_timing.block_h2d_calls, 0);
-        assert_eq!(first_timing.block_h2d_bytes, 0);
-        assert_eq!(first, expected_row_major_mask(&selected_a));
-        let (same, same_timing) = run(Some(&selected_a), &offsets);
-        assert_eq!(same, first);
-        assert_eq!(same_timing.block_h2d_calls, 0);
-        assert_eq!(same_timing.block_h2d_bytes, 0);
-        let (remapped, remap_timing) = run(Some(&selected_b), &offsets);
-        assert_eq!(remap_timing.block_h2d_calls, 0);
-        assert_eq!(remap_timing.block_h2d_bytes, 0);
-        assert_eq!(remapped, expected_row_major_mask(&selected_b));
-        assert_ne!(
-            remapped, first,
-            "changed row-major feature mask was ignored"
-        );
-
-        // Valid full-width offsets refresh metadata while bins remain in range.
-        let changed_offsets = [0u32, 3, 6, 9, 12, 15];
-        let (changed, changed_timing) = run(None, &changed_offsets);
-        assert_eq!(changed_timing.block_h2d_calls, 1);
-        assert_eq!(
-            changed_timing.block_h2d_bytes,
-            changed_offsets.len() as u64 * 4
-        );
-        assert_eq!(changed.len(), 15);
-        let (_, restored_timing) = run(Some(&selected_a), &offsets);
-        assert_eq!(restored_timing.block_h2d_calls, 1);
-        assert_eq!(restored_timing.block_h2d_bytes, offsets.len() as u64 * 4);
     } else {
         // The legacy bucket-profile column-major ABI has no compact map and
         // ignores selected-local, so cover full-width metadata only.
@@ -1206,8 +1153,8 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
             let mut session = ctx
                 .block_session(0, &bins, n_rows, n_feats, offsets, None)
                 .unwrap();
-            // The opt-in row-major path (FB_ROW_MAJOR=1) requires the batched
-            // entry point, even when the batch contains just one node.
+            // Compact selection requires the batched entry point even for
+            // a single-node batch.
             if session.requires_batched_hist() {
                 break;
             }
@@ -1532,25 +1479,11 @@ fn gpu_math_fast_keeps_structure_and_stays_deterministic() {
     }
 }
 
-/// 宽列块(>32 特征/块)在行主序原型下**必须回退到列主序**,不能静默丢特征。
-///
-/// ⚠️ 这个用例来自一次真实的静默错误:行主序 kernel 用「两条 lane 一行、
-/// 每条一次 uint4」的映射,一行最多覆盖 32 个特征,而 `feat_hi` 当时写成
-/// `min(feat_lo + 16, n_feats)` —— 于是第 33 个及以后的特征被
-/// **悄悄丢掉**,直方图少算而没有任何报错。
-///
-/// 现在的约定是:`max_block_feats > 32` 时整个关掉行主序(见
-/// `GpuTrainCtx::new` 里的硬门槛),**明确 fallback,而不是用 `min()`
-/// 把不支持的形状伪装成支持**。将来要支持 64+ 特征/块,应当单独设计
-/// lanes_per_row / 多段映射,而不是放宽这里的判断。
-///
-/// 在 `FB_ROW_MAJOR=1`(内部 opt-in;默认是列主序)下运行时这条用例才真正
-/// 走到 fallback;不设该变量时它退化成一个普通的宽列块正确性用例,两种情况
-/// 都应该通过。
+/// Column-major histograms must include every feature in blocks wider than 32.
 #[test]
-fn wide_blocks_fall_back_from_row_major_without_dropping_features() {
+fn wide_column_major_blocks_do_not_drop_features() {
     let n_rows = 3000usize;
-    // 64 特征/块 —— 超过行主序 kernel 一行能覆盖的 32。
+    // Use a physical block wider than 32 features.
     let n_feats = 64usize;
     let data: Vec<f32> = (0..n_rows)
         .flat_map(|row| (0..n_feats).map(move |feat| ((row * 7 + feat * 13) % 43) as f32))
@@ -1559,7 +1492,7 @@ fn wide_blocks_fall_back_from_row_major_without_dropping_features() {
         .map(|row| if (row * 11) % 19 < 9 { 1.0 } else { 0.0 })
         .collect();
     // cols_per_block = 64 => 一个列块就装下全部 64 个特征。
-    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 64, 3);
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 64, 64);
     let params = ferrisboost::types::TrainParams {
         n_rounds: 2,
         max_depth: 4,
@@ -1572,42 +1505,23 @@ fn wide_blocks_fall_back_from_row_major_without_dropping_features() {
     assert_eq!(
         serde_json::to_vec(&gpu).unwrap(),
         serde_json::to_vec(&cpu).unwrap(),
-        "宽列块下 GPU 必须和 CPU 逐字节相同 —— 行主序要么正确处理,要么明确回退"
+        "wide column-major blocks must match CPU byte-for-byte"
     );
 }
 
-/// Column-major is the default GPU layout on every path, including blocks
-/// narrow enough for the row-major kernel; row-major only runs under the
-/// internal `FB_ROW_MAJOR=1` opt-in. A process that sets `FB_ROW_MAJOR` (the
-/// external layout runner) checks that layout instead.
+/// Narrow resident and streaming blocks use the column-major training layout.
 #[test]
-fn narrow_blocks_default_to_the_column_major_layout() {
-    let opt_in = match std::env::var("FB_ROW_MAJOR").as_deref() {
-        Ok("1") | Ok("true") => true,
-        Ok(_) | Err(_) => false,
-    };
+fn narrow_blocks_use_the_column_major_layout() {
     for resident_blocks in [Some(0), Some(2)] {
         let config = SharedHistogramConfig {
             resident_blocks,
             hist_streams: Some(1),
             ..Default::default()
         };
-        // Eight features per block: inside the 32-feature row-major limit.
         let ctx = GpuTrainCtx::new(0, 4096, 8, 64, 2, 8, config, false).unwrap();
         let path = ctx.path_summary();
-        let expected = if opt_in {
-            "layout_gpu=row_major"
-        } else {
-            "layout_gpu=col_major"
-        };
-        assert!(path.contains(expected), "{path}");
-        // Column-major allocates no row-major staging, so the budget has none.
-        assert_eq!(
-            ctx.budget().rm_stage_bytes == 0,
-            !opt_in,
-            "{}",
-            ctx.budget().report()
-        );
+        assert!(path.contains("layout_gpu=col_major"), "{path}");
+        assert!(ctx.supports_compact_column_histogram());
     }
 }
 
@@ -1757,7 +1671,7 @@ fn streaming_block_width_changes_timing_not_the_model() {
         .collect();
 
     // 规划器在这个形状上会解出什么宽度(用一个宽裕的预算,让它按块数目标走)。
-    let model = StreamingMemModel::new(n_rows as u64, 32, 1, 16, true, false, true, 0);
+    let model = StreamingMemModel::new(n_rows as u64, 32, 1, 16, true, false);
     let plan = resolve_gpu_streaming_cols_per_block(
         None,
         n_feats as u64,
@@ -1894,18 +1808,9 @@ fn subsample_shapes_the_tree_without_masking_predictions() {
     }
 }
 
-/// 常驻块的**行主序行距必须来自这个块自己的宽度**,不能拿 buffer 容量反推。
-///
-/// `slot.bins` 是按**最坏情况**(`max_block_feats`)分配的,所以
-/// `bins.len() / n_rows` 恒等于最宽的块。等宽切分时它碰巧等于真实宽度,
-/// 一旦**最后一块更窄**(30 特征 / 每块 16 → 16 + 14)且那一块也常驻,
-/// 行主序 partition 就会按 16 的行距去读一个行距 14 的块,**整块读偏**。
-///
-/// 它只在"最后那块也常驻"时发作 —— 而在 residency 还是 env-only、默认 0 的
-/// 年代根本没人跑到这个组合,所以藏了很久。现在规划器会主动选满常驻,
-/// 这条路成了默认路径。
-///
-/// 钉的是:**不等宽切分 + 全常驻,模型必须和纯 streaming 逐字节相同。**
+/// Physical resident metadata must describe the narrower final block rather
+/// than the capacity reserved for the widest block. Resident and streaming
+/// plans must produce identical models for unequal block widths.
 #[test]
 fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     let n_rows = 3000usize;
@@ -1940,8 +1845,7 @@ fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     assert_eq!(streaming, partial, "部分常驻不该改变模型");
     assert_eq!(
         streaming, full,
-        "更窄的最后一块常驻之后模型变了 —— 行主序行距用错了(拿 buffer 容量反推,\
-         而不是用这个块自己的宽度)"
+        "a narrower last resident block must preserve the model"
     );
 
     // 等宽切分作为对照:这一档**过去也是通过的**,所以它不能证明修复,
@@ -1951,13 +1855,9 @@ fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     assert_eq!(even_streaming, even_full, "等宽切分下全常驻本来就该一致");
 }
 
-/// The resident split cache is an exact, bounded alternative to the existing
-/// host split path. Cover both GPU histogram layouts and both objectives with
-/// missing values, row and column sampling, tree resets, and depth beyond the
-/// two-generation cache capacity. The 40-column first block always selects the
-/// column-major kernel; the 16+14 split runs column-major by default and
-/// row-major under the internal FB_ROW_MAJOR=1 opt-in, and makes the final
-/// resident block narrower than the first.
+/// Resident split-cache results match the host split path across narrow and
+/// wide column-major blocks, missing values, sampling and repeated tree resets.
+/// The final resident block is narrower than the first.
 #[test]
 fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {
     let n_rows = 768usize;
@@ -3057,7 +2957,7 @@ fn gpu_multiclass_fast_budget_matches_planner_and_echo() {
             "{echo}"
         );
         // 规划器用同一个公式。
-        let base = StreamingMemModel::new(n_rows as u64, 32, 1, 16, true, true, true, 0);
+        let base = StreamingMemModel::new(n_rows as u64, 32, 1, 16, true, true);
         let planned = base.with_fast_multiclass(n_rows as u64, k as u64);
         assert_eq!(planned.fixed_bytes - base.fixed_bytes, extra as u64);
     }

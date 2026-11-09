@@ -126,8 +126,7 @@ pub struct GpuMemoryBudget {
     /// `gpu_math = "fast"` ranking: the device LambdaMART buffers
     /// (`gpu_mem_plan::fast_rank_bytes`). Zero otherwise.
     pub rank_bytes: usize,
-    /// 行主序原型的转置暂存区(一块,不随 resident 块数增长)。关闭时为 0。
-    pub rm_stage_bytes: usize,
+
     pub offsets_bytes: usize,
     /// 每个 histogram slot 的 colsample 选择表,O(max block features)。
     pub hist_feature_select_bytes: usize,
@@ -145,11 +144,9 @@ pub struct GpuMemoryBudget {
 /// device 预算分开报告。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuHostMemoryBudget {
-    /// 列主序臂的整块 pinned staging(每个 slot 一份)。
-    /// **行主序不用它**,那条路有自己的分块 pinned 暂存,见下。
+    /// Whole-block pinned staging, one independent buffer per slot.
     pub block_bins_bytes: usize,
-    /// 行主序分块落地的 pinned 暂存(每个 slot 两块轮转)。
-    pub rm_stage_bytes: usize,
+
     /// 一轮定点梯度的 pinned staging buffer。
     pub gpair_bytes: usize,
     /// Pinned mirrors of the resident split caches' packet windows.
@@ -158,16 +155,15 @@ pub struct GpuHostMemoryBudget {
 
 impl GpuHostMemoryBudget {
     pub fn total(&self) -> usize {
-        self.block_bins_bytes + self.rm_stage_bytes + self.gpair_bytes + self.split_packets_bytes
+        self.block_bins_bytes + self.gpair_bytes + self.split_packets_bytes
     }
 
     pub fn report(&self) -> String {
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
         format!(
-            "pinned host {:.1} MB = column-block staging {:.1} + row-major staging {:.1} + gpair staging {:.1} + split packets {:.3}",
+            "pinned host {:.1} MB = column-block staging {:.1} + gpair staging {:.1} + split packets {:.3}",
             mb(self.total()),
             mb(self.block_bins_bytes),
-            mb(self.rm_stage_bytes),
             mb(self.gpair_bytes),
             mb(self.split_packets_bytes),
         )
@@ -191,7 +187,6 @@ impl GpuMemoryBudget {
             + self.fast_math_bytes
             + self.multiclass_bytes
             + self.rank_bytes
-            + self.rm_stage_bytes
             + self.hist_feature_select_bytes
     }
 
@@ -214,7 +209,7 @@ impl GpuMemoryBudget {
         format!(
             "preallocated device memory {:.1} MB ({} histogram streams) = gpair {:.1} + row_idx {:.1} + partition output {:.1} \
              + partition scratch {:.1} + partition column fetch {:.1} + column-block buffers {:.1} \
-             + histograms {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample selection {:.3} + prediction {:.1} + device-quant {:.1} + batch index {:.3} + fast-math {:.1} + multiclass {:.1} + rank {:.1} + rm-stage {:.1}; O(rows) part {:.1} MB",
+             + histograms {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample selection {:.3} + prediction {:.1} + device-quant {:.1} + batch index {:.3} + fast-math {:.1} + multiclass {:.1} + rank {:.1}; O(rows) part {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -233,7 +228,6 @@ impl GpuMemoryBudget {
             mb(self.fast_math_bytes),
             mb(self.multiclass_bytes),
             mb(self.rank_bytes),
-            mb(self.rm_stage_bytes),
             mb(self.per_row_bytes()),
         )
     }
@@ -313,44 +307,6 @@ const MAX_LEVEL_NODES: usize = 8192;
 /// 节点;设 32 是为了让「批大小」永远是**有界**的显存项,而不是随树深
 /// 无限增长(depth 10 的一层就有 512 个节点)。超出的部分自动分成多批。
 const MAX_HIST_NODES_PER_BATCH: usize = 32;
-
-/// 行主序转置的暂存预算。**按行分块转置**,所以它和列块大小无关。
-///
-/// ⚠️ 第一版是整块大小的暂存区(wide 上 305 MB),而它**只在 warm-up
-/// 用一次** —— 常驻一整块只为了转置那一下,是白占。分块之后这笔常驻
-/// 从 305 MB 降到 32 MB,而转置本身仍然是那个两维都合并的 tiled kernel。
-const RM_STAGE_BYTES: usize = crate::gpu_mem_plan::RM_STAGE_BYTES as usize;
-
-/// 行主序流式上传的暂存区,**每个 slot 独占一份**。
-///
-/// H2D 要真正藏到 kernel 后面,CUDA 要求**四个条件同时成立**:
-/// pinned host 内存、非默认 stream、异步 copy、彼此独立的 buffer。
-/// 这条路径以前一个都没占全:
-///
-/// * buffer 是**全局一块**,还配一把持有到 `synchronize()` 的锁 → 所有
-///   slot 串成一条(已修);
-/// * 源是**可分页**内存 —— `cuMemcpyHtoDAsync` 在可分页内存上是
-///   **实质同步**的,driver 必须先经自己的暂存区搬一道。
-///   所以"异步 copy"这条当时也没成立,只是看起来成立。
-///
-/// pinned 打开时用**两组** buffer 轮转:host 填第 i 块的同时,第 i-1 块的
-/// H2D + 转置还在 GPU 上跑。等待用的是 `PinnedHostSlice` 自带的 per-buffer
-/// event(`as_mut_slice()` 只等这一块自己的前一次使用),**不是**整条流的
-/// `synchronize()` —— 后者会把刚建立的重叠再毁掉。
-struct RmStaging {
-    /// device 落地区,pinned 模式下是 2 块(轮转),否则 1 块。
-    dev: Vec<CudaSlice<u8>>,
-    /// pinned host 暂存,和 `dev` 一一对应;可分页模式下为空。
-    host: Vec<PinnedHostSlice<u8>>,
-    /// 每块暂存能装的行数。
-    chunk_rows: usize,
-}
-
-impl RmStaging {
-    fn pinned(&self) -> bool {
-        !self.host.is_empty()
-    }
-}
 
 /// `partition()` 的返回值:本层内的登记号,`resolve_partitions()` 后才有行数。
 pub type PartitionToken = usize;
@@ -487,17 +443,15 @@ struct GpuHistBuffers {
     batch_idx: CudaSlice<u32>,
     hist_host: Vec<i64>,
     bins_host: Option<PinnedHostSlice<u8>>,
-    /// 行主序转置的分块暂存区,**每个 slot 一份**(见 `RmStaging`)。
-    rm_stage: Option<RmStaging>,
+
     start_event: CudaEvent,
     end_event: CudaEvent,
     /// 常驻块的**实际特征数**。
     ///
     /// ⚠️ 不能拿 `bins.len() / n_rows` 反推 —— `bins` 是按**最坏情况**
     /// (`max_block_feats`)分配的,反推出来的永远是最宽的那个块。
-    /// 最后一块通常更窄(28 特征 / 每块 16 → 16 + 12),行主序下
-    /// 行距就是特征数,用错会**整块读偏**,而且只在"最后那块也常驻"时
-    /// 才发作 —— 等宽的块碰巧对,所以这个 bug 藏得很深。
+    /// Bounds use this physical width even when the final block is narrower
+    /// than the buffer capacity.
     resident_feats: usize,
     resident_rows: usize,
     /// `Some(block)` marks an immutable, device-resident training block.
@@ -620,13 +574,6 @@ pub struct GpuTrainCtx {
     n_outputs: usize,
     /// 多个 `quantile_alpha`:没有 softmax 统计量 buffer,每个目标走 quantile kernel。
     multi_quantile: bool,
-    /// GPU-local row-major 原型:转置、行主序 histogram、行主序取列。
-    /// 三个要么都有要么都没有。
-    rm_transpose_fn: Option<CudaFunction>,
-    rm_hist_fn: Option<CudaFunction>,
-    /// XGBoost 式 flattened (row × feature) 映射。`Some` 时取代 `rm_hist_fn`。
-    /// 行主序下按 active row 直接取 split feature 的 partition 分类 kernel。
-    rm_count_fn: Option<CudaFunction>,
     gpu_math: crate::types::GpuMath,
     gpair_max_fn: Option<CudaFunction>,
     gpair_quantize_fn: Option<CudaFunction>,
@@ -652,8 +599,7 @@ pub struct GpuTrainCtx {
     /// **它改变内存计划**(每个节点要一份独立的直方图切片),所以和
     /// `hist_streams` 一样必须登记进 `GpuMemoryBudget`。
     hist_nodes_per_batch: usize,
-    /// 行主序转置一次处理多少行。0 表示未启用。
-    rm_chunk_rows: usize,
+
     n_rows: usize,
     partition_threads: u32,
     /// 是否记录分段耗时。打开会在 H2D/D2H 前后显式同步,产生额外 sync ——
@@ -854,60 +800,11 @@ impl GpuTrainCtx {
         let qt_partials_fn = load_qt("quantile_apply_delta_partials")?;
         let qt_reduce_fn = load_qt("quantile_reduce_scale")?;
         let qt_grad_fn = load_qt("quantile_gradient_rows")?;
-        // GPU-local row-major 原型。**只是 GPU 侧的表示**:Parquet / Arrow /
-        // host 量化 cache / FFI 一个都不动,列块照旧按列主序上传,上传后在
-        // device 上转置一次。
-        //
-        // 限制:只支持 `n_feats <= 32` 且能整除 16 的向量取数快路径之外的
-        // 情况会回落到标量路径;`hist_nodes_per_batch > 1` 才有意义
-        // (复用 batched 的 blk_ptr 语义,batching 本身不变)。
-        // ⚠️ The fused row-major kernel uses R=4, with each thread processing
-        // four rows. A row can cover at most **32 features**; exceeding that
-        // bound would silently omit later features. This hard width gate keeps
-        // the tested fallback to column-major whenever the shape is unsupported.
-        // **OFF by default since 2026-11-08; column-major is the default on
-        // every path.** It was the default from 2026-09-04 (wide fast −22.4%,
-        // wide exact −15.6% at the time), but the 0.0.7 release benchmark A/B
-        // measured column-major faster in every arm on HIGGS and Epsilon with
-        // byte-identical models (row-major +12..30% on HIGGS, +15..33% on
-        // Epsilon c=32), and row-major goes against the column-first design.
-        // The 16-bit row-major layout was dropped for the same reasons.
-        // Opt in (internal, undocumented, benchmarking only) with
-        // `FB_ROW_MAJOR=1`; unset or `FB_ROW_MAJOR=0` selects column-major.
-        // The full rationale and numbers live at the shared switch
-        // `gpu_mem_plan::gpu_row_major_opt_in`, which the memory planner reads
-        // too, so a plan charges row-major staging only when it is used.
-        let row_major_requested = crate::gpu_mem_plan::gpu_row_major_opt_in()?;
-        // 一行最多 32 个特征是 kernel 的硬上界,超过就明确回退到列主序。
-        // ⚠️ 上界用 `gpu_mem_plan` 里那个**共享常量** —— 显存规划器要靠同一个
-        // 值预测运行时会不会开第二条流,两边各写一个 32 就会悄悄漂移。
-        let row_major = row_major_requested
-            && hist_fused_fn.is_some()
-            && max_block_feats as u64 <= crate::gpu_mem_plan::ROW_MAJOR_MAX_FEATS;
-        let (rm_transpose_fn, rm_hist_fn, rm_count_fn) = if row_major {
-            (
-                Some(
-                    state
-                        .module
-                        .load_function("transpose_bins_to_row_major")
-                        .context("transpose_bins_to_row_major not found in PTX")?,
-                ),
-                Some(
-                    state
-                        .module
-                        .load_function("hist_build_shared_planar32_batched_rm")
-                        .context("hist_build_shared_planar32_batched_rm not found in PTX")?,
-                ),
-                Some(
-                    state
-                        .module
-                        .load_function("partition_count_rm")
-                        .context("partition_count_rm not found in PTX")?,
-                ),
-            )
-        } else {
-            (None, None, None)
-        };
+        // GPU training is column-major only (2026-11-08). Balanced HIGGS
+        // A/B made U8 row-major 12–29% slower with identical models; partial
+        // Epsilon results agreed. Remove transpose/staging/synchronization
+        // overhead. U16 row-major was never implemented. See the removal
+        // decision in internal-docs/history.md.
         let hist_batched_fn = if hist_fused_fn.is_some() {
             Some(
                 state
@@ -1030,10 +927,10 @@ impl GpuTrainCtx {
         let offsets_len = max_block_feats + 1;
         // [blk_ptr(batch+1) | node_off(batch) | node_len(batch)]
         //
-        // ⚠️ 行主序**只有 batched 一个入口**,所以哪怕
+
         // `hist_nodes_per_batch == 1` 也要按批分配 —— 否则批里那一个节点
         // 要写 4 个 u32 到一个长度为 1 的 buffer 上,cudarc 直接 panic。
-        let batch_capable = hist_fused_fn.is_some() || row_major;
+        let batch_capable = hist_fused_fn.is_some();
         let batch_idx_len = if batch_capable {
             hist_nodes_per_batch.max(1) * 3 + 1
         } else {
@@ -1072,61 +969,14 @@ impl GpuTrainCtx {
         // 环境变量只是 benchmark/debug 的 override,**不能压过用户明确传进来的
         // 值** —— 正式 API 是 `TrainParams::hist_streams`,不是 env。
         //
-        // planner 默认按模式选,因为这不只是调度参数,它直接参与内存计划:
-        // 第二条 stream 要多一整套列块 buffer,c=28 时是 280 MB(约占预分配
-        // 的 25%)。resident 命中之后块 H2D 已经很少,没什么可重叠的,实测
-        // wide resident 单流反而快 4.2%;streaming 仍然是传输受限的。
+        // Stream count is part of the allocation contract; the path planner
+        // resolves it before construction. Direct callers retain one stream.
         let hist_stream_count = match config.hist_streams {
             Some(n) => n,
             None => match std::env::var("FB_CUDA_HIST_STREAMS") {
                 Ok(v) => v
                     .parse::<usize>()
                     .context("FB_CUDA_HIST_STREAMS must be an integer")?,
-                // **按模式选,两档的证据完全不同**(2026-09-05 重测;
-                // 旧的「两种模式都不值」是在**全局 staging 锁**下量的,
-                // 那把锁把所有 slot 串成一条,双流结构上不可能有收益。
-                // 锁去掉之后两边都变了 —— 这就是「负结论只在其前提下成立」):
-                //
-                // | 配置 | s=1 | s=2 | 第二条 stream |
-                // |---|---:|---:|---:|
-                // | HIGGS resident | **0.112** | 0.114 | 打平,−280 MB 更划算 |
-                // | wide resident | **0.706** | 0.709 | 打平 |
-                // | HIGGS streaming | 0.6185 | **0.512** | **−17.2%**,+282 MB |
-                // | wide streaming | 3.6965 | **3.2195** | **−12.9%**,+307 MB |
-                //
-                // resident:块 H2D 只在 warm-up 发生,稳态几乎没有可重叠的
-                // 传输,所以是打平 —— 打平不值 280 MB,保持单流。
-                // (旧记录说 wide resident 单流快 4.2%;那 4.2% 里有一部分
-                // 其实是锁在惩罚双流那一档,现在是干净的打平。)
-                //
-                // streaming:仍然是传输受限的,双流拿到稳定的两位数收益,
-                // 而**显存规划器已经把 stream 数算进 `per_col_bytes`**,
-                // 预算不够时它会自己收窄列块或明确失败,所以默认双流
-                // 不会让本来能训的数据训不了 —— 能力边界由规划器守,
-                // 不是由这个默认值守。
-                // **按执行路径分派,不是按 resident/streaming 分派:**
-                //
-                //   行主序分块 streaming → 2
-                //   列主序 streaming     → 1
-                //   resident             → 1
-                //
-                // 机制:**行主序是分块上传的** —— 每块切成多个 chunk 依次
-                // 上传 / 转置 / 建直方图,独立的 slot 之间因此有东西可以
-                // 流水起来。第二条流让**本来就要做的传输**真正并发,
-                // 而不是为了 overlap 再复制一遍数据(后者正是 pinned 被
-                // 否掉的原因)。收益随 chunk 数走:
-                // c=8 **−28%**、c=28 −17%、c=32 −13%。
-                //
-                // **列主序一块一次大 memcpy,没有 chunk 可交错,实测打平**
-                // (wide c=64:3.237 vs 3.230)—— 那一档 +307 MB 换 0.2%。
-                // resident 同样打平(HIGGS 0.112/0.114、wide 0.706/0.709),
-                // 稳态几乎没有块 H2D 可重叠。
-                //
-                // 显存代价:+282 MB(HIGGS)/ +307 MB(wide),全是列块
-                // buffer 翻倍。规划器 `resolve_gpu_streaming_plan` 用同一条
-                // 判据预测这个决定,并在第二条流会把块宽夹到拐点以下时
-                // 降回单流(拐点 −42.6% 比第二条流值钱)。
-                Err(_) if resident_block_count == 0 && row_major => 2,
                 Err(_) => 1,
             },
         };
@@ -1245,69 +1095,6 @@ impl GpuTrainCtx {
             None
         };
 
-        // 行主序转置暂存:每个 slot 一份,与 planner 共用分配公式。
-        // 以前是全局一块 32 MiB 配一把 `self.lock()`,而那把锁一直持有到
-        // `stream.synchronize()`,把所有 slot 的上传串成一条 —— 多流之下
-        // 重叠因此**结构上不可能出现**。现在把同一份预算切给每个 slot,
-        // 超过八个 slot 时 4 MiB 下限会提高总量,由 planner 同步计入。
-        let rm_slot_count = hist_stream_count + resident_block_count;
-        // pinned 模式要两块轮转,所以把**同一份**每-slot 预算切成两半,
-        // device 总量不变;多出来的只有 pinned host 内存(单独登记)。
-        let rm_bufs = if row_major && use_pinned { 2usize } else { 1 };
-        let rm_chunk_rows = if row_major {
-            crate::gpu_mem_plan::row_major_stage_rows(
-                n_rows as u64,
-                max_block_feats as u64,
-                rm_slot_count as u64,
-                rm_bufs as u64,
-                RM_STAGE_BYTES as u64,
-            ) as usize
-        } else {
-            0
-        };
-        let rm_stage_len = rm_chunk_rows * max_block_feats;
-        let alloc_rm_staging = |stream: &Arc<CudaStream>,
-                                what: &str|
-         -> Result<Option<RmStaging>> {
-            if !row_major {
-                return Ok(None);
-            }
-            let mut dev = Vec::with_capacity(rm_bufs);
-            let mut host = Vec::with_capacity(if use_pinned { rm_bufs } else { 0 });
-            for b in 0..rm_bufs {
-                dev.push(
-                    stream
-                        .alloc_zeros::<u8>(rm_stage_len.max(1))
-                        .with_context(|| format!("allocate {what} row-major staging {b}"))?,
-                );
-                if use_pinned {
-                    // ⚠️ 双 buffer 轮转的**全部**安全性都压在
-                    // `PinnedHostSlice` 自带的那个 event 上:H2D 之后由
-                    // cudarc 记录,下一轮 `as_mut_slice()` 等它。
-                    // 但 cudarc 只在 `is_managing_stream_synchronization()`
-                    // 为真时才**真的记录**;为假时那个 event 从未被 record,
-                    // `synchronize()` 于是立刻返回 —— host 会覆写一块仍在
-                    // 被 DMA 读的 buffer,而且**静默**,只表现为偶发错值。
-                    // 这个前提必须显式检查,不能默认它一直成立。
-                    ensure!(
-                            state.ctx.is_managing_stream_synchronization(),
-                            "row-major pinned double buffering requires cudarc stream event tracking, \
-                         but it is disabled on this context; continuing would silently overwrite in-flight pinned buffers"
-                        );
-                    host.push(
-                        unsafe { state.ctx.alloc_pinned::<u8>(rm_stage_len.max(1)) }.with_context(
-                            || format!("allocate {what} row-major pinned staging {b}"),
-                        )?,
-                    );
-                }
-            }
-            Ok(Some(RmStaging {
-                dev,
-                host,
-                chunk_rows: rm_chunk_rows,
-            }))
-        };
-
         let mut hist_slots = Vec::with_capacity(hist_stream_count);
         for (slot, hist_stream) in hist_streams.into_iter().enumerate() {
             let bins = hist_stream
@@ -1325,10 +1112,8 @@ impl GpuTrainCtx {
             let batch_idx = hist_stream
                 .alloc_zeros::<u32>(batch_idx_len)
                 .with_context(|| format!("allocate histogram slot {slot} batch index"))?;
-            // 只有**列主序**那条臂会用 `bins_host`;行主序有自己的分块 pinned
-            // 暂存(`RmStaging.host`),再留一份整块大小的 pinned buffer 是
-            // 纯浪费(而且是按最宽块 × 行数算的,不小)。
-            let bins_host = if use_pinned && !row_major {
+            // Optional pinned upload buffer for this independent slot.
+            let bins_host = if use_pinned {
                 Some(
                     unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }.with_context(
                         || format!("allocate histogram slot {slot} pinned staging"),
@@ -1345,7 +1130,6 @@ impl GpuTrainCtx {
                 .ctx
                 .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
                 .with_context(|| format!("create histogram slot {slot} end event"))?;
-            let rm_stage = alloc_rm_staging(&hist_stream, &format!("histogram slot {slot}"))?;
             hist_slots.push(Mutex::new(GpuHistBuffers {
                 split_cache: None,
                 stream: hist_stream,
@@ -1359,7 +1143,6 @@ impl GpuTrainCtx {
                 batch_idx,
                 hist_host: Vec::new(),
                 bins_host,
-                rm_stage,
                 start_event,
                 end_event,
                 resident_feats: 0,
@@ -1395,13 +1178,12 @@ impl GpuTrainCtx {
             let end_event = state
                 .ctx
                 .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-            let rm_stage = alloc_rm_staging(&hist_stream, &format!("resident block {cache_slot}"))?;
             // ⚠️ resident slot 也要 pinned staging:它同样要**加载一次**自己的
             // 块,走的是和 streaming slot 完全相同的 `block_session`。
             // 以前这里恒为 None,于是 `FB_CUDA_PINNED=1` + 常驻块直接报
             // 「pinned 列块 staging 未分配」—— 在 residency 还是 env-only、
             // 默认 0 的年代没人同时打开这两个开关,所以一直没暴露。
-            let bins_host = if use_pinned && !row_major {
+            let bins_host = if use_pinned {
                 Some(
                     unsafe { state.ctx.alloc_pinned::<u8>(bins_len.max(1)) }.with_context(
                         || format!("allocate resident block {cache_slot} pinned staging"),
@@ -1434,7 +1216,6 @@ impl GpuTrainCtx {
                 selected_host: Vec::new(),
                 hist_host: Vec::new(),
                 bins_host,
-                rm_stage,
                 start_event,
                 end_event,
                 resident_feats: 0,
@@ -1526,7 +1307,7 @@ impl GpuTrainCtx {
         } else {
             None
         };
-        // 行主序转置的落地区:H2D 先进这里(列主序),转置后写进 slot.bins
+
         let budget = GpuMemoryBudget {
             fast_math_bytes: if fast_math {
                 n_rows * 4 * 2 + crate::gpu_mem_plan::FAST_QUANTILE_SCRATCH_BYTES as usize
@@ -1535,11 +1316,6 @@ impl GpuTrainCtx {
             } + fast_weight_bytes,
             multiclass_bytes,
             rank_bytes,
-            rm_stage_bytes: if row_major {
-                rm_stage_len * rm_bufs * rm_slot_count
-            } else {
-                0
-            },
             hist_streams: hist_stream_count + resident_block_count,
             gpair_bytes: n_rows * 2 * 8,
             row_idx_bytes: n_rows * 4,
@@ -1611,24 +1387,14 @@ impl GpuTrainCtx {
                 * (hist_stream_count + resident_block_count),
             prediction_bytes: n_rows * 4,
         };
-        // ⚠️ **预算必须report实际分配的东西,不能按公式猜。**
-        // 列块 staging 只在**列主序 + pinned** 下存在,而且 streaming slot 和
-        // resident slot 各一份;行主序那条路一份都不分配,改用自己的分块
-        // pinned 暂存(每 slot 两块)。之前这里恒按 `use_pinned × bins_len ×
-        // hist_stream_count` 算,于是行主序下报了 160 MB 根本没分配的内存,
-        // 同时把真正分配了的行主序暂存漏掉 —— 两个方向都错。
-        let pinned_col_slots = if use_pinned && !row_major {
+        // Price the pinned block buffer in every allocation slot.
+        let pinned_col_slots = if use_pinned {
             hist_stream_count + resident_block_count
         } else {
             0
         };
         let host_budget = GpuHostMemoryBudget {
             block_bins_bytes: pinned_col_slots * bins_len.max(1),
-            rm_stage_bytes: if use_pinned && row_major {
-                rm_stage_len.max(1) * rm_bufs * rm_slot_count
-            } else {
-                0
-            },
             gpair_bytes: usize::from(use_pinned) * n_rows * 2 * 8,
             split_packets_bytes: if split_cache_enabled {
                 resident_block_count
@@ -1660,9 +1426,6 @@ impl GpuTrainCtx {
             split_nodes_fn,
             split_features_cat_fn,
             split_nodes_cat_fn,
-            rm_transpose_fn,
-            rm_hist_fn,
-            rm_count_fn,
             apply_grad_fn,
             mc_stats_fn,
             mc_grad_fn,
@@ -1697,7 +1460,6 @@ impl GpuTrainCtx {
             config,
             max_bins_per_tile,
             hist_nodes_per_batch,
-            rm_chunk_rows,
             n_rows,
             partition_threads,
             timing,
@@ -1793,11 +1555,7 @@ impl GpuTrainCtx {
             self.config.threads_per_block,
         ) + if self.hist_fused_r4_fn.is_some() { " rows_per_thread=4" } else { " rows_per_thread=1" }
             + &format!(" hist_nodes_per_batch={}", if self.hist_batched_fn.is_some() { self.hist_nodes_per_batch } else { 1 })
-            + if self.rm_hist_fn.is_some() {
-                " layout_gpu=row_major hist_map=row_per_lane"
-            } else {
-                " layout_gpu=col_major hist_map=row_per_lane"
-            }
+            + " layout_gpu=col_major hist_map=row_per_lane"
             + " partition=resident_block_batched partition_batch_cap=32"
             + match self.gpu_math {
                 crate::types::GpuMath::Exact => " gpu_math=exact",
@@ -1820,7 +1578,7 @@ impl GpuTrainCtx {
                 (crate::types::GpuMath::Exact, false) => " subsample=host",
             }
             // ⚠️ 这一段回显的是**列块 H2D 实际执行的那条路**,不是
-            // `use_pinned` 这个字段。两者曾经不一致:行主序(默认)臂
+
             // 根本没有 pinned 分支,于是 `FB_CUDA_PINNED=1` 那一档跟
             // 对照组跑的是同一条路,量出来的差异全是噪声。
             // **A/B 脚本 grep 的必须是这里,不是环境变量。**
@@ -1844,16 +1602,7 @@ impl GpuTrainCtx {
                 self.n_blocks,
                 self.n_blocks.saturating_sub(self.resident_block_count),
             )
-            + &format!(
-                " block_upload={} rm_stage_per_slot={}",
-                match (self.rm_transpose_fn.is_some(), self.use_pinned) {
-                    (true, true) => "rm_chunked_pinned_async_x2",
-                    (true, false) => "rm_chunked_pageable",
-                    (false, true) => "colmajor_pinned",
-                    (false, false) => "colmajor_pageable",
-                },
-                self.rm_chunk_rows,
-            )
+            + &format!(" block_upload={}", if self.use_pinned { "colmajor_pinned" } else { "colmajor_pageable" })
             + &format!(" max_bins_per_tile={}", self.max_bins_per_tile)
             + &format!(" categorical_split={}",
                 if self.split_features_cat_fn.is_some() { "device_cache" } else { "none" })
@@ -1883,7 +1632,7 @@ impl GpuTrainCtx {
     /// Compact selected-feature histograms are available only on the normal
     /// batched column-major path. Bucket profiling keeps the legacy kernels.
     pub fn supports_compact_column_histogram(&self) -> bool {
-        self.rm_hist_fn.is_none() && self.hist_batched_fn.is_some()
+        self.hist_batched_fn.is_some()
     }
 
     pub fn hist_stream_count(&self) -> usize {
@@ -3337,9 +3086,9 @@ impl GpuTrainCtx {
         // (只含采样行),所以这里不能再要求等于训练行数。
         //
         // ⚠️ 但仍然要卡上界:比训练行数还多一定是算错了。
-        // 行主序 kernel 不用 `n_rows` 当 stride(它按 `row * n_feats` 寻址),
+
         // 所以少行数是安全的;列主序参照臂会用它当 stride,因此那条路上
-        // 压实是关掉的(见 train.rs 里只在 streaming + 行主序时压实)。
+
         if block_n_rows > self.n_rows {
             bail!(
                 "column block row count {block_n_rows} exceeds training row count {}",
@@ -3369,11 +3118,10 @@ impl GpuTrainCtx {
                 bail!("colsample local features must be strictly increasing and less than the physical n_feats");
             }
         }
-        let column_major = self.rm_transpose_fn.is_none();
         // Bucket profiling uses the legacy full-width column-major kernels.
         // They cannot consume a selected-index map; sampling is still applied
         // by host split enumeration. Do not validate that map as compact ABI.
-        let selected_local = if column_major && self.hist_batched_fn.is_none() {
+        let selected_local = if self.hist_batched_fn.is_none() {
             anyhow::ensure!(
                 hist_n_feats == n_feats,
                 "legacy column-major histogram requires physical full-width offsets"
@@ -3382,17 +3130,15 @@ impl GpuTrainCtx {
         } else {
             selected_local
         };
-        if column_major {
-            if let Some(selected) = selected_local {
-                if selected.len() != hist_n_feats {
-                    bail!("column-major selected_local must equal the compact histogram feature count");
-                }
-            } else if hist_n_feats != n_feats {
-                bail!("without selected_local the histogram feature count must equal the physical n_feats");
+
+        if let Some(selected) = selected_local {
+            if selected.len() != hist_n_feats {
+                bail!("column-major selected_local must equal the compact histogram feature count");
             }
         } else if hist_n_feats != n_feats {
-            bail!("row-major histogram offsets must keep the full physical width");
+            bail!("without selected_local the histogram feature count must equal the physical n_feats");
         }
+
         let n_hist = feat_offsets[hist_n_feats] as usize;
         // 独立入口每次调用都全量扫一遍 bin 范围;那是 O(行数 × 特征数),
         // 和 kernel 本身一个量级,接进训练循环就不能每块都付。
@@ -3403,11 +3149,8 @@ impl GpuTrainCtx {
         debug_assert!(
             block_payload.is_none()
                 || (0..hist_n_feats).all(|hist_feat| {
-                    let physical_feat = if column_major {
-                        selected_local.map_or(hist_feat, |selected| selected[hist_feat])
-                    } else {
-                        hist_feat
-                    };
+                    let physical_feat =
+                        selected_local.map_or(hist_feat, |selected| selected[hist_feat]);
                     let n_bins = feat_offsets[hist_feat + 1] - feat_offsets[hist_feat];
                     block_data[physical_feat * block_n_rows..(physical_feat + 1) * block_n_rows]
                         .iter()
@@ -3457,23 +3200,10 @@ impl GpuTrainCtx {
             return Ok(None);
         }
         let selection_active = selected_local.is_some_and(|selected| selected.len() < n_feats);
-        let row_major_feat_mask = if selection_active {
-            let mut mask = 0u32;
-            for &feat in selected_local.expect("selection_active implies selected_local") {
-                if feat < 32 {
-                    mask |= 1u32 << feat;
-                }
-            }
-            mask
-        } else {
-            !0u32
-        };
         // 这里是唯一一次量化数据的 H2D。块本身在调用方的 `with_block`
         // 闭包结束时就还回去了,device 上留下的只是 slot 的可覆写 buffer。
-        // 行主序的 pinned 落地在下面的分块循环里做(`RmStaging.host`),
-        // 这里这次预拷贝**只服务列主序那条臂**。不加这个判据的话,行主序
-        // 下会白白把整块再搬进一个根本不会被读的 buffer。
-        if self.use_pinned && !cache_hit && self.rm_transpose_fn.is_none() {
+
+        if self.use_pinned && !cache_hit {
             let host = slot
                 .bins_host
                 .as_mut()
@@ -3488,129 +3218,26 @@ impl GpuTrainCtx {
         if !cache_hit {
             {
                 let GpuHistBuffers {
-                    bins,
-                    bins_host,
-                    rm_stage,
-                    ..
+                    bins, bins_host, ..
                 } = &mut *slot;
-                // 行主序原型:H2D 仍然是**原封不动的列主序**(host / Parquet /
-                // Arrow / 量化 cache / FFI 全不动),只是先落到暂存区,再在
-                // device 上转置一次进 slot.bins。转置**每个 resident 块只做一次**,
-                // 之后所有层、所有轮直接复用 —— 这是能不能摊薄的关键。
-                match self.rm_transpose_fn.as_ref() {
-                    Some(tfn) => {
-                        // **按行分块**上传 + 转置,暂存区因此和列块大小无关。
-                        // 每块的列主序源数据在 host 上是 n_feats 段、段内连续,
-                        // 所以一个 chunk 要 n_feats 次 H2D;这只在 warm-up 发生
-                        // (resident 块每块一次),之后全是 cache hit。
-                        // ⚠️ 这里**没有** `self.lock()`。暂存区是 slot 自己的,
-                        // 所以下面的 `synchronize()` 只等自己这条流 —— 全局锁
-                        // 曾经把它变成"等所有流",多流重叠因此结构上不可能。
-                        let staging = rm_stage
+
+                // Upload the original column-major cache directly; no layout
+                // staging or transpose (see the removal decision above).
+                let mut bins_view = bins.slice_mut(..block_data.len());
+                if self.use_pinned {
+                    let pinned = PinnedPrefix {
+                        inner: bins_host
                             .as_mut()
-                            .context("row-major staging not allocated")?;
-                        let pinned = staging.pinned();
-                        let n_bufs = staging.dev.len();
-                        let n_rows_total = block_n_rows;
-                        let chunk = staging.chunk_rows.max(1);
-                        let n_feats_u =
-                            u32::try_from(n_feats).context("feature count exceeds u32")?;
-                        let mut r0 = 0usize;
-                        let mut turn = 0usize;
-                        while r0 < n_rows_total {
-                            let r1 = (r0 + chunk).min(n_rows_total);
-                            let len = r1 - r0;
-                            let b = turn % n_bufs;
-                            if pinned {
-                                // ⚠️ `as_mut_slice()` 只等**这一块**自己的 event,
-                                // 不是整条流。所以上一块的 H2D + 转置仍在飞,
-                                // host 这边已经可以填下一块 —— 重叠就在这里。
-                                // 换成 `hist_stream.synchronize()` 会当场毁掉它。
-                                let hbuf = staging.host[b]
-                                    .as_mut_slice()
-                                    .context("access row-major pinned staging")?;
-                                for f in 0..n_feats {
-                                    let src =
-                                        &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
-                                    hbuf[f * len..(f + 1) * len].copy_from_slice(src);
-                                }
-                                // pinned 源 → 这一次 `cuMemcpyHtoDAsync` 才**真的**异步,
-                                // 而且整块只发一次,不是 n_feats 次。
-                                let src = PinnedPrefix {
-                                    inner: &mut staging.host[b],
-                                    len: len * n_feats,
-                                };
-                                let mut dst = staging.dev[b].slice_mut(..len * n_feats);
-                                hist_stream
-                                    .memcpy_htod(&src, &mut dst)
-                                    .context("quantized column block H2D (row-major pinned)")?;
-                            } else {
-                                for f in 0..n_feats {
-                                    let src =
-                                        &block_data[f * n_rows_total + r0..f * n_rows_total + r1];
-                                    let mut dst = staging.dev[b].slice_mut(f * len..(f + 1) * len);
-                                    hist_stream.memcpy_htod(src, &mut dst).context(
-                                        "quantized column block H2D (row-major chunked)",
-                                    )?;
-                                }
-                            }
-                            let src = staging.dev[b].slice(..len * n_feats);
-                            let mut dst = bins.slice_mut(r0 * n_feats..r1 * n_feats);
-                            let len_u =
-                                u32::try_from(len).context("chunk row count exceeds u32")?;
-                            let cfg = LaunchConfig {
-                                grid_dim: (len_u.div_ceil(32), n_feats_u.div_ceil(32), 1),
-                                block_dim: (32, 32, 1),
-                                shared_mem_bytes: 0,
-                            };
-                            let mut lb = hist_stream.launch_builder(tfn);
-                            lb.arg(&src).arg(&mut dst).arg(&len_u).arg(&n_feats_u);
-                            unsafe { lb.launch(cfg) }
-                                .context("launch transpose_bins_to_row_major")?;
-                            // ⚠️ 暂存区下一个 chunk 就要覆写,而转置是异步的。
-                            // **enqueue 完成不等于 buffer 可复用。**
-                            //
-                            // 试过删掉它:同流顺序**确实**保证了正确性(暂存区
-                            // 已经是 per-slot,一个 slot 只有一条流),但墙钟上
-                            // 单流只快 1.2~1.5%(噪声量级),而**双流反而变慢**
-                            // (HIGGS 0.481 → 0.546、wide 3.220 → 3.365)——
-                            // 少了这个节流,两条流的可分页 H2D 互相抢 driver 的
-                            // 暂存池。所以保留:它不是双流收益的来源
-                            //(那个假设已被这次实测推翻),删了也不划算。
-                            if !pinned {
-                                hist_stream
-                                    .synchronize()
-                                    .context("wait for row-major transpose chunk")?;
-                            }
-                            r0 = r1;
-                            turn += 1;
-                        }
-                        if pinned {
-                            // 块级收尾:两块暂存都要在离开前退休,否则下一块的
-                            // host 填充会覆写仍在被读的 pinned buffer。
-                            hist_stream
-                                .synchronize()
-                                .context("wait for row-major pinned drain")?;
-                        }
-                    }
-                    None => {
-                        let mut bins_view = bins.slice_mut(..block_data.len());
-                        if self.use_pinned {
-                            let pinned = PinnedPrefix {
-                                inner: bins_host
-                                    .as_mut()
-                                    .context("pinned column-block staging not allocated")?,
-                                len: block_data.len(),
-                            };
-                            hist_stream
-                                .memcpy_htod(&pinned, &mut bins_view)
-                                .context("quantized column block H2D")?;
-                        } else {
-                            hist_stream
-                                .memcpy_htod(block_data, &mut bins_view)
-                                .context("quantized column block H2D")?;
-                        }
-                    }
+                            .context("pinned column-block staging not allocated")?,
+                        len: block_data.len(),
+                    };
+                    hist_stream
+                        .memcpy_htod(&pinned, &mut bins_view)
+                        .context("quantized column block H2D")?;
+                } else {
+                    hist_stream
+                        .memcpy_htod(block_data, &mut bins_view)
+                        .context("quantized column block H2D")?;
                 }
             }
             if block_index < self.resident_block_count {
@@ -3623,9 +3250,9 @@ impl GpuTrainCtx {
         }
         let metadata_shape = (block_index, block_n_rows, n_feats);
         let same_shape = slot.metadata_shape == Some(metadata_shape);
-        // Row-major kernels consume the scalar mask, never the device index map.
-        // Keep the map only for the normal column-major compact ABI.
-        let selected = if selection_active && column_major {
+        // Refresh the compact logical-to-physical feature map when sampling
+        // changes, independently of the immutable resident payload.
+        let selected = if selection_active {
             selected_local.expect("selection_active implies selected_local")
         } else {
             &[]
@@ -3689,7 +3316,6 @@ impl GpuTrainCtx {
             n_feats: hist_n_feats,
             n_hist,
             selection_active,
-            row_major_feat_mask,
             timing,
             feature_tiles: 0,
         }))
@@ -3728,25 +3354,19 @@ impl GpuTrainCtx {
         if slot.resident_block != Some(block_index) {
             return Ok(None);
         }
-        // ⚠️ 两种布局的越界判据不同,不能共用一个:
-        // 列主序取的是连续一列 `[feat*n_rows, (feat+1)*n_rows)`;
-        // 行主序按 `row * n_feats + feat` 寻址,约束是 `feat < n_feats`。
         let feats = slot.resident_feats;
         if feats == 0 || feats > slot.bins.len() / self.n_rows.max(1) {
             bail!("resident block {block_index} feature count {feats} does not match its buffer");
         }
-        if self.rm_count_fn.is_some() {
-            if local_feat >= feats {
-                bail!("resident column {local_feat} exceeds block width {feats}");
-            }
-        } else {
-            let end = local_feat
-                .checked_add(1)
-                .and_then(|f| f.checked_mul(self.n_rows))
-                .context("resident column offset overflow")?;
-            if end > slot.bins.len() {
-                bail!("resident column {local_feat} exceeds the block buffer");
-            }
+        if local_feat >= feats {
+            bail!("resident column {local_feat} exceeds block width {feats}");
+        }
+        let end = local_feat
+            .checked_add(1)
+            .and_then(|f| f.checked_mul(self.n_rows))
+            .context("resident column offset overflow")?;
+        if end > slot.bins.len() {
+            bail!("resident column {local_feat} exceeds the block buffer");
         }
         self.echo_part_col_source(true);
         let buf = self.lock()?;
@@ -3909,7 +3529,6 @@ pub struct GpuBlockSession<'a> {
     n_feats: usize,
     n_hist: usize,
     selection_active: bool,
-    row_major_feat_mask: u32,
     timing: GpuSegmentTiming,
     feature_tiles: usize,
 }
@@ -4325,8 +3944,7 @@ impl GpuBlockSession<'_> {
     /// 是 memcpy。
     ///
     /// 调用方保证 `spans.len() == outs.len()`,且不超过 `hist_nodes_per_batch`。
-    /// Column-major consumes a compact logical feature list; row-major keeps
-    /// its scalar mask ABI while retaining the full output shape.
+    /// Column-major consumes a compact logical feature list.
     pub fn histogram_device_batch(
         &mut self,
         spans: &[GpuRowSpan],
@@ -4357,21 +3975,13 @@ impl GpuBlockSession<'_> {
 
     /// Enqueue one batched histogram build without copying the result to host.
     pub(super) fn produce_histogram_device_batch(&mut self, spans: &[GpuRowSpan]) -> Result<()> {
-        // Both layouts use the same R=4 launch geometry: each block covers
-        // threads_per_block * 4 rows. The packed-index ABI changes feature
-        // addressing, not node block boundaries.
-        let row_major = self.ctx.rm_hist_fn.is_some();
-        let batched_fn = if row_major {
-            self.ctx
-                .rm_hist_fn
-                .as_ref()
-                .expect("row_major implies the kernel is loaded")
-        } else {
-            self.ctx
-                .hist_batched_fn
-                .as_ref()
-                .context("histogram batch requires hist_nodes_per_batch > 1")?
-        };
+        // Each block covers threads_per_block * 4 rows. The packed-index ABI
+        // changes feature addressing, not node block boundaries.
+        let batched_fn = self
+            .ctx
+            .hist_batched_fn
+            .as_ref()
+            .context("histogram batch requires the batched column-major kernel")?;
         if spans.len() > self.ctx.hist_nodes_per_batch {
             bail!(
                 "histogram batch: {} nodes exceed capacity {}",
@@ -4394,8 +4004,8 @@ impl GpuBlockSession<'_> {
         // 余数由 kernel 内的 `ok[r]` 边界判断吃掉 —— 所以不再需要
         // 单独的 remainder / tail launch,那 66 个装不满 SM 的小 launch
         // 一并消失。
-        // Both row-major and column-major kernels process four rows per
-        // thread; packed-index metadata does not change rows_per_block.
+        // Four rows per thread; packed-index metadata does not change
+        // rows_per_block.
         let rows_per_block = threads_per_block as usize * 4;
         let mut blk_ptr: Vec<u32> = Vec::with_capacity(n_nodes + 1);
         let mut node_off: Vec<u32> = Vec::with_capacity(n_nodes);
@@ -4542,11 +4152,7 @@ impl GpuBlockSession<'_> {
                 .arg(&batch_idx_view)
                 .arg(&n_nodes_u32)
                 .arg(&hist_stride_u32);
-            if row_major {
-                launch.arg(&self.row_major_feat_mask);
-            } else {
-                launch.arg(&feature_select_view).arg(&selection_active_u32);
-            }
+            launch.arg(&feature_select_view).arg(&selection_active_u32);
             unsafe { launch.launch(cfg) }.context("launch batched histogram")?;
             self.timing.kernel_calls += 1;
         }
@@ -4623,23 +4229,17 @@ impl GpuBlockSession<'_> {
 
     /// 本 session 一次最多能合并多少个节点。1 表示 batching 关闭。
     pub fn hist_nodes_batch_capacity(&self) -> usize {
-        if self.ctx.hist_batched_fn.is_some() || self.ctx.rm_hist_fn.is_some() {
+        if self.ctx.hist_batched_fn.is_some() {
             self.ctx.hist_nodes_per_batch
         } else {
             1
         }
     }
 
-    /// 是否必须走 batched 入口。
-    ///
-    /// ⚠️ 行主序 kernel **只有 batched 这一个入口** —— 逐节点的
-    /// `histogram_device_at_depth` 仍然按列主序寻址 bins。所以哪怕
-    /// `hist_nodes_per_batch == 1`(批里只有一个节点),行主序也必须走
-    /// batched 路径,否则会拿行主序的字节按列主序解释,**静默算错**。
-    /// 这个 bug 被 `gpu_multi_node_batching_crosses_the_batch_boundary`
-    /// 抓到过一次。
+    /// Compact selected features require the batched entry point even when
+    /// hist_nodes_per_batch is one; scalar kernels cannot consume the map.
     pub fn requires_batched_hist(&self) -> bool {
-        self.ctx.rm_hist_fn.is_some() || self.selection_active
+        self.selection_active
     }
 
     pub fn timing(&self) -> GpuSegmentTiming {
@@ -4838,7 +4438,6 @@ impl GpuPartitionSession<'_> {
             }
             let n_nodes = requests.len() as u32;
             let n_rows = self.ctx.n_rows as u32;
-            let row_major = u32::from(self.ctx.rm_count_fn.is_some());
             {
                 let GpuBuffers {
                     rows,
@@ -4879,7 +4478,6 @@ impl GpuPartitionSession<'_> {
                     .arg(&*part_descriptors)
                     .arg(&n_nodes)
                     .arg(&n_rows)
-                    .arg(&row_major)
                     .arg(part_flags)
                     .arg(part_block_counts);
                 unsafe {
@@ -5101,26 +4699,12 @@ impl GpuPartitionSession<'_> {
             // resident 命中就直接看常驻 bins 里的那一列,不用 `part_col`。
             // 两条路给出的都是长度 n_rows 的 `CudaView<u8>`,kernel 侧
             // 完全看不出区别 —— 契约仍是 `const uint8_t* col` + n_rows stride。
-            // 行主序:没有连续的一列,但也**不需要**物化一列 ——
-            // 直接按 active row 算地址 `row * n_feats + feat`。
-            // 代价只随 active row 走,不随 n_rows 走。
-            let rm = self.ctx.rm_count_fn.is_some();
-            let (col_view, rm_feat) = match self.resident.as_ref() {
-                Some((slot, local_feat)) if rm => {
-                    // 用**这个块自己**的宽度,不是 buffer 容量反推的宽度。
-                    let n_feats = slot.resident_feats;
-                    debug_assert!(n_feats > 0 && *local_feat < n_feats);
-                    (
-                        slot.bins.slice(..n_rows_usize * n_feats),
-                        Some((n_feats, *local_feat)),
-                    )
-                }
-                Some((slot, local_feat)) => (
-                    slot.bins
-                        .slice(local_feat * n_rows_usize..(local_feat + 1) * n_rows_usize),
-                    None,
-                ),
-                None => (part_col.slice(..n_rows_usize), None),
+
+            let col_view = match self.resident.as_ref() {
+                Some((slot, local_feat)) => slot
+                    .bins
+                    .slice(local_feat * n_rows_usize..(local_feat + 1) * n_rows_usize),
+                None => part_col.slice(..n_rows_usize),
             };
             let rows_view = rows_dev.slice(span.offset..span.offset + span.len);
             // Scalar fallback immediately consumes prefix scratch. Batches use
@@ -5132,47 +4716,22 @@ impl GpuPartitionSession<'_> {
                 block_dim: (threads, 1, 1),
                 shared_mem_bytes: threads * 4,
             };
-            match rm_feat {
-                Some((n_feats, feat)) => {
-                    let n_feats_u32 =
-                        u32::try_from(n_feats).context("column block feature count exceeds u32")?;
-                    let feat_u32 = u32::try_from(feat).context("column index exceeds u32")?;
-                    let rm_fn = self
-                        .ctx
-                        .rm_count_fn
-                        .as_ref()
-                        .expect("rm_feat implies the kernel is loaded");
-                    let mut launch = self.ctx.stream.launch_builder(rm_fn);
-                    launch
-                        .arg(&col_view)
-                        .arg(&n_feats_u32)
-                        .arg(&feat_u32)
-                        .arg(&rows_view)
-                        .arg(&n_selected)
-                        .arg(&split_bin)
-                        .arg(&missing_left_u32)
-                        .arg(&mut flags_view)
-                        .arg(&mut counts_view)
-                        .arg(&*part_descriptors);
-                    unsafe { launch.launch(cfg) }.context("launch partition_count_rm")?;
-                }
-                None => {
-                    let mut launch = self.ctx.stream.launch_builder(&self.ctx.count_fn);
-                    launch
-                        .arg(&col_view)
-                        .arg(&rows_view)
-                        .arg(&n_rows_u32)
-                        .arg(&n_selected)
-                        .arg(&split_bin)
-                        .arg(&missing_left_u32)
-                        .arg(&mut flags_view)
-                        .arg(&mut counts_view)
-                        .arg(&*part_descriptors);
-                    // 行下标已在上面验过范围,列 buffer 就是本层选中的整列,
-                    // 三个输出 view 长度都按 n_selected / n_blocks 裁好。
-                    unsafe { launch.launch(cfg) }.context("launch partition_count")?;
-                }
-            }
+
+            let mut launch = self.ctx.stream.launch_builder(&self.ctx.count_fn);
+            launch
+                .arg(&col_view)
+                .arg(&rows_view)
+                .arg(&n_rows_u32)
+                .arg(&n_selected)
+                .arg(&split_bin)
+                .arg(&missing_left_u32)
+                .arg(&mut flags_view)
+                .arg(&mut counts_view)
+                .arg(&*part_descriptors);
+            // 行下标已在上面验过范围,列 buffer 就是本层选中的整列,
+            // 三个输出 view 长度都按 n_selected / n_blocks 裁好。
+            unsafe { launch.launch(cfg) }.context("launch partition_count")?;
+
             self.timing.kernel_calls += 1;
         }
         {

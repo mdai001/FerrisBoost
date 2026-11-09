@@ -306,8 +306,7 @@ fn run_batch(
 #[test]
 fn resident_partition_batch_matches_stable_cpu_rows_and_rejects_invalid_levels() {
     let _gpu_guard = GPU_PARTITION_TEST_LOCK.lock().unwrap();
-    // The harness runs this single GPU test in isolation. Layout variants are
-    // selected externally: the default column-major mode and FB_ROW_MAJOR=1.
+    // The harness runs this column-major GPU test in isolation.
     let bins = bins_for(N_ROWS, N_FEATURES);
     let ctx = make_context(N_ROWS, N_FEATURES, 1, 1);
     assert_partition_scratch_budget(&ctx, N_ROWS);
@@ -547,6 +546,9 @@ fn resident_partition_batch_matches_stable_cpu_rows_and_rejects_invalid_levels()
     let narrow_bins = bins_for(N_ROWS, 2);
     seed_resident(&narrow_ctx, 1, N_ROWS, 2, &narrow_bins);
     narrow_ctx.begin_tree_rows().unwrap();
+    // The standalone scalar session must reject columns inside the allocation
+    // capacity but outside this physical block, just like the batched path.
+    assert!(narrow_ctx.partition_session_resident(1, 2).is_err());
     {
         let mut session = narrow_ctx
             .partition_session_resident(1, 0)

@@ -5,15 +5,14 @@ byte-identical `gpu_math="exact"` models that also match the CPU, for every
 objective family and the features that touch the histogram / partition / split
 paths (column sampling at all three levels, categorical splits, weights,
 base_margin, init_model continuation, eval sets with early stopping, missing
-values). Both GPU layouts are covered: row-major chunked upload (blocks of at most
-32 features) and column-major (wider blocks), each with a last block narrower than
-the others. `gpu_math="fast"` must be deterministic per plan; it is also checked to
-be plan-invariant (the plan only changes where the quantized bins live, not the
-arithmetic). Every GPU run confirms the executed plan from the runtime `GPU_PATH`
+values). Narrow and wide column-major blocks are covered, each with a last block
+narrower than the others. `gpu_math="fast"` must be deterministic per plan; it is
+also checked to be plan-invariant (the plan only changes where the quantized bins
+live, not the arithmetic). Every GPU run confirms the executed plan from the runtime `GPU_PATH`
 echo, never from the requested configuration.
 
 Budget-driven planning (no resident-block override) and a forced host-cache spill
-are covered too. Larger datasets (multi-chunk row-major upload, auto block width,
+are covered too. Larger datasets (large column-major upload, auto block width,
 observed device memory against the planner estimate) run with FB_SLOW_TESTS=1.
 """
 import os
@@ -52,10 +51,10 @@ slow = pytest.mark.skipif(not SLOW, reason="set FB_SLOW_TESTS=1 for the large st
 
 # Physical geometry, forced with cols_per_block. Both have a narrower last block.
 LAYOUTS = {
-    # 3, 3, 3, 2 -> four row-major blocks
-    "row_major": {"n_feats": 11, "cols_per_block": 3, "blocks": 4},
-    # 33, 33, 4 -> three column-major blocks (wider than the 32-feature row-major limit)
-    "col_major": {"n_feats": 70, "cols_per_block": 33, "blocks": 3},
+    # 3, 3, 3, 2 -> four narrow column-major blocks
+    "narrow": {"n_feats": 11, "cols_per_block": 3, "blocks": 4},
+    # 33, 33, 4 -> three wide column-major blocks
+    "wide": {"n_feats": 70, "cols_per_block": 33, "blocks": 3},
 }
 CAT_FEATURES = (1, 3)  # categorical columns when a case asks for them
 
@@ -178,7 +177,7 @@ def _plans(total):
 
 
 def _check_plan(info, layout, resident, total):
-    assert info["layout"] == layout, info["log"][-1500:]
+    assert info["layout"] == "col_major", info["log"][-1500:]
     assert info["total"] == total
     assert info["resident"] == resident
     assert info["streamed"] == total - resident
@@ -308,7 +307,7 @@ def test_budget_driven_plans_without_override_train_the_cpu_model(tmp_path, capf
     (block width and stream count are pinned so only residency is left to plan),
     so the case does not depend on the device or its free memory.
     """
-    n = 200_000 if layout == "row_major" else 80_000
+    n = 200_000 if layout == "narrow" else 80_000
     path, p, kw, total = _setup(tmp_path, "binary:logistic", layout, n=n, rounds=3,
                                 sampling={"subsample": 0.8, "colsample_bytree": 0.8}, n_cat=1)
     p = {**p, "hist_streams": 1}
@@ -335,7 +334,7 @@ def test_budget_driven_plans_without_override_train_the_cpu_model(tmp_path, capf
 def test_override_over_a_set_budget_raises_before_training(tmp_path, capfd):
     """A user-set gpu_memory_budget is a limit: an explicit resident_blocks that
     needs more memory fails up front; the same override without a budget trains."""
-    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major", n=200_000, rounds=2)
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "narrow", n=200_000, rounds=2)
     p = {**p, "hist_streams": 1}
     estimate = {}
     for resident in (total, 0):
@@ -354,7 +353,7 @@ def test_override_over_a_set_budget_raises_before_training(tmp_path, capfd):
 
 @cuda
 def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd):
-    path, p, kw, total = _setup(tmp_path, "binary:logistic", "row_major",
+    path, p, kw, total = _setup(tmp_path, "binary:logistic", "narrow",
                                 sampling={"subsample": 0.8, "colsample_bytree": 0.7})
     ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu")
     table = pq.read_table(path)
@@ -370,7 +369,7 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
         for resident in (total, 1, 0):
             for spill in ({}, {"cache_budget_bytes": 0}):
                 model, info = _gpu(capfd, {**p, **spill}, src, kw, resident_blocks=resident)
-                _check_plan(info, "row_major", resident, total)
+                _check_plan(info, "narrow", resident, total)
                 assert _bytes(model, tmp_path, "gpu") == ref, (src, resident, spill)
 
 
@@ -380,7 +379,7 @@ def test_gpu_csv_without_cols_per_block_uses_a_default_width(tmp_path, capfd):
     """CSV has no row count before open: without cols_per_block the GPU path uses
     a conservative default width (announced in the log) instead of failing, and
     the model still equals the CPU model."""
-    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "row_major")
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", "narrow")
     p = {k: v for k, v in p.items() if k != "cols_per_block"}
     csv = str(tmp_path / "data.csv")
     pq.read_table(path).to_pandas().to_csv(csv, index=False, na_rep="")
@@ -503,7 +502,7 @@ class _PeakVram:
 @pytest.fixture(scope="module")
 def large_parquet(tmp_path_factory):
     """3M x 23 rows (two categorical): an auto plan of 8-column blocks (8, 8, 7) whose
-    row-major upload takes several chunks per block."""
+    column-major upload uses several reusable allocation slots."""
     n, f = 3_000_000, 23
     rng = np.random.default_rng(0)
     x = rng.normal(size=(n, f)).astype(np.float32)
@@ -560,7 +559,7 @@ def test_large_auto_plans_match_and_stay_within_the_planner_estimate(
 @cuda
 @slow
 @pytest.mark.parametrize("pinned", [False, True])
-def test_large_forced_plans_with_multi_chunk_row_major_upload(
+def test_large_forced_plans_with_large_column_major_upload(
         large_parquet, tmp_path, capfd, monkeypatch, pinned):
     path, ftypes = large_parquet
     if pinned:
@@ -572,11 +571,7 @@ def test_large_forced_plans_with_multi_chunk_row_major_upload(
     for resident in (3, 2, 1, 0):
         for hs in (1, 2):
             model, info = _gpu(capfd, p, path, kw, resident_blocks=resident, hist_streams=hs)
-            _check_plan(info, "row_major", resident, 3)
-            chunk = int(re.search(r"rm_stage_per_slot=(\d+)", info["log"]).group(1))
-            if resident + hs >= 2 or pinned:
-                # the 32 MB staging budget is split across slots (and halved when pinned)
-                assert chunk < 3_000_000, "the case must exercise multi-chunk uploads"
+            _check_plan(info, "narrow", resident, 3)
             assert _bytes(model, tmp_path, "gpu") == ref, (resident, hs, pinned)
 
 
