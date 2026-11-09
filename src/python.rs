@@ -3718,6 +3718,32 @@ fn check_categorical_codes(
     Ok(())
 }
 
+/// `cache_path` / `cache_budget_bytes` configure the quantized column cache,
+/// which only single-file Parquet training builds. Every other input would
+/// ignore them silently, so they are rejected with the reason and the way out.
+fn reject_cache_options(cfg: &Parsed, got: &str, way_out: &str) -> PyResult<()> {
+    let set: Vec<&str> = [
+        ("cache_path", cfg.cache_path.is_some()),
+        ("cache_budget_bytes", cfg.cache_budget_bytes.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    let names = set.join(" and ");
+    let verb = if set.len() == 1 {
+        "supports"
+    } else {
+        "support"
+    };
+    Err(PyValueError::new_err(format!(
+        "{names} {verb} a single Parquet file; got {got} — {way_out} or drop {}",
+        set.join(" / ")
+    )))
+}
+
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
 #[pyfunction]
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
@@ -3748,6 +3774,11 @@ fn train_dense(
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
+    reject_cache_options(
+        &cfg,
+        "in-memory data (numpy / pandas / pyarrow)",
+        "write it to one Parquet file and train on that path",
+    )?;
     let weights: Option<Vec<f32>> = weight
         .map(|w| w.as_slice().map(<[f32]>::to_vec))
         .transpose()?;
@@ -4114,6 +4145,23 @@ fn train_file(
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let paths = resolved.paths.clone();
     let fmt = resolved.format.label();
+    match (fmt, paths.len()) {
+        ("parquet", 1) => {}
+        ("parquet", n) => reject_cache_options(
+            &cfg,
+            &format!("{n} Parquet files"),
+            "merge them into one file",
+        )?,
+        (other, n) => reject_cache_options(
+            &cfg,
+            &format!(
+                "{n} {} file{}",
+                other.to_uppercase(),
+                if n == 1 { "" } else { "s" }
+            ),
+            "convert the data to one Parquet file",
+        )?,
+    }
     let path_disp = paths[0].display().to_string();
     let path = path_disp.as_str();
     // CSV schema inference samples text rows, so keep the result used for
@@ -4445,6 +4493,8 @@ fn train_file(
     // 为多文件重构它不属于 v0.0.1 的范围。
     // ⚠️ 代价要说清楚:多文件走的是量化后常驻内存的 `Dataset` 路径,
     // 和单文件的按需加载不是同一条内存曲线。
+    // The cache options only exist on this path; other inputs were rejected
+    // right after resolve (`reject_cache_options`).
     if fmt == "parquet" && paths.len() == 1 {
         let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         cfg.resolve_monotone(n_features, &names)?;
