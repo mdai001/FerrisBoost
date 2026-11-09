@@ -1550,6 +1550,7 @@ fn predict_files_to_parquet(
             header,
             ingest_workers,
             missing,
+            &model.inner.feature_types,
             model.inner.categories.as_deref(),
             |data, n_rows| {
                 let workers = resolved_predict_workers(
@@ -2365,6 +2366,7 @@ impl PyModel {
                     header,
                     ingest_workers,
                     missing,
+                    &self.inner.feature_types,
                     self.inner.categories.as_deref(),
                     |data, n_rows| {
                         // This batch's slice of the per-row start (row-major

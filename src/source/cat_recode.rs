@@ -25,7 +25,10 @@
 //! categories existed.
 //!
 //! CSV has no dictionaries: a categorical CSV column read as text (see
-//! `csv_source::text_category_features`) is a plain string column here.
+//! `csv_source::cat_reads`) is a plain string column here. A declared
+//! categorical CSV column without a known list is read as text in training
+//! pass 1 and *decided* there from every field ([`Coder::Decide`]): integer
+//! codes when every non-empty field is a number, category names otherwise.
 
 use std::sync::Arc;
 
@@ -109,6 +112,143 @@ enum Coder<'t> {
     Learn(CategoryBuilder),
     /// A known list (a trained model, or a continued model's list).
     Fixed(&'t FeatureCategories),
+    /// Training pass 1 of a declared categorical CSV column without a known
+    /// list, read as text: codes or names is decided from every field.
+    Decide(Box<Decide>),
+}
+
+/// A CSV field as the CSV type inference reads it: `Some(value)` for a
+/// number (an integer or a decimal), `None` for anything else (text).
+///
+/// The rules are Arrow's CSV inference patterns (`-?\d+`, and
+/// `-?((\d*\.\d+|\d+\.\d*)([eE][-+]?\d+)?|\d+([eE][-+]?\d+))`; an integer
+/// of 19+ characters outside `i64` is text), with ASCII digits only. An
+/// integer is converted like an `Int64` column (`i64 as f32`), a decimal like
+/// a `Float64` one, so a column decided as numbers yields the values the
+/// sampled reader used to give it.
+pub(crate) fn csv_number(s: &str) -> Option<f32> {
+    let b = s.as_bytes();
+    let body = b.strip_prefix(b"-").unwrap_or(b);
+    let digits = |from: usize| {
+        body[from..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    };
+    let int = digits(0);
+    if int == body.len() {
+        if int == 0 {
+            return None;
+        }
+        return s.parse::<i64>().ok().map(|v| v as f32);
+    }
+    let mut at = int;
+    let dot = body[at] == b'.';
+    if dot {
+        let frac = digits(at + 1);
+        at += 1 + frac;
+        if int + frac == 0 {
+            return None;
+        }
+    } else if int == 0 {
+        return None;
+    }
+    if at < body.len() {
+        if !matches!(body[at], b'e' | b'E') {
+            return None;
+        }
+        at += 1;
+        if at < body.len() && matches!(body[at], b'+' | b'-') {
+            at += 1;
+        }
+        let exp = digits(at);
+        if exp == 0 || at + exp != body.len() {
+            return None;
+        }
+    } else if !dot {
+        return None;
+    }
+    use arrow::compute::kernels::cast_utils::Parser;
+    arrow::datatypes::Float64Type::parse(s).map(|v| v as f32)
+}
+
+/// Both readings of a [`Coder::Decide`] column, kept side by side over the
+/// whole pass: the names in first-appearance order, and the code scan the
+/// categorical sketch would have made of the numbers.
+pub(crate) struct Decide {
+    names: CategoryBuilder,
+    /// The too-many-categories error, raised only if the column is names.
+    overflow: Option<anyhow::Error>,
+    /// Every non-empty field so far is a number.
+    numeric: bool,
+    /// The `missing` sentinel: a number equal to it is missing.
+    missing: f32,
+    /// Largest valid code, `-1` while none (as the categorical sketch).
+    max_code: i32,
+    /// The first number that is not a valid code.
+    bad: Option<f32>,
+}
+
+/// What pass 1 decided for a [`Coder::Decide`] column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Decided {
+    /// Every field a number: integer codes, no names. The categorical sketch
+    /// state of those codes.
+    Codes { max_code: i32, bad: Option<f32> },
+    /// Category names (codes `0..n` in first-appearance order).
+    Names { n: usize },
+}
+
+impl Decide {
+    fn new(missing: f32) -> Self {
+        Self {
+            names: CategoryBuilder::default(),
+            overflow: None,
+            numeric: true,
+            missing,
+            max_code: -1,
+            bad: None,
+        }
+    }
+
+    fn push(&mut self, s: &str, name: &str) -> Result<()> {
+        if self.overflow.is_none() {
+            if let Err(e) = self.names.intern(s, name) {
+                self.overflow = Some(e);
+            }
+        }
+        if self.numeric {
+            match csv_number(s) {
+                Some(v) if v == self.missing => {}
+                Some(v) if crate::categorical::invalid_code(v) => {
+                    self.bad.get_or_insert(v);
+                }
+                Some(v) => self.max_code = self.max_code.max(v as i32),
+                None => self.numeric = false,
+            }
+        }
+        match (self.numeric, self.overflow.take()) {
+            (false, Some(e)) => Err(e),
+            (true, overflow) => {
+                self.overflow = overflow;
+                Ok(())
+            }
+            (false, None) => Ok(()),
+        }
+    }
+
+    fn decided(&self) -> Decided {
+        if self.numeric {
+            Decided::Codes {
+                max_code: self.max_code,
+                bad: self.bad,
+            }
+        } else {
+            Decided::Names {
+                n: self.names.len(),
+            }
+        }
+    }
 }
 
 struct ColState<'t> {
@@ -123,6 +263,7 @@ impl<'t> ColState<'t> {
         match &mut self.coder {
             Coder::Learn(b) => b.intern(s, name),
             Coder::Fixed(c) => Ok(c.code_of_str(s).unwrap_or(UNSEEN)),
+            Coder::Decide(_) => unreachable!("decided columns are coded by `recode` directly"),
         }
     }
 
@@ -147,6 +288,9 @@ impl<'t> ColState<'t> {
                         (None, _) => MISSING,
                         (Some(v), Coder::Learn(b)) => b.get(v).unwrap_or(UNASSIGNED),
                         (Some(v), Coder::Fixed(c)) => c.code_of_str(v).unwrap_or(UNSEEN),
+                        (Some(_), Coder::Decide(_)) => {
+                            unreachable!("CSV columns have no dictionaries")
+                        }
                     });
                 }
             } else {
@@ -250,7 +394,23 @@ impl<'t> Recoder<'t> {
     /// A learning recoder for training pass 1: categorical features (`flags`)
     /// with a list in `seed` (a continued model) are coded with it; the other
     /// categorical features learn their list from string columns.
+    #[cfg(test)]
     pub(crate) fn learning(flags: &[bool], seed: Option<&'t CategoryTable>) -> Self {
+        Self::learning_deciding(flags, &[], seed, f32::NAN)
+    }
+
+    /// [`Self::learning`] where the features marked in `decide` (declared
+    /// categorical CSV columns without a seeded list, read as text) are
+    /// decided from every field: integer codes when all non-empty fields are
+    /// numbers, else names. Their columns become all-missing for the sketch;
+    /// the caller sets the sketch from [`Self::decided`] after the pass.
+    /// `missing` is the feature sentinel, which a number equal to it is.
+    pub(crate) fn learning_deciding(
+        flags: &[bool],
+        decide: &[bool],
+        seed: Option<&'t CategoryTable>,
+        missing: f32,
+    ) -> Self {
         let features: Vec<Option<ColState<'t>>> = flags
             .iter()
             .enumerate()
@@ -261,6 +421,9 @@ impl<'t> Recoder<'t> {
                 Some(ColState {
                     coder: match seed.and_then(|t| t.get(f)) {
                         Some(c) => Coder::Fixed(c),
+                        None if decide.get(f).copied().unwrap_or(false) => {
+                            Coder::Decide(Box::new(Decide::new(missing)))
+                        }
                         None => Coder::Learn(CategoryBuilder::default()),
                     },
                     cache: None,
@@ -273,8 +436,24 @@ impl<'t> Recoder<'t> {
         }
     }
 
-    /// The learned table: seeded lists plus learned non-empty lists. `None`
-    /// when no feature has a list.
+    /// What pass 1 decided for each decided feature, by feature id.
+    pub(crate) fn decided(&self) -> Vec<(usize, Decided)> {
+        self.features
+            .iter()
+            .enumerate()
+            .filter_map(|(f, s)| match s {
+                Some(ColState {
+                    coder: Coder::Decide(d),
+                    ..
+                }) => Some((f, d.decided())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The learned table: seeded lists plus learned non-empty lists (a
+    /// decided feature has its list only when decided as names). `None` when
+    /// no feature has a list.
     pub(crate) fn into_table(self, n_features: usize) -> Option<CategoryTable> {
         let mut out: Vec<Option<FeatureCategories>> = Vec::with_capacity(n_features);
         let mut states = self.features.into_iter();
@@ -289,6 +468,10 @@ impl<'t> Recoder<'t> {
                     coder: Coder::Learn(b),
                     ..
                 }) => (!b.is_empty()).then(|| b.finish()),
+                Some(ColState {
+                    coder: Coder::Decide(d),
+                    ..
+                }) => (!d.numeric).then(|| d.names.finish()),
             });
         }
         CategoryTable::new(out).non_empty()
@@ -314,6 +497,18 @@ impl<'t> Recoder<'t> {
             let dt = field.data_type();
             let column = batch.column(c);
             let name = field.name().as_str();
+            if let Coder::Decide(d) = &mut state.coder {
+                let s = Strs::of(column.as_ref()).ok_or_else(|| {
+                    anyhow::anyhow!("CSV categorical column {name:?} was not read as text")
+                })?;
+                for i in 0..column.len() {
+                    if let Some(v) = s.get(i) {
+                        d.push(v, name)?;
+                    }
+                }
+                replaced.push((c, Arc::new(Float32Array::new_null(column.len()))));
+                continue;
+            }
             let codes: Option<Vec<f32>> = match dt {
                 DataType::Dictionary(_, v) if is_string(v) || v.is_integer() => {
                     if v.is_integer() && matches!(state.coder, Coder::Learn(_)) {
@@ -535,5 +730,135 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must match"), "{err}");
+    }
+
+    #[test]
+    fn csv_numbers_follow_the_csv_inference_patterns() {
+        for (s, v) in [
+            ("0", 0.0),
+            ("-7", -7.0),
+            ("0012", 12.0),
+            ("1.5", 1.5),
+            ("2.", 2.0),
+            (".25", 0.25),
+            ("-.5", -0.5),
+            ("1e3", 1000.0),
+            ("1.5E-1", 0.15),
+            ("2e+2", 200.0),
+        ] {
+            assert_eq!(csv_number(s), Some(v as f32), "{s}");
+        }
+        for s in [
+            "",
+            "-",
+            ".",
+            "+1",
+            " 1",
+            "1 ",
+            "1e",
+            "e3",
+            "1.5e",
+            "1x",
+            "x",
+            "NaN",
+            "inf",
+            "true",
+            "1,000",
+            "1.2.3",
+            "--1",
+            "\u{0661}",             // Arabic-Indic one: ASCII digits only
+            "99999999999999999999", // outside i64: text, as the inference reads it
+        ] {
+            assert_eq!(csv_number(s), None, "{s:?}");
+        }
+        assert_eq!(csv_number("9223372036854775807"), Some(i64::MAX as f32));
+    }
+
+    fn text(values: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    #[test]
+    fn decided_columns_learn_names_and_codes_side_by_side() {
+        // Feature 0 is numbers in every batch, feature 1 turns to text in the
+        // last batch: codes for 0 (with the code scan), names for 1 in order of
+        // first appearance, the numbers before the text included.
+        let mut r = Recoder::learning_deciding(&[true, true], &[true, true], None, -1.0);
+        let batches = [
+            (
+                vec![Some("3"), None, Some("-1")],
+                vec![Some("2"), Some("10"), None],
+            ),
+            (
+                vec![Some("7"), Some("1.0"), Some("4")],
+                vec![Some("x"), Some("2"), Some("10")],
+            ),
+        ];
+        for (a, b) in batches {
+            let out = r
+                .recode(batch(vec![("a", text(&a)), ("b", text(&b))]), Some)
+                .unwrap();
+            for c in 0..2 {
+                assert_eq!(out.column(c).data_type(), &DataType::Float32);
+                assert_eq!(out.column(c).null_count(), out.num_rows());
+            }
+        }
+        assert_eq!(
+            r.decided(),
+            vec![
+                (
+                    0,
+                    Decided::Codes {
+                        max_code: 7,
+                        bad: None
+                    }
+                ),
+                (1, Decided::Names { n: 3 })
+            ]
+        );
+        let t = r.into_table(2).unwrap();
+        assert!(t.get(0).is_none());
+        assert_eq!(
+            t.get(1).unwrap().values(),
+            &CategoryValues::Str(vec!["2".into(), "10".into(), "x".into()])
+        );
+        // An invalid code is reported only if the column stays numbers.
+        let mut r = Recoder::learning_deciding(&[true, true], &[true, true], None, f32::NAN);
+        let a = [Some("1.5"), Some("2")];
+        let b = [Some("-3"), Some("y")];
+        r.recode(batch(vec![("a", text(&a)), ("b", text(&b))]), Some)
+            .unwrap();
+        assert_eq!(
+            r.decided(),
+            vec![
+                (
+                    0,
+                    Decided::Codes {
+                        max_code: 2,
+                        bad: Some(1.5)
+                    }
+                ),
+                (1, Decided::Names { n: 2 })
+            ]
+        );
+    }
+
+    #[test]
+    fn decided_columns_raise_the_category_limit_only_as_names() {
+        let n = crate::category_names::MAX_CATEGORIES + 1;
+        let codes: Vec<String> = (0..n).map(|i| format!("{:06}", i % 60_000)).collect();
+        let more: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let mut r = Recoder::learning_deciding(&[true], &[true], None, f32::NAN);
+        // Distinct spellings past the limit: fine while every field is a number.
+        for values in [&codes, &more] {
+            let column: Vec<Option<&str>> = values.iter().map(|s| Some(s.as_str())).collect();
+            r.recode(batch(vec![("k", text(&column))]), Some).unwrap();
+        }
+        assert!(matches!(r.decided()[0].1, Decided::Codes { .. }));
+        let err = r
+            .recode(batch(vec![("k", text(&[Some("z")]))]), Some)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than") && err.contains("\"k\""), "{err}");
     }
 }

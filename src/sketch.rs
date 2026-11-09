@@ -95,6 +95,16 @@ impl FeatureSketch {
         }
     }
 
+    /// Set a categorical feature's scan result, made elsewhere (a CSV column
+    /// whose codes or names are decided only at the end of the pass).
+    pub fn set_categorical_scan(&mut self, max_code: i32, bad: Option<f32>) {
+        let cat = self
+            .cat
+            .as_mut()
+            .expect("only a categorical feature has a category scan");
+        *cat = CatState { max_code, bad };
+    }
+
     /// The first invalid category value seen, if this is a categorical feature.
     pub fn invalid_category(&self) -> Option<f32> {
         self.cat.and_then(|c| c.bad)

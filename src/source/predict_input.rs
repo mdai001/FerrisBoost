@@ -69,6 +69,7 @@ where
         csv_has_header,
         ingest_threads,
         f32::NAN,
+        &[],
         None,
         |data, _| {
             let rows = data
@@ -89,7 +90,10 @@ where
 ///
 /// `categories` (the model's category names, indexed by canonical feature id)
 /// re-codes named categorical columns (string dictionaries) by value; a row
-/// holding a category the model does not know is an error.
+/// holding a category the model does not know is an error. `categorical` (the
+/// model's per-feature flags, empty = none) lets CSV read the categorical
+/// features without names as text parsed into codes, so a field that is not a
+/// number is an error naming the file, column and value.
 #[allow(clippy::too_many_arguments)]
 pub fn for_each_projected_contiguous_batch<F>(
     resolved: &ResolvedInput,
@@ -99,6 +103,7 @@ pub fn for_each_projected_contiguous_batch<F>(
     csv_has_header: bool,
     ingest_threads: usize,
     missing: f32,
+    categorical: &[bool],
     categories: Option<&crate::category_names::CategoryTable>,
     mut on_rows: F,
 ) -> Result<usize>
@@ -125,10 +130,12 @@ where
             projected_features,
             csv_has_header,
             ingest_threads,
+            categorical,
             categories,
         )?
     } else {
         let paths = Arc::new(resolved.paths.clone());
+        let flags = Arc::new(categorical.to_vec());
         let names = Arc::new(canonical_feature_names.to_vec());
         let projected = Arc::new(projected_features.to_vec());
         let format = resolved.format;
@@ -145,6 +152,7 @@ where
                     &projected,
                     csv_has_header,
                     1,
+                    &flags,
                     table.as_deref(),
                 )
             },
@@ -174,6 +182,7 @@ fn open_projected(
     projected_features: &[usize],
     csv_has_header: bool,
     ingest_threads: usize,
+    categorical: &[bool],
     categories: Option<&crate::category_names::CategoryTable>,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + 'static>> {
     match format {
@@ -193,14 +202,22 @@ fn open_projected(
         InputFormat::Csv => {
             let (schema, names) = super::csv_source::schema_and_names(path, csv_has_header)?;
             let canonical = bind(&names, canonical_feature_names, canonical_n_features, path)?;
-            // Features with string categories are read as text and re-coded by value.
-            let schema = super::csv_source::prediction_schema(schema, &canonical, categories);
+            // Features with string categories are read as text and re-coded by
+            // value; categorical features without names are text parsed as codes.
+            let (schema, codes) =
+                super::csv_source::prediction_schema(schema, &canonical, categorical, categories);
+            let codes: Arc<[usize]> = projected_features
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| codes.contains(f))
+                .map(|(at, _)| at)
+                .collect();
             let proj = projected_features
                 .iter()
                 .map(|&feature| canonical[feature])
                 .collect::<Vec<_>>();
             let (mask, order) = projection_and_order(&proj);
-            Ok(Box::new(
+            Ok(Box::new(super::csv_source::CheckedCodes::new(
                 super::csv_source::raw_batches_with_nthread(
                     path,
                     schema,
@@ -209,7 +226,9 @@ fn open_projected(
                     ingest_threads,
                 )?
                 .map(move |b| b.map(|b| reorder(&b, &order))),
-            ))
+                path.to_path_buf(),
+                codes,
+            )))
         }
     }
 }

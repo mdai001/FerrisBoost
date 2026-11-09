@@ -424,6 +424,10 @@ impl CategoryBuilder {
         self.values.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
     pub fn finish(self) -> FeatureCategories {
         FeatureCategories {
             values: CategoryValues::Str(self.values),

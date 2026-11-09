@@ -887,11 +887,12 @@ layout, and every later read re-codes by **value**:
 
 CSV has no types, so FerrisBoost infers each column's type from the first
 10,000 records of every file. A column declared `"c"` in `feature_types` is
-read as **text** (category names) when any training file's inferred type for it
-is not a number, and then in every file, so one feature never mixes codes and
-names; a declared column whose fields are all integers keeps them as category
-codes, without names, as before. Text columns that are not declared `"c"` raise
-`ValueError`.
+decided from **every** record of every training file instead, during the first
+pass that also learns the categories: it is read as **text** (category names)
+when any non-empty field is not a number, and then in every file, so one feature
+never mixes codes and names; a declared column whose fields are all numbers
+keeps them as category codes, without names, as before. Text columns that are
+not declared `"c"` raise `ValueError`.
 
 ```python
 # city,x1,label
@@ -917,8 +918,10 @@ model.get_categories()  # [['Oslo', 'Lima', ...], None]
   codes 1 and 2. A model with **integer** categories (trained on pandas integer
   categories) re-codes CSV integers, and plain Parquet integer columns, by value
   too.
-- A column whose sampled records are numbers but whose later records hold text
-  fails to parse: put a text value in the first 10,000 records of the file.
+- Validation and prediction files read the categorical features of a model
+  without category names (trained on integer codes) as codes from every
+  record: a field that is not a number raises `ValueError` naming the file, the
+  column, the value and its row.
 
 #### Integer dictionaries: Arrow tables and Parquet files
 

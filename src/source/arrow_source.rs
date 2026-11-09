@@ -263,6 +263,34 @@ pub(crate) fn build_cuts_and_count_typed(
     missing: f32,
     seed: Option<&crate::category_names::CategoryTable>,
 ) -> anyhow::Result<(BinCuts, usize)> {
+    build_cuts_and_count_deciding(
+        batches,
+        max_bins,
+        nthread,
+        weighted,
+        categorical,
+        &[],
+        missing,
+        seed,
+    )
+}
+
+/// [`build_cuts_and_count_typed`] where the categorical features marked in
+/// `decide` (CSV columns read as text, see `cat_recode::Coder::Decide`) are
+/// decided from every field of the pass: integer codes when every non-empty
+/// field is a number, category names otherwise. Either way the cuts are what
+/// the pass would have built had the column been read that way from the start.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_cuts_and_count_deciding(
+    batches: impl Iterator<Item = anyhow::Result<RecordBatch>>,
+    max_bins: usize,
+    nthread: usize,
+    weighted: bool,
+    categorical: &[bool],
+    decide: &[bool],
+    missing: f32,
+    seed: Option<&crate::category_names::CategoryTable>,
+) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
@@ -310,7 +338,9 @@ pub(crate) fn build_cuts_and_count_typed(
                     None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
                 })
                 .collect();
-            recoder = Some(crate::source::cat_recode::Recoder::learning(&flags, seed));
+            recoder = Some(crate::source::cat_recode::Recoder::learning_deciding(
+                &flags, decide, seed, missing,
+            ));
             feature_names = schema
                 .fields()
                 .iter()
@@ -373,9 +403,27 @@ pub(crate) fn build_cuts_and_count_typed(
     }
     drop(scan_profile);
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
-    let sketches = sketches.ok_or_else(|| {
+    let mut sketches = sketches.ok_or_else(|| {
         crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
     })?;
+    // Decided columns reached the sketch as missing: set the scan each
+    // reading would have made. Names are the codes `0..n`, all seen, and a
+    // code equal to the sentinel is skipped like any value.
+    for (f, decided) in recoder.as_ref().map(|r| r.decided()).unwrap_or_default() {
+        let (max_code, bad) = match decided {
+            crate::source::cat_recode::Decided::Codes { max_code, bad } => (max_code, bad),
+            crate::source::cat_recode::Decided::Names { n } => {
+                let top = n as i32 - 1;
+                let max = if top >= 0 && top as f32 == missing {
+                    top - 1
+                } else {
+                    top
+                };
+                (max, None)
+            }
+        };
+        sketches.per_feat[f].set_categorical_scan(max_code, bad);
+    }
     let n_feats = sketches.n_feats();
     let categories = recoder
         .and_then(|r| r.into_table(n_feats))
@@ -1291,5 +1339,110 @@ mod tests {
         for row in 0..6 {
             assert_eq!(a.bin_at(row, 1), b.bin_at(row, 1), "row {row}");
         }
+    }
+
+    #[test]
+    fn decided_text_columns_build_the_cuts_of_their_reading() {
+        use arrow::array::ArrayRef;
+        // The same fields read as text and decided, or read as numbers / as a
+        // string column from the start, give the same cuts and categories.
+        let col = |name: &str, a: ArrayRef| {
+            RecordBatch::try_from_iter(vec![(name.to_string(), a)]).map_err(anyhow::Error::from)
+        };
+        let as_text = |v: &[Option<&str>]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let bits = |c: &BinCuts| {
+            (
+                c.offsets.clone(),
+                c.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                c.categorical_flags().to_vec(),
+                c.categories().map(|t| {
+                    t.features()
+                        .iter()
+                        .map(|f| f.as_ref().map(|f| format!("{:?}", f.values())))
+                        .collect::<Vec<_>>()
+                }),
+            )
+        };
+        let cases: [(&[Option<&str>], f32); 3] = [
+            (&[Some("3"), None, Some("9"), Some("-1"), Some("0")], -1.0),
+            (&[Some("3"), None, Some("9"), Some("0")], 9.0),
+            (&[Some("3"), None, Some("9"), Some("0")], f32::NAN),
+        ];
+        for (ints, missing) in cases {
+            let as_ints: ArrayRef = Arc::new(Int64Array::from(
+                ints.iter()
+                    .map(|v| v.map(|s| s.parse::<i64>().unwrap()))
+                    .collect::<Vec<_>>(),
+            ));
+            let decided = build_cuts_and_count_deciding(
+                std::iter::once(col("k", as_text(ints))),
+                16,
+                1,
+                false,
+                &[true],
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            let read = build_cuts_and_count_typed(
+                std::iter::once(col("k", as_ints.clone())),
+                16,
+                1,
+                false,
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(bits(&decided), bits(&read));
+            assert!(decided.categories().is_none());
+        }
+        let names: Vec<Option<&str>> = vec![Some("3"), Some("b"), None, Some("3"), Some("a")];
+        for missing in [f32::NAN, 2.0, 1.0] {
+            let decided = build_cuts_and_count_deciding(
+                std::iter::once(col("k", as_text(&names))),
+                16,
+                1,
+                false,
+                &[true],
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            let learned = build_cuts_and_count_typed(
+                std::iter::once(col("k", as_text(&names))),
+                16,
+                1,
+                false,
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(bits(&decided), bits(&learned));
+            assert!(decided.categories().is_some());
+        }
+        // An invalid code of a column decided as numbers is the usual error.
+        let bad: Vec<Option<&str>> = vec![Some("3"), Some("2.5")];
+        let Err(err) = build_cuts_and_count_deciding(
+            std::iter::once(col("k", as_text(&bad))),
+            16,
+            1,
+            false,
+            &[true],
+            &[true],
+            f32::NAN,
+            None,
+        ) else {
+            panic!("an invalid code must be rejected")
+        };
+        let err = err.to_string();
+        assert!(err.contains("2.5") && err.contains("integer"), "{err}");
     }
 }

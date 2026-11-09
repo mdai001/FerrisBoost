@@ -123,16 +123,32 @@ fn check_numeric(schema: &Schema, skip: &str, text: &[usize]) -> anyhow::Result<
     Ok(())
 }
 
-/// A CSV column type the numeric readers decode. `Null` (a column whose
-/// sampled fields are all empty) is neither numbers nor text.
-fn is_number_type(t: &DataType) -> bool {
-    matches!(
-        t,
-        DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 | DataType::Null
-    )
+/// How a canonical feature's CSV column is read, decided before any read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatRead {
+    /// As inferred: numeric features, and categorical features with
+    /// **integer** categories (re-coded by value).
+    Inferred,
+    /// Text, coded by a known list of string categories.
+    Names,
+    /// Training: a declared categorical feature without a known list. Pass 1
+    /// reads it as text and decides from **every** field, not the inference
+    /// sample: integer codes when all non-empty fields are numbers, category
+    /// names otherwise. Pass 2 reads it as the decision says.
+    Decide,
+    /// Validation / prediction: a categorical feature the model has no names
+    /// for. Read as text and parsed as numbers by [`CheckedCodes`], so a field
+    /// that is not a number past the inference sample is a clear error.
+    Codes,
 }
 
-/// Which canonical features are read as text, i.e. as category names.
+impl CatRead {
+    fn as_text(self) -> bool {
+        self != CatRead::Inferred
+    }
+}
+
+/// How each canonical feature is read.
 ///
 /// * A feature with a `known` list of strings (the trained model's for a
 ///   validation set; for training, a continued model's, when the feature is
@@ -140,43 +156,43 @@ fn is_number_type(t: &DataType) -> bool {
 ///   a file holding only `"1"` and `"2"` of the categories `["1", "2", "x"]`
 ///   must not be read as the codes 1 and 2.
 /// * Training (`learn`): a declared categorical feature without a known list
-///   is text when any file's inferred type for it is not a number (strings,
-///   booleans, dates, ...), and then in every file, so one feature never mixes
-///   codes and names. A categorical feature whose fields are all integers
-///   keeps them as the category codes (no names), as before.
-///
-/// `feat_proj[i][f]` = column of canonical feature `f` in file `i`.
-fn text_category_features(
-    schemas: &[SchemaRef],
-    feat_proj: &[Vec<usize>],
+///   is decided by pass 1 from all rows of all files ([`CatRead::Decide`]),
+///   so one feature never mixes codes and names.
+/// * Validation: a categorical feature of the model (`model_categorical`)
+///   without a list is integer codes ([`CatRead::Codes`]).
+fn cat_reads(
     n_features: usize,
     categorical: Option<&[bool]>,
+    model_categorical: &[bool],
     known: Option<&crate::category_names::CategoryTable>,
     learn: bool,
-) -> Vec<bool> {
+) -> Vec<CatRead> {
     use crate::category_names::CategoryValues;
-    let declared =
-        |f: usize| categorical.is_some_and(|flags| flags.get(f).copied().unwrap_or(false));
+    let flag = |flags: Option<&[bool]>, f: usize| {
+        flags.is_some_and(|flags| flags.get(f).copied().unwrap_or(false))
+    };
     (0..n_features)
         .map(|f| match known.and_then(|t| t.get(f)) {
             // Training codes only declared features (a continued model's list
             // included); validation codes every feature with a list.
-            Some(c) => matches!(c.values(), CategoryValues::Str(_)) && (!learn || declared(f)),
-            None => {
-                learn
-                    && declared(f)
-                    && schemas
-                        .iter()
-                        .zip(feat_proj)
-                        .any(|(s, cols)| !is_number_type(s.field(cols[f]).data_type()))
+            Some(c) => {
+                if matches!(c.values(), CategoryValues::Str(_)) && (!learn || flag(categorical, f))
+                {
+                    CatRead::Names
+                } else {
+                    CatRead::Inferred
+                }
             }
+            None if learn && flag(categorical, f) => CatRead::Decide,
+            None if !learn && flag(Some(model_categorical), f) => CatRead::Codes,
+            None => CatRead::Inferred,
         })
         .collect()
 }
 
-/// `schema` with the given columns read as nullable UTF-8 text. An empty field
-/// stays null (a missing category), as for numbers.
-fn with_text_columns(schema: &SchemaRef, columns: &[usize]) -> SchemaRef {
+/// `schema` with the given columns re-typed (nullable). An empty field stays
+/// null (a missing value or category), whatever the type.
+fn with_column_types(schema: &SchemaRef, columns: &[(usize, DataType)]) -> SchemaRef {
     if columns.is_empty() {
         return Arc::clone(schema);
     }
@@ -184,39 +200,116 @@ fn with_text_columns(schema: &SchemaRef, columns: &[usize]) -> SchemaRef {
         .fields()
         .iter()
         .enumerate()
-        .map(|(c, f)| {
-            if columns.contains(&c) {
-                arrow::datatypes::Field::new(f.name(), DataType::Utf8, true)
-            } else {
-                f.as_ref().clone()
-            }
+        .map(|(c, f)| match columns.iter().find(|(at, _)| *at == c) {
+            Some((_, t)) => arrow::datatypes::Field::new(f.name(), t.clone(), true),
+            None => f.as_ref().clone(),
         })
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// The schema a prediction reads `path` with: features with string categories
-/// in the model (`categories`, by canonical feature id; `canonical[f]` = its
-/// column) are text.
+/// The schema a prediction reads `path` with, and the canonical features
+/// [`CheckedCodes`] must parse. Features with string categories in the model
+/// (`categories`, by canonical feature id; `canonical[f]` = its column) are
+/// text; categorical features (`categorical`) without a list are text parsed
+/// as codes; the rest are read as inferred.
 pub(crate) fn prediction_schema(
     schema: SchemaRef,
     canonical: &[usize],
+    categorical: &[bool],
     categories: Option<&crate::category_names::CategoryTable>,
-) -> SchemaRef {
-    let Some(table) = categories else {
-        return schema;
-    };
-    let text: Vec<usize> = canonical
+) -> (SchemaRef, Vec<usize>) {
+    let reads = cat_reads(canonical.len(), None, categorical, categories, false);
+    let text: Vec<(usize, DataType)> = canonical
         .iter()
-        .enumerate()
-        .filter(|(f, _)| {
-            table.get(*f).is_some_and(|c| {
-                matches!(c.values(), crate::category_names::CategoryValues::Str(_))
-            })
-        })
-        .map(|(_, &c)| c)
+        .zip(&reads)
+        .filter(|(_, r)| r.as_text())
+        .map(|(&c, _)| (c, DataType::Utf8))
         .collect();
-    with_text_columns(&schema, &text)
+    let codes = (0..canonical.len())
+        .filter(|&f| reads[f] == CatRead::Codes)
+        .collect();
+    (with_column_types(&schema, &text), codes)
+}
+
+/// Parses the text columns of categorical features without names (output
+/// columns `columns`) as numbers, like a `Float64` CSV column, into `Float64`
+/// columns. A field that is not a number is an error naming the file, the
+/// column, the value and its data row, where the Arrow reader would only have
+/// said it failed to parse.
+pub(crate) struct CheckedCodes<I> {
+    inner: I,
+    path: PathBuf,
+    columns: Arc<[usize]>,
+    rows: usize,
+}
+
+impl<I> CheckedCodes<I> {
+    pub(crate) fn new(inner: I, path: PathBuf, columns: Arc<[usize]>) -> Self {
+        Self {
+            inner,
+            path,
+            columns,
+            rows: 0,
+        }
+    }
+}
+
+impl<I: Iterator<Item = anyhow::Result<RecordBatch>>> Iterator for CheckedCodes<I> {
+    type Item = anyhow::Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.inner.next()? {
+            Ok(batch) if !self.columns.is_empty() => batch,
+            other => return Some(other),
+        };
+        let first = self.rows;
+        self.rows += batch.num_rows();
+        Some(parse_codes(batch, &self.columns, &self.path, first))
+    }
+}
+
+fn parse_codes(
+    batch: RecordBatch,
+    columns: &[usize],
+    path: &Path,
+    first_row: usize,
+) -> anyhow::Result<RecordBatch> {
+    use arrow::array::{Array, AsArray, Float64Array};
+    use arrow::compute::kernels::cast_utils::Parser;
+    let schema = batch.schema();
+    let mut fields: Vec<arrow::datatypes::FieldRef> = schema.fields().iter().cloned().collect();
+    let mut arrays = batch.columns().to_vec();
+    for &c in columns {
+        let name = schema.field(c).name();
+        let text = arrays[c].as_string_opt::<i32>().ok_or_else(|| {
+            anyhow::anyhow!("CSV categorical column {name:?} was not read as text")
+        })?;
+        let mut values = Vec::with_capacity(text.len());
+        for i in 0..text.len() {
+            if text.is_null(i) {
+                values.push(None);
+                continue;
+            }
+            let s = text.value(i);
+            match arrow::datatypes::Float64Type::parse(s) {
+                Some(v) => values.push(Some(v)),
+                None => crate::bail_input!(
+                    "{}: feature column {name:?} holds {s:?} (data row {}), which is not a \
+                     number; the model has no category names for this categorical feature, so \
+                     the file must hold its integer category codes",
+                    path.display(),
+                    first_row + i + 1
+                ),
+            }
+        }
+        arrays[c] = Arc::new(Float64Array::from(values));
+        fields[c] = Arc::new(arrow::datatypes::Field::new(name, DataType::Float64, true));
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        arrays,
+    )?)
 }
 
 fn batch_reader(
@@ -482,37 +575,56 @@ fn open_many_impl(
     }
     let feature_names = feature_names.expect("non-empty");
 
-    // Categorical features read as category names (text) are re-typed in
-    // every file before any read; the recoders then code them by value.
+    // Categorical features read as text are re-typed in every file before
+    // any read: names are coded by value, decided columns are decided by
+    // pass 1, unnamed codes of a model are parsed by `CheckedCodes`.
     let known = match &cuts {
         Some(c) => c.categories().map(|t| &**t),
         None => targets.categories,
     };
-    let text = text_category_features(
-        &schemas,
-        &feat_proj,
+    let model_categorical: Vec<bool> = cuts
+        .as_ref()
+        .map(|c| c.categorical_flags().to_vec())
+        .unwrap_or_default();
+    let reads = cat_reads(
         feature_names.len(),
         targets.categorical,
+        &model_categorical,
         known,
         cuts.is_none(),
     );
-    let schemas: Vec<SchemaRef> = schemas
-        .iter()
-        .zip(&feat_proj)
-        .map(|(schema, cols)| {
-            let text_cols: Vec<usize> = cols
-                .iter()
-                .zip(&text)
-                .filter_map(|(&c, &t)| t.then_some(c))
-                .collect();
-            check_numeric(schema, label, &text_cols)?;
-            Ok(with_text_columns(schema, &text_cols))
-        })
-        .collect::<anyhow::Result<_>>()?;
+    let typed = |text_type: &dyn Fn(usize) -> Option<DataType>| -> Vec<SchemaRef> {
+        schemas
+            .iter()
+            .zip(&feat_proj)
+            .map(|(schema, cols)| {
+                let types: Vec<(usize, DataType)> = cols
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(f, &c)| text_type(f).map(|t| (c, t)))
+                    .collect();
+                with_column_types(schema, &types)
+            })
+            .collect()
+    };
+    for (schema, cols) in schemas.iter().zip(&feat_proj) {
+        let text_cols: Vec<usize> = cols
+            .iter()
+            .zip(&reads)
+            .filter_map(|(&c, r)| r.as_text().then_some(c))
+            .collect();
+        check_numeric(schema, label, &text_cols)?;
+    }
+    let decide: Vec<bool> = reads.iter().map(|&r| r == CatRead::Decide).collect();
+    let codes: Arc<[usize]> = (0..reads.len())
+        .filter(|&f| reads[f] == CatRead::Codes)
+        .collect();
+    let first_pass_schemas = typed(&|f| reads[f].as_text().then_some(DataType::Utf8));
 
     let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
     let owned = paths.to_vec();
-    let (sc, fp) = (schemas.clone(), feat_proj.clone());
+    let (sc, fp) = (first_pass_schemas.clone(), feat_proj.clone());
+    let no_codes: Arc<[usize]> = Arc::from(Vec::new());
     let feats = || -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
         Ok(dataset_reader(
             owned.clone(),
@@ -520,6 +632,7 @@ fn open_many_impl(
             fp.clone(),
             has_header,
             reader_threads,
+            no_codes.clone(),
         ))
     };
     let (cuts, known_rows) = match cuts {
@@ -536,12 +649,20 @@ fn open_many_impl(
                     cols
                 })
                 .collect();
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
-                dataset_reader(owned.clone(), sc.clone(), proj, has_header, reader_threads),
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_deciding(
+                dataset_reader(
+                    owned.clone(),
+                    sc.clone(),
+                    proj,
+                    has_header,
+                    reader_threads,
+                    no_codes.clone(),
+                ),
                 max_bins as usize,
                 transform_threads,
                 true,
                 targets.categorical.unwrap_or(&[]),
+                &decide,
                 targets.missing,
                 targets.categories,
             )?;
@@ -549,12 +670,13 @@ fn open_many_impl(
         }
         None => {
             let _profile = crate::source::openprof::start("cuts");
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_deciding(
                 feats()?,
                 max_bins as usize,
                 transform_threads,
                 false,
                 targets.categorical.unwrap_or(&[]),
+                &decide,
                 targets.missing,
                 targets.categories,
             )?;
@@ -575,6 +697,19 @@ fn open_many_impl(
             choose(n_rows as u64)?
         }
     };
+
+    // Pass 1 has decided each decided column from every field: names are
+    // text, codes are numbers (every field parses as one). The rest read as
+    // in pass 1.
+    let schemas = typed(&|f| match reads[f] {
+        CatRead::Inferred => None,
+        CatRead::Names | CatRead::Codes => Some(DataType::Utf8),
+        CatRead::Decide => Some(if cuts.categories().is_some_and(|t| t.get(f).is_some()) {
+            DataType::Utf8
+        } else {
+            DataType::Float64
+        }),
+    });
 
     // CSV must scan complete records even for a one-column projection. Read
     // the label beside features during the quantization pass, then expose a
@@ -602,6 +737,7 @@ fn open_many_impl(
             combined_proj,
             has_header,
             reader_threads,
+            codes,
         ),
         feature_names.len(),
         &mut labels,
@@ -640,26 +776,34 @@ fn open_many_impl(
     )
 }
 
+/// Batches of every file in order, columns in each projection's order.
+/// `codes` = output columns parsed by [`CheckedCodes`] (empty = none).
 fn dataset_reader(
     paths: Vec<PathBuf>,
     schemas: Vec<SchemaRef>,
     projections: Vec<Vec<usize>>,
     has_header: bool,
     nthread: usize,
+    codes: Arc<[usize]>,
 ) -> crate::source::parallel_reader::BatchIter {
     if nthread <= 1 {
-        return Box::new(chained_csv(paths, schemas, projections, has_header));
+        return Box::new(chained_csv(paths, schemas, projections, has_header, codes));
     }
     if paths.len() == 1 {
         let (mask, order) = crate::source::input::projection_and_order(&projections[0]);
-        return parallel_csv_chunks(
-            paths[0].clone(),
-            schemas[0].clone(),
-            has_header,
-            mask,
-            order,
-            nthread,
-        );
+        let path = paths[0].clone();
+        return Box::new(CheckedCodes::new(
+            parallel_csv_chunks(
+                path.clone(),
+                schemas[0].clone(),
+                has_header,
+                mask,
+                order,
+                nthread,
+            ),
+            path,
+            codes,
+        ));
     }
     let paths = Arc::new(paths);
     let schemas = Arc::new(schemas);
@@ -673,9 +817,13 @@ fn dataset_reader(
             let schema = schemas[index].clone();
             let (mask, order) = crate::source::input::projection_and_order(&projections[index]);
             let iter = batch_reader(&path, schema, has_header, mask)?;
-            Ok(Box::new(iter.map(move |batch| {
-                batch.map(|batch| crate::source::input::reorder(&batch, &order))
-            })))
+            Ok(Box::new(CheckedCodes::new(
+                iter.map(move |batch| {
+                    batch.map(|batch| crate::source::input::reorder(&batch, &order))
+                }),
+                path,
+                codes.clone(),
+            )))
         },
     ))
 }
@@ -929,6 +1077,7 @@ fn chained_csv(
     schemas: Vec<SchemaRef>,
     projections: Vec<Vec<usize>>,
     has_header: bool,
+    codes: Arc<[usize]>,
 ) -> impl Iterator<Item = anyhow::Result<RecordBatch>> {
     paths
         .into_iter()
@@ -938,10 +1087,12 @@ fn chained_csv(
             // 同 parquet:投影之后必须按规范顺序重排。
             let (mask, order) = crate::source::input::projection_and_order(&cols);
             match batch_reader(&p, sc, has_header, mask) {
-                Ok(it) => {
-                    Box::new(it.map(move |b| b.map(|b| crate::source::input::reorder(&b, &order))))
-                        as Box<dyn Iterator<Item = anyhow::Result<RecordBatch>>>
-                }
+                Ok(it) => Box::new(CheckedCodes::new(
+                    it.map(move |b| b.map(|b| crate::source::input::reorder(&b, &order))),
+                    p,
+                    codes.clone(),
+                ))
+                    as Box<dyn Iterator<Item = anyhow::Result<RecordBatch>>>,
                 Err(e) => Box::new(std::iter::once(Err(e))),
             }
         })

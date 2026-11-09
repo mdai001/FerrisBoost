@@ -310,6 +310,7 @@ impl PyModel {
                             header,
                             ingest_workers,
                             missing,
+                            &self.inner.feature_types,
                             self.inner.categories.as_deref(),
                             |batch, n_rows| {
                                 let workers = resolved_predict_workers(
