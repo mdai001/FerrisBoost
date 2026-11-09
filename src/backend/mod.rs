@@ -240,6 +240,17 @@ pub mod cuda {
         ) -> Result<Self> {
             anyhow::bail!("CUDA backend is not enabled")
         }
+        pub fn new_with_shape(
+            _device: usize,
+            _n_rows: usize,
+            _shape: crate::gpu_mem_plan::GpuBlockShape,
+            _n_blocks: usize,
+            _partition_threads: u32,
+            _config: SharedHistogramConfig,
+            _timing: bool,
+        ) -> Result<Self> {
+            anyhow::bail!("CUDA backend is not enabled")
+        }
         pub fn budget(&self) -> GpuMemoryBudget {
             match self.0 {}
         }
@@ -252,10 +263,19 @@ pub mod cuda {
         pub fn hist_stream_count(&self) -> usize {
             match self.0 {}
         }
+        pub fn max_bins_per_tile(&self) -> usize {
+            match self.0 {}
+        }
+        pub fn ensure_features_fit_tile(&self, _max_feature_bins: usize) -> Result<()> {
+            match self.0 {}
+        }
         pub fn resident_block_count(&self) -> usize {
             match self.0 {}
         }
         pub fn supports_compact_column_histogram(&self) -> bool {
+            match self.0 {}
+        }
+        pub fn supports_compact_column_histogram_for(&self, _width: crate::bins::BinWidth) -> bool {
             match self.0 {}
         }
         pub fn device_mem_used(&self) -> Result<(usize, usize)> {
@@ -317,6 +337,17 @@ pub mod cuda {
         ) -> Result<GpuBlockSession<'_>> {
             match self.0 {}
         }
+        pub fn block_session_bins(
+            &self,
+            _block: usize,
+            _data: crate::bins::BinSlice<'_>,
+            _rows: usize,
+            _feats: usize,
+            _offsets: &[u32],
+            _selected_local: Option<&[usize]>,
+        ) -> Result<GpuBlockSession<'_>> {
+            match self.0 {}
+        }
         pub fn block_session_resident(
             &self,
             _block: usize,
@@ -327,7 +358,24 @@ pub mod cuda {
         ) -> Result<Option<GpuBlockSession<'_>>> {
             match self.0 {}
         }
+        pub fn block_session_resident_width(
+            &self,
+            _block: usize,
+            _width: crate::bins::BinWidth,
+            _rows: usize,
+            _feats: usize,
+            _offsets: &[u32],
+            _selected_local: Option<&[usize]>,
+        ) -> Result<Option<GpuBlockSession<'_>>> {
+            match self.0 {}
+        }
         pub fn partition_session(&self, _col: &[Bin]) -> Result<GpuPartitionSession<'_>> {
+            match self.0 {}
+        }
+        pub fn partition_session_bins(
+            &self,
+            _col: crate::bins::BinSlice<'_>,
+        ) -> Result<GpuPartitionSession<'_>> {
             match self.0 {}
         }
         pub fn partition_session_resident(

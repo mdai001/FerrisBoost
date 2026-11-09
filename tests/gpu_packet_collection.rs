@@ -125,7 +125,7 @@ fn packet_collection_is_exact_across_windows_spills_and_cache_paths() {
     let mut found_missing = false;
     source
         .with_block(0, &mut |block| {
-            found_missing = block.data.contains(&MISSING_BIN)
+            found_missing = block.data.as_u8().unwrap().contains(&MISSING_BIN)
         })
         .unwrap();
     assert!(

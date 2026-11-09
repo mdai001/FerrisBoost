@@ -262,6 +262,12 @@ pub struct Model {
     /// (`lambdarank_unbiased`), stored in the objective JSON as `ti+` / `tj-`.
     #[serde(default)]
     pub rank_bias: Option<RankBias>,
+    /// Category names of categorical features trained from named input
+    /// (pandas categories, Arrow / Parquet string dictionaries), serialized as
+    /// XGBoost 3.x `cats`. Named prediction input is re-coded by value with
+    /// them. `None` for models trained on integer codes only.
+    #[serde(skip)]
+    pub categories: Option<std::sync::Arc<crate::category_names::CategoryTable>>,
 }
 
 /// The position biases `ti+` / `tj-` of an unbiased LambdaMART model. XGBoost keeps
@@ -392,6 +398,7 @@ impl Model {
             scale_pos_weight: self.scale_pos_weight,
             feature_types: self.feature_types.clone(),
             rank_bias: None,
+            categories: self.categories.clone(),
         }
     }
 
@@ -416,6 +423,7 @@ impl Model {
             scale_pos_weight: self.scale_pos_weight,
             feature_types: self.feature_types.clone(),
             rank_bias: self.rank_bias.clone(),
+            categories: self.categories.clone(),
         }
     }
 
@@ -573,6 +581,7 @@ impl Model {
                 gradient_booster: xgb::GradientBooster {
                     name: "gbtree".into(),
                     model: xgb::GbTreeModel {
+                        cats: self.categories.as_ref().map(|t| t.to_xgb()),
                         gbtree_model_param: xgb::GbTreeModelParam {
                             num_trees: trees.len().to_string(),
                             num_parallel_tree: "1".into(),
@@ -772,6 +781,31 @@ impl Model {
         };
         let trees = converted.into_iter().collect::<Result<Vec<_>, _>>()?;
 
+        let feature_types: Vec<bool> = if learner.feature_types.iter().any(|t| t == "c") {
+            anyhow_like_check(
+                learner.feature_types.len() == n_features,
+                format_args!(
+                    "feature_types has {} entries, but the model has {n_features} features",
+                    learner.feature_types.len()
+                ),
+            )?;
+            learner.feature_types.iter().map(|t| t == "c").collect()
+        } else {
+            Vec::new()
+        };
+        let categories = match &booster.model.cats {
+            None => None,
+            Some(c) => crate::category_names::CategoryTable::from_xgb(c, n_features)
+                .and_then(|t| {
+                    if let Some(t) = &t {
+                        t.check_against(n_features, &feature_types)?;
+                    }
+                    Ok(t)
+                })
+                .map_err(|e| unsupported(format_args!("invalid category names (cats): {e}")))?
+                .map(std::sync::Arc::new),
+        };
+
         // 闭包没法泛型,两个字段的目标类型不同,分开写
         let attrs = &learner.attributes;
         Ok(Self {
@@ -802,18 +836,8 @@ impl Model {
                 _ => None,
             },
             scale_pos_weight: Objective::scale_pos_weight_from_json(&learner.objective.rest),
-            feature_types: if learner.feature_types.iter().any(|t| t == "c") {
-                anyhow_like_check(
-                    learner.feature_types.len() == n_features,
-                    format_args!(
-                        "feature_types has {} entries, but the model has {n_features} features",
-                        learner.feature_types.len()
-                    ),
-                )?;
-                learner.feature_types.iter().map(|t| t == "c").collect()
-            } else {
-                Vec::new()
-            },
+            feature_types,
+            categories,
         })
     }
 }
@@ -966,6 +990,9 @@ mod xgb {
 
     #[derive(Serialize, Deserialize)]
     pub struct GbTreeModel {
+        /// XGBoost 3.x category names; omitted for models without any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cats: Option<crate::category_names::XgbCats>,
         pub gbtree_model_param: GbTreeModelParam,
         /// 2.0 才有:每轮的树区间。单目标每轮一棵,就是 0..=n。
         #[serde(default)]
@@ -1360,6 +1387,7 @@ mod tests {
             scale_pos_weight: 1.0,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1519,6 +1547,7 @@ mod tests {
                 scale_pos_weight: spw,
                 feature_types: Vec::new(),
                 rank_bias: None,
+                categories: None,
                 ..fixture_model()
             };
             let json = m.to_xgboost_json().unwrap();
@@ -1553,6 +1582,7 @@ mod tests {
             scale_pos_weight: 4.0,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
             ..fixture_model()
         }
         .class_view(0);

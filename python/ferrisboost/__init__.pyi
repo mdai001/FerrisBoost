@@ -127,9 +127,9 @@ def train(
     files (positional over the feature columns). With
     params["enable_categorical"] = True, pandas category and PyArrow dictionary
     columns are detected as categorical; Parquet dictionary columns of integers
-    are always categorical. Category values are integer codes in 0..=253
-    (NaN / null = missing), so a feature has at most 254 categories in this
-    version; anything else raises ValueError. params["max_cat_to_onehot"]
+    are always categorical. Category values are integer codes in 0..=65533
+    (NaN / null = missing), so a feature has at most 65,534 categories, on CPU
+    and GPU; anything else raises ValueError. params["max_bin"] is 1..=65535. params["max_cat_to_onehot"]
     (default 4) and params["max_cat_threshold"] (default 64) match XGBoost.
 
     params["missing"] (default NaN) is XGBoost's DMatrix `missing`: a feature
@@ -142,5 +142,9 @@ def train(
     categorical columns. The model does not store it (XGBoost does not either):
     pass the same `missing` to Model.predict / predict_to_parquet. A quantized
     cache_path is only reused with the same `missing`.
+
+    params["cache_path"] and params["cache_budget_bytes"] apply only to training
+    on a single Parquet file; several files, CSV and in-memory data raise
+    ValueError instead of ignoring them.
     """
     ...

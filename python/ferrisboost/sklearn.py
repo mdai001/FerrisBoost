@@ -48,7 +48,8 @@ scikit-learn 是**可选依赖**:`import ferrisboost` 不需要它;访问
 * `enable_categorical` / `feature_types` / `max_cat_to_onehot` / `max_cat_threshold`
   转给 `ferrisboost.train`。pandas `category` 列在 `fit` / `predict` /
   `predict_proba` / `apply` 里都可用;估计器记住训练时的类别表,预测时按**取值**
-  重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。
+  重新编码(训练没见过的类别走缺失方向的另一侧,和 XGBoost 一致)。每个特征最多
+  65534 个类别(码 0..=65533),`max_bin` 取 1..=65535,CPU 和 GPU 相同。
 * `fit(..., base_margin=, base_margin_eval_set=, init_model=)`(XGBoost 的 `xgb_model=` 同样接受)和
   `predict` / `predict_proba(..., base_margin=)` 与 XGBoost 一致:`base_margin` 是每行的
   起始 raw margin(替换 `base_score` 作为起点),`init_model` 接已有的 `Model` / 估计器 /
@@ -87,7 +88,8 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import Model, _frame_matrix, _is_pandas_frame, train
+from . import (Model, _arrow_table, _as_ref, _categories_wire, _frame_matrix, _is_pandas_frame,
+               _load_prior, _model_refs, _table_matrix, _value_ref, train)
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 
@@ -152,6 +154,18 @@ def _has_category_column(frame: Any) -> bool:
     import pandas as pd
 
     return any(isinstance(dt, pd.CategoricalDtype) for dt in frame.dtypes)
+
+
+def _dictionary_table(X: Any) -> Any:
+    """A PyArrow Table / RecordBatch with a dictionary column, else None."""
+    if _is_pandas_frame(X) or not hasattr(X, "column_names"):  # not a stream reader either
+        return None
+    table = _arrow_table(X)
+    if table is None:
+        return None
+    import pyarrow as pa
+
+    return table if any(pa.types.is_dictionary(t) for t in table.schema.types) else None
 
 
 def _seed_of(random_state: Any) -> int | None:
@@ -287,7 +301,7 @@ class _FerrisBoostBase(BaseEstimator):
 
     # ------------------------------------------------------------------ 输入
     def _prepare_X(
-        self, X: Any, y: Any = None, *, reset: bool, **kwargs: Any
+        self, X: Any, y: Any = None, *, reset: bool, prior: Any = None, **kwargs: Any
     ) -> tuple[Any, Any, list[str] | None]:
         """sklearn validation plus pandas `category` handling.
 
@@ -295,20 +309,66 @@ class _FerrisBoostBase(BaseEstimator):
         (category columns as their integer codes, NaN for a missing value) and
         `feature_types` the per-feature "c" / "q" list detected from the frame
         (None when the frame has no category column). Training stores the
-        categories; later calls re-code onto them by value.
+        categories (in the booster too); later calls re-code onto them by
+        value. A continued model (`prior`) codes the training frame with its
+        own categories. PyArrow tables with dictionary columns are coded as
+        `ferrisboost.train` and `Model.predict` code them (an integer
+        dictionary of a feature without categories is read by its values).
+        Prediction and eval sets read frames and tables as files are read: a
+        plain integer column of a feature with integer categories is looked
+        up by value, and an integer `category` column of a feature without
+        categories yields its values. NumPy input is codes.
         """
         flags = None
-        if _is_pandas_frame(X) and _has_category_column(X):
-            import pandas as pd
+        table = _dictionary_table(X)
+        frame = _is_pandas_frame(X) and _has_category_column(X)
+        categorical = levels = None
+        if not reset:
+            # This fit's categories first (eval sets are prepared before the
+            # booster exists); a loaded model brings its own.
+            levels = getattr(self, "_cat_levels_", None)
+            if levels is None:
+                levels = _model_refs(getattr(self, "_Booster", None))
+            if self.feature_types is not None:
+                categorical = [t == "c" for t in self.feature_types]
+            if table is None and not frame:
+                if _is_pandas_frame(X):
+                    # Plain integer columns may be category values. An empty
+                    # _cat_levels_ is meaningful: this fit has no category
+                    # lists, even if the estimator still holds an older booster.
+                    frame = any(
+                        _value_ref(_as_ref(lv), i, categorical) is not None
+                        for i, lv in (levels or {}).items()
+                    )
+                elif hasattr(X, "column_names"):
+                    # sklearn's validation sets may be Arrow tables with only
+                    # numeric columns too; route them through the same dtype-
+                    # aware adapter, which preserves integer codes without refs.
+                    table = _arrow_table(X)
+        if table is not None or frame:
+            if reset:
+                if hasattr(prior, "get_booster"):
+                    prior = prior.get_booster()
+                levels = _model_refs(_load_prior(prior)) if prior is not None else None
+            if table is not None:
+                import pyarrow as pa
 
-            levels = None if reset else getattr(self, "_cat_levels_", None)
-            matrix, _, flag_list, new_levels = _frame_matrix(
-                X, bool(self.enable_categorical), levels, "X"
-            )
+                matrix, names, flag_list, new_levels = _table_matrix(
+                    table, None, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    categorical=categorical,
+                )
+                X = pa.table({n: matrix[:, i] for i, n in enumerate(names)})
+            else:
+                import pandas as pd
+
+                matrix, _, flag_list, new_levels = _frame_matrix(
+                    X, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    categorical=categorical,
+                )
+                # A numeric stand-in with the same labels: sklearn then sets
+                # `n_features_in_` / `feature_names_in_` exactly as for any frame.
+                X = pd.DataFrame(matrix, columns=X.columns, index=X.index)
             flags = ["c" if f else "q" for f in flag_list]
-            # A numeric stand-in with the same labels: sklearn then sets
-            # `n_features_in_` / `feature_names_in_` exactly as for any frame.
-            X = pd.DataFrame(matrix, columns=X.columns, index=X.index)
             new = new_levels if reset else None
         else:
             new = {} if reset else None
@@ -349,6 +409,15 @@ class _FerrisBoostBase(BaseEstimator):
             )
         if hasattr(init_model, "get_booster"):
             init_model = init_model.get_booster()
+        # The booster stores the category names the training frame was coded with.
+        types = feature_types if self.feature_types is None else self.feature_types
+        wire = _categories_wire(
+            getattr(self, "_cat_levels_", None) or {},
+            None if types is None else [t == "c" for t in types],
+            X.shape[1],
+        )
+        if wire is not None:
+            params = {**params, "_categories": wire}
         if sample_weight is not None:
             if per_group:
                 sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
@@ -563,7 +632,7 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         init_model = _pick_init_model(init_model, xgb_model)
         if y is None:
             raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
         params = self.get_ferrisboost_params()
         self._fit_booster(
             X,
@@ -639,7 +708,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
 
         if y is None:
             raise ValueError("This FerrisBoostClassifier estimator requires y to be passed, but the target y is None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, dtype=np.float32)
         check_classification_targets(y)
         classes, encoded = np.unique(y, return_inverse=True)
         if len(classes) < 2:
@@ -816,7 +885,7 @@ class FerrisBoostRanker(_FerrisBoostBase):
             raise ValueError("Either `group` or `qid` is required for ranking task")
         if qid is not None and group is not None:
             raise ValueError("Either one of `group` or `qid` should be None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, y_numeric=True, dtype=np.float32)
+        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
         eval_set = list(eval_set) if eval_set else None
         eq_list: list = []
         eg_list: list = []

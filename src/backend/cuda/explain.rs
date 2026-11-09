@@ -29,6 +29,22 @@ const FRAME_WORDS: usize = 22;
 const MAX_BATCH_BYTES: usize = 512 * 1024 * 1024;
 /// Free device memory always left to the driver and other users.
 const DEVICE_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
+/// CUDA's limit on `gridDim.y` (the tree axis of the tree-parallel launch).
+const MAX_GRID_Y: usize = 65_535;
+/// Below `CONTRIBS_TREE_PARALLEL_PER_SM` (row, output) pairs per SM the
+/// per-row exact-contribution kernel leaves the device mostly idle and its
+/// latency is one thread's walk over every tree, so the tree-parallel pair is
+/// used instead. Measured crossover: about 64 pairs per SM
+/// (200 depth-6 trees, binary and 5-class); above it the per-tree scratch
+/// traffic makes the tree-parallel pair up to ~1.9x slower.
+const CONTRIBS_TREE_PARALLEL_PER_SM: usize = 64;
+/// The same switch for interactions. The tree-parallel log variant measured
+/// faster at every tested size (up to 20,000 pairs on 30 SMs: 0.05x to
+/// 0.89x of the per-row kernel); larger batches keep the per-row kernel.
+const INTERACTIONS_TREE_PARALLEL_PER_SM: usize = 512;
+/// Per-row scratch cap of the tree-parallel launch, so a very large ensemble
+/// keeps the per-row kernel (whose scratch does not grow with the tree count).
+const TREE_PARALLEL_MAX_ROW_SCRATCH: usize = 16 * 1024 * 1024;
 
 /// Early-return guard: pageable host copies are not guaranteed to be finished
 /// when an async copy call returns, so drain the stream before the host
@@ -51,8 +67,12 @@ pub struct GpuExplainModel {
     state: Arc<DeviceState>,
     stream: Arc<CudaStream>,
     contribs_fn: CudaFunction,
+    contribs_per_tree_fn: CudaFunction,
+    contribs_reduce_fn: CudaFunction,
     saabas_fn: CudaFunction,
     interactions_fn: CudaFunction,
+    interactions_log_fn: CudaFunction,
+    interactions_apply_fn: CudaFunction,
     symmetrize_fn: CudaFunction,
     diagonal_fn: CudaFunction,
     leaf_fn: CudaFunction,
@@ -77,9 +97,19 @@ pub struct GpuExplainModel {
     tree_levels: Vec<u32>,
     /// Per tree: number of distinct split features.
     tree_slots: Vec<u32>,
+    /// Tree-parallel interactions (`shx_interactions_log`): per-tree log
+    /// offsets (host copy for sizing, device copy for the kernels) and the
+    /// per-slot log entries.
+    ix_tree_begin_host: Vec<u32>,
+    ix_tree_begin: CudaSlice<u32>,
+    ix_slot_ptr: CudaSlice<u32>,
+    ix_entry_index: CudaSlice<u32>,
+    ix_entry_col: CudaSlice<u32>,
     n_features: usize,
     n_trees: usize,
     k: usize,
+    /// Streaming multiprocessors of the device (tree-parallel switch).
+    sm_count: usize,
     // One stream per cached model: calls are serialized on it.
     call_lock: Mutex<()>,
 }
@@ -105,6 +135,48 @@ struct Flat {
     mean: Vec<f32>,
     tree_levels: Vec<u32>,
     tree_slots: Vec<u32>,
+    ix_tree_begin: Vec<u32>,
+    ix_slot_ptr: Vec<u32>,
+    ix_entry_index: Vec<u32>,
+    ix_entry_col: Vec<u32>,
+}
+
+/// The cells `shx_run_tree<1>` adds to, in order, for the subtree under `nd`
+/// (the tree structure alone fixes them; see `shx_interactions_log`). Edge
+/// `nd -> child` is unwound after the child's subtree: first the diagonal of
+/// the parent's feature, then one partner per newest occurrence of every
+/// other feature on the path (newest to oldest), skipping the parent's own
+/// newest occurrence. `efeats[j - 1]` is the split feature above level `j`.
+fn interaction_writes(
+    nodes: &[crate::tree::Node],
+    nd: usize,
+    efeats: &mut Vec<u32>,
+    out: &mut Vec<(u32, u32)>,
+) {
+    let node = &nodes[nd];
+    if node.is_leaf {
+        return;
+    }
+    let feat = node.feat;
+    for child in [node.left as usize, node.right as usize] {
+        efeats.push(feat);
+        interaction_writes(nodes, child, efeats, out);
+        out.push((feat, feat));
+        let d = efeats.len();
+        let mut skipped_current = false;
+        for j in (1..=d).rev() {
+            let split = efeats[j - 1];
+            if efeats[j..d].contains(&split) {
+                continue;
+            }
+            if !skipped_current && split == feat {
+                skipped_current = true;
+                continue;
+            }
+            out.push((feat, split));
+        }
+        efeats.pop();
+    }
 }
 
 fn to_u32(v: usize, what: &str) -> Result<u32> {
@@ -168,6 +240,8 @@ fn flatten(model: &Model) -> Result<Flat> {
                 }
             }
         }
+        f.ix_tree_begin
+            .push(to_u32(f.ix_entry_index.len(), "interaction log")?);
         let mut means = vec![0.0f32; n];
         let (mut max_level, mut slots) = (0u32, 0u32);
         if n > 0 {
@@ -208,6 +282,24 @@ fn flatten(model: &Model) -> Result<Flat> {
                 }
             }
             slots = slot_of.len() as u32;
+            // Interaction log entries of this tree, grouped by matrix row
+            // (= feature slot), log order inside a slot.
+            let mut writes = Vec::new();
+            interaction_writes(&tree.nodes, 0, &mut Vec::new(), &mut writes);
+            let mut per_slot: Vec<Vec<(u32, u32)>> = vec![Vec::new(); slot_of.len()];
+            for (j, &(row, col)) in writes.iter().enumerate() {
+                per_slot[slot_of[&row] as usize].push((to_u32(j, "interaction log")?, col));
+            }
+            // Every log value is exactly one entry, so the entry count before
+            // this tree (pushed to `ix_tree_begin` above) is also its log offset.
+            for entries in per_slot {
+                f.ix_slot_ptr
+                    .push(to_u32(f.ix_entry_index.len(), "interaction entries")?);
+                for (j, col) in entries {
+                    f.ix_entry_index.push(j);
+                    f.ix_entry_col.push(col);
+                }
+            }
         }
         f.mean.extend_from_slice(&means);
         f.tree_levels.push(max_level + 1);
@@ -217,7 +309,15 @@ fn flatten(model: &Model) -> Result<Flat> {
         .push(to_u32(f.feature.len(), "node count")?);
     f.uniq_begin
         .push(to_u32(f.uniq_feats.len(), "feature slots")?);
+    f.ix_tree_begin
+        .push(to_u32(f.ix_entry_index.len(), "interaction log")?);
+    f.ix_slot_ptr
+        .push(to_u32(f.ix_entry_index.len(), "interaction entries")?);
     // CUDA allocations cannot be empty: keep one inert entry per table.
+    if f.ix_entry_index.is_empty() {
+        f.ix_entry_index.push(0);
+        f.ix_entry_col.push(0);
+    }
     if f.feature.is_empty() {
         f.feature.push(0);
         f.split.push(0.0);
@@ -268,8 +368,12 @@ impl GpuExplainModel {
         let up = |what: &str| format!("explanation {what} H2D");
         Ok(Self {
             contribs_fn: load("shx_contribs")?,
+            contribs_per_tree_fn: load("shx_contribs_per_tree")?,
+            contribs_reduce_fn: load("shx_contribs_reduce")?,
             saabas_fn: load("shx_saabas")?,
             interactions_fn: load("shx_interactions")?,
+            interactions_log_fn: load("shx_interactions_log")?,
+            interactions_apply_fn: load("shx_interactions_apply")?,
             symmetrize_fn: load("shx_interactions_symmetrize")?,
             diagonal_fn: load("shx_interactions_diagonal")?,
             leaf_fn: load("shx_leaf")?,
@@ -324,6 +428,29 @@ impl GpuExplainModel {
             rule: stream
                 .clone_htod(&crate::explain::rule_values())
                 .with_context(|| up("quadrature rule"))?,
+            ix_tree_begin: stream
+                .clone_htod(&flat.ix_tree_begin)
+                .with_context(|| up("interaction log offsets"))?,
+            ix_slot_ptr: stream
+                .clone_htod(&flat.ix_slot_ptr)
+                .with_context(|| up("interaction slot offsets"))?,
+            ix_entry_index: stream
+                .clone_htod(&flat.ix_entry_index)
+                .with_context(|| up("interaction log entries"))?,
+            ix_entry_col: stream
+                .clone_htod(&flat.ix_entry_col)
+                .with_context(|| up("interaction log columns"))?,
+            ix_tree_begin_host: flat.ix_tree_begin,
+            sm_count: usize::try_from(
+                state
+                    .ctx
+                    .attribute(
+                        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    )
+                    .context("query multiprocessor count")?,
+            )
+            .unwrap_or(1)
+            .max(1),
             tree_levels: flat.tree_levels,
             tree_slots: flat.tree_slots,
             n_features: model.n_features,
@@ -419,11 +546,41 @@ impl GpuExplainModel {
             Kind::Interactions => levels * FRAME_WORDS,
             Kind::Leaf => 0,
         };
+        // Exact contributions of a small batch run one thread per (row, tree)
+        // instead of per (row, output) (see `shx_contribs_per_tree`); the
+        // scratch then holds one frame stack and slot set per tree.
+        let tree_parallel = matches!(kind, Kind::Contribs { approx: false })
+            && n_trees > 0
+            && n_trees <= MAX_GRID_Y
+            && n_rows.saturating_mul(k) < self.sm_count * CONTRIBS_TREE_PARALLEL_PER_SM
+            && n_trees
+                .saturating_mul(scratch_words)
+                .saturating_mul(std::mem::size_of::<f32>())
+                <= TREE_PARALLEL_MAX_ROW_SCRATCH;
+        // Interactions likewise run one thread per (row, tree) for a small
+        // batch, recording values into a per-row log (`shx_interactions_log`).
+        let log_words = self.ix_tree_begin_host[n_trees] as usize;
+        let interactions_parallel = matches!(kind, Kind::Interactions)
+            && n_trees > 0
+            && n_trees <= MAX_GRID_Y
+            && n_rows.saturating_mul(k) < self.sm_count * INTERACTIONS_TREE_PARALLEL_PER_SM
+            && n_trees
+                .saturating_mul(scratch_words)
+                .saturating_add(log_words)
+                .saturating_mul(std::mem::size_of::<f32>())
+                <= TREE_PARALLEL_MAX_ROW_SCRATCH;
+        let scratch_units = if tree_parallel || interactions_parallel {
+            n_trees
+        } else {
+            k
+        };
+        let row_log_words = if interactions_parallel { log_words } else { 0 };
         let f32_size = std::mem::size_of::<f32>();
         let per_row_bytes = nf
             .checked_add(if margin.is_some() { k } else { 0 })
             .and_then(|v| v.checked_add(out_width))
-            .and_then(|v| v.checked_add(k.checked_mul(scratch_words)?))
+            .and_then(|v| v.checked_add(scratch_units.checked_mul(scratch_words)?))
+            .and_then(|v| v.checked_add(row_log_words))
             .and_then(|v| v.checked_mul(f32_size))
             .context("GPU explanation row size overflow")?;
 
@@ -456,8 +613,11 @@ impl GpuExplainModel {
         };
         let mut out_buf = unsafe { stream.alloc::<f32>(batch * out_width) }
             .context("allocate GPU explanation output")?;
-        let mut scratch = unsafe { stream.alloc::<f32>((batch * k * scratch_words).max(1)) }
-            .context("allocate GPU explanation scratch")?;
+        let mut scratch =
+            unsafe { stream.alloc::<f32>((batch * scratch_units * scratch_words).max(1)) }
+                .context("allocate GPU explanation scratch")?;
+        let mut log_buf = unsafe { stream.alloc::<f32>((batch * row_log_words).max(1)) }
+            .context("allocate GPU interaction log")?;
         let group_root_mean = stream
             .clone_htod(ex.group_root_mean())
             .context("explanation group means H2D")?;
@@ -504,6 +664,37 @@ impl GpuExplainModel {
                 shared_mem_bytes: 0,
             };
             match kind {
+                Kind::Contribs { approx: false } if tree_parallel => {
+                    let per_tree = LaunchConfig {
+                        grid_dim: (r_u32.div_ceil(THREADS), n_trees_u32, 1),
+                        ..config
+                    };
+                    let mut l = stream.launch_builder(&self.contribs_per_tree_fn);
+                    self.push_model(&mut l);
+                    l.arg(&self.rule)
+                        .arg(&input_view)
+                        .arg(&r_u32)
+                        .arg(&n_features)
+                        .arg(&n_trees_u32)
+                        .arg(&levels_u32)
+                        .arg(&mut scratch);
+                    unsafe { l.launch(per_tree) }.context("launch shx_contribs_per_tree")?;
+                    let mut l = stream.launch_builder(&self.contribs_reduce_fn);
+                    self.push_model(&mut l);
+                    l.arg(&r_u32)
+                        .arg(&n_features)
+                        .arg(&n_trees_u32)
+                        .arg(&k_u32)
+                        .arg(&levels_u32)
+                        .arg(&group_root_mean)
+                        .arg(&group_bias);
+                    match &margin_view {
+                        Some(v) => l.arg(v),
+                        None => l.arg(&null_margin),
+                    };
+                    l.arg(&scratch).arg(&mut out_view);
+                    unsafe { l.launch(config) }.context("launch shx_contribs_reduce")?;
+                }
                 Kind::Contribs { approx: false } => {
                     let mut l = stream.launch_builder(&self.contribs_fn);
                     self.push_model(&mut l);
@@ -540,17 +731,55 @@ impl GpuExplainModel {
                     unsafe { l.launch(config) }.context("launch shx_saabas")?;
                 }
                 Kind::Interactions => {
-                    let mut l = stream.launch_builder(&self.interactions_fn);
-                    self.push_model(&mut l);
-                    l.arg(&self.rule)
-                        .arg(&input_view)
-                        .arg(&r_u32)
-                        .arg(&n_features)
-                        .arg(&n_trees_u32)
-                        .arg(&k_u32)
-                        .arg(&mut scratch)
-                        .arg(&mut out_view);
-                    unsafe { l.launch(config) }.context("launch shx_interactions")?;
+                    if interactions_parallel {
+                        let per_tree = LaunchConfig {
+                            grid_dim: (r_u32.div_ceil(THREADS), n_trees_u32, 1),
+                            ..config
+                        };
+                        let mut l = stream.launch_builder(&self.interactions_log_fn);
+                        self.push_model(&mut l);
+                        l.arg(&self.rule)
+                            .arg(&input_view)
+                            .arg(&r_u32)
+                            .arg(&n_features)
+                            .arg(&n_trees_u32)
+                            .arg(&self.ix_tree_begin)
+                            .arg(&mut scratch)
+                            .arg(&mut log_buf);
+                        unsafe { l.launch(per_tree) }.context("launch shx_interactions_log")?;
+                        let cells =
+                            u32::try_from(r * nc).context("GPU interaction batch too large")?;
+                        let apply = LaunchConfig {
+                            grid_dim: (cells.div_ceil(256), k_u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut l = stream.launch_builder(&self.interactions_apply_fn);
+                        self.push_model(&mut l);
+                        l.arg(&r_u32)
+                            .arg(&n_features)
+                            .arg(&n_trees_u32)
+                            .arg(&k_u32)
+                            .arg(&self.ix_tree_begin)
+                            .arg(&self.ix_slot_ptr)
+                            .arg(&self.ix_entry_index)
+                            .arg(&self.ix_entry_col)
+                            .arg(&log_buf)
+                            .arg(&mut out_view);
+                        unsafe { l.launch(apply) }.context("launch shx_interactions_apply")?;
+                    } else {
+                        let mut l = stream.launch_builder(&self.interactions_fn);
+                        self.push_model(&mut l);
+                        l.arg(&self.rule)
+                            .arg(&input_view)
+                            .arg(&r_u32)
+                            .arg(&n_features)
+                            .arg(&n_trees_u32)
+                            .arg(&k_u32)
+                            .arg(&mut scratch)
+                            .arg(&mut out_view);
+                        unsafe { l.launch(config) }.context("launch shx_interactions")?;
+                    }
                     let groups_total = (r * k) as u64;
                     let pair_threads =
                         u32::try_from(r * k * nc).context("GPU interaction batch too large")?;
@@ -605,7 +834,7 @@ impl GpuExplainModel {
         guard.done = true;
         drop(guard);
         // Release the staging before returning (stream-ordered frees).
-        drop((input, margin_buf, out_buf, scratch));
+        drop((input, margin_buf, out_buf, scratch, log_buf));
         stream
             .synchronize()
             .context("release explanation staging")?;

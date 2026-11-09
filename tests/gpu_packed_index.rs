@@ -275,17 +275,18 @@ fn run_plan(
 }
 
 #[test]
-fn packed_index_batch_histograms_match_cpu_with_compact_selection_and_reused_slots() {
+fn packed_index_batch_histograms_match_cpu_across_layouts_and_reused_slots() {
     let (bins, gpair) = fixture();
 
+    // Training uses the compact column-major ABI for selected features.
     let probe = make_context(0, false);
     let path = probe.path_summary();
     let compact_column = probe.supports_compact_column_histogram();
+    assert!(path.contains("layout_gpu=col_major"), "{path}");
     assert!(
         compact_column,
-        "expected the production compact column-major ABI: {path}"
+        "expected the compact column-major ABI: {path}"
     );
-    assert!(path.contains("layout_gpu=col_major"), "{path}");
     drop(probe);
 
     // Streaming reuses its single temporary slot across all node counts and

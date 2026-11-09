@@ -25,7 +25,8 @@ pub(crate) const PARTITION_MAX_BLOCKS: usize = 32;
 pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
 /// 32-bit words in one categorical winner's category set (a bitset over the
 /// feature's bins). Must equal `CAT_SET_WORDS` in `histogram.cu` (unit-tested).
-/// 16-bit categorical bins would raise this together with the kernel constant.
+/// 16-bit categorical features use variable-length sets instead
+/// ([`wide_categorical_split_cache_bytes`]).
 pub(crate) const CAT_SET_WORDS: usize = 8;
 /// One categorical winner's category set, in bytes.
 pub(crate) const CAT_SET_BYTES: u64 = CAT_SET_WORDS as u64 * 4;
@@ -56,6 +57,90 @@ pub(crate) fn node_feature_mask_bytes(cols: u64, hist_nodes_per_batch: u64) -> u
 pub(crate) fn categorical_split_cache_bytes(cols: u64, hist_nodes_per_batch: u64) -> u64 {
     cols * categorical_split_cache_col_bytes(hist_nodes_per_batch)
         + categorical_split_cache_fixed_bytes(hist_nodes_per_batch)
+}
+
+/// Device split-cache bytes one resident slot adds for 16-bit categorical
+/// features (features with more than 254 categories), on top of
+/// [`categorical_split_cache_bytes`]: per cache node, one weight key per
+/// category (the sorted-partition selection) and one variable-length set per
+/// categorical feature; the per-feature layout words; and the packet-window
+/// slots widened from the fixed 8-word set to the widest 16-bit set. Zero
+/// without a 16-bit categorical feature. The runtime allocation
+/// (`ResidentSplitBuffers`) and the planner use this one function.
+pub(crate) fn wide_categorical_split_cache_bytes(
+    shape: &GpuBlockShape,
+    hist_nodes_per_batch: u64,
+) -> u64 {
+    if shape.wide_cat_feats == 0 {
+        return 0;
+    }
+    let cap = hist_nodes_per_batch;
+    cap * shape.wide_cat_bins as u64 * 4
+        + cap * shape.wide_cat_set_words as u64 * 4
+        + shape.wide_cat_feats as u64 * 3 * 4
+        + cap
+            * SPLIT_PACKET_WINDOW_BATCHES as u64
+            * shape.cat_mask_words.saturating_sub(CAT_SET_WORDS) as u64
+            * 4
+}
+
+/// The bin geometry of the real column blocks that GPU training allocates for.
+///
+/// Column blocks are homogeneous in bin width (8- or 16-bit cells, see
+/// [`crate::bins`]). Slots are byte buffers sized by the widest block in bytes,
+/// so an all-8-bit dataset has exactly the shape of the 8-bit-only runtime.
+/// `GpuTrainCtx` allocates from this shape and the post-open planner prices the
+/// same numbers ([`StreamingMemModel::new_for_shape`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuBlockShape {
+    /// Widest block in features.
+    pub max_block_feats: usize,
+    /// Widest block in bytes per row (features × bytes per cell).
+    pub max_block_row_bytes: usize,
+    /// Largest histogram of one block (sum of its features' bins).
+    pub max_hist_bins: usize,
+    /// Bytes per cell of the widest column (the partition column buffer).
+    pub max_cell_bytes: usize,
+    /// 32-bit words of the widest category set a partition ships to the device
+    /// (8 for 8-bit categorical features: the fixed 256-bit set).
+    pub cat_mask_words: usize,
+    /// Most categorical features in one 16-bit block (0 = none). With the
+    /// two fields below it sizes the device split buffers of 16-bit
+    /// categorical features ([`wide_categorical_split_cache_bytes`]).
+    pub wide_cat_feats: usize,
+    /// Largest sum of categorical bins in one 16-bit block (one weight key
+    /// per category and cache node).
+    pub wide_cat_bins: usize,
+    /// Largest sum of categorical set words in one 16-bit block (one set per
+    /// categorical feature and cache node).
+    pub wide_cat_set_words: usize,
+}
+
+impl GpuBlockShape {
+    /// The shape of 8-bit-only blocks (every pre-0.0.8 caller).
+    pub fn all_u8(max_block_feats: usize, max_hist_bins: usize) -> Self {
+        Self {
+            max_block_feats,
+            max_block_row_bytes: max_block_feats,
+            max_hist_bins,
+            max_cell_bytes: 1,
+            cat_mask_words: CAT_SET_WORDS,
+            wide_cat_feats: 0,
+            wide_cat_bins: 0,
+            wide_cat_set_words: 0,
+        }
+    }
+
+    /// Whether any block stores 16-bit cells.
+    pub fn has_wide(&self) -> bool {
+        self.max_cell_bytes > 1
+    }
+
+    /// Partition descriptor words: the batch descriptors, or the widest
+    /// category set (shipped through the same buffer), whichever is larger.
+    pub fn partition_descriptor_words(&self) -> usize {
+        (PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS).max(self.cat_mask_words)
+    }
 }
 
 pub(crate) fn partition_batch_capacities(n_rows: usize, threads: usize) -> (usize, usize) {
@@ -171,7 +256,7 @@ pub(crate) const FAST_QUANTILE_SCRATCH_BYTES: u64 = (QUANTILE_REDUCE_BLOCKS as u
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
     /// 和列块宽度无关的部分:gpair、row index、partition、prediction、
-    /// device-quant、fast-math 等。
+    /// device-quant 和 fast-math。
     pub fixed_bytes: u64,
     /// 每多一列要多付的字节:量化列块本身(n_rows)+ 该列的直方图切片。
     pub per_col_bytes: u64,
@@ -219,7 +304,6 @@ impl StreamingMemModel {
         } else {
             0
         };
-
         let fixed_bytes = gpair
             + row_idx
             + partition_out
@@ -243,6 +327,71 @@ impl StreamingMemModel {
             resident_extra_col_bytes: 0,
             resident_extra_fixed_bytes: 0,
         }
+    }
+
+    /// The model of an opened source: the physical block width `cols` is fixed
+    /// and every slot is priced from the real blocks — the widest block in
+    /// bytes (8- and 16-bit cells) and the largest block histogram from the
+    /// actual per-feature bin counts — instead of `cols` columns at the scalar
+    /// `max_bin`. These are exactly the numbers `GpuTrainCtx::new_with_shape`
+    /// allocates with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_shape(
+        n_rows: u64,
+        shape: &GpuBlockShape,
+        cols: u64,
+        hist_streams: u64,
+        hist_nodes_per_batch: u64,
+        device_quantize: bool,
+        fast_math: bool,
+    ) -> Self {
+        let mut model = Self::new(
+            n_rows,
+            0,
+            hist_streams,
+            hist_nodes_per_batch,
+            device_quantize,
+            fast_math,
+        );
+        // Partition column of the widest cell, and the descriptor buffer that
+        // also carries the widest 16-bit category set.
+        model.fixed_bytes += n_rows * (shape.max_cell_bytes as u64).saturating_sub(1)
+            + (shape.partition_descriptor_words()
+                - PARTITION_BATCH_CAPACITY * PARTITION_DESCRIPTOR_WORDS) as u64
+                * 4;
+        let slot = shape.max_block_row_bytes as u64 * n_rows
+            + shape.max_hist_bins as u64 * 16 * hist_nodes_per_batch;
+        model.slot_col_bytes = slot.div_ceil(cols.max(1));
+        model.per_col_bytes = model.slot_col_bytes * hist_streams;
+        model
+    }
+
+    /// [`Self::with_resident_split_cache`] (and its categorical / node-mask
+    /// parts) priced from the real block shape, like [`Self::new_for_shape`].
+    pub fn with_resident_split_cache_for_shape(
+        mut self,
+        shape: &GpuBlockShape,
+        cols: u64,
+        hist_nodes_per_batch: u64,
+        categorical: bool,
+        node_masks: bool,
+    ) -> Self {
+        if hist_nodes_per_batch < 2 {
+            return self;
+        }
+        let cap = hist_nodes_per_batch;
+        let feats = shape.max_block_feats as u64;
+        let mut slot = shape.max_hist_bins as u64 * 16 * 2 * cap + feats * (cap * 64 + 12);
+        if categorical {
+            slot += categorical_split_cache_bytes(feats, cap)
+                + wide_categorical_split_cache_bytes(shape, cap);
+        }
+        if node_masks {
+            slot += node_feature_mask_bytes(feats, cap);
+        }
+        self.resident_extra_col_bytes = slot.div_ceil(cols.max(1));
+        self.resident_extra_fixed_bytes = cap * (40 + 64 * SPLIT_PACKET_WINDOW_BATCHES as u64);
+        self
     }
 
     /// `gpu_math = "fast"` 且带样本权重:权重常驻 device,+4 B/行。
@@ -432,10 +581,7 @@ pub struct GpuStreamingPlan {
     pub target_blocks: u64,
     pub target_cols: u64,
     pub resolved_cols_per_block: u64,
-    /// 解出来的 histogram stream 数。streaming 默认 2 —— 第二条流让本来
-    /// 就要做的传输真正并发起来(**不是**为了 overlap 多复制一遍数据)。
-    /// 但它会让 `per_col_bytes` 翻倍,**若因此把块宽夹到拐点以下就降回 1**:
-    /// 拐点值 −42.6%,第二条流只值 −13~28%,**拐点优先**。
+    /// Resolved histogram stream count.
     pub resolved_hist_streams: u64,
     /// 常驻的物理列块数。`0` = 纯 streaming,`== physical_blocks` = 全常驻,
     /// 中间是 hybrid。**空闲显存优先买这个** —— 它消掉的是"每层重新上传
@@ -565,17 +711,26 @@ pub fn resolve_gpu_streaming_cols_per_block(
     })
 }
 
-/// Preserve the measured column-major streaming policy: narrow blocks use two
-/// streams only when doing so does not narrow the selected width. This is the
-/// policy used by the accepted 0.0.7 A/B; stream tuning is separate work.
-/// GPU row-major was removed after balanced HIGGS A/B regressed 12–29% with
-/// identical models (partial Epsilon agreed): transpose/staging/sync overhead.
-/// U16 row-major was never implemented. See internal-docs/history.md.
+/// Maximum streaming block width that retains the existing two-stream choice.
+/// Preserve the existing cutoff: the accepted column-major benchmark arms
+/// used this geometry. This is not a new one-versus-two-stream speed claim.
+/// The abandoned GPU row-major training path was slower despite byte-identical
+/// models (HIGGS +12–29%, with partial Epsilon evidence pointing the same way).
+/// Transpose, staging, and synchronization cost outweighed its intended benefit;
+/// 16-bit GPU row-major was never implemented. See `internal-docs/history.md`,
+/// “Decision: remove GPU training row-major entirely” (2026-11-08).
 pub const NARROW_STREAMING_MAX_FEATS: u64 = 32;
 
-/// Resolve block width, stream count and residency together. Explicit streams
-/// are respected; automatic streams retain the measured narrow-block policy.
-/// `make_model` must price each stream count independently.
+/// GPU streaming 的**完整**计划:块宽 + stream 数一起解。
+///
+/// stream 数**按执行路径分派**,不是按 resident/streaming 分派:
+///
+/// Automatic stream selection keeps its existing narrow-block cutoff. Two
+/// streams are selected only when their candidate is at least as wide as the
+/// one-stream candidate and no wider than `NARROW_STREAMING_MAX_FEATS`.
+///
+/// `make_model` 按 stream 数造模型 —— stream 数进 `per_col_bytes`,
+/// 所以两档必须各算各的,不能拿一个模型套两次。
 pub fn resolve_gpu_streaming_plan(
     explicit_cols: Option<usize>,
     explicit_streams: Option<usize>,
@@ -618,8 +773,8 @@ pub fn resolve_gpu_streaming_plan(
         total_vram,
         make_model(2),
     ) {
-        // Retain the accepted column-major policy; changing stream defaults
-        // requires a separate balanced comparison.
+        // Preserve the established narrow-width stream choice; the clean
+        // column-major comparisons used the same two-stream choice here.
         Ok(mut two)
             if two.resolved_cols_per_block >= one.resolved_cols_per_block
                 && two.resolved_cols_per_block <= NARROW_STREAMING_MAX_FEATS =>
@@ -635,6 +790,36 @@ pub fn resolve_gpu_streaming_plan(
             Ok(one)
         }
     }
+}
+
+/// [`resolve_gpu_streaming_plan`] for an opened source whose block width is
+/// already fixed: the physical block count is the real one (16-bit blocks hold
+/// half the features, so it can exceed `ceil(features / cols)`), and the
+/// residency is solved against it.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_gpu_streaming_plan_for_blocks(
+    cols: usize,
+    explicit_streams: Option<usize>,
+    explicit_resident: Option<usize>,
+    n_features: u64,
+    physical_blocks: u64,
+    free_vram: u64,
+    total_vram: u64,
+    make_model: impl Fn(u64) -> StreamingMemModel,
+) -> anyhow::Result<GpuStreamingPlan> {
+    let mut plan = resolve_gpu_streaming_plan(
+        Some(cols),
+        explicit_streams,
+        explicit_resident,
+        n_features,
+        free_vram,
+        total_vram,
+        &make_model,
+    )?;
+    plan.physical_blocks = physical_blocks.max(1);
+    let model = make_model(plan.resolved_hist_streams);
+    fill_residency(&mut plan, explicit_resident, &model);
+    Ok(plan)
 }
 
 /// 几何定下来之后,**把剩余安全预算换成常驻物理块**。
@@ -807,7 +992,19 @@ mod tests {
     }
     use super::*;
 
-    /// HIGGS shape with the column-major allocation contract.
+    /// Historical calibration snapshot, including the now-removed GPU
+    /// row-major staging. These are not the current allocation expectations;
+    /// current tests derive costs from the surviving column-major resources.
+    ///
+    /// 实测(HIGGS 10.5M 行、max_bin=255、单流、batch=16、device-quant 开、
+    /// fast 开,`FB_CUDA_RESIDENT_BLOCKS=0`):
+    ///
+    /// | cols | 预分配 |
+    /// |---:|---:|
+    /// | 4 | 533.3 MiB |
+    /// | 7 | 563.5 MiB |
+    /// | 14 | 633.9 MiB |
+    /// | 28 | 774.8 MiB |
     fn higgs_model() -> StreamingMemModel {
         StreamingMemModel::new(10_500_000, 255, 1, 16, true, true)
     }
@@ -870,9 +1067,15 @@ mod tests {
             .parse::<usize>()
             .unwrap();
         assert_eq!(defined, CAT_SET_WORDS);
+        // The host's inline (8-bit feature) set is exactly the device set.
+        let crate::categorical::CatBits::Small(inline) = crate::categorical::CatBits::empty()
+        else {
+            unreachable!()
+        };
+        assert_eq!(std::mem::size_of_val(&inline), CAT_SET_WORDS * 4);
         assert_eq!(
-            std::mem::size_of::<crate::categorical::CatBits>(),
-            CAT_SET_WORDS * 4
+            crate::categorical::CatBits::empty().words8().len(),
+            CAT_SET_WORDS
         );
     }
 
@@ -898,6 +1101,37 @@ mod tests {
             categorical_split_cache_bytes(7, 16),
             7 * (4 + 16 * 32) + 16 * 32 * SPLIT_PACKET_WINDOW_BATCHES as u64
         );
+    }
+
+    #[test]
+    fn wide_categorical_split_buffers_are_priced_from_the_block_shape() {
+        let narrow = GpuBlockShape::all_u8(8, 8 * 256);
+        assert_eq!(wide_categorical_split_cache_bytes(&narrow, 16), 0);
+        // One 16-bit block holding a 20,000- and a 1,000-category feature.
+        let wide = GpuBlockShape {
+            max_block_feats: 4,
+            max_block_row_bytes: 8,
+            max_hist_bins: 21_000 + 2 * 1024,
+            max_cell_bytes: 2,
+            cat_mask_words: 20_000usize.div_ceil(64) * 2,
+            wide_cat_feats: 2,
+            wide_cat_bins: 21_000,
+            wide_cat_set_words: (20_000usize.div_ceil(64) + 1_000usize.div_ceil(64)) * 2,
+        };
+        let cap = 16;
+        let expected = cap * 21_000 * 4
+            + cap * wide.wide_cat_set_words as u64 * 4
+            + 2 * 3 * 4
+            + cap * SPLIT_PACKET_WINDOW_BATCHES as u64 * (626 - 8) * 4;
+        assert_eq!(wide_categorical_split_cache_bytes(&wide, cap), expected);
+        // The resident slot price carries exactly that addition.
+        let slot = wide.max_hist_bins as u64 * 16 * 2 * cap
+            + 4 * (cap * 64 + 12)
+            + categorical_split_cache_bytes(4, cap)
+            + expected;
+        let model = StreamingMemModel::new_for_shape(1_000_000, &wide, 4, 1, cap, true, false)
+            .with_resident_split_cache_for_shape(&wide, 4, cap, true, false);
+        assert_eq!(model.resident_extra_col_bytes, slot.div_ceil(4));
     }
 
     #[test]
@@ -995,13 +1229,10 @@ mod tests {
     }
 
     #[test]
-    fn model_matches_historical_preallocation_after_retired_stage_is_removed() {
+    fn model_matches_measured_preallocation_within_a_few_percent() {
         let m = higgs_model();
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
         for (cols, measured) in [(4u64, 533.3), (7.0 as u64, 563.5), (14, 633.9), (28, 774.8)] {
-            // Historical measurements included 32 MiB of retired layout
-            // staging; compare only the allocations retained by column-major.
-            let measured = measured - 32.0;
             let est = mib(m.peak_for(cols));
             let err = (est - measured).abs() / measured;
             assert!(

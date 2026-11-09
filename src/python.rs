@@ -9,9 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use numpy::{
-    PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods, ToPyArray,
-};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 #[cfg(not(feature = "cuda"))]
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -28,13 +26,6 @@ use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 
 mod explain;
 mod margin;
-
-/// Block width for GPU file input whose row count is unknown before open
-/// (CSV / CSV.gz) when `cols_per_block` is not given. Conservative: a narrow
-/// width from the planner's candidate set (`gpu_mem_plan::CANDIDATE_WIDTHS`),
-/// so each block slot stays small whatever the row count turns out to be.
-#[cfg(feature = "cuda")]
-const DEFERRED_GPU_COLS_PER_BLOCK: usize = 8;
 
 fn on_off(flag: bool) -> &'static str {
     if flag {
@@ -154,7 +145,7 @@ struct BlockingPlan {
     /// 常驻块数)是在**同一个内存模型**里一起解的;运行时若按自己的默认
     /// 再挑一个,预算和实际分配就对不上 —— 规划器为了装下而选了 1 条流,
     /// 运行时却按路径又开了 2 条,就是一次 OOM。
-    /// `None` = 规划器尚未参与(仅 CPU 或 deferred source 的 pre-open 几何)。
+    /// `None` = 规划器未参与(CPU)。
     hist_streams: Option<usize>,
     resident_blocks: Option<usize>,
     /// 规划器实际用的预算(字节),= `min(用户给的, 空闲显存)`。
@@ -163,19 +154,6 @@ struct BlockingPlan {
 }
 
 impl BlockingPlan {
-    /// 已经定好的宽度(用户显式给的,或规划器解出来的)。
-    fn explicit(effective: usize, n_features: usize, nthread: usize) -> Self {
-        Self {
-            requested: Some(effective),
-            effective,
-            n_blocks: n_features.max(1).div_ceil(effective.max(1)),
-            nthread,
-            hist_streams: None,
-            resident_blocks: None,
-            effective_gpu_budget: None,
-        }
-    }
-
     /// 显存规划器解出来的完整几何:块宽 + stream 数 + 常驻块数。
     fn from_plan(
         p: &crate::gpu_mem_plan::GpuStreamingPlan,
@@ -233,7 +211,7 @@ fn resolve_blocking(
     match cfg.device {
         #[cfg(feature = "cuda")]
         Some(ordinal) => {
-            use crate::gpu_mem_plan::{resolve_gpu_streaming_plan, StreamingMemModel};
+            use crate::gpu_mem_plan::resolve_gpu_streaming_plan;
             // ⚠️ **必须查用户真正要用的那张卡。** 这里以前固定
             // `CudaContext::new(0)`,而 buffer 实际分配在 `train_gpu(ordinal, ..)`
             // 指定的卡上 —— `device="cuda:1"` 时预算读的是 GPU 0 的空闲显存,
@@ -250,29 +228,27 @@ fn resolve_blocking(
             // **整个乘以 stream 数** —— 所以块宽和 stream 数必须**一起解**。
             // 分开解会得到一个装不下的组合:规划器按单流选了宽块,运行时
             // 却按路径开了双流,然后 CUDA OOM(而不是明确的规划失败)。
-            let fast = matches!(cfg.params.gpu_math, crate::types::GpuMath::Fast);
-            let max_bin = cfg.params.max_bin as u64;
             // ⚠️ **拿不到真实行数就明确报错,不要拿别的数顶上。**
             // 这里曾经传的是 `n_rounds`(注释还写着"下面用真实行数覆盖",
             // 而下面根本没有覆盖),于是模型把上千万行当成几十行算,
             // 解出来的块宽在真实数据上放不下。
             // 「规划失败必须报错,不能悄悄回退」——顶一个假行数比报错更糟。
+            // File input without a pre-open row count plans from the exact
+            // count of the reader's first pass (see `train_file`), so `None`
+            // means a source that cannot count its rows before building blocks.
             let rows = n_rows.ok_or_else(|| {
                 PyValueError::new_err(
-                    "GPU planning needs the row count, but this input source cannot provide it before open; construct the source with an explicit cols_per_block, and planning finishes with the real aggregate row count after open",
+                    "GPU planning needs the row count, but this input source provides none before its column blocks are built",
                 )
             })?;
             // Fast ranking allocates per query group, so the planner needs the
             // groups themselves; planning without them would have to guess.
-            let rank_groups: &[u32] = match (fast, cfg.objective.rank(), &cfg.group_ptr) {
-                (true, Some(_), Some(g)) => g,
-                (true, Some(_), None) => {
-                    return Err(PyRuntimeError::new_err(
-                        "GPU planning for fast ranking needs the query groups, but none were resolved before planning",
-                    ))
-                }
-                _ => &[],
-            };
+            let fast = matches!(cfg.params.gpu_math, crate::types::GpuMath::Fast);
+            if fast && cfg.objective.rank().is_some() && cfg.group_ptr.is_none() {
+                return Err(PyRuntimeError::new_err(
+                    "GPU planning for fast ranking needs the query groups, but none were resolved before planning",
+                ));
+            }
             let p = resolve_gpu_streaming_plan(
                 cfg.requested_cols_per_block,
                 cfg.params.hist_streams,
@@ -282,74 +258,7 @@ fn resolve_blocking(
                     .gpu_memory_budget
                     .map_or(free as u64, |b| (b as u64).min(free as u64)),
                 total as u64,
-                |streams| {
-                    let model = StreamingMemModel::new(
-                        rows,
-                        max_bin,
-                        streams,
-                        cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64,
-                        cfg.params.device_quantize.unwrap_or(true),
-                        fast,
-                    );
-                    // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
-                    // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
-                    // 和训练时的分配用同一个判断。
-                    let model = if fast
-                        && crate::train::has_gradient_weights(
-                            cfg.objective,
-                            cfg.weighted,
-                            cfg.params.scale_pos_weight,
-                        ) {
-                        model.with_fast_weights(rows)
-                    } else {
-                        model
-                    };
-                    // fast 多分类:K 份常驻 prediction + softmax 统计量。
-                    // exact 的多分类在 host 算梯度,device 上不多占。
-                    let model = if fast && cfg.objective.is_multi_quantile() {
-                        // 多个 quantile_alpha:K 份 prediction,没有 softmax 统计量。
-                        model.with_fast_multi_quantile(rows, cfg.objective.num_outputs() as u64)
-                    } else if fast {
-                        model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
-                    } else {
-                        model
-                    };
-                    // fast ranking: the device LambdaMART buffers, for the real query
-                    // groups. Array inputs carry them; file inputs read their query-id
-                    // column before planning (see `train_file`).
-                    let model = match (fast, cfg.objective.rank()) {
-                        (true, Some((kind, params))) => model.with_fast_rank(
-                            rows,
-                            &crate::gpu_mem_plan::FastRankShape::for_groups(
-                                kind,
-                                &params,
-                                rank_groups,
-                            ),
-                        ),
-                        _ => model,
-                    };
-                    if cfg.params.gpu_split_cache
-                        && !matches!(
-                            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
-                            Ok("1") | Ok("true")
-                        )
-                    {
-                        let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
-                        // Categorical set outputs are reserved unconditionally:
-                        // Arrow dictionary columns make a file input categorical
-                        // without a declaration (tiny: ~0.5 KB / column / slot).
-                        let model = model
-                            .with_resident_split_cache(max_bin, cap)
-                            .with_categorical_split_cache(cap);
-                        if cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0 {
-                            model.with_node_feature_masks(cap)
-                        } else {
-                            model
-                        }
-                    } else {
-                        model
-                    }
-                },
+                |streams| gpu_plan_model(cfg, rows, streams, None),
             )
             .map_err(to_py_err)?;
             if !cfg.quiet {
@@ -397,6 +306,200 @@ fn resolve_blocking(
             cfg.params.max_bin as usize,
         )),
     }
+}
+
+/// The streaming memory model the GPU planner prices one candidate stream
+/// count with. Pre-open (`shape = None`) every column is priced at the scalar
+/// `max_bin` and one byte per cell; after open, `Some((shape, cols))` prices the
+/// real blocks (16-bit cells, actual per-feature bins) at the fixed width.
+#[cfg(feature = "cuda")]
+fn gpu_plan_model(
+    cfg: &Parsed,
+    rows: u64,
+    streams: u64,
+    shape: Option<(&crate::gpu_mem_plan::GpuBlockShape, u64)>,
+) -> crate::gpu_mem_plan::StreamingMemModel {
+    use crate::gpu_mem_plan::StreamingMemModel;
+    let fast = matches!(cfg.params.gpu_math, crate::types::GpuMath::Fast);
+    let max_bin = cfg.params.max_bin as u64;
+    let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
+    let device_quantize = cfg.params.device_quantize.unwrap_or(true);
+    let model = match shape {
+        None => StreamingMemModel::new(rows, max_bin, streams, cap, device_quantize, fast),
+        Some((shape, cols)) => {
+            StreamingMemModel::new_for_shape(rows, shape, cols, streams, cap, device_quantize, fast)
+        }
+    };
+    // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
+    // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
+    // 和训练时的分配用同一个判断。
+    let model = if fast
+        && crate::train::has_gradient_weights(
+            cfg.objective,
+            cfg.weighted,
+            cfg.params.scale_pos_weight,
+        ) {
+        model.with_fast_weights(rows)
+    } else {
+        model
+    };
+    // fast 多分类:K 份常驻 prediction + softmax 统计量。
+    // exact 的多分类在 host 算梯度,device 上不多占。
+    let model = if fast && cfg.objective.is_multi_quantile() {
+        // 多个 quantile_alpha:K 份 prediction,没有 softmax 统计量。
+        model.with_fast_multi_quantile(rows, cfg.objective.num_outputs() as u64)
+    } else if fast {
+        model.with_fast_multiclass(rows, cfg.objective.num_outputs() as u64)
+    } else {
+        model
+    };
+    // fast ranking: the device LambdaMART buffers, for the real query
+    // groups. Array inputs carry them; file inputs read their query-id
+    // column before planning (see `train_file`; `resolve_blocking` rejects
+    // fast ranking without resolved groups).
+    let model = match (fast, cfg.objective.rank()) {
+        (true, Some((kind, params))) => model.with_fast_rank(
+            rows,
+            &crate::gpu_mem_plan::FastRankShape::for_groups(
+                kind,
+                &params,
+                cfg.group_ptr.as_deref().unwrap_or(&[]),
+            ),
+        ),
+        _ => model,
+    };
+    if !cfg.params.gpu_split_cache
+        || matches!(
+            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    {
+        return model;
+    }
+    let node_masks = cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0;
+    match shape {
+        // Categorical set outputs are reserved unconditionally:
+        // Arrow dictionary columns make a file input categorical
+        // without a declaration (tiny: ~0.5 KB / column / slot).
+        None => {
+            let model = model
+                .with_resident_split_cache(max_bin, cap)
+                .with_categorical_split_cache(cap);
+            if node_masks {
+                model.with_node_feature_masks(cap)
+            } else {
+                model
+            }
+        }
+        Some((shape, cols)) => {
+            model.with_resident_split_cache_for_shape(shape, cols, cap, true, node_masks)
+        }
+    }
+}
+
+/// The GPU geometry the user asked for, before the planner overwrote
+/// `TrainParams` with its resolved values.
+#[derive(Clone, Copy)]
+struct UserGpuGeometry {
+    hist_streams: Option<usize>,
+    resident_blocks: Option<usize>,
+    gpu_memory_budget: Option<usize>,
+}
+
+fn user_gpu_geometry(cfg: &Parsed) -> UserGpuGeometry {
+    UserGpuGeometry {
+        hist_streams: cfg.params.hist_streams,
+        resident_blocks: cfg.params.resident_blocks,
+        gpu_memory_budget: cfg.params.gpu_memory_budget,
+    }
+}
+
+/// Re-plan the GPU memory once the source is open and its real blocks are
+/// known, when the pre-open pricing could not know them: any 16-bit block
+/// (features with more than 255 bins or 254 categories) or `max_bin > 255`
+/// (pre-open pricing charges every column `max_bin` bins). The block width is
+/// kept (the source is already built with it); streams and residency are
+/// solved again against the real block count and slot bytes, from the user's
+/// original requests. 8-bit data with `max_bin <= 255` keeps its pre-open plan.
+#[allow(unused_variables)]
+fn refine_gpu_plan_for_source(
+    cfg: &Parsed,
+    user: UserGpuGeometry,
+    n_features: usize,
+    source: &dyn crate::train::BlockSource,
+    params: &mut crate::types::TrainParams,
+) -> PyResult<()> {
+    #[cfg(feature = "cuda")]
+    if let Some(ordinal) = cfg.device {
+        let shape = crate::train::gpu_block_shape(source).map_err(to_py_err)?;
+        if !shape.has_wide() && cfg.params.max_bin <= 255 {
+            return Ok(());
+        }
+        let ctx = crate::backend::cuda::cuda_context(ordinal).map_err(|e| {
+            PyValueError::new_err(format!("cannot open CUDA device {ordinal}: {e}"))
+        })?;
+        let (free, total) = ctx
+            .mem_get_info()
+            .map_err(|e| PyValueError::new_err(format!("cannot read device memory info: {e}")))?;
+        let budget = user
+            .gpu_memory_budget
+            .map_or(free as u64, |b| (b as u64).min(free as u64));
+        let rows = source.n_rows() as u64;
+        let cols = params.cols_per_block.max(1);
+        let model = |streams| gpu_plan_model(cfg, rows, streams, Some((&shape, cols as u64)));
+        let plan = |streams: Option<usize>| {
+            crate::gpu_mem_plan::resolve_gpu_streaming_plan_for_blocks(
+                cols,
+                streams,
+                user.resident_blocks,
+                n_features as u64,
+                source.n_blocks() as u64,
+                budget,
+                total as u64,
+                model,
+            )
+            .map_err(to_py_err)
+        };
+        // Streaming-only floor of a plan: its block width and streams, nothing
+        // resident. The second stream is dropped (when the user did not fix
+        // the count) before the configuration is declared too large.
+        let floor = |p: &crate::gpu_mem_plan::GpuStreamingPlan| {
+            model(p.resolved_hist_streams).peak_for_layout(cols as u64, p.resolved_hist_streams, 0)
+        };
+        let mut p = plan(user.hist_streams)?;
+        if user.hist_streams.is_none()
+            && p.resolved_hist_streams > 1
+            && floor(&p) > budget.saturating_sub(p.reserve)
+        {
+            p = plan(Some(1))?;
+        }
+        let floor = floor(&p);
+        if floor > budget.saturating_sub(p.reserve) {
+            return Err(PyValueError::new_err(format!(
+                "the streaming configuration of these column blocks does not fit in GPU memory: \
+                 needs about {:.1} MB, budget is only {:.1} MB (free {:.1} MB − reserve {:.1} MB); \
+                 lower cols_per_block or max_bin, or raise gpu_memory_budget",
+                floor as f64 / 1048576.0,
+                budget.saturating_sub(p.reserve) as f64 / 1048576.0,
+                budget as f64 / 1048576.0,
+                p.reserve as f64 / 1048576.0,
+            )));
+        }
+        if !cfg.quiet {
+            eprintln!(
+                "{}\n               priced from the opened blocks: {} blocks, widest {} B/row, \
+                 largest histogram {} bins",
+                p.report(),
+                source.n_blocks(),
+                shape.max_block_row_bytes,
+                shape.max_hist_bins
+            );
+        }
+        params.hist_streams = Some(p.resolved_hist_streams as usize);
+        params.resident_blocks = Some(p.resident_blocks as usize);
+        params.gpu_memory_budget = Some(p.free_vram as usize);
+    }
+    Ok(())
 }
 
 /// 把规划器解出来的几何写回训练参数。
@@ -951,7 +1054,7 @@ fn resolved_predict_workers(
 fn score_rows<F>(
     n_rows: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     score_row: F,
 ) -> anyhow::Result<Vec<f32>>
 where
@@ -968,7 +1071,7 @@ where
         return Ok(out);
     }
     if pool.is_none() {
-        *pool = Some(crate::threading::build_pool(workers)?);
+        *pool = Some(crate::threading::prediction_pool(workers)?);
     }
     let chunks = workers.saturating_mul(4).max(1);
     let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
@@ -987,6 +1090,25 @@ where
     Ok(out)
 }
 
+/// Rows per parallel task of the blocked CPU scorers, or `None` to score on
+/// the calling thread. Tasks cover whole `CPU_PREDICTION_BLOCK_ROWS` row
+/// blocks (a smaller task loses the per-block tree reuse) and at least
+/// `AUTO_PREDICT_MIN_WORK` traversal steps each, the same crossover the
+/// automatic worker count uses. A small batch therefore occupies fewer
+/// workers than requested, or runs serially (waking pool threads costs more
+/// than scoring it); the pool keeps the requested size. Every row is still
+/// scored on its own, in tree order, so the split cannot change a result.
+fn blocked_rows_per_chunk(n_rows: usize, workers: usize, work_per_row: usize) -> Option<usize> {
+    const BLOCK: usize = crate::inference::CPU_PREDICTION_BLOCK_ROWS;
+    let blocks = n_rows.div_ceil(BLOCK);
+    let by_work = n_rows.saturating_mul(work_per_row) / AUTO_PREDICT_MIN_WORK;
+    let chunks = workers.saturating_mul(4).min(blocks).min(by_work);
+    if workers <= 1 || chunks <= 1 {
+        return None;
+    }
+    Some(n_rows.div_ceil(chunks).div_ceil(BLOCK) * BLOCK)
+}
+
 /// Cache-friendly fast path for C-contiguous NumPy input. Parallelism still
 /// owns disjoint deterministic row ranges; inside each range the CPU inference
 /// model blocks rows while preserving every row's original tree-add order. An
@@ -1000,22 +1122,21 @@ fn score_contiguous_rows_from(
     n_features: usize,
     n_trees: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     init: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
     let mut out = vec![0.0f32; n_rows];
     if n_rows == 0 {
         return Ok(out);
     }
-    if workers <= 1 {
+    let Some(rows_per_chunk) = blocked_rows_per_chunk(n_rows, workers, model.work_per_row(n_trees))
+    else {
         model.predict_margins_from(data, n_features, n_trees, init, &mut out)?;
         return Ok(out);
-    }
+    };
     if pool.is_none() {
-        *pool = Some(crate::threading::build_pool(workers)?);
+        *pool = Some(crate::threading::prediction_pool(workers)?);
     }
-    let chunks = workers.saturating_mul(4).max(1);
-    let rows_per_chunk = n_rows.div_ceil(chunks).max(1);
     pool.as_ref()
         .expect("prediction pool just initialized")
         .install(|| {
@@ -1034,6 +1155,68 @@ fn score_contiguous_rows_from(
                     )
                 })
         })?;
+    Ok(out)
+}
+
+/// Reject the reserved value f32::MAX in prediction input, as training does
+/// (every array prediction path, CPU and GPU, checks here).
+fn reject_reserved_max(x: &PyReadonlyArray2<'_, f32>) -> PyResult<()> {
+    let has_max = if x.is_c_contiguous() {
+        x.as_slice()?.contains(&f32::MAX)
+    } else {
+        x.as_array().iter().any(|&v| v == f32::MAX)
+    };
+    if has_max {
+        let view = x.as_array();
+        let (r, c) = view
+            .indexed_iter()
+            .find(|(_, &v)| v == f32::MAX)
+            .map(|(ix, _)| ix)
+            .expect("found above");
+        return Err(PyValueError::new_err(format!(
+            "prediction data at row {r}, column {c} is f32::MAX: this value is reserved for the missing-value split boundary and is rejected in training and prediction; rescale this feature first"
+        )));
+    }
+    Ok(())
+}
+
+/// Multi-output counterpart of `score_contiguous_rows_from`: row-major
+/// `rows x K` margins, disjoint deterministic row ranges per worker.
+fn score_contiguous_multi_from(
+    model: &crate::inference::CpuInferenceModel,
+    data: &[f32],
+    n_rows: usize,
+    n_features: usize,
+    n_trees: usize,
+    workers: usize,
+    init: Option<&[f32]>,
+) -> anyhow::Result<Vec<f32>> {
+    let k = model.n_outputs();
+    let mut out = vec![0.0f32; n_rows * k];
+    if n_rows == 0 {
+        return Ok(out);
+    }
+    let Some(rows_per_chunk) = blocked_rows_per_chunk(n_rows, workers, model.work_per_row(n_trees))
+    else {
+        model.predict_multi_margins_from(data, n_features, n_trees, init, &mut out)?;
+        return Ok(out);
+    };
+    let pool = crate::threading::prediction_pool(workers)?;
+    pool.install(|| {
+        out.par_chunks_mut(rows_per_chunk * k)
+            .enumerate()
+            .try_for_each(|(chunk, values)| {
+                let first = chunk * rows_per_chunk;
+                let rows = values.len() / k;
+                model.predict_multi_margins_from(
+                    &data[first * n_features..(first + rows) * n_features],
+                    n_features,
+                    n_trees,
+                    init.map(|m| &m[first * k..(first + rows) * k]),
+                    values,
+                )
+            })
+    })?;
     Ok(out)
 }
 
@@ -1211,14 +1394,8 @@ fn predict_files_to_parquet(
     // Multi-output models (multiclass, several quantiles): the file is read once, every
     // batch is scored for all outputs and written before the next one is read.
     let k_out = model.inner.num_outputs();
-    let multi: Option<MulticlassPredictors> = if k_out > 1 {
-        let views = model.class_views().map_err(to_py_err)?;
-        let infs = views
-            .iter()
-            .map(|v| v.inference_model())
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map_err(to_py_err)?;
-        Some((views, infs))
+    let multi: Option<Arc<crate::inference::CompactInferenceModel>> = if k_out > 1 {
+        Some(model.inference_model().map_err(to_py_err)?)
     } else {
         None
     };
@@ -1229,7 +1406,7 @@ fn predict_files_to_parquet(
     };
     let projected_features: Vec<usize> = match (&single, &multi) {
         (Some(inference), _) => inference.canonical_features().to_vec(),
-        (None, Some((_, infs))) => union_features(infs),
+        (None, Some(inference)) => inference.canonical_features().to_vec(),
         (None, None) => unreachable!("either a single or a multi-output predictor"),
     };
     let n_features = projected_features.len();
@@ -1267,11 +1444,7 @@ fn predict_files_to_parquet(
     );
     let work_per_row = match (&single, &multi) {
         (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
-        (None, Some((views, _))) => views
-            .iter()
-            .enumerate()
-            .map(|(c, v)| prediction_work_per_row(&v.inner, model.inner.class_tree_count(upto, c)))
-            .sum(),
+        (None, Some(_)) => prediction_work_per_row(&model.inner, upto),
         (None, None) => unreachable!("either a single or a multi-output predictor"),
     };
     let (ingest_workers, predict_worker_cap, oversubscribed) = prediction_output_pipeline_workers(
@@ -1361,6 +1534,8 @@ fn predict_files_to_parquet(
             header,
             ingest_workers,
             missing,
+            &model.inner.feature_types,
+            model.inner.categories.as_deref(),
             |data, n_rows| {
                 let workers = resolved_predict_workers(
                     predict_threads,
@@ -1394,19 +1569,9 @@ fn predict_files_to_parquet(
                         transform_prediction_margins(inference.model(), &mut batch, output_margin);
                         vec![batch]
                     }
-                    (_, Some((views, infs)), _) => {
+                    (_, Some(inference), _) => {
                         let mut margins = score_multi_output_batch(
-                            &model.inner,
-                            views,
-                            infs,
-                            upto,
-                            data,
-                            n_rows,
-                            &projected_features,
-                            false,
-                            workers,
-                            &mut predict_pool,
-                            batch_init,
+                            model, inference, upto, data, n_rows, false, workers, batch_init,
                         )?;
                         if output_margin {
                             deinterleave_columns(&margins, k_out)
@@ -1513,98 +1678,42 @@ fn deinterleave_columns(values: &[f32], k: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Score one batch of canonical-width rows for every output of a multi-output model
-/// (multiclass classes, or one quantile per alpha): each output view scores its own
-/// compressed feature subset with the single-output predictor. Returns the `n × K`
-/// raw margins, row-major.
+/// One batch of a multi-output model (multiclass classes, or one quantile per
+/// alpha), row-major `n_rows x K`. `data` holds the columns of `inference`'s
+/// compact feature list, which covers every output; all outputs are scored in
+/// one pass (one upload on the device), bit-identical to scoring each class
+/// view on its own.
 #[allow(clippy::too_many_arguments)]
 fn score_multi_output_batch(
-    model: &Model,
-    views: &[PyModel],
-    infs: &[Arc<crate::inference::CompactInferenceModel>],
+    owner: &PyModel,
+    inference: &crate::inference::CompactInferenceModel,
     upto: usize,
     data: &[f32],
     n_rows: usize,
-    // Canonical feature ids held by the columns of `data` (ascending): the union
-    // of every view's features, so a file is read for those columns only.
-    layout: &[usize],
     gpu_batch: bool,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
     // Per-row start margins of this batch, row-major `n_rows x K` (replaces the intercepts).
     init: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
-    let k_out = views.len();
-    let mut margins = vec![0.0f32; n_rows * k_out];
-    for (c, (view, vinf)) in views.iter().zip(infs).enumerate() {
-        let nt = model.class_tree_count(upto, c);
-        let gathered;
-        let vdata: &[f32] = if vinf.canonical_features() == layout {
-            data
-        } else {
-            let positions = vinf
-                .canonical_features()
-                .iter()
-                .map(|feature| {
-                    layout
-                        .binary_search(feature)
-                        .map_err(|_| anyhow::anyhow!("prediction layout lacks feature {feature}"))
-                })
-                .collect::<anyhow::Result<Vec<usize>>>()?;
-            gathered = project_canonical_rows(data, n_rows, layout.len(), &positions)?;
-            &gathered
-        };
-        let col_init: Option<Vec<f32>> =
-            init.map(|m| m.chunks_exact(k_out).map(|row| row[c]).collect());
-        #[cfg(feature = "cuda")]
-        let col = if gpu_batch {
-            view.gpu_predictor(0)?
-                .predict_margins_from(vdata, n_rows, nt, col_init.as_deref())?
-        } else {
-            score_contiguous_rows_from(
-                &*vinf.cpu_predictor()?,
-                vdata,
-                n_rows,
-                vinf.n_features(),
-                nt,
-                workers,
-                pool,
-                col_init.as_deref(),
-            )?
-        };
-        #[cfg(not(feature = "cuda"))]
-        let col = {
-            let _ = (gpu_batch, view);
-            score_contiguous_rows_from(
-                &*vinf.cpu_predictor()?,
-                vdata,
-                n_rows,
-                vinf.n_features(),
-                nt,
-                workers,
-                pool,
-                col_init.as_deref(),
-            )?
-        };
-        for (i, v) in col.into_iter().enumerate() {
-            margins[i * k_out + c] = v;
-        }
+    #[cfg(feature = "cuda")]
+    if gpu_batch {
+        return owner
+            .gpu_predictor(0)?
+            .predict_multi_margins_from(data, n_rows, upto, init);
     }
-    Ok(margins)
+    let _ = (gpu_batch, owner);
+    score_contiguous_multi_from(
+        &*inference.cpu_predictor()?,
+        data,
+        n_rows,
+        inference.n_features(),
+        upto,
+        workers,
+        init,
+    )
 }
 
-/// Ascending union of the canonical features the output views of a
-/// multi-output model read.
-fn union_features(infs: &[Arc<crate::inference::CompactInferenceModel>]) -> Vec<usize> {
-    let mut union: Vec<usize> = infs
-        .iter()
-        .flat_map(|inf| inf.canonical_features().iter().copied())
-        .collect();
-    union.sort_unstable();
-    union.dedup();
-    union
-}
-
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn project_canonical_rows(
     row_major: &[f32],
     n_rows: usize,
@@ -1738,12 +1847,6 @@ fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin
     }
 }
 
-/// 多分类文件预测:每类的单输出视图和它的压缩推理模型。
-type MulticlassPredictors = (
-    Arc<Vec<PyModel>>,
-    Vec<Arc<crate::inference::CompactInferenceModel>>,
-);
-
 #[pyclass(name = "Model", module = "ferrisboost._core")]
 pub struct PyModel {
     inner: Model,
@@ -1760,8 +1863,6 @@ pub struct PyModel {
     #[cfg(feature = "cuda")]
     gpu_explainers:
         Mutex<std::collections::HashMap<usize, Arc<crate::backend::cuda::GpuExplainModel>>>,
-    /// 多分类:每类一个单输出视图(`Model::class_view`),带各自的预测缓存。
-    class_views: Mutex<Option<Arc<Vec<PyModel>>>>,
 }
 
 /// `iteration_range` 的执行方式:`begin == 0` 是树的前缀(不拷贝),否则是
@@ -1810,7 +1911,7 @@ impl PyModel {
         )))
     }
 
-    /// 不带训练历史的普通包装(多分类的类视图用)。
+    /// A plain wrapper without training history (`iteration_range` slices).
     fn plain(inner: Model, quiet: bool, model_io_threads: usize, ingest_threads: usize) -> Self {
         PyModel {
             inner,
@@ -1824,37 +1925,13 @@ impl PyModel {
             gpu_predictors: Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "cuda")]
             gpu_explainers: Mutex::new(std::collections::HashMap::new()),
-            class_views: Mutex::new(None),
         }
     }
 
-    fn class_views(&self) -> anyhow::Result<Arc<Vec<PyModel>>> {
-        let mut cache = self
-            .class_views
-            .lock()
-            .map_err(|_| anyhow::anyhow!("class view cache poisoned"))?;
-        if let Some(v) = cache.as_ref() {
-            return Ok(Arc::clone(v));
-        }
-        let views = Arc::new(
-            (0..self.inner.num_outputs())
-                .map(|c| {
-                    PyModel::plain(
-                        self.inner.class_view(c),
-                        self.quiet,
-                        self.model_io_threads,
-                        self.ingest_threads,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
-        *cache = Some(Arc::clone(&views));
-        Ok(views)
-    }
-
-    /// 多输出(多分类、多分位数)预测:每个输出的视图各跑一遍单输出路径(CPU / GPU 都复用),
-    /// 再按行组合。返回按行排的 `n × K` margin。文件输入走 `predict_files_from`:
-    /// 只读一遍,每个 batch 对所有输出打分(见 `score_multi_output_batch`)。
+    /// Multi-output (multiclass, multi-quantile) margins, row-major `n x K`.
+    /// Arrays score every output in one pass (`multi_output_array_margins`);
+    /// file input goes through `predict_files_from`, which reads each file once
+    /// and scores every batch for all outputs (`score_multi_output_batch`).
     #[allow(clippy::too_many_arguments)]
     fn multiclass_margins<'py>(
         &self,
@@ -1886,61 +1963,93 @@ impl PyModel {
             let margins = arr.readonly().as_slice()?.to_vec();
             return Ok((margins.len() / k, margins));
         }
-        let views = self.class_views().map_err(to_py_err)?;
         let upto = n_trees.unwrap_or(self.inner.trees.len());
-        let mut cols: Vec<Vec<f32>> = Vec::with_capacity(k);
-        // A per-row start scores through the array path of each class view.
-        let start_matrix = match init {
-            Some(_) => Some(array_input(py, data)?),
-            None => None,
+        let x = array_input(py, data)?;
+        self.multi_output_array_margins(py, x, upto, predict_threads, use_gpu, init)
+    }
+
+    /// Row-major `rows x K` margins of a multi-output model from one array,
+    /// validated like the single-output array path. Every output is scored in
+    /// one pass over the rows (one upload on the device), bit-identical to
+    /// scoring each class view on its own: see
+    /// `CpuInferenceModel::predict_multi_margins_from` and
+    /// `GpuInferenceModel::predict_multi_margins_from`.
+    fn multi_output_array_margins<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f32>,
+        upto: usize,
+        predict_threads: usize,
+        use_gpu: bool,
+        init: Option<&[f32]>,
+    ) -> PyResult<(usize, Vec<f32>)> {
+        let k = self.inner.num_outputs();
+        let shape = x.shape();
+        let (n_rows, n_features) = (shape[0], shape[1]);
+        if n_features != self.inner.n_features {
+            return Err(PyValueError::new_err(format!(
+                "model was trained on {} features, got {n_features} columns",
+                self.inner.n_features
+            )));
+        }
+        if let Some(m) = init {
+            if m.len() != n_rows * k {
+                return Err(PyValueError::new_err(format!(
+                    "base_margin has {} values, the data has {n_rows} rows x {k} outputs",
+                    m.len()
+                )));
+            }
+        }
+        reject_reserved_max(&x)?;
+        let work_per_row = prediction_work_per_row(&self.inner, upto);
+        if use_gpu {
+            let inference = self.inference_model().map_err(to_py_err)?;
+            if gpu_prediction_selected(use_gpu, n_rows, inference.n_features(), work_per_row) {
+                #[cfg(feature = "cuda")]
+                {
+                    let predictor = self.gpu_predictor(0).map_err(to_py_err)?;
+                    let margins = if x.is_c_contiguous() && inference.is_identity(n_features) {
+                        let data = x.as_slice()?;
+                        py.detach(|| predictor.predict_multi_margins_from(data, n_rows, upto, init))
+                    } else {
+                        let view = x.as_array();
+                        py.detach(|| {
+                            let mut projected = Vec::with_capacity(n_rows * inference.n_features());
+                            for row in view.rows() {
+                                for &feature in inference.canonical_features() {
+                                    projected.push(row[feature]);
+                                }
+                            }
+                            predictor.predict_multi_margins_from(&projected, n_rows, upto, init)
+                        })
+                    }
+                    .map_err(to_py_err)?;
+                    return Ok((n_rows, margins));
+                }
+            }
+        }
+        let gathered: Vec<f32>;
+        let data: &[f32] = if x.is_c_contiguous() {
+            x.as_slice()?
+        } else {
+            gathered = x.as_array().iter().copied().collect();
+            &gathered
         };
-        for (c, view) in views.iter().enumerate() {
-            let nt = self.inner.class_tree_count(upto, c);
-            if let (Some(x), Some(m)) = (&start_matrix, init) {
-                let col_init: Vec<f32> = m.chunks_exact(k).map(|row| row[c]).collect();
-                let out = view.predict_array_from(
-                    py,
-                    x.clone(),
-                    true,
-                    Some(nt),
-                    predict_threads,
-                    use_gpu,
-                    Some(&col_init),
-                )?;
-                cols.push(out.readonly().as_slice()?.to_vec());
-                continue;
-            }
-            let out = view.predict(
-                py,
-                data,
-                true,
-                Some(nt),
-                header,
-                predict_threads,
-                use_gpu,
-                None,
-                false,
-                false,
-                false,
-                false,
-                // Array input: the sentinel was already mapped to NaN by `predict`.
-                f64::NAN,
-                None,
-                false,
-            )?;
-            let arr = out
-                .cast::<PyArray1<f32>>()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            cols.push(arr.readonly().as_slice()?.to_vec());
-        }
-        let n = cols[0].len();
-        let mut margins = vec![0.0f32; n * k];
-        for (c, col) in cols.iter().enumerate() {
-            for (i, &v) in col.iter().enumerate() {
-                margins[i * k + c] = v;
-            }
-        }
-        Ok((n, margins))
+        let workers = resolved_predict_workers(
+            predict_threads,
+            effective_nthread(predict_threads),
+            n_rows,
+            work_per_row,
+        );
+        let predictor = self.cpu_predictor().map_err(to_py_err)?;
+        let margins = py
+            .detach(|| {
+                score_contiguous_multi_from(
+                    &predictor, data, n_rows, n_features, upto, workers, init,
+                )
+            })
+            .map_err(to_py_err)?;
+        Ok((n_rows, margins))
     }
 
     /// 多分类预测的最终形状:`output_margin` / softprob → `(n, K)`,
@@ -2034,22 +2143,7 @@ impl PyModel {
                 }
             }
             // 和训练一样拒绝保留值 f32::MAX(CPU 和 GPU 预测都走这里)。
-            let has_max = if x.is_c_contiguous() {
-                x.as_slice()?.contains(&f32::MAX)
-            } else {
-                x.as_array().iter().any(|&v| v == f32::MAX)
-            };
-            if has_max {
-                let view = x.as_array();
-                let (r, c) = view
-                    .indexed_iter()
-                    .find(|(_, &v)| v == f32::MAX)
-                    .map(|(ix, _)| ix)
-                    .expect("found above");
-                return Err(PyValueError::new_err(format!(
-                    "prediction data at row {r}, column {c} is f32::MAX: this value is reserved for the missing-value split boundary and is rejected in training and prediction; rescale this feature first"
-                )));
-            }
+            reject_reserved_max(&x)?;
             let upto = n_trees.unwrap_or(self.inner.trees.len());
             let work_per_row = prediction_work_per_row(&self.inner, upto);
             let inference = if use_gpu {
@@ -2094,7 +2188,7 @@ impl PyModel {
                     }
                     .map_err(to_py_err)?;
                     transform_prediction_margins(&self.inner, &mut out, output_margin);
-                    return Ok(out.to_pyarray(py));
+                    return Ok(PyArray1::from_vec(py, out));
                 }
             }
             let worker_cap = effective_nthread(predict_threads);
@@ -2138,7 +2232,7 @@ impl PyModel {
                 })
             }
             .map_err(to_py_err)?;
-            Ok(out.to_pyarray(py))
+            Ok(PyArray1::from_vec(py, out))
         })
     }
 
@@ -2171,14 +2265,8 @@ impl PyModel {
         // 多分类:文件只读一遍。每个 batch 只读各类别视图用到的特征的**并集**,
         // 然后每个类别视图在内存里 gather 自己(压缩过)的特征子集、用自己的
         // 单输出预测器打分,按行交错后做 softmax / argmax。
-        let multiclass: Option<MulticlassPredictors> = if k_out > 1 {
-            let views = self.class_views().map_err(to_py_err)?;
-            let infs = views
-                .iter()
-                .map(|v| v.inference_model())
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map_err(to_py_err)?;
-            Some((views, infs))
+        let multiclass: Option<Arc<crate::inference::CompactInferenceModel>> = if k_out > 1 {
+            Some(self.inference_model().map_err(to_py_err)?)
         } else {
             None
         };
@@ -2189,7 +2277,7 @@ impl PyModel {
         };
         let projected_features: Vec<usize> = match (&single, &multiclass) {
             (Some(inference), _) => inference.canonical_features().to_vec(),
-            (None, Some((_, infs))) => union_features(infs),
+            (None, Some(inference)) => inference.canonical_features().to_vec(),
             (None, None) => unreachable!("either a single or a multi-output predictor"),
         };
         let n_features = projected_features.len();
@@ -2214,13 +2302,7 @@ impl PyModel {
         );
         let work_per_row = match (&single, &multiclass) {
             (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
-            (None, Some((views, _))) => views
-                .iter()
-                .enumerate()
-                .map(|(c, v)| {
-                    prediction_work_per_row(&v.inner, self.inner.class_tree_count(upto, c))
-                })
-                .sum(),
+            (None, Some(_)) => prediction_work_per_row(&self.inner, upto),
             (None, None) => unreachable!(),
         };
         let known_gpu_selection = rows_total
@@ -2268,6 +2350,8 @@ impl PyModel {
                     header,
                     ingest_workers,
                     missing,
+                    &self.inner.feature_types,
+                    self.inner.categories.as_deref(),
                     |data, n_rows| {
                         // This batch's slice of the per-row start (row-major
                         // `n_rows x k_out`); batches arrive in file/row order.
@@ -2286,7 +2370,7 @@ impl PyModel {
                         let gpu_batch = known_gpu_selection.unwrap_or_else(|| {
                             gpu_prediction_selected(use_gpu, n_rows, n_features, work_per_row)
                         });
-                        if let Some((views, infs)) = &multiclass {
+                        if let Some(inference) = &multiclass {
                             let workers = resolved_predict_workers(
                                 predict_threads,
                                 predict_worker_cap,
@@ -2294,17 +2378,7 @@ impl PyModel {
                                 work_per_row,
                             );
                             let mut margins = score_multi_output_batch(
-                                &self.inner,
-                                views,
-                                infs,
-                                upto,
-                                data,
-                                n_rows,
-                                &projected_features,
-                                gpu_batch,
-                                workers,
-                                &mut predict_pool,
-                                batch_init,
+                                self, inference, upto, data, n_rows, gpu_batch, workers, batch_init,
                             )?;
                             if output_margin {
                                 out.extend(margins);
@@ -2538,7 +2612,7 @@ impl PyModel {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         // A pandas DataFrame / pyarrow Table is bound to the model's feature
         // names (when it has them) before anything else, like evals in training.
-        let data = &bind_named_table(py, data, &self.inner.feature_names)?;
+        let data = &bind_named_table(py, data, self)?;
         let data = &normalize_array_input(py, data, missing)?;
         // iteration_range 先于一切:begin == 0 折成 n_trees 前缀,否则换成只含
         // 这些轮的模型切片再走同一条路径(SHAP / leaf 也只看被选中的树)。
@@ -2834,7 +2908,6 @@ impl PyModel {
                 gpu_predictors: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "cuda")]
                 gpu_explainers: Mutex::new(std::collections::HashMap::new()),
-                class_views: Mutex::new(None),
                 inference_model: Mutex::new(None),
             })
         })
@@ -2885,6 +2958,31 @@ impl PyModel {
     #[getter]
     fn num_class(&self) -> usize {
         self.inner.num_outputs()
+    }
+
+    /// Category names stored in the model, one entry per feature: a list of
+    /// the categories in code order (`str` or `int`), or `None` for a numeric
+    /// feature or a categorical feature trained on bare integer codes. `None`
+    /// instead of a list when no feature has names. Prediction from a
+    /// DataFrame, an Arrow table or a Parquet file re-codes categories by value
+    /// with these lists.
+    fn get_categories<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        let Some(table) = &self.inner.categories else {
+            return Ok(None);
+        };
+        let out = PyList::empty(py);
+        for c in table.features() {
+            match c.as_ref().map(|c| c.values()) {
+                None => out.append(py.None())?,
+                Some(crate::category_names::CategoryValues::Str(v)) => {
+                    out.append(PyList::new(py, v)?)?
+                }
+                Some(crate::category_names::CategoryValues::Int { values, .. }) => {
+                    out.append(PyList::new(py, values)?)?
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Feature importance with XGBoost's `Booster.get_score` semantics:
@@ -3446,7 +3544,6 @@ fn finish(
         gpu_predictors: Mutex::new(std::collections::HashMap::new()),
         #[cfg(feature = "cuda")]
         gpu_explainers: Mutex::new(std::collections::HashMap::new()),
-        class_views: Mutex::new(None),
     }
 }
 
@@ -3480,9 +3577,10 @@ fn array_input<'py>(
 fn bind_named_table<'py>(
     py: Python<'py>,
     data: &Bound<'py, PyAny>,
-    names: &[String],
+    model: &PyModel,
 ) -> PyResult<Bound<'py, PyAny>> {
-    if names.is_empty()
+    let names = &model.inner.feature_names;
+    if (names.is_empty() && model.inner.categories.is_none())
         || path_specs_of(data)?.is_some()
         || data.extract::<PyReadonlyArray2<f32>>().is_ok()
     {
@@ -3493,8 +3591,9 @@ fn bind_named_table<'py>(
     if !is_table {
         return Ok(data.clone());
     }
+    // Categorical columns are re-coded by value onto the model's categories.
     fb.getattr("_as_predict_matrix")?
-        .call1((data, names.to_vec()))
+        .call1((data, names.to_vec(), model.get_categories(py)?))
 }
 
 /// Apply the XGBoost `missing` sentinel to array-like prediction input.
@@ -3534,7 +3633,47 @@ fn reject_inf(data: &[f32], n_features: usize, what: &str) -> PyResult<()> {
     }
 }
 
-/// Training categorical columns must hold integer codes `0..=253` (NaN =
+/// Category names handed over by the Python layer (`params["_categories"]`):
+/// one entry per feature, `None` or `(kind, values)` with `kind` either
+/// `"str"` or an XGBoost integer type code (9..=16).
+fn parse_categories(
+    obj: Option<Bound<'_, PyAny>>,
+    n_features: usize,
+) -> PyResult<Option<crate::category_names::CategoryTable>> {
+    use crate::category_names::{CategoryTable, CategoryValues, FeatureCategories};
+    let Some(obj) = obj.filter(|o| !o.is_none()) else {
+        return Ok(None);
+    };
+    let entries: Vec<Option<(Bound<'_, PyAny>, Bound<'_, PyAny>)>> = obj.extract()?;
+    if entries.len() != n_features {
+        return Err(PyValueError::new_err(format!(
+            "category names cover {} features, the data has {n_features}",
+            entries.len()
+        )));
+    }
+    let mut features = Vec::with_capacity(n_features);
+    for (f, e) in entries.into_iter().enumerate() {
+        features.push(match e {
+            None => None,
+            Some((kind, values)) => {
+                let values = if kind.extract::<String>().is_ok_and(|k| k == "str") {
+                    CategoryValues::Str(values.extract()?)
+                } else {
+                    CategoryValues::Int {
+                        type_code: kind.extract()?,
+                        values: values.extract()?,
+                    }
+                };
+                Some(FeatureCategories::new(values).map_err(|e| {
+                    PyValueError::new_err(format!("categories of feature {f}: {e}"))
+                })?)
+            }
+        });
+    }
+    Ok(CategoryTable::new(features).non_empty())
+}
+
+/// Training categorical columns must hold integer codes `0..=65533` (NaN =
 /// missing). Report the first offender by feature index before binning.
 fn check_categorical_codes(
     data: &[f32],
@@ -3563,6 +3702,32 @@ fn check_categorical_codes(
         }
     }
     Ok(())
+}
+
+/// `cache_path` / `cache_budget_bytes` configure the quantized column cache,
+/// which only single-file Parquet training builds. Every other input would
+/// ignore them silently, so they are rejected with the reason and the way out.
+fn reject_cache_options(cfg: &Parsed, got: &str, way_out: &str) -> PyResult<()> {
+    let set: Vec<&str> = [
+        ("cache_path", cfg.cache_path.is_some()),
+        ("cache_budget_bytes", cfg.cache_budget_bytes.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    let names = set.join(" and ");
+    let verb = if set.len() == 1 {
+        "supports"
+    } else {
+        "support"
+    };
+    Err(PyValueError::new_err(format!(
+        "{names} {verb} a single Parquet file; got {got} — {way_out} or drop {}",
+        set.join(" / ")
+    )))
 }
 
 /// numpy 入口。`x` 是行主序的 f32 矩阵(Python 层负责转 dtype)。
@@ -3595,6 +3760,11 @@ fn train_dense(
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
+    reject_cache_options(
+        &cfg,
+        "in-memory data (numpy / pandas / pyarrow)",
+        "write it to one Parquet file and train on that path",
+    )?;
     let weights: Option<Vec<f32>> = weight
         .map(|w| w.as_slice().map(<[f32]>::to_vec))
         .transpose()?;
@@ -3638,6 +3808,7 @@ fn train_dense(
     // 这里是 Python 侧唯一一次决定物理块宽的地方。
     let plan = resolve_blocking(&cfg, n_features, Some(n_rows as u64))?;
     cfg.params.cols_per_block = plan.effective;
+    let user_gpu = user_gpu_geometry(&cfg);
     // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
     apply_resolved_geometry(&mut cfg, &plan);
     if let Some(w) = &weights {
@@ -3671,6 +3842,11 @@ fn train_dense(
     let x_values = crate::source::missing_as_nan(x.as_slice()?, cfg.missing);
     reject_inf(&x_values, n_features, "training data")?;
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
+    let categories = parse_categories(params.get_item("_categories")?, n_features)?;
+    if let Some(t) = &categories {
+        t.check_against(n_features, &cfg.categorical)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
     // 分箱边界按样本权重加权(XGBoost hist 同样如此);全 1 / None 逐位相同。
     // Ranking: the group weight is repeated on the rows of its group.
     let unrolled_weights: Option<Vec<f32>> = match (&weights, &group_ptr, ranking) {
@@ -3696,6 +3872,11 @@ fn train_dense(
         cfg.params.nthread,
         sketch_weights,
     );
+    {
+        let mut params = cfg.params.clone();
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &train_src, &mut params)?;
+        cfg.params = params;
+    }
 
     // 验证集必须复用训练集的 cuts,否则同一个值会落进不同的 bin
     #[allow(clippy::type_complexity)]
@@ -3878,6 +4059,25 @@ fn train_dense(
         }
     };
     let feature_names = margin::continued_feature_names(prior_model.as_deref(), feature_names)?;
+    // Category names of named input (pandas / Arrow) come from the Python
+    // layer, which has already coded the data with them (a continued model's
+    // lists for its features).
+    let mut model = model;
+    if let Some(table) = categories {
+        // A continued model's lists are kept exactly (integer type codes too).
+        let table = match prior_model
+            .as_ref()
+            .and_then(|p| p.inner.categories.clone())
+        {
+            None => table,
+            Some(prior) => crate::category_names::CategoryTable::new(
+                (0..n_features)
+                    .map(|f| prior.get(f).or(table.get(f)).cloned())
+                    .collect(),
+            ),
+        };
+        model.categories = Some(std::sync::Arc::new(table));
+    }
     Ok(finish(
         model,
         handle,
@@ -3931,6 +4131,23 @@ fn train_file(
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let paths = resolved.paths.clone();
     let fmt = resolved.format.label();
+    match (fmt, paths.len()) {
+        ("parquet", 1) => {}
+        ("parquet", n) => reject_cache_options(
+            &cfg,
+            &format!("{n} Parquet files"),
+            "merge them into one file",
+        )?,
+        (other, n) => reject_cache_options(
+            &cfg,
+            &format!(
+                "{n} {} file{}",
+                other.to_uppercase(),
+                if n == 1 { "" } else { "s" }
+            ),
+            "convert the data to one Parquet file",
+        )?,
+    }
     let path_disp = paths[0].display().to_string();
     let path = path_disp.as_str();
     // CSV schema inference samples text rows, so keep the result used for
@@ -4090,9 +4307,15 @@ fn train_file(
         )));
     }
     let categorical_flags = cfg.categorical.clone();
+    // A continued model's category names code the named columns of the new
+    // files (XGBoost keeps the model's categories on continuation).
+    let prior_categories = prior_model
+        .as_ref()
+        .and_then(|p| p.inner.categories.clone());
     let targets = targets
         .with_categorical(&categorical_flags)
-        .with_missing(cfg.missing);
+        .with_missing(cfg.missing)
+        .with_categories(prior_categories.as_deref());
     // 行数同样要在 open 之前拿到 —— 显存模型的每一项都按它走。
     // parquet 从 footer 读,不解压任何数据;CSV 不扫全文件就是不知道。
     // ⚠️ **规划器要看到整个数据集的行数,不是第一个文件的。** 只报第一个
@@ -4131,47 +4354,40 @@ fn train_file(
     // 定块宽、建 source,Python 只给路径和参数。
     // 走 numpy 那条路等于先在 Python 里把整份数据物化一遍,
     // streaming / 部分列读 / colsample 的 I/O 削减 / 显存规划全都用不上。
-    // ⚠️ 任意拿不到 pre-open row count 的 GPU source 都走 deferred planning。
-    // 显式宽度**只用于构造 source**,不是完整 GPU plan；open 后必须用聚合的
-    // 真实行数补齐 streams / residency / effective budget。这个 seam 按能力
-    // (`n_rows_peek`)分派,不能按 CSV/Parquet 格式名特判,否则下一个 streaming
-    // 或远端 source 会重现同一个 bug。
-    let (plan, deferred_gpu_plan) = match (n_rows_peek, cfg.device) {
+    // ⚠️ A GPU source without a pre-open row count (CSV / CSV.gz) plans after
+    // the reader's first pass: that pass counts the exact aggregate rows of all
+    // files while it builds the cuts, and the block width is only needed by the
+    // second pass, which builds the blocks. The same planner then solves block
+    // width, streams, residency and the effective budget as for a source with a
+    // pre-open count, so equivalent CSV and Parquet input get the same plan.
+    // This seam dispatches on the capability (`n_rows_peek`), never on the
+    // format name. An explicit cols_per_block is honored by the planner itself.
+    let deferred_gpu_plan = match (n_rows_peek, cfg.device) {
         #[cfg(feature = "cuda")]
-        (None, Some(_)) => {
-            // Without a pre-open row count (CSV / CSV.gz) the block width cannot be
-            // solved by the memory planner, so an explicit width wins and otherwise
-            // a conservative narrow width is used: narrow blocks keep every slot
-            // small, and streams / residency / the effective budget are still
-            // planned after open with the real row count (a plan that does not fit
-            // fails there, never silently).
-            let c = match cfg.requested_cols_per_block.filter(|c| *c > 0) {
-                Some(c) => c,
-                None => {
-                    if !cfg.quiet {
-                        eprintln!(
-                            "GPU_BLOCKING cols_per_block={DEFERRED_GPU_COLS_PER_BLOCK} (default: row count unknown before open; set cols_per_block to override)"
-                        );
-                    }
-                    // Treat it as the requested width from here on, so the
-                    // post-open plan keeps the geometry the source was built with.
-                    cfg.requested_cols_per_block = Some(DEFERRED_GPU_COLS_PER_BLOCK);
-                    DEFERRED_GPU_COLS_PER_BLOCK
-                }
-            };
-            (
-                BlockingPlan::explicit(c, n_features, cfg.params.nthread),
-                true,
-            )
-        }
-        _ => (resolve_blocking(&cfg, n_features, n_rows_peek)?, false),
+        (None, Some(_)) => true,
+        _ => false,
     };
-    cfg.params.cols_per_block = plan.effective;
-    // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
-    apply_resolved_geometry(&mut cfg, &plan);
-    let cols_per_block = plan.effective;
-    let ingest_threads =
-        resolved_ingest_workers(cfg.ingest_threads, fmt, &paths, n_features, cols_per_block);
+    let user_gpu = user_gpu_geometry(&cfg);
+    if !deferred_gpu_plan {
+        let plan = resolve_blocking(&cfg, n_features, n_rows_peek)?;
+        cfg.params.cols_per_block = plan.effective;
+        // 规划器解出来的几何是权威的(见 `BlockingPlan`)。
+        apply_resolved_geometry(&mut cfg, &plan);
+    }
+    // Ingest concurrency is fixed before the first pass. A deferred width is
+    // not known yet: bound the work by the narrowest geometry (one column per
+    // block); CPU and memory limits still apply.
+    let ingest_threads = resolved_ingest_workers(
+        cfg.ingest_threads,
+        fmt,
+        &paths,
+        n_features,
+        if deferred_gpu_plan {
+            1
+        } else {
+            cfg.params.cols_per_block
+        },
+    );
     let ingest_reporter = IngestReporter::start(
         cfg.quiet,
         fmt,
@@ -4187,7 +4403,8 @@ fn train_file(
     let open_paths = |ps: &[std::path::PathBuf],
                       targets: crate::source::Targets<'_>,
                       cuts: Option<crate::columns::BinCuts>,
-                      first_csv_schema: Option<arrow::datatypes::SchemaRef>|
+                      first_csv_schema: Option<arrow::datatypes::SchemaRef>,
+                      width: csv_source::BlockWidth<'_>|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         match fmt {
             "parquet" => parquet_source::open_many_observed(
@@ -4195,7 +4412,14 @@ fn train_file(
                 targets,
                 cuts,
                 max_bin,
-                cols_per_block,
+                match width {
+                    csv_source::BlockWidth::Fixed(c) => c,
+                    // Parquet has a pre-open row count, so its width is planned
+                    // before open and never deferred.
+                    csv_source::BlockWidth::FromRowCount(_) => {
+                        anyhow::bail!("Parquet input takes its block width before open")
+                    }
+                },
                 ingest_threads,
                 |phase, readers, transforms| {
                     if !ingest_quiet {
@@ -4203,27 +4427,16 @@ fn train_file(
                     }
                 },
             ),
-            "csv" => match first_csv_schema {
-                Some(schema) => csv_source::open_many_with_header_and_nthread_prepared(
-                    ps,
-                    targets,
-                    cuts,
-                    max_bin,
-                    cols_per_block,
-                    header,
-                    ingest_threads,
-                    schema,
-                ),
-                None => csv_source::open_many_with_header_and_nthread(
-                    ps,
-                    targets,
-                    cuts,
-                    max_bin,
-                    cols_per_block,
-                    header,
-                    ingest_threads,
-                ),
-            },
+            "csv" => csv_source::open_many_with_header_and_nthread_prepared(
+                ps,
+                targets,
+                cuts,
+                max_bin,
+                width,
+                header,
+                ingest_threads,
+                first_csv_schema,
+            ),
             other => Err(anyhow::anyhow!("unknown format {other:?}")),
         }
     };
@@ -4232,7 +4445,8 @@ fn train_file(
     // 按位置读的话,列顺序不同的验证文件会被静默错配,早停跟着选错轮数。
     let open_spec = |spec: &str,
                      train_features: &[String],
-                     cuts: Option<crate::columns::BinCuts>|
+                     cuts: Option<crate::columns::BinCuts>,
+                     cols_per_block: usize|
      -> anyhow::Result<crate::source::parquet_source::Dataset> {
         let r = crate::source::input::resolve(&[spec.to_string()])?;
         anyhow::ensure!(
@@ -4246,7 +4460,13 @@ fn train_file(
         } else {
             targets
         };
-        open_paths(&r.paths, eval_targets, cuts, None)
+        open_paths(
+            &r.paths,
+            eval_targets,
+            cuts,
+            None,
+            csv_source::BlockWidth::Fixed(cols_per_block),
+        )
     };
 
     let device = cfg.device;
@@ -4259,6 +4479,8 @@ fn train_file(
     // 为多文件重构它不属于 v0.0.1 的范围。
     // ⚠️ 代价要说清楚:多文件走的是量化后常驻内存的 `Dataset` 路径,
     // 和单文件的按需加载不是同一条内存曲线。
+    // The cache options only exist on this path; other inputs were rejected
+    // right after resolve (`reject_cache_options`).
     if fmt == "parquet" && paths.len() == 1 {
         let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         cfg.resolve_monotone(n_features, &names)?;
@@ -4300,6 +4522,7 @@ fn train_file(
             },
         )
         .map_err(to_py_err)?;
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &src, &mut train_cfg.params)?;
         // 权重是单独一列,不进量化缓存;每次 open 都从源文件读。
         let read_weights = |p: &str| -> PyResult<Option<Vec<f32>>> {
             let Some(w) = targets.weight else {
@@ -4456,8 +4679,6 @@ fn train_file(
         ));
     }
 
-    let ds = open_paths(&paths, targets, None, csv_preflight.clone()).map_err(to_py_err)?;
-    ingest_reporter.complete(ds.source.n_rows());
     // Ranking: query ids come from the qid column of every file, in dataset order.
     let read_qid_paths = |ps: &[std::path::PathBuf]| -> PyResult<Option<Vec<u64>>> {
         let Some(q) = targets.qid else {
@@ -4470,28 +4691,70 @@ fn train_file(
         .map(Some)
         .map_err(to_py_err)
     };
-    // CSV reads its query ids now, so the deferred plan below charges the real
-    // groups too (Parquet read them before planning).
+    // A deferred GPU plan (CSV) is resolved inside the reader's first pass, and
+    // fast ranking is planned for the real query groups, so read the ids first.
+    if train_qid.is_none() && deferred_gpu_plan {
+        train_qid = read_qid_paths(&paths)?;
+        if let Some(ids) = &train_qid {
+            cfg.group_ptr = Some(crate::rank::group_ptr_from_qid(ids).map_err(to_py_err)?);
+        }
+    }
+    let ds = if deferred_gpu_plan {
+        // Plan from the exact aggregate row count of the first pass; a planning
+        // error (e.g. an override over a set gpu_memory_budget) keeps its type.
+        let mut planned: Option<BlockingPlan> = None;
+        let mut plan_err: Option<PyErr> = None;
+        let mut choose = |rows: u64| -> anyhow::Result<usize> {
+            match resolve_blocking(&cfg, n_features, Some(rows)) {
+                Ok(plan) => {
+                    let width = plan.effective;
+                    planned = Some(plan);
+                    Ok(width)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    plan_err = Some(e);
+                    Err(anyhow::anyhow!(msg))
+                }
+            }
+        };
+        let opened = open_paths(
+            &paths,
+            targets,
+            None,
+            csv_preflight.clone(),
+            csv_source::BlockWidth::FromRowCount(&mut choose),
+        );
+        if let Some(e) = plan_err {
+            return Err(e);
+        }
+        let ds = opened.map_err(to_py_err)?;
+        let plan = planned
+            .ok_or_else(|| PyRuntimeError::new_err("the GPU plan was not resolved during open"))?;
+        cfg.params.cols_per_block = plan.effective;
+        apply_resolved_geometry(&mut cfg, &plan);
+        ds
+    } else {
+        open_paths(
+            &paths,
+            targets,
+            None,
+            csv_preflight.clone(),
+            csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+        )
+        .map_err(to_py_err)?
+    };
+    ingest_reporter.complete(ds.source.n_rows());
     if train_qid.is_none() {
         train_qid = read_qid_paths(&paths)?;
         if let Some(ids) = &train_qid {
             cfg.group_ptr = Some(crate::rank::group_ptr_from_qid(ids).map_err(to_py_err)?);
         }
     }
-    // A deferred source only learns its aggregate row count during open.
-    // Complete the GPU plan now, preserving the requested block width while
-    // resolving memory budget, stream count and residency from the real shape.
-    #[cfg(feature = "cuda")]
-    if deferred_gpu_plan {
-        let completed = resolve_blocking(&cfg, n_features, Some(ds.source.n_rows() as u64))?;
-        if completed.effective != cols_per_block {
-            return Err(PyRuntimeError::new_err(format!(
-                "deferred GPU planner changed source geometry from {cols_per_block} to {}; explicit cols_per_block must be preserved",
-                completed.effective
-            )));
-        }
-        cfg.params.cols_per_block = completed.effective;
-        apply_resolved_geometry(&mut cfg, &completed);
+    {
+        let mut params = cfg.params.clone();
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &ds.source, &mut params)?;
+        cfg.params = params;
     }
     cfg.resolve_monotone(n_features, &ds.feature_names)?;
     margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
@@ -4532,8 +4795,13 @@ fn train_file(
     if let Some(list) = evals {
         for item in list.iter() {
             let (p, name): (String, String) = item.extract()?;
-            let d = open_spec(&p, &ds.feature_names, Some(ds.source.cuts().clone()))
-                .map_err(to_py_err)?;
+            let d = open_spec(
+                &p,
+                &ds.feature_names,
+                Some(ds.source.cuts().clone()),
+                cfg.params.cols_per_block,
+            )
+            .map_err(to_py_err)?;
             eval_paths.push(p.clone());
             let eval_paths = crate::source::input::resolve(&[p.clone()])
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?

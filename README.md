@@ -228,7 +228,7 @@ Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `r
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
-* **Categorical features:** at most 254 categories per feature in this version; a larger limit is planned.
+* **Bins and categories:** `max_bin` is at most 65535, and a categorical feature has at most 65,534 categories (codes `0..=65533`).
 * **Explanations:** SHAP values, interactions, and leaf indices run on the GPU with `use_gpu=True` (bit-identical to the CPU); the device path uses GPU 0 only.
 * **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
 
@@ -245,6 +245,23 @@ Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
+
+See the [Python API How-To](documents/howto.md) for details.
+
+### 0.0.8 (unreleased)
+
+- Added `max_bin` above 255 (up to 65535).
+- Up to 65,534 categories per feature (was 254).
+- Wide bins and many categories train on CPU and GPU.
+- GPU speed optimization for wide features.
+- Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.
+- Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost `cats` layout); named input is re-coded by value, and unseen categories raise `ValueError`.
+- CSV text columns declared categorical train as named categories.
+- Changed: models with integer categories now look up plain integer input by value, not as codes.
+- Changed: Arrow integer dictionaries are read by value for models without category lists, as Parquet files are.
+- Changed: pandas and Arrow integer columns are read by value like files (NumPy stays codes).
+- Fixed: sklearn estimators handle Arrow dictionary columns like `train` (nulls are missing).
+- Fixed: `cache_path` / `cache_budget_bytes` with unsupported input (such as several Parquet files) now raise instead of being ignored.
 
 ### 0.0.7
 
@@ -276,8 +293,6 @@ logging, and the complete parameter reference.
 - Added `Model.objective` and `Model.num_class`.
 - Faster CPU training.
 - GPU speed optimizations.
-
-See the [Python API How-To](documents/howto.md) for details.
 
 ### 0.0.5
 

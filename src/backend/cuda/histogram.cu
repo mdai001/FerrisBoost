@@ -14,8 +14,8 @@ static_assert(sizeof(SplitPacket) == 64, "split packet ABI");
 // category set is CAT_SET_WORDS 32-bit words (a bitset over those bins). Both
 // size the shared scratch, the per-winner set output and the packet tail, and
 // must match `gpu_mem_plan::CAT_SET_WORDS` (checked by a unit test). Wider
-// categorical features (more than SPLIT_CTA_THREADS bins) need these raised
-// and the per-thread bin loops below turned into strided loops.
+// features (more than 255 bins, 16-bit blocks) run split_features_wide_body
+// at the end of this file: tiled scans and variable-length category sets.
 #define SPLIT_CTA_THREADS 256
 #define CAT_SET_WORDS 8
 static_assert(CAT_SET_WORDS * 32 >= SPLIT_CTA_THREADS, "set must cover every bin");
@@ -437,10 +437,10 @@ extern "C" __global__ void split_cached_nodes_cat(const SplitPacket* features,
 
 // 每个 block 归约出自己那段的 max|grad| / max|hess|,写进 out_max[2*blockIdx]。
 // host 再对这 n_blocks 对做最终 max —— 很小,而且同样是精确的。
-// Column-major training avoids the retired U8 row-major transpose/staging/sync
-// overhead: balanced HIGGS A/B was 12–29% slower with identical models, and
-// partial Epsilon agreed (2026-11-08). U16 row-major was never implemented.
-// See internal-docs/history.md for the removal decision.
+// GPU training remains column-major. The retired U8 row-major path added
+// transpose/staging/synchronization cost and regressed HIGGS by 12–29% with
+// identical models (2026-11-08); partial Epsilon results agreed. U16 row-major
+// was never implemented. See internal-docs/history.md for the removal decision.
 
 // `gpu_math = "fast"` 专用:prediction apply + objective gradient 全部留在
 // device 上,于是每轮消掉 prediction D2H(4 B/行)、host 的按行 gradient
@@ -1231,8 +1231,31 @@ extern "C" __global__ void hist_build_shared(
 // 这是有意的:tile 边界原本由 host 算(依赖 driver 报的 shared 上限),融合
 // 之后必须让 kernel 自己走同一套贪心切分,所以那个上限得传进来。既有的
 // 七参数 kernel 一个都没改。
-extern "C" __global__ void hist_build_shared_planar32_fused(
-    const uint8_t* bins,
+// Bin storage width of a column block: 8-bit blocks (`uint8_t`) and 16-bit
+// blocks (`uint16_t`) run the same templated bodies; a launch never mixes
+// widths. The largest code is the missing sentinel.
+template <typename T>
+__device__ __forceinline__ T bin_missing() { return (T)~(T)0; }
+
+// A 16-bit feature can have more histogram slots than one shared-memory tile
+// (a high-cardinality categorical feature). The greedy tiling then cannot place
+// it (`f1 == f0`); such a feature alone is accumulated straight into the global
+// histogram with native 64-bit integer atomics. Integer addition modulo 2^64 is
+// order independent, so this is bit-identical to the shared-tile path. The
+// branch depends only on the offsets, so it is uniform across the block, and
+// it is compiled out of the 8-bit instantiations (255 slots always fit a tile).
+template <typename T>
+__device__ __forceinline__ void hist_wide_feature_global(
+    T bin, uint32_t off, int64_t* out, unsigned long long grad, unsigned long long hess) {
+    if (bin == bin_missing<T>()) return;
+    const uint64_t slot = (uint64_t)off + bin;
+    atomicAdd(reinterpret_cast<unsigned long long*>(out) + slot * 2, grad);
+    atomicAdd(reinterpret_cast<unsigned long long*>(out) + slot * 2 + 1, hess);
+}
+
+template <typename T>
+__device__ __forceinline__ void hist_fused_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1263,6 +1286,12 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+            hist_wide_feature_global<T>(bins[(uint64_t)f0 * n_rows + row], hist_begin,
+                                        out_hist, row_grad, row_hess);
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist;
@@ -1276,8 +1305,8 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
         __syncthreads();
 
         for (uint32_t feat = f0; feat < f1; ++feat) {
-            const uint8_t bin = bins[(uint64_t)feat * n_rows + row];
-            if (bin == UINT8_MAX) {
+            const T bin = bins[(uint64_t)feat * n_rows + row];
+            if (bin == bin_missing<T>()) {
                 continue;
             }
             const uint32_t s = feat_offsets[feat] + bin - hist_begin;
@@ -1309,6 +1338,19 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
     }
 }
 
+extern "C" __global__ void hist_build_shared_planar32_fused(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                             max_tile_bins);
+}
+extern "C" __global__ void hist_build_shared_planar32_fused_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                              max_tile_bins);
+}
+
 // R=4 multi-row/thread:每个线程处理 4 行,其余全部不变。
 //
 // **收益来源只有摊薄**:一个 block 的 shared init、flush、barrier 和 launch
@@ -1324,8 +1366,9 @@ extern "C" __global__ void hist_build_shared_planar32_fused(
 // ⚠️ 2026-09-02 第一次做时实测只有 2.2%(wide),按当时 5% 的门槛回滚了;
 // 实现从未进过提交。现在基线快了一倍,同样的约 24 ms 绝对收益约合 3.3%,
 // 所以按 memo 重开 —— **这是重写,不是恢复**。
-extern "C" __global__ void hist_build_shared_planar32_fused_r4(
-    const uint8_t* bins,
+template <typename T>
+__device__ __forceinline__ void hist_fused_r4_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1361,6 +1404,17 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                hist_wide_feature_global<T>(
+                    bins[(uint64_t)f0 * n_rows + rows_v[r]], hist_begin, out_hist,
+                    ((unsigned long long)g_hi[r] << 32) | g_lo[r],
+                    ((unsigned long long)h_hi[r] << 32) | h_lo[r]);
+            }
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist_r4;
@@ -1377,8 +1431,8 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
             const uint32_t off = feat_offsets[feat] - hist_begin;
 #pragma unroll
             for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-                const uint8_t bin = bins[(uint64_t)feat * n_rows + rows_v[r]];
-                if (bin == UINT8_MAX) {
+                const T bin = bins[(uint64_t)feat * n_rows + rows_v[r]];
+                if (bin == bin_missing<T>()) {
                     continue;
                 }
                 const uint32_t s = off + bin;
@@ -1411,6 +1465,19 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
 }
 
 
+extern "C" __global__ void hist_build_shared_planar32_fused_r4(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_r4_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                                max_tile_bins);
+}
+extern "C" __global__ void hist_build_shared_planar32_fused_r4_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins) {
+    hist_fused_r4_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+                                 max_tile_bins);
+}
+
 // 一层里多个 Accumulate 节点合并进一次 launch。
 //
 // **几何完全不变**:仍然是一个 block 负责一个节点的 `blockDim.x *
@@ -1429,8 +1496,9 @@ extern "C" __global__ void hist_build_shared_planar32_fused_r4(
 // block 的调度顺序,不改变任何一次加法的操作数。越界行走
 // `ok[r] == false` 直接跳过,和「不存在这一行」等价 —— 不是加 0,
 // 所以连原子次数都不变。
-extern "C" __global__ void hist_build_shared_planar32_batched(
-    const uint8_t* bins,
+template <typename T>
+__device__ __forceinline__ void hist_batched_body(
+    const T* bins,
     const int64_t* gpair,
     const uint32_t* row_idx,
     uint32_t n_rows,
@@ -1443,7 +1511,7 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
     uint32_t hist_stride,
     const uint32_t* feature_select,
     uint32_t selection_active) {
-    // Packed indices retain one safe dependency per allocation.
+    // Use the packed node-index ABI and retain one safe dependency per allocation.
     const uint32_t* blk_ptr = batch_idx;
     const uint32_t* node_off = batch_idx + n_nodes + 1;
     const uint32_t* node_len = batch_idx + 2 * n_nodes + 1;
@@ -1506,6 +1574,22 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
         while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) {
             ++f1;
         }
+        if (sizeof(T) > 1 && f1 == f0) {
+            const uint32_t physical_feat =
+                selection_active != 0 ? feature_select[f0] : f0;
+#pragma unroll
+            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+                if (!ok[r]) {
+                    continue;
+                }
+                hist_wide_feature_global<T>(
+                    bins[(uint64_t)physical_feat * n_rows + rows_v[r]], hist_begin, out,
+                    ((unsigned long long)g_hi[r] << 32) | g_lo[r],
+                    ((unsigned long long)h_hi[r] << 32) | h_lo[r]);
+            }
+            f0 += 1;
+            continue;
+        }
         const uint32_t n_slots = feat_offsets[f1] - hist_begin;
 
         unsigned int* grad_lo = fused_hist_b;
@@ -1527,8 +1611,8 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
                 if (!ok[r]) {
                     continue;
                 }
-                const uint8_t bin = bins[(uint64_t)physical_feat * n_rows + rows_v[r]];
-                if (bin == UINT8_MAX) {
+                const T bin = bins[(uint64_t)physical_feat * n_rows + rows_v[r]];
+                if (bin == bin_missing<T>()) {
                     continue;
                 }
                 const uint32_t s = off + bin;
@@ -1558,6 +1642,24 @@ extern "C" __global__ void hist_build_shared_planar32_batched(
 
         f0 = f1;
     }
+}
+
+
+extern "C" __global__ void hist_build_shared_planar32_batched(
+    const uint8_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins,
+    const uint32_t* batch_idx, uint32_t n_nodes, uint32_t hist_stride,
+    const uint32_t* feature_select, uint32_t selection_active) {
+    hist_batched_body<uint8_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+        max_tile_bins, batch_idx, n_nodes, hist_stride, feature_select, selection_active);
+}
+extern "C" __global__ void hist_build_shared_planar32_batched_u16(
+    const uint16_t* bins, const int64_t* gpair, const uint32_t* row_idx, uint32_t n_rows,
+    uint32_t n_feats, const uint32_t* feat_offsets, int64_t* out_hist, uint32_t max_tile_bins,
+    const uint32_t* batch_idx, uint32_t n_nodes, uint32_t hist_stride,
+    const uint32_t* feature_select, uint32_t selection_active) {
+    hist_batched_body<uint16_t>(bins, gpair, row_idx, n_rows, n_feats, feat_offsets, out_hist,
+        max_tile_bins, batch_idx, n_nodes, hist_stride, feature_select, selection_active);
 }
 
 
@@ -1719,6 +1821,53 @@ __device__ __forceinline__ uint32_t partition_goes_left(
     if (bin == UINT8_MAX) return missing_left;
     if (split_bin == CAT_SPLIT) return ((cat_mask[bin >> 5] >> (bin & 31)) & 1u) ^ 1u;
     return (uint32_t)(bin < split_bin);
+}
+
+// 16-bit column: the category set covers `mask_words` words (sized by the
+// feature's bins, not a fixed 256); a bin beyond it is not in the set.
+__device__ __forceinline__ uint32_t partition_goes_left_u16(
+    uint16_t bin, uint32_t split_bin, uint32_t missing_left, const uint32_t* cat_mask,
+    uint32_t mask_words) {
+    if (bin == UINT16_MAX) return missing_left;
+    if (split_bin == CAT_SPLIT) {
+        const uint32_t w = (uint32_t)bin >> 5;
+        return w < mask_words ? ((cat_mask[w] >> (bin & 31)) & 1u) ^ 1u : 1u;
+    }
+    return (uint32_t)(bin < split_bin);
+}
+
+// `partition_count` over a 16-bit column (same flags / block-count contract).
+extern "C" __global__ void partition_count_u16(
+    const uint16_t* col,
+    const uint32_t* rows,
+    uint32_t n_rows,
+    uint32_t n_selected,
+    uint32_t split_bin,
+    uint32_t missing_left,
+    uint8_t* flags,
+    uint32_t* block_left_counts,
+    const uint32_t* cat_mask,
+    uint32_t mask_words) {
+    extern __shared__ uint32_t counts_u16[];
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t left = 0;
+    if (idx < n_selected) {
+        const uint32_t row = rows[idx];
+        left = partition_goes_left_u16(col[(uint64_t)row], split_bin, missing_left, cat_mask,
+                                       mask_words);
+        flags[idx] = (uint8_t)left;
+    }
+    counts_u16[threadIdx.x] = left;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            counts_u16[threadIdx.x] += counts_u16[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        block_left_counts[blockIdx.x] = counts_u16[0];
+    }
 }
 
 extern "C" __global__ void partition_count(
@@ -1902,6 +2051,34 @@ extern "C" __global__ void partition_count_batched(
         __syncthreads();
     }
     if (threadIdx.x == 0) counts[blockIdx.x] = sums[0];
+}
+
+// `partition_count_batched` over resident column-major 16-bit blocks. A batch
+// holds one width; the host launches U8 and U16 nodes separately.
+extern "C" __global__ void partition_count_batched_u16(
+    const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
+    uint32_t nodes, uint32_t n_rows, uint8_t* flags, uint32_t* counts) {
+    const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
+    const uint32_t* d = descriptors + node * PART_DESC_WORDS;
+    const uint32_t local_block = blockIdx.x - d[5];
+    const uint32_t idx = local_block * blockDim.x + threadIdx.x;
+    uint32_t left = 0;
+    if (idx < d[1]) {
+        const uint16_t* bins = (const uint16_t*)blocks.base[d[10]];
+        const uint32_t arena = d[0] + idx;
+        const uint32_t row = rows[arena];
+        const uint16_t bin = bins[(uint64_t)d[2] * n_rows + row];
+        left = bin == UINT16_MAX ? d[4] : (uint32_t)(bin < d[3]);
+        flags[arena] = (uint8_t)left;
+    }
+    extern __shared__ uint32_t sums_u16[];
+    sums_u16[threadIdx.x] = left;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) sums_u16[threadIdx.x] += sums_u16[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) counts[blockIdx.x] = sums_u16[0];
 }
 
 extern "C" __global__ void partition_scan_batched(
@@ -2929,11 +3106,15 @@ __device__ __forceinline__ void shx_descend(const ShxModel& m, const float* feat
 // One tree for one row. MODE 0 accumulates per-tree contributions into the
 // scratch slots starting at word `tc_base`; MODE 1 adds the diagonal and the
 // path-partner deltas straight into `mat` (`nc` x `nc` floats of this row/group).
+// MODE 2 performs MODE 1's computation but appends every value MODE 1 would
+// add (including the zero partner deltas MODE 1 skips) to the log at `mat`,
+// one value every `log_stride` floats, in the same order.
 template <int MODE>
 __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float* rn,
                              const float* rw, uint32_t root, uint32_t* su, float* sf,
                              uint64_t stride, uint64_t sid, uint32_t tc_base, float* mat,
-                             uint32_t nc) {
+                             uint32_t nc, uint64_t log_stride = 0) {
+    uint64_t log_at = 0;
     uint32_t d = 0;
     SHX_FU(0, SHX_NODE) = root;
     SHX_FF(0, SHX_W) = 1.0f;
@@ -2971,8 +3152,13 @@ __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float*
                 const uint32_t w = tc_base + m.slot[pn];
                 SHX_SF(w) = SHX_FADD(SHX_SF(w), delta);
             } else {
-                float* diag = mat + (uint64_t)feat * nc + feat;
-                *diag = SHX_FADD(*diag, delta);
+                if (MODE == 2) {
+                    mat[log_at] = delta;
+                    log_at += log_stride;
+                } else {
+                    float* diag = mat + (uint64_t)feat * nc + feat;
+                    *diag = SHX_FADD(*diag, delta);
+                }
                 // Partners: the newest occurrence of every other feature on the
                 // live path, newest to oldest; older duplicates are shadowed.
                 bool skipped_current = false;
@@ -2992,7 +3178,10 @@ __device__ void shx_run_tree(const ShxModel& m, const float* feats, const float*
                     }
                     const float dp = shx_interaction_delta(rn, h, p_enter, p_exit,
                                                            SHX_FF(j, SHX_PE));
-                    if (dp != 0.0f) {
+                    if (MODE == 2) {
+                        mat[log_at] = dp;
+                        log_at += log_stride;
+                    } else if (dp != 0.0f) {
                         float* cell = mat + (uint64_t)feat * nc + split;
                         *cell = SHX_FADD(*cell, dp);
                     }
@@ -3261,4 +3450,543 @@ extern "C" __global__ void predict_margin_soa_cat(
         margin += leaf_values[node];
     }
     output[row] = margin;
+}
+
+// ---- Features with more bins than SPLIT_CTA_THREADS (16-bit blocks) --------
+//
+// One CTA still evaluates one (node, feature), but the bins are visited in
+// tiles of SPLIT_CTA_THREADS: thread t owns bins t, t + 256, ... in the
+// subtraction / caching pass, and the scans walk the tiles in order with a
+// running carry. Candidates, their packets and their ordinals are exactly those
+// of split_features_body (and of the host enumeration), so the strict-greater /
+// first-wins rule and every rounding step are unchanged.
+//
+// Sorted categorical partition: only the first and the last max_threshold - 1
+// categories of the stable (weight, category) order are ever scanned, so the
+// CTA selects them tile by tile instead of sorting every category: a radix
+// select over a unique 48-bit key (an order-preserving 32-bit weight key, then
+// the 16-bit category) finds each tile's last key, the tile is gathered and
+// ranked in shared memory, then scanned. The winner's category set is rebuilt
+// from its boundary key. `wkeys` (one u32 per category, per node and
+// categorical feature) caches the weight keys between the passes.
+//
+// Categorical layout (`cat_layout[3 * ordinal ..]`): the feature's set offset
+// and set words inside a node's `node_set_words`, and its key offset inside a
+// node's `node_key_elems`. Sets are written whole (zero words included).
+__device__ __forceinline__ uint32_t split_weight_key(float w) {
+    uint32_t u = __float_as_uint(w);
+    if ((u << 1) == 0u) u = 0u;  // -0.0 and 0.0 are equal under `<`
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+// Direction 0: ascending (weight, category), the host's stable sort.
+// Direction 1: its exact reverse (the host's backward scan order).
+__device__ __forceinline__ uint64_t split_order_key(uint32_t wkey, uint32_t i, uint32_t count,
+    uint32_t d) {
+    return d ? ((uint64_t)(~wkey) << 16) | (uint64_t)(count - 1u - i)
+             : ((uint64_t)wkey << 16) | (uint64_t)i;
+}
+__device__ __forceinline__ uint32_t split_order_cat(uint64_t key, uint32_t count, uint32_t d) {
+    uint32_t c = (uint32_t)(key & 0xffffu);
+    return d ? count - 1u - c : c;
+}
+// The `target`-th smallest (1-based) direction-d key above `lower` (above
+// nothing when !has_lower); at least `target` such keys exist. When a radix
+// bucket holds exactly the remaining keys, the bucket's upper bound is
+// returned instead: no key lies between it and the true k-th key, so both
+// `key <= result` and `key > result` select the same keys. All threads call it.
+__device__ uint64_t split_select_kth(const uint32_t* wkeys, uint32_t count, uint32_t d,
+    bool has_lower, uint64_t lower, uint32_t target, uint32_t* radix, uint32_t* sh_digit,
+    uint32_t* sh_target) {
+    const uint32_t t = threadIdx.x, lane = t & 31u;
+    uint64_t prefix = 0, mask = 0;
+    for (int shift = 40; shift >= 0; shift -= 8) {
+        radix[t] = 0u;
+        __syncthreads();
+        for (uint32_t base = 0; base < count; base += SPLIT_CTA_THREADS) {
+            uint32_t i = base + t;
+            bool counted = false;
+            uint32_t digit = 256u;
+            if (i < count) {
+                uint64_t key = split_order_key(wkeys[i], i, count, d);
+                counted = (!has_lower || key > lower) && (key & mask) == prefix;
+                if (counted) digit = (uint32_t)(key >> shift) & 255u;
+            }
+            // Warp-aggregated count: one shared atomic per distinct digit.
+            uint32_t peers = __match_any_sync(0xffffffffu, digit);
+            if (counted && lane == (uint32_t)(__ffs(peers) - 1))
+                atomicAdd(&radix[digit], (uint32_t)__popc(peers));
+        }
+        __syncthreads();
+        if (t < 32) {
+            uint32_t c[8], s = 0;
+            for (uint32_t j = 0; j < 8; ++j) { c[j] = radix[lane * 8 + j]; s += c[j]; }
+            uint32_t inc = s;
+            for (uint32_t off = 1; off < 32; off *= 2) {
+                uint32_t y = __shfl_up_sync(0xffffffffu, inc, off);
+                if (lane >= off) inc += y;
+            }
+            uint32_t hit = __ballot_sync(0xffffffffu, inc >= target);
+            if (lane == (uint32_t)(__ffs(hit) - 1)) {
+                uint32_t before = inc - s;
+                for (uint32_t j = 0; j < 8; ++j) {
+                    if (before + c[j] >= target) {
+                        *sh_digit = lane * 8 + j;
+                        *sh_target = target - before;
+                        break;
+                    }
+                    before += c[j];
+                }
+            }
+        }
+        __syncthreads();
+        uint32_t digit = *sh_digit;
+        target = *sh_target;
+        bool whole = radix[digit] == target;
+        prefix |= (uint64_t)digit << shift;
+        mask |= (uint64_t)0xffu << shift;
+        __syncthreads();
+        if (whole) return prefix | (((uint64_t)1 << shift) - 1u);
+    }
+    return prefix;
+}
+
+template <bool CAT>
+__device__ __forceinline__ void split_features_wide_body(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    SplitPacket* output, const uint8_t* node_enabled,
+    const uint32_t* cat_info, const uint32_t* cat_layout, uint32_t max_onehot,
+    uint32_t max_threshold, uint32_t node_set_words, uint32_t node_key_elems,
+    uint32_t* wkeys_all, uint32_t* cat_out) {
+    __shared__ SplitPair warp_totals[8];
+    __shared__ unsigned long long total_words[2];
+    __shared__ double parent_gain;
+    __shared__ float mono_parent;
+    __shared__ SplitPacket winners[SPLIT_CTA_THREADS];
+    __shared__ uint32_t ordinals[SPLIT_CTA_THREADS];
+    __shared__ uint64_t boundary[CAT ? SPLIT_CTA_THREADS : 1];
+    __shared__ uint64_t gathered[CAT ? SPLIT_CTA_THREADS : 1];
+    __shared__ uint64_t ranked[CAT ? SPLIT_CTA_THREADS : 1];
+    __shared__ uint32_t radix[CAT ? 256 : 1];
+    __shared__ uint32_t sh_digit, sh_target, n_gathered;
+    const uint32_t t = threadIdx.x, f = blockIdx.x, n = blockIdx.y;
+    const uint32_t lo = offsets[f], count = offsets[f + 1] - lo;
+    const uint32_t* m = metadata + n * 4;
+    const size_t out_base = (size_t)m[0] * hist_stride + lo;
+    float lower = 0.0f, upper = 0.0f;
+    int32_t constraint = 0;
+    if (has_monotone) {
+        lower = bounds[(size_t)n * 2];
+        upper = bounds[(size_t)n * 2 + 1];
+        constraint = monotone[f];
+    }
+    const bool on = (node_enabled ? node_enabled[(size_t)n * features + f] : enabled[f]) != 0;
+    const uint32_t kind = CAT ? cat_info[f] : 0u;
+    const bool onehot = CAT && kind && count < max_onehot;
+    const uint32_t n_scan = count < max_threshold ? count : max_threshold;
+    const bool sorted = CAT && kind && !onehot && on && n_scan >= 2;
+    uint32_t* wkeys = sorted
+        ? wkeys_all + (size_t)n * node_key_elems + cat_layout[3 * (kind - 1) + 2] : nullptr;
+    if (!t) {
+        total_words[0] = 0ull;
+        total_words[1] = 0ull;
+        parent_gain = split_gain(sums[n], ig, ih, lambda);
+        mono_parent = has_monotone
+            ? mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, lower, upper) : 0.0f;
+    }
+    __syncthreads();
+    // Pass 1: subtract / cache every bin, sum the bins, and cache the weight
+    // keys of a sorted categorical feature. Later passes read back only bins
+    // this thread wrote, or read after a CTA barrier.
+    SplitPair local{};
+    for (uint32_t i = t; i < count; i += SPLIT_CTA_THREADS) {
+        SplitPair v;
+        if (m[2] != 0xffffffffu) {
+            v = split_sub(previous[(size_t)m[2] * cache_stride + lo + i],
+                hist[(size_t)m[1] * hist_stride + lo + i]);
+            hist[out_base + i] = v;
+        } else v = hist[out_base + i];
+        if (m[3] != 0xffffffffu)
+            next[(size_t)m[3] * cache_stride + lo + i] = v;
+        local = split_add(local, v);
+        if (sorted) {
+            double g = split_value(v.grad, ig), h = split_value(v.hess, ih);
+            wkeys[i] = split_weight_key(mono_weight(g, h, lambda, alpha, mds));
+        }
+    }
+    // Modulo-2^64 sums: exact in any order.
+    atomicAdd(&total_words[0], (unsigned long long)local.grad);
+    atomicAdd(&total_words[1], (unsigned long long)local.hess);
+    __syncthreads();
+    const SplitPair total{(int64_t)total_words[0], (int64_t)total_words[1]};
+    const SplitPair sum = sums[n];
+    SplitPacket best{};
+    uint32_t ordinal = 0xffffffffu;
+    uint64_t best_key = 0;
+    if (CAT && kind) {
+        const uint32_t cat_ord = kind - 1;
+        if (onehot && on) {
+            SplitPair missing = split_sub(sum, total);
+            for (uint32_t i = t; i < count; i += SPLIT_CTA_THREADS) {
+                SplitPair v = hist[out_base + i];
+                SplitPacket c = split_any_candidate(split_sub(sum, v), v, feats[f], cat_ord, true,
+                    parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
+                    has_monotone, constraint, lower, upper);
+                if (split_better(c, 2 * i, best, ordinal)) { best = c; ordinal = 2 * i; best_key = i; }
+                SplitPair right = split_add(v, missing);
+                c = split_any_candidate(split_sub(sum, right), right, feats[f], cat_ord, false,
+                    parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
+                    has_monotone, constraint, lower, upper);
+                if (split_better(c, 2 * i + 1, best, ordinal)) {
+                    best = c; ordinal = 2 * i + 1; best_key = i;
+                }
+            }
+        } else if (sorted) {
+            const uint32_t k = n_scan - 1;
+            for (uint32_t d = 0; d < 2; ++d) {
+                SplitPair acc{};
+                uint32_t pos = 0;
+                bool has_lower = false;
+                uint64_t lower_key = 0;
+                while (pos < k) {
+                    const uint32_t take = k - pos < SPLIT_CTA_THREADS ? k - pos : SPLIT_CTA_THREADS;
+                    const uint64_t kth = split_select_kth(wkeys, count, d, has_lower, lower_key,
+                        take, radix, &sh_digit, &sh_target);
+                    if (!t) n_gathered = 0u;
+                    __syncthreads();
+                    for (uint32_t i = t; i < count; i += SPLIT_CTA_THREADS) {
+                        uint64_t key = split_order_key(wkeys[i], i, count, d);
+                        if ((!has_lower || key > lower_key) && key <= kth)
+                            gathered[atomicAdd(&n_gathered, 1u)] = key;
+                    }
+                    __syncthreads();
+                    if (t < take) {
+                        uint64_t mine = gathered[t];
+                        uint32_t rank = 0;
+                        for (uint32_t u = 0; u < take; ++u) rank += gathered[u] < mine ? 1u : 0u;
+                        ranked[rank] = mine;
+                    }
+                    __syncthreads();
+                    uint64_t key = 0;
+                    SplitPair x{};
+                    if (t < take) {
+                        key = ranked[t];
+                        x = hist[out_base + split_order_cat(key, count, d)];
+                    }
+                    SplitPair inc = split_add(acc, split_block_scan(x, warp_totals));
+                    const SplitPair tile = warp_totals[7];
+                    if (t < take) {
+                        const uint32_t p = pos + t;
+                        SplitPacket c;
+                        uint32_t o;
+                        if (!d) {
+                            // Forward: the first p+1 sorted categories right, missing left.
+                            c = split_any_candidate(split_sub(sum, inc), inc, feats[f], cat_ord,
+                                true, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw,
+                                alpha, mds, has_monotone, constraint, lower, upper);
+                            o = p;
+                        } else {
+                            // Backward: the last p+1 sorted categories left, missing right.
+                            c = split_any_candidate(inc, split_sub(sum, inc), feats[f], cat_ord,
+                                false, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw,
+                                alpha, mds, has_monotone, constraint, lower, upper);
+                            o = k + p;
+                        }
+                        if (split_better(c, o, best, ordinal)) { best = c; ordinal = o; best_key = key; }
+                    }
+                    acc = split_add(acc, tile);
+                    has_lower = true;
+                    lower_key = kth;
+                    pos += take;
+                    __syncthreads();
+                }
+            }
+        }
+        if (best.flags & 1u) best.flags |= 4u;
+    } else if (on) {
+        const bool reverse = total.grad != sum.grad || total.hess != sum.hess;
+        SplitPair carry{};
+        for (uint32_t base = 0; base < count; base += SPLIT_CTA_THREADS) {
+            const uint32_t i = base + t;
+            SplitPair x = i < count ? hist[out_base + i] : SplitPair{};
+            SplitPair inc = split_add(carry, split_block_scan(x, warp_totals));
+            const SplitPair tile = warp_totals[7];
+            if (i < count) {
+                SplitPacket c = has_monotone
+                    ? mono_candidate(inc, split_sub(sum, inc), feats[f], i + 1, false,
+                        mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
+                    : split_candidate(inc, split_sub(sum, inc), feats[f], i + 1,
+                        false, parent_gain, ig, ih, lambda, gamma, mcw);
+                if (split_better(c, i, best, ordinal)) { best = c; ordinal = i; }
+                if (reverse) {
+                    SplitPair right = split_sub(total, split_sub(inc, x));
+                    c = has_monotone
+                        ? mono_candidate(split_sub(sum, right), right, feats[f], i, true,
+                            mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
+                        : split_candidate(split_sub(sum, right), right, feats[f], i,
+                            true, parent_gain, ig, ih, lambda, gamma, mcw);
+                    uint32_t ro = count + count - 1 - i;
+                    if (split_better(c, ro, best, ordinal)) { best = c; ordinal = ro; }
+                }
+            }
+            carry = split_add(carry, tile);
+            __syncthreads();
+        }
+    }
+    winners[t] = best; ordinals[t] = ordinal;
+    if (CAT) boundary[t] = best_key;
+    __syncthreads();
+    for (uint32_t step = SPLIT_CTA_THREADS / 2; step; step /= 2) {
+        if (t < step && split_better(winners[t + step], ordinals[t + step],
+                                    winners[t], ordinals[t])) {
+            winners[t] = winners[t + step]; ordinals[t] = ordinals[t + step];
+            if (CAT) boundary[t] = boundary[t + step];
+        }
+        __syncthreads();
+    }
+    if (!t) output[(size_t)n * features + f] = winners[0];
+    if (CAT && kind && (winners[0].flags & 1u)) {
+        const uint32_t o = ordinals[0];
+        const uint64_t edge = boundary[0];
+        const uint32_t* layout = cat_layout + 3 * (kind - 1);
+        uint32_t* words = cat_out + (size_t)n * node_set_words + layout[0];
+        const uint32_t k = n_scan - 1;
+        for (uint32_t w = t; w < layout[1]; w += SPLIT_CTA_THREADS) {
+            uint32_t bits = 0u;
+            for (uint32_t b = 0; b < 32; ++b) {
+                uint32_t i = w * 32 + b;
+                if (i >= count) break;
+                bool in;
+                if (onehot) in = i == (uint32_t)edge;
+                else if (o < k) in = split_order_key(wkeys[i], i, count, 0) <= edge;
+                // Backward: every category except the scanned tail.
+                else in = split_order_key(wkeys[i], i, count, 1) > edge;
+                bits |= (in ? 1u : 0u) << b;
+            }
+            words[w] = bits;
+        }
+    }
+}
+extern "C" __global__ void split_cached_features_wide(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    SplitPacket* output, const uint8_t* node_enabled) {
+    split_features_wide_body<false>(hist, previous, next, offsets, feats, enabled, sums,
+        metadata, features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds,
+        bounds, monotone, has_monotone, output, node_enabled, nullptr, nullptr, 0, 0, 0, 0,
+        nullptr, nullptr);
+}
+extern "C" __global__ void split_cached_features_wide_cat(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    SplitPacket* output, const uint8_t* node_enabled,
+    const uint32_t* cat_info, const uint32_t* cat_layout, uint32_t max_onehot,
+    uint32_t max_threshold, uint32_t node_set_words, uint32_t node_key_elems,
+    uint32_t* wkeys, uint32_t* cat_out) {
+    split_features_wide_body<true>(hist, previous, next, offsets, feats, enabled, sums,
+        metadata, features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds,
+        bounds, monotone, has_monotone, output, node_enabled, cat_info, cat_layout, max_onehot,
+        max_threshold, node_set_words, node_key_elems, wkeys, cat_out);
+}
+// Node reduction for 16-bit blocks with categorical features: like
+// split_cached_nodes_cat, but each categorical feature's set has its own
+// offset and length (`cat_layout`), and the packet tail of `stride - 64`
+// bytes is zero-filled past the winner's set. One warp copies the set.
+extern "C" __global__ void split_cached_nodes_wide_cat(const SplitPacket* features,
+    uint32_t n_features, const uint32_t* cat_sets, const uint32_t* cat_layout,
+    uint32_t node_set_words, uint8_t* output, uint32_t stride) {
+    __shared__ SplitPacket best_sh;
+    if (!threadIdx.x) {
+        SplitPacket best{};
+        for (uint32_t f = 0; f < n_features; ++f) {
+            SplitPacket p = features[(size_t)blockIdx.x * n_features + f];
+            if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
+        }
+        best_sh = best;
+    }
+    __syncthreads();
+    SplitPacket best = best_sh;
+    uint8_t* out = output + (size_t)blockIdx.x * stride;
+    uint32_t* words = (uint32_t*)(out + sizeof(SplitPacket));
+    const uint32_t tail = (stride - (uint32_t)sizeof(SplitPacket)) / 4;
+    uint32_t have = 0;
+    const uint32_t* src = cat_sets;
+    if (best.flags & 4u) {
+        src = cat_sets + (size_t)blockIdx.x * node_set_words + cat_layout[3 * best.bin];
+        have = cat_layout[3 * best.bin + 1];
+    }
+    for (uint32_t w = threadIdx.x; w < tail; w += blockDim.x) words[w] = w < have ? src[w] : 0u;
+    if (!threadIdx.x) {
+        if (best.flags & 4u) best.bin = 0;
+        *(SplitPacket*)out = best;
+    }
+}
+
+// ================================================= SHAP: tree-parallel exact contributions
+//
+// `shx_contribs` gives each (row, output) one thread that walks that output's
+// trees in sequence, so a small batch launches too few threads to fill the
+// device and its latency is one thread's walk over the whole ensemble. A
+// tree's contributions start from zero in that tree's own slots, so they can
+// be computed for every (row, tree) pair independently
+// (`shx_contribs_per_tree`) and then added to the output in tree order by
+// `shx_contribs_reduce`: the same additions, in the same order, as
+// `shx_contribs`, so both produce identical bits.
+//
+// Scratch layout: stride = n_rows * n_trees threads, sid = tree * n_rows + row;
+// words [0, levels * SHX_FRAME_WORDS) hold the traversal frames, the tree's
+// feature slots follow.
+extern "C" __global__ void shx_contribs_per_tree(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, uint32_t levels, float* __restrict__ scratch) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (row >= n_rows || t >= n_trees) return;
+    const uint32_t root = m.tree_node_begin[t];
+    if ((m.flags[root] & 1u) != 0u) return;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint64_t sid = (uint64_t)t * n_rows + row;
+    const uint32_t tc_base = levels * SHX_FRAME_WORDS;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    const uint32_t un = m.uniq_begin[t + 1u] - m.uniq_begin[t];
+    for (uint32_t u = 0; u < un; ++u) SHX_SF(tc_base + u) = 0.0f;
+    shx_run_tree<0>(m, feats, rn, rw, root, su, sf, stride, sid, tc_base, nullptr,
+                    n_features + 1u);
+}
+
+extern "C" __global__ void shx_contribs_reduce(
+    SHX_MODEL_PARAMS,
+    uint32_t n_rows, uint32_t n_features, uint32_t n_trees, uint32_t k, uint32_t levels,
+    const float* __restrict__ group_root_mean, const float* __restrict__ group_bias,
+    const float* __restrict__ margin, const float* __restrict__ scratch,
+    float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const uint32_t g = blockIdx.y;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint32_t nc = n_features + 1u;
+    const uint32_t tc_base = levels * SHX_FRAME_WORDS;
+    float* p = out + ((uint64_t)row * k + g) * nc;
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        const uint64_t sid = (uint64_t)t * n_rows + row;
+        for (uint32_t u = 0; u < un; ++u) {
+            const uint32_t f = m.uniq_feats[ub + u];
+            p[f] = SHX_FADD(p[f], scratch[(uint64_t)(tc_base + u) * stride + sid]);
+        }
+    }
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], group_root_mean[g]);
+    const float bias = margin != nullptr ? margin[(uint64_t)row * k + g] : group_bias[g];
+    p[nc - 1u] = SHX_FADD(p[nc - 1u], bias);
+}
+
+// ================================================= SHAP: tree-parallel interactions
+//
+// `shx_interactions` walks each (row, output)'s trees in sequence and adds
+// every delta straight into the row's matrix, so a small batch is limited by
+// one thread's walk over the ensemble. Which cell each delta lands in, and in
+// which order, depends only on the tree structure (the host precomputes it per
+// tree). `shx_interactions_log` therefore walks every (row, tree) pair
+// independently and only records the values (`shx_run_tree<2>`), and
+// `shx_interactions_apply` adds them to the matrices: one thread per (row,
+// output, matrix row r) visits the output's trees in order and, inside a tree,
+// that row's log entries in log order. Every cell thus receives the same
+// additions in the same order as in `shx_interactions` (the zero partner
+// deltas it skips are exact no-ops: a cell starts at +0 and is never -0), so
+// the matrices are identical bit for bit.
+//
+// Log layout: value j of tree t for row `row` is at
+// log[(ix_tree_begin[t] + j) * n_rows + row]. Entries of tree t's feature slot
+// q (global slot index ub + s, feature uniq_feats[ub + s]) are
+// [ix_slot_ptr[q], ix_slot_ptr[q + 1]) of ix_entry_index (j) / ix_entry_col.
+extern "C" __global__ void shx_interactions_log(
+    SHX_MODEL_PARAMS,
+    const float* __restrict__ rule, const float* __restrict__ rows, uint32_t n_rows,
+    uint32_t n_features, uint32_t n_trees, const uint32_t* __restrict__ ix_tree_begin,
+    float* __restrict__ scratch, float* __restrict__ log) {
+    SHX_MODEL_INIT;
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (row >= n_rows || t >= n_trees) return;
+    const uint32_t root = m.tree_node_begin[t];
+    if ((m.flags[root] & 1u) != 0u) return;
+    uint32_t* su = reinterpret_cast<uint32_t*>(scratch);
+    float* sf = scratch;
+    const uint64_t stride = (uint64_t)n_rows * n_trees;
+    const uint64_t sid = (uint64_t)t * n_rows + row;
+    const float* feats = rows + (uint64_t)row * n_features;
+    float rn[SHX_POINTS], rw[SHX_POINTS];
+#pragma unroll
+    for (int i = 0; i < SHX_POINTS; ++i) {
+        rn[i] = rule[i];
+        rw[i] = rule[SHX_POINTS + i];
+    }
+    float* row_log = log + (uint64_t)ix_tree_begin[t] * n_rows + row;
+    shx_run_tree<2>(m, feats, rn, rw, root, su, sf, stride, sid, 0u, row_log, n_features + 1u,
+                    (uint64_t)n_rows);
+}
+
+extern "C" __global__ void shx_interactions_apply(
+    SHX_MODEL_PARAMS,
+    uint32_t n_rows, uint32_t n_features, uint32_t n_trees, uint32_t k,
+    const uint32_t* __restrict__ ix_tree_begin, const uint32_t* __restrict__ ix_slot_ptr,
+    const uint32_t* __restrict__ ix_entry_index, const uint32_t* __restrict__ ix_entry_col,
+    const float* __restrict__ log, float* __restrict__ out) {
+    SHX_MODEL_INIT;
+    const uint32_t nc = n_features + 1u;
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n_rows * nc) return;
+    const uint32_t row = (uint32_t)(idx / nc);
+    const uint32_t r = (uint32_t)(idx % nc);
+    const uint32_t g = blockIdx.y;
+    float* mat_row = out + ((uint64_t)row * k + g) * nc * nc + (uint64_t)r * nc;
+    for (uint32_t t = g; t < n_trees; t += k) {
+        const uint32_t root = m.tree_node_begin[t];
+        if ((m.flags[root] & 1u) != 0u) continue;
+        const uint32_t ub = m.uniq_begin[t];
+        const uint32_t un = m.uniq_begin[t + 1u] - ub;
+        uint32_t q = 0xffffffffu;
+        for (uint32_t s = 0; s < un; ++s) {
+            if (m.uniq_feats[ub + s] == r) {
+                q = ub + s;
+                break;
+            }
+        }
+        if (q == 0xffffffffu) continue;
+        const uint64_t base = (uint64_t)ix_tree_begin[t];
+        for (uint32_t e = ix_slot_ptr[q]; e < ix_slot_ptr[q + 1u]; ++e) {
+            const uint32_t c = ix_entry_col[e];
+            mat_row[c] = SHX_FADD(mat_row[c],
+                                  log[(base + ix_entry_index[e]) * n_rows + row]);
+        }
+    }
 }

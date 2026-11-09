@@ -101,23 +101,215 @@ pub(crate) fn positional_label_name_from_schema(
 /// 把推断出来的列类型收紧成训练能用的形状。
 ///
 /// 推断出 Utf8 的列直接报错,而不是留到量化时才炸 —— 那时候的错误
-/// 信息里只有列号,这里还能说出列名。
-fn check_numeric(schema: &Schema, skip: &str) -> anyhow::Result<()> {
-    for f in schema.fields() {
-        if f.name() == skip {
+/// 信息里只有列号,这里还能说出列名。Columns in `text` (categorical
+/// features read as category names, see [`text_category_features`]) are
+/// strings by design.
+fn check_numeric(schema: &Schema, skip: &str, text: &[usize]) -> anyhow::Result<()> {
+    for (c, f) in schema.fields().iter().enumerate() {
+        if f.name() == skip || text.contains(&c) {
             continue;
         }
         match f.data_type() {
             DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64 => {}
             other => crate::bail_input!(
-                "column {:?} was inferred as {other:?}; only numeric columns are supported; \
-                 encode categorical features as numbers upstream; if it is actually numeric, \
-                 check for invalid characters or thousands separators",
+                "column {:?} was inferred as {other:?}; only numeric columns are supported, \
+                 except text columns declared categorical (\"c\" in feature_types), which are \
+                 read as category names; if it is actually numeric, check for invalid \
+                 characters or thousands separators",
                 f.name()
             ),
         }
     }
     Ok(())
+}
+
+/// How a canonical feature's CSV column is read, decided before any read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatRead {
+    /// As inferred: numeric features, and categorical features with
+    /// **integer** categories (re-coded by value).
+    Inferred,
+    /// Text, coded by a known list of string categories.
+    Names,
+    /// Training: a declared categorical feature without a known list. Pass 1
+    /// reads it as text and decides from **every** field, not the inference
+    /// sample: integer codes when all non-empty fields are numbers, category
+    /// names otherwise. Pass 2 reads it as the decision says.
+    Decide,
+    /// Validation / prediction: a categorical feature the model has no names
+    /// for. Read as text and parsed as numbers by [`CheckedCodes`], so a field
+    /// that is not a number past the inference sample is a clear error.
+    Codes,
+}
+
+impl CatRead {
+    fn as_text(self) -> bool {
+        self != CatRead::Inferred
+    }
+}
+
+/// How each canonical feature is read.
+///
+/// * A feature with a `known` list of strings (the trained model's for a
+///   validation set; for training, a continued model's, when the feature is
+///   declared categorical) is text in every file, whatever the inferred type:
+///   a file holding only `"1"` and `"2"` of the categories `["1", "2", "x"]`
+///   must not be read as the codes 1 and 2.
+/// * Training (`learn`): a declared categorical feature without a known list
+///   is decided by pass 1 from all rows of all files ([`CatRead::Decide`]),
+///   so one feature never mixes codes and names.
+/// * Validation: a categorical feature of the model (`model_categorical`)
+///   without a list is integer codes ([`CatRead::Codes`]).
+fn cat_reads(
+    n_features: usize,
+    categorical: Option<&[bool]>,
+    model_categorical: &[bool],
+    known: Option<&crate::category_names::CategoryTable>,
+    learn: bool,
+) -> Vec<CatRead> {
+    use crate::category_names::CategoryValues;
+    let flag = |flags: Option<&[bool]>, f: usize| {
+        flags.is_some_and(|flags| flags.get(f).copied().unwrap_or(false))
+    };
+    (0..n_features)
+        .map(|f| match known.and_then(|t| t.get(f)) {
+            // Training codes only declared features (a continued model's list
+            // included); validation codes every feature with a list.
+            Some(c) => {
+                if matches!(c.values(), CategoryValues::Str(_)) && (!learn || flag(categorical, f))
+                {
+                    CatRead::Names
+                } else {
+                    CatRead::Inferred
+                }
+            }
+            None if learn && flag(categorical, f) => CatRead::Decide,
+            None if !learn && flag(Some(model_categorical), f) => CatRead::Codes,
+            None => CatRead::Inferred,
+        })
+        .collect()
+}
+
+/// `schema` with the given columns re-typed (nullable). An empty field stays
+/// null (a missing value or category), whatever the type.
+fn with_column_types(schema: &SchemaRef, columns: &[(usize, DataType)]) -> SchemaRef {
+    if columns.is_empty() {
+        return Arc::clone(schema);
+    }
+    let fields: Vec<arrow::datatypes::Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(c, f)| match columns.iter().find(|(at, _)| *at == c) {
+            Some((_, t)) => arrow::datatypes::Field::new(f.name(), t.clone(), true),
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// The schema a prediction reads `path` with, and the canonical features
+/// [`CheckedCodes`] must parse. Features with string categories in the model
+/// (`categories`, by canonical feature id; `canonical[f]` = its column) are
+/// text; categorical features (`categorical`) without a list are text parsed
+/// as codes; the rest are read as inferred.
+pub(crate) fn prediction_schema(
+    schema: SchemaRef,
+    canonical: &[usize],
+    categorical: &[bool],
+    categories: Option<&crate::category_names::CategoryTable>,
+) -> (SchemaRef, Vec<usize>) {
+    let reads = cat_reads(canonical.len(), None, categorical, categories, false);
+    let text: Vec<(usize, DataType)> = canonical
+        .iter()
+        .zip(&reads)
+        .filter(|(_, r)| r.as_text())
+        .map(|(&c, _)| (c, DataType::Utf8))
+        .collect();
+    let codes = (0..canonical.len())
+        .filter(|&f| reads[f] == CatRead::Codes)
+        .collect();
+    (with_column_types(&schema, &text), codes)
+}
+
+/// Parses the text columns of categorical features without names (output
+/// columns `columns`) as numbers, like a `Float64` CSV column, into `Float64`
+/// columns. A field that is not a number is an error naming the file, the
+/// column, the value and its data row, where the Arrow reader would only have
+/// said it failed to parse.
+pub(crate) struct CheckedCodes<I> {
+    inner: I,
+    path: PathBuf,
+    columns: Arc<[usize]>,
+    rows: usize,
+}
+
+impl<I> CheckedCodes<I> {
+    pub(crate) fn new(inner: I, path: PathBuf, columns: Arc<[usize]>) -> Self {
+        Self {
+            inner,
+            path,
+            columns,
+            rows: 0,
+        }
+    }
+}
+
+impl<I: Iterator<Item = anyhow::Result<RecordBatch>>> Iterator for CheckedCodes<I> {
+    type Item = anyhow::Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.inner.next()? {
+            Ok(batch) if !self.columns.is_empty() => batch,
+            other => return Some(other),
+        };
+        let first = self.rows;
+        self.rows += batch.num_rows();
+        Some(parse_codes(batch, &self.columns, &self.path, first))
+    }
+}
+
+fn parse_codes(
+    batch: RecordBatch,
+    columns: &[usize],
+    path: &Path,
+    first_row: usize,
+) -> anyhow::Result<RecordBatch> {
+    use arrow::array::{Array, AsArray, Float64Array};
+    use arrow::compute::kernels::cast_utils::Parser;
+    let schema = batch.schema();
+    let mut fields: Vec<arrow::datatypes::FieldRef> = schema.fields().iter().cloned().collect();
+    let mut arrays = batch.columns().to_vec();
+    for &c in columns {
+        let name = schema.field(c).name();
+        let text = arrays[c].as_string_opt::<i32>().ok_or_else(|| {
+            anyhow::anyhow!("CSV categorical column {name:?} was not read as text")
+        })?;
+        let mut values = Vec::with_capacity(text.len());
+        for i in 0..text.len() {
+            if text.is_null(i) {
+                values.push(None);
+                continue;
+            }
+            let s = text.value(i);
+            match arrow::datatypes::Float64Type::parse(s) {
+                Some(v) => values.push(Some(v)),
+                None => crate::bail_input!(
+                    "{}: feature column {name:?} holds {s:?} (data row {}), which is not a \
+                     number; the model has no category names for this categorical feature, so \
+                     the file must hold its integer category codes",
+                    path.display(),
+                    first_row + i + 1
+                ),
+            }
+        }
+        arrays[c] = Arc::new(Float64Array::from(values));
+        fields[c] = Arc::new(arrow::datatypes::Field::new(name, DataType::Float64, true));
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        arrays,
+    )?)
 }
 
 fn batch_reader(
@@ -264,11 +456,20 @@ pub fn open_many_with_header_and_nthread<'a>(
         label.into(),
         cuts,
         max_bins,
-        cols_per_block,
+        BlockWidth::Fixed(cols_per_block),
         has_header,
         nthread,
         None,
     )
+}
+
+/// Block width of a CSV open: fixed up front, or chosen from the exact
+/// aggregate row count that the first (cut-building) pass counts, before the
+/// second pass builds the column blocks. The second form lets a caller plan
+/// memory from the real row count of input that has none before open.
+pub(crate) enum BlockWidth<'a> {
+    Fixed(usize),
+    FromRowCount(&'a mut dyn FnMut(u64) -> anyhow::Result<usize>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -277,20 +478,20 @@ pub(crate) fn open_many_with_header_and_nthread_prepared<'a>(
     label: impl Into<Targets<'a>>,
     cuts: Option<BinCuts>,
     max_bins: u32,
-    cols_per_block: usize,
+    width: BlockWidth<'_>,
     has_header: bool,
     nthread: usize,
-    first_schema: SchemaRef,
+    first_schema: Option<SchemaRef>,
 ) -> anyhow::Result<Dataset> {
     open_many_impl(
         paths,
         label.into(),
         cuts,
         max_bins,
-        cols_per_block,
+        width,
         has_header,
         nthread,
-        Some(first_schema),
+        first_schema,
     )
 }
 
@@ -300,7 +501,7 @@ fn open_many_impl(
     targets: Targets<'_>,
     cuts: Option<BinCuts>,
     max_bins: u32,
-    cols_per_block: usize,
+    width: BlockWidth<'_>,
     has_header: bool,
     nthread: usize,
     first_schema: Option<SchemaRef>,
@@ -327,7 +528,6 @@ fn open_many_impl(
     let mut feature_names: Option<Vec<String>> = None;
 
     for (p, schema) in paths.iter().zip(&schemas) {
-        check_numeric(schema, label)?;
         let roles = columns(schema, targets)?;
         let (cols, label_col, names) = (roles.features, roles.label, roles.names);
         if let Some(w) = roles.weight {
@@ -375,9 +575,56 @@ fn open_many_impl(
     }
     let feature_names = feature_names.expect("non-empty");
 
+    // Categorical features read as text are re-typed in every file before
+    // any read: names are coded by value, decided columns are decided by
+    // pass 1, unnamed codes of a model are parsed by `CheckedCodes`.
+    let known = match &cuts {
+        Some(c) => c.categories().map(|t| &**t),
+        None => targets.categories,
+    };
+    let model_categorical: Vec<bool> = cuts
+        .as_ref()
+        .map(|c| c.categorical_flags().to_vec())
+        .unwrap_or_default();
+    let reads = cat_reads(
+        feature_names.len(),
+        targets.categorical,
+        &model_categorical,
+        known,
+        cuts.is_none(),
+    );
+    let typed = |text_type: &dyn Fn(usize) -> Option<DataType>| -> Vec<SchemaRef> {
+        schemas
+            .iter()
+            .zip(&feat_proj)
+            .map(|(schema, cols)| {
+                let types: Vec<(usize, DataType)> = cols
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(f, &c)| text_type(f).map(|t| (c, t)))
+                    .collect();
+                with_column_types(schema, &types)
+            })
+            .collect()
+    };
+    for (schema, cols) in schemas.iter().zip(&feat_proj) {
+        let text_cols: Vec<usize> = cols
+            .iter()
+            .zip(&reads)
+            .filter_map(|(&c, r)| r.as_text().then_some(c))
+            .collect();
+        check_numeric(schema, label, &text_cols)?;
+    }
+    let decide: Vec<bool> = reads.iter().map(|&r| r == CatRead::Decide).collect();
+    let codes: Arc<[usize]> = (0..reads.len())
+        .filter(|&f| reads[f] == CatRead::Codes)
+        .collect();
+    let first_pass_schemas = typed(&|f| reads[f].as_text().then_some(DataType::Utf8));
+
     let (reader_threads, transform_threads) = crate::source::pipeline_threads(nthread);
     let owned = paths.to_vec();
-    let (sc, fp) = (schemas.clone(), feat_proj.clone());
+    let (sc, fp) = (first_pass_schemas.clone(), feat_proj.clone());
+    let no_codes: Arc<[usize]> = Arc::from(Vec::new());
     let feats = || -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
         Ok(dataset_reader(
             owned.clone(),
@@ -385,6 +632,7 @@ fn open_many_impl(
             fp.clone(),
             has_header,
             reader_threads,
+            no_codes.clone(),
         ))
     };
     let (cuts, known_rows) = match cuts {
@@ -401,29 +649,67 @@ fn open_many_impl(
                     cols
                 })
                 .collect();
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
-                dataset_reader(owned.clone(), sc.clone(), proj, has_header, reader_threads),
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_deciding(
+                dataset_reader(
+                    owned.clone(),
+                    sc.clone(),
+                    proj,
+                    has_header,
+                    reader_threads,
+                    no_codes.clone(),
+                ),
                 max_bins as usize,
                 transform_threads,
                 true,
                 targets.categorical.unwrap_or(&[]),
+                &decide,
                 targets.missing,
+                targets.categories,
             )?;
             (cuts, Some(n_rows))
         }
         None => {
             let _profile = crate::source::openprof::start("cuts");
-            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_typed(
+            let (cuts, n_rows) = crate::source::arrow_source::build_cuts_and_count_deciding(
                 feats()?,
                 max_bins as usize,
                 transform_threads,
                 false,
                 targets.categorical.unwrap_or(&[]),
+                &decide,
                 targets.missing,
+                targets.categories,
             )?;
             (cuts, Some(n_rows))
         }
     };
+
+    // The first pass has counted the exact rows of every file: the block width
+    // can be chosen now, before the second pass builds the blocks.
+    let cols_per_block = match width {
+        BlockWidth::Fixed(c) => c,
+        BlockWidth::FromRowCount(choose) => {
+            let n_rows = known_rows.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a CSV block width chosen from the row count needs the cut-building pass; it cannot be combined with given cuts"
+                )
+            })?;
+            choose(n_rows as u64)?
+        }
+    };
+
+    // Pass 1 has decided each decided column from every field: names are
+    // text, codes are numbers (every field parses as one). The rest read as
+    // in pass 1.
+    let schemas = typed(&|f| match reads[f] {
+        CatRead::Inferred => None,
+        CatRead::Names | CatRead::Codes => Some(DataType::Utf8),
+        CatRead::Decide => Some(if cuts.categories().is_some_and(|t| t.get(f).is_some()) {
+            DataType::Utf8
+        } else {
+            DataType::Float64
+        }),
+    });
 
     // CSV must scan complete records even for a one-column projection. Read
     // the label beside features during the quantization pass, then expose a
@@ -451,6 +737,7 @@ fn open_many_impl(
             combined_proj,
             has_header,
             reader_threads,
+            codes,
         ),
         feature_names.len(),
         &mut labels,
@@ -489,26 +776,34 @@ fn open_many_impl(
     )
 }
 
+/// Batches of every file in order, columns in each projection's order.
+/// `codes` = output columns parsed by [`CheckedCodes`] (empty = none).
 fn dataset_reader(
     paths: Vec<PathBuf>,
     schemas: Vec<SchemaRef>,
     projections: Vec<Vec<usize>>,
     has_header: bool,
     nthread: usize,
+    codes: Arc<[usize]>,
 ) -> crate::source::parallel_reader::BatchIter {
     if nthread <= 1 {
-        return Box::new(chained_csv(paths, schemas, projections, has_header));
+        return Box::new(chained_csv(paths, schemas, projections, has_header, codes));
     }
     if paths.len() == 1 {
         let (mask, order) = crate::source::input::projection_and_order(&projections[0]);
-        return parallel_csv_chunks(
-            paths[0].clone(),
-            schemas[0].clone(),
-            has_header,
-            mask,
-            order,
-            nthread,
-        );
+        let path = paths[0].clone();
+        return Box::new(CheckedCodes::new(
+            parallel_csv_chunks(
+                path.clone(),
+                schemas[0].clone(),
+                has_header,
+                mask,
+                order,
+                nthread,
+            ),
+            path,
+            codes,
+        ));
     }
     let paths = Arc::new(paths);
     let schemas = Arc::new(schemas);
@@ -522,9 +817,13 @@ fn dataset_reader(
             let schema = schemas[index].clone();
             let (mask, order) = crate::source::input::projection_and_order(&projections[index]);
             let iter = batch_reader(&path, schema, has_header, mask)?;
-            Ok(Box::new(iter.map(move |batch| {
-                batch.map(|batch| crate::source::input::reorder(&batch, &order))
-            })))
+            Ok(Box::new(CheckedCodes::new(
+                iter.map(move |batch| {
+                    batch.map(|batch| crate::source::input::reorder(&batch, &order))
+                }),
+                path,
+                codes.clone(),
+            )))
         },
     ))
 }
@@ -778,6 +1077,7 @@ fn chained_csv(
     schemas: Vec<SchemaRef>,
     projections: Vec<Vec<usize>>,
     has_header: bool,
+    codes: Arc<[usize]>,
 ) -> impl Iterator<Item = anyhow::Result<RecordBatch>> {
     paths
         .into_iter()
@@ -787,10 +1087,12 @@ fn chained_csv(
             // 同 parquet:投影之后必须按规范顺序重排。
             let (mask, order) = crate::source::input::projection_and_order(&cols);
             match batch_reader(&p, sc, has_header, mask) {
-                Ok(it) => {
-                    Box::new(it.map(move |b| b.map(|b| crate::source::input::reorder(&b, &order))))
-                        as Box<dyn Iterator<Item = anyhow::Result<RecordBatch>>>
-                }
+                Ok(it) => Box::new(CheckedCodes::new(
+                    it.map(move |b| b.map(|b| crate::source::input::reorder(&b, &order))),
+                    p,
+                    codes.clone(),
+                ))
+                    as Box<dyn Iterator<Item = anyhow::Result<RecordBatch>>>,
                 Err(e) => Box::new(std::iter::once(Err(e))),
             }
         })
@@ -931,10 +1233,10 @@ mod tests {
     fn empty_fields_are_missing_not_zero() {
         let path = write("empty_missing", BODY);
         let ds = open(&path, "target", 16, 3).unwrap();
-        assert_eq!(ds.source.bin_at(1, 1), crate::types::MISSING_BIN);
-        assert_eq!(ds.source.bin_at(5, 1), crate::types::MISSING_BIN);
+        assert_eq!(ds.source.bin_at(1, 1), crate::types::MISSING_BIN as u32);
+        assert_eq!(ds.source.bin_at(5, 1), crate::types::MISSING_BIN as u32);
         for row in [0usize, 2, 3, 4] {
-            assert_ne!(ds.source.bin_at(row, 1), crate::types::MISSING_BIN);
+            assert_ne!(ds.source.bin_at(row, 1), crate::types::MISSING_BIN as u32);
         }
         std::fs::remove_file(&path).ok();
     }
@@ -952,6 +1254,85 @@ mod tests {
         assert!(msg.contains("city"), "error should name the column: {msg}");
         assert!(msg.contains("only numeric columns are supported"), "{msg}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn declared_text_columns_learn_category_names_in_row_order() {
+        use crate::category_names::CategoryValues;
+        // File a's "city" fields are all integers, file b's are text: the
+        // column is text in both, and the list follows the rows.
+        let a = write("names_a", "city,target,x\n2,0,1\n1,1,2\n,0,3\n2,1,4\n");
+        let b = write("names_b", "x,city,target\n5,Oslo,0\n6,1,1\n7,Lima,0\n");
+        let flags = [true, false];
+        let targets = Targets::from("target").with_categorical(&flags);
+        let paths = vec![a.clone(), b.clone()];
+        for nthread in [1, 3] {
+            let ds = open_many_with_header_and_nthread(&paths, targets, None, 16, 2, true, nthread)
+                .unwrap();
+            let table = ds.source.cuts().categories().expect("names").clone();
+            let strs = |v: &[&str]| CategoryValues::Str(v.iter().map(|s| s.to_string()).collect());
+            assert_eq!(
+                table.get(0).unwrap().values(),
+                &strs(&["2", "1", "Oslo", "Lima"])
+            );
+            assert!(table.get(1).is_none());
+            let bins: Vec<u32> = (0..7).map(|r| ds.source.bin_at(r, 0)).collect();
+            let m = crate::types::MISSING_BIN as u32;
+            assert_eq!(bins, vec![0, 1, m, 0, 2, 1, 3]);
+
+            // A validation file of integers only is read as text and coded by value.
+            let v = write("names_v", "city,target,x\n1,0,1\nLima,1,2\n");
+            let valid = open_many_with_header_and_nthread(
+                std::slice::from_ref(&v),
+                targets.with_features(&ds.feature_names),
+                Some(ds.source.cuts().clone()),
+                0,
+                2,
+                true,
+                nthread,
+            )
+            .unwrap();
+            assert_eq!(valid.source.bin_at(0, 0), 1);
+            assert_eq!(valid.source.bin_at(1, 0), 3);
+            let unseen = write("names_u", "city,target,x\nRome,0,1\n");
+            let err = open_many_with_header_and_nthread(
+                std::slice::from_ref(&unseen),
+                targets.with_features(&ds.feature_names),
+                Some(ds.source.cuts().clone()),
+                0,
+                2,
+                true,
+                nthread,
+            )
+            .err()
+            .expect("unseen category")
+            .to_string();
+            assert!(
+                err.contains("\"city\"") && err.contains("\"Rome\""),
+                "{err}"
+            );
+        }
+        // Without names an all-integer categorical column keeps its codes.
+        let ds = open_many_with_header_and_nthread(
+            std::slice::from_ref(&a),
+            targets,
+            None,
+            16,
+            2,
+            true,
+            1,
+        )
+        .unwrap();
+        assert!(ds.source.cuts().categories().is_none());
+        // Undeclared text is rejected by name.
+        let err = open_many(&paths, "target", None, 16, 2)
+            .err()
+            .expect("undeclared text")
+            .to_string();
+        assert!(
+            err.contains("city") && err.contains("only numeric columns"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1011,10 +1392,10 @@ mod tests {
             "target",
             None,
             16,
-            2,
+            BlockWidth::Fixed(2),
             true,
             4,
-            schema,
+            Some(schema),
         )
         .unwrap();
         let regular = open(&path, "target", 16, 2).unwrap();
@@ -1035,5 +1416,71 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn block_width_from_the_aggregate_row_count_of_the_first_pass() {
+        let a = write("width_rows_a", BODY);
+        let b = write("width_rows_b", BODY);
+        let paths = vec![a.clone(), b.clone()];
+        let mut seen = Vec::new();
+        let mut choose = |rows: u64| -> anyhow::Result<usize> {
+            seen.push(rows);
+            Ok(2)
+        };
+        let planned = open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            None,
+            16,
+            BlockWidth::FromRowCount(&mut choose),
+            true,
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(seen, vec![12], "the width is chosen once, from all files");
+        let fixed = open_many(&paths, "target", None, 16, 2).unwrap();
+        assert_eq!(planned.source.n_blocks(), fixed.source.n_blocks());
+        assert_eq!(planned.labels, fixed.labels);
+        for feature in 0..fixed.source.n_features() as u32 {
+            for row in 0..fixed.source.n_rows() {
+                assert_eq!(
+                    planned.source.bin_at(row, feature),
+                    fixed.source.bin_at(row, feature)
+                );
+            }
+        }
+
+        // A failed choice fails the open; given cuts have no first pass to count.
+        let mut fail = |_: u64| -> anyhow::Result<usize> { anyhow::bail!("no plan fits") };
+        let err = match open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            None,
+            16,
+            BlockWidth::FromRowCount(&mut fail),
+            true,
+            2,
+            None,
+        ) {
+            Ok(_) => panic!("a failed width choice must fail the open"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("no plan fits"));
+        let mut never = |_: u64| -> anyhow::Result<usize> { unreachable!() };
+        assert!(open_many_with_header_and_nthread_prepared(
+            &paths,
+            "target",
+            Some(fixed.source.cuts().clone()),
+            16,
+            BlockWidth::FromRowCount(&mut never),
+            true,
+            2,
+            None,
+        )
+        .is_err());
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
     }
 }

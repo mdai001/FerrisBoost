@@ -12,9 +12,10 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 
-use crate::columns::{partition_features, BinCuts, ColumnBlock};
+use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
+use crate::columns::{partition_features_by_width, quantize_value, BinCuts, ColumnBlock};
 use crate::sketch::SketchSet;
-use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
+use crate::types::{FeatId, MAX_BIN_LIMIT};
 
 /// A query-id column as u64. Integer columns of any width, and floating point
 /// columns holding integral values; nulls and negative values are errors.
@@ -121,19 +122,20 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
     missing: f32,
     mut visit: impl FnMut(f32),
 ) -> anyhow::Result<()> {
-    // A dictionary column carries category codes: visit its decoded values.
-    // Only numeric dictionaries are stable codes; string dictionaries have a
-    // per-batch ordering that cannot be turned into consistent codes here.
+    // A numeric dictionary column carries category codes: visit its decoded
+    // values. String dictionaries of categorical features with category names
+    // were already re-coded to codes (`cat_recode`); one reaching this point
+    // belongs to a numeric feature or to a model without category names.
     let decoded;
     let array = match batch.column(col).data_type() {
         DataType::Dictionary(_, value) => {
             if !(value.is_numeric()) {
                 let name = batch.schema().field(col).name().clone();
                 crate::bail_input!(
-                    "column {name:?} is a dictionary of {value:?} values: categorical \
-                     file columns must hold integer category codes (the codes of a string \
-                     dictionary differ between row groups). Encode the categories as integers \
-                     upstream, or train from a pandas / PyArrow in-memory table"
+                    "column {name:?} is a dictionary of {value:?} values, which can only be a \
+                     categorical feature with category names: train it as categorical (do not \
+                     declare it \"q\" in feature_types); a model trained on integer codes for \
+                     this feature needs integer codes here"
                 );
             }
             decoded = arrow::compute::cast(batch.column(col), &DataType::Float64)?;
@@ -188,8 +190,9 @@ fn visit_column_f32<const REJECT_INF: bool, const REJECT_MAX: bool>(
         DataType::Int32 => visit_values!(Int32Array),
         DataType::Int64 => visit_values!(Int64Array),
         other => crate::bail_input!(
-            "column {col} is {other:?}; only numeric columns are supported; \
-             encode categorical features upstream as integer codes (0..=253) and declare them with feature_types=\"c\""
+            "column {col} is {other:?}; only numeric columns are supported. A string \
+             column can be a categorical feature: store it as a dictionary column or declare \
+             it with feature_types=\"c\" (integer category codes 0..=65533 work too)"
         ),
     }
     Ok(())
@@ -238,7 +241,7 @@ pub(crate) fn build_cuts_and_count_weighted(
     nthread: usize,
     weighted: bool,
 ) -> anyhow::Result<(BinCuts, usize)> {
-    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[], f32::NAN)
+    build_cuts_and_count_typed(batches, max_bins, nthread, weighted, &[], f32::NAN, None)
 }
 
 /// `build_cuts_and_count_weighted` with categorical features.
@@ -258,11 +261,40 @@ pub(crate) fn build_cuts_and_count_typed(
     weighted: bool,
     categorical: &[bool],
     missing: f32,
+    seed: Option<&crate::category_names::CategoryTable>,
+) -> anyhow::Result<(BinCuts, usize)> {
+    build_cuts_and_count_deciding(
+        batches,
+        max_bins,
+        nthread,
+        weighted,
+        categorical,
+        &[],
+        missing,
+        seed,
+    )
+}
+
+/// [`build_cuts_and_count_typed`] where the categorical features marked in
+/// `decide` (CSV columns read as text, see `cat_recode::Coder::Decide`) are
+/// decided from every field of the pass: integer codes when every non-empty
+/// field is a number, category names otherwise. Either way the cuts are what
+/// the pass would have built had the column been read that way from the start.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_cuts_and_count_deciding(
+    batches: impl Iterator<Item = anyhow::Result<RecordBatch>>,
+    max_bins: usize,
+    nthread: usize,
+    weighted: bool,
+    categorical: &[bool],
+    decide: &[bool],
+    missing: f32,
+    seed: Option<&crate::category_names::CategoryTable>,
 ) -> anyhow::Result<(BinCuts, usize)> {
     let scan_profile = crate::source::openprof::start("cuts scan");
     assert!(
         max_bins as u32 <= MAX_BIN_LIMIT,
-        "max_bin must be at most {MAX_BIN_LIMIT} (255 is reserved for the missing sentinel), got {max_bins}"
+        "max_bin must be at most {MAX_BIN_LIMIT}, got {max_bins}"
     );
 
     // 整次扫描只建一个 pool。每 batch 重建一次在线程数较多、batch 很小
@@ -272,6 +304,9 @@ pub(crate) fn build_cuts_and_count_typed(
     let profile_columns = pool.current_num_threads() == 1;
     let mut sketches: Option<SketchSet> = None;
     let mut feature_names: Vec<String> = Vec::new();
+    // Named categories (string dictionaries) are coded here, before any
+    // decoding; the list each feature learns is attached to the cuts.
+    let mut recoder: Option<crate::source::cat_recode::Recoder<'_>> = None;
     let mut n_rows = 0usize;
     // 手动迭代:`next()` 里才是 Parquet 解压,要和 sketch 分开计时。
     let mut batches = batches;
@@ -287,6 +322,37 @@ pub(crate) fn build_cuts_and_count_typed(
             .checked_add(batch.num_rows())
             .ok_or_else(|| anyhow::anyhow!("input row count overflows usize"))?;
         let n_feats = batch.num_columns() - usize::from(weighted);
+        if recoder.is_none() {
+            crate::ensure_input!(
+                categorical.is_empty() || categorical.len() == n_feats,
+                "feature_types has {} entries but the data has {n_feats} feature columns",
+                categorical.len()
+            );
+            let schema = batch.schema();
+            // An explicit feature_types list decides; otherwise dictionary-typed
+            // columns are detected as categorical (same rule as in-memory input).
+            // Resolved from the batch as read, before string columns become codes.
+            let flags: Vec<bool> = (0..n_feats)
+                .map(|f| match categorical.get(f) {
+                    Some(&declared) => declared,
+                    None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
+                })
+                .collect();
+            recoder = Some(crate::source::cat_recode::Recoder::learning_deciding(
+                &flags, decide, seed, missing,
+            ));
+            feature_names = schema
+                .fields()
+                .iter()
+                .take(n_feats)
+                .map(|f| f.name().clone())
+                .collect();
+            sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));
+        }
+        let batch = recoder
+            .as_mut()
+            .expect("created above")
+            .recode(batch, |c| (c < n_feats).then_some(c))?;
         let weights: Option<Vec<f32>> = if weighted {
             let mut w = Vec::with_capacity(batch.num_rows());
             for_each_column_f32(&batch, n_feats, |v| w.push(v))?;
@@ -311,29 +377,6 @@ pub(crate) fn build_cuts_and_count_typed(
                 })
             }
         };
-        if sketches.is_none() {
-            crate::ensure_input!(
-                categorical.is_empty() || categorical.len() == n_feats,
-                "feature_types has {} entries but the data has {n_feats} feature columns",
-                categorical.len()
-            );
-            let schema = batch.schema();
-            feature_names = schema
-                .fields()
-                .iter()
-                .take(n_feats)
-                .map(|f| f.name().clone())
-                .collect();
-            // An explicit feature_types list decides; otherwise dictionary-typed
-            // columns are detected as categorical (same rule as in-memory input).
-            let flags: Vec<bool> = (0..n_feats)
-                .map(|f| match categorical.get(f) {
-                    Some(&declared) => declared,
-                    None => matches!(schema.field(f).data_type(), DataType::Dictionary(_, _)),
-                })
-                .collect();
-            sketches = Some(SketchSet::with_categorical(n_feats, max_bins, &flags));
-        }
         let sk = sketches.as_mut().expect("created above");
         anyhow::ensure!(
             n_feats == sk.n_feats(),
@@ -360,11 +403,34 @@ pub(crate) fn build_cuts_and_count_typed(
     }
     drop(scan_profile);
     let _finalize_profile = crate::source::openprof::start("cuts finalize");
+    let mut sketches = sketches.ok_or_else(|| {
+        crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
+    })?;
+    // Decided columns reached the sketch as missing: set the scan each
+    // reading would have made. Names are the codes `0..n`, all seen, and a
+    // code equal to the sentinel is skipped like any value.
+    for (f, decided) in recoder.as_ref().map(|r| r.decided()).unwrap_or_default() {
+        let (max_code, bad) = match decided {
+            crate::source::cat_recode::Decided::Codes { max_code, bad } => (max_code, bad),
+            crate::source::cat_recode::Decided::Names { n } => {
+                let top = n as i32 - 1;
+                let max = if top >= 0 && top as f32 == missing {
+                    top - 1
+                } else {
+                    top
+                };
+                (max, None)
+            }
+        };
+        sketches.per_feat[f].set_categorical_scan(max_code, bad);
+    }
+    let n_feats = sketches.n_feats();
+    let categories = recoder
+        .and_then(|r| r.into_table(n_feats))
+        .map(std::sync::Arc::new);
     let cuts = sketches
-        .ok_or_else(|| {
-            crate::input_err!("no batches: cannot build bin boundaries (the data has no rows)")
-        })?
-        .finalize_checked(&feature_names)?;
+        .finalize_checked(&feature_names)?
+        .with_categories(categories);
     Ok((cuts, n_rows))
 }
 
@@ -398,19 +464,26 @@ pub fn quantize_with_nthread(
 ) -> anyhow::Result<(Vec<ColumnBlock>, usize)> {
     assert!(cols_per_block > 0, "cols_per_block must be > 0");
     let n_features = cuts.n_feats();
-    let groups = partition_features(n_features, cols_per_block);
+    cuts.check_widths()?;
+    let groups = partition_features_by_width(&cuts.widths(), cols_per_block);
 
     // 每个块先攒成"按特征分段"的 Vec,行数未知所以只能边走边 push。
     // 列主序的好处在这里也成立:同一个特征的 bin 是连续追加的。
-    let mut per_block: Vec<Vec<Vec<Bin>>> =
-        groups.iter().map(|g| vec![Vec::new(); g.len()]).collect();
+    let mut per_block: Vec<GrowBlock> = groups
+        .iter()
+        .map(|g| match cuts.block_width(g) {
+            BinWidth::U8 => GrowBlock::U8(vec![Vec::new(); g.len()]),
+            BinWidth::U16 => GrowBlock::U16(vec![Vec::new(); g.len()]),
+        })
+        .collect();
     let mut n_rows = 0usize;
     let pool = crate::threading::build_pool(nthread).map_err(|e| {
         anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
     })?;
 
+    let mut recoder = crate::source::cat_recode::Recoder::fixed(cuts.categories().map(|t| &**t));
     for batch in batches {
-        let batch = batch?;
+        let batch = recoder.recode(batch?, Some)?;
         anyhow::ensure!(
             batch.num_columns() == n_features,
             "batch has {} columns but cuts were built for {n_features} columns",
@@ -423,19 +496,10 @@ pub fn quantize_with_nthread(
                 .par_iter_mut()
                 .zip(groups.par_iter())
                 .try_for_each(|(block, feats)| -> anyhow::Result<()> {
-                    for (local, &f) in feats.iter().enumerate() {
-                        let dst = &mut block[local];
-                        dst.reserve(batch.num_rows());
-                        for_each_feature_f32(&batch, f as usize, missing, |value| {
-                            // null, NaN and the `missing` sentinel share MISSING_BIN.
-                            dst.push(if value.is_nan() {
-                                MISSING_BIN
-                            } else {
-                                cuts.find_bin(f, value)
-                            });
-                        })?;
+                    match block {
+                        GrowBlock::U8(cols) => append_batch(cols, feats, &batch, cuts, missing),
+                        GrowBlock::U16(cols) => append_batch(cols, feats, &batch, cuts, missing),
                     }
-                    Ok(())
                 })
         })?;
     }
@@ -444,15 +508,10 @@ pub fn quantize_with_nthread(
         .into_iter()
         .zip(per_block)
         .map(|(feat_ids, cols)| {
-            let mut data = Vec::with_capacity(feat_ids.len() * n_rows);
-            for col in cols {
-                debug_assert_eq!(
-                    col.len(),
-                    n_rows,
-                    "a column's row count does not match the other columns"
-                );
-                data.extend_from_slice(&col);
-            }
+            let data = match cols {
+                GrowBlock::U8(cols) => BinData::U8(concat_columns(cols, n_rows)),
+                GrowBlock::U16(cols) => BinData::U16(concat_columns(cols, n_rows)),
+            };
             ColumnBlock {
                 feat_ids,
                 data,
@@ -462,6 +521,68 @@ pub fn quantize_with_nthread(
         .collect();
 
     Ok((blocks, n_rows))
+}
+
+/// Per-column growth buffers of one block at its width.
+enum GrowBlock {
+    U8(Vec<Vec<u8>>),
+    U16(Vec<Vec<u16>>),
+}
+
+/// Append one batch's bins of `feats` to their growth buffers.
+fn append_batch<B: BinCode>(
+    cols: &mut [Vec<B>],
+    feats: &[FeatId],
+    batch: &RecordBatch,
+    cuts: &BinCuts,
+    missing: f32,
+) -> anyhow::Result<()> {
+    for (local, &f) in feats.iter().enumerate() {
+        let dst = &mut cols[local];
+        dst.reserve(batch.num_rows());
+        // null, NaN and the `missing` sentinel share the missing bin.
+        for_each_feature_f32(batch, f as usize, missing, |value| {
+            dst.push(quantize_value::<B>(cuts, f, value));
+        })?;
+    }
+    Ok(())
+}
+
+fn concat_columns<B: BinCode>(cols: Vec<Vec<B>>, n_rows: usize) -> Vec<B> {
+    let mut data = Vec::with_capacity(cols.len() * n_rows);
+    for col in cols {
+        debug_assert_eq!(
+            col.len(),
+            n_rows,
+            "a column's row count does not match the other columns"
+        );
+        data.extend_from_slice(&col);
+    }
+    data
+}
+
+/// Write one batch's bins of `features` into a known-size column-major block.
+fn fill_batch<B: BinCode>(
+    data: &mut [B],
+    features: &[FeatId],
+    batch: &RecordBatch,
+    cuts: &BinCuts,
+    missing: f32,
+    n_rows: usize,
+    row_offset: usize,
+) -> anyhow::Result<()> {
+    let batch_rows = batch.num_rows();
+    for (local, &feature) in features.iter().enumerate() {
+        let start = local * n_rows + row_offset;
+        let output = &mut data[start..start + batch_rows];
+        let mut index = 0usize;
+        for_each_feature_f32(batch, feature as usize, missing, |value| {
+            output[index] = quantize_value::<B>(cuts, feature, value);
+            index += 1;
+        })?;
+        debug_assert_eq!(index, batch_rows);
+    }
+    Ok(())
 }
 
 /// Quantize into final column-major blocks when the first scan already
@@ -477,7 +598,8 @@ fn quantize_with_nthread_known_rows(
 ) -> anyhow::Result<Vec<ColumnBlock>> {
     let allocation_profile = crate::source::openprof::start("bins allocate");
     assert!(cols_per_block > 0, "cols_per_block must be > 0");
-    let groups = partition_features(cuts.n_feats(), cols_per_block);
+    cuts.check_widths()?;
+    let groups = partition_features_by_width(&cuts.widths(), cols_per_block);
     let mut blocks = groups
         .iter()
         .map(|features| {
@@ -487,7 +609,7 @@ fn quantize_with_nthread_known_rows(
                 .ok_or_else(|| anyhow::anyhow!("quantized block size overflows usize"))?;
             Ok(ColumnBlock {
                 feat_ids: features.clone(),
-                data: vec![MISSING_BIN; len],
+                data: BinData::missing(cuts.block_width(features), len),
                 n_rows,
             })
         })
@@ -498,6 +620,7 @@ fn quantize_with_nthread_known_rows(
         anyhow::anyhow!("failed to create the Arrow quantize ingest thread pool: {e}")
     })?;
     let mut row_offset = 0usize;
+    let mut recoder = crate::source::cat_recode::Recoder::fixed(cuts.categories().map(|t| &**t));
 
     let mut batches = batches;
     loop {
@@ -506,7 +629,7 @@ fn quantize_with_nthread_known_rows(
             batches.next()
         };
         let Some(batch) = next else { break };
-        let batch = batch?;
+        let batch = recoder.recode(batch?, Some)?;
         anyhow::ensure!(
             batch.num_columns() == cuts.n_feats(),
             "batch has {} columns but cuts were built for {} columns",
@@ -526,21 +649,14 @@ fn quantize_with_nthread_known_rows(
         pool.install(|| {
             blocks.par_iter_mut().zip(groups.par_iter()).try_for_each(
                 |(block, features)| -> anyhow::Result<()> {
-                    for (local, &feature) in features.iter().enumerate() {
-                        let start = local * n_rows + row_offset;
-                        let output = &mut block.data[start..start + batch_rows];
-                        let mut index = 0usize;
-                        for_each_feature_f32(&batch, feature as usize, missing, |value| {
-                            output[index] = if value.is_nan() {
-                                MISSING_BIN
-                            } else {
-                                cuts.find_bin(feature, value)
-                            };
-                            index += 1;
-                        })?;
-                        debug_assert_eq!(index, batch_rows);
+                    match &mut block.data {
+                        BinData::U8(d) => {
+                            fill_batch(d, features, &batch, cuts, missing, n_rows, row_offset)
+                        }
+                        BinData::U16(d) => {
+                            fill_batch(d, features, &batch, cuts, missing, n_rows, row_offset)
+                        }
                     }
-                    Ok(())
                 },
             )
         })?;
@@ -617,6 +733,7 @@ impl ArrowSource {
             quantize_threads,
             &[],
             f32::NAN,
+            None,
         )
     }
 
@@ -629,6 +746,7 @@ impl ArrowSource {
         quantize_threads: usize,
         categorical: &[bool],
         missing: f32,
+        seed: Option<&crate::category_names::CategoryTable>,
     ) -> anyhow::Result<Self>
     where
         I: Iterator<Item = anyhow::Result<RecordBatch>>,
@@ -641,6 +759,7 @@ impl ArrowSource {
             false,
             categorical,
             missing,
+            seed,
         )?;
         let blocks = quantize_with_nthread_known_rows(
             batches(true)?,
@@ -759,10 +878,10 @@ impl ArrowSource {
     }
 
     /// 某一行某个特征的 bin。测试和调试用。
-    pub fn bin_at(&self, row: usize, feat: FeatId) -> Bin {
+    pub fn bin_at(&self, row: usize, feat: FeatId) -> u32 {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return b.column(local)[row];
+                return b.column(local).get(row);
             }
         }
         panic!("feature {feat} is not in any column block");
@@ -802,10 +921,10 @@ impl crate::train::BlockSource for ArrowSource {
     /// 再切一列」,对全量驻留的 source 就是「为了 1 列克隆整块」。
     /// HIGGS 上 28 列 × 1050 万行 = 每次克隆 294MB,行重分区因此吃掉
     /// 单轮一半的时间(profile 抓出来的,见 CLAUDE.md「6.9× 花在哪」)。
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>> {
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<BinData> {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return Ok(b.column(local).to_vec());
+                return Ok(b.column(local).to_owned());
             }
         }
         anyhow::bail!(
@@ -819,7 +938,7 @@ impl crate::train::BlockSource for ArrowSource {
         true
     }
 
-    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, feat: FeatId) -> Option<BinSlice<'_>> {
         self.blocks.iter().find_map(|b| {
             b.feat_ids
                 .iter()
@@ -848,6 +967,7 @@ mod tests {
     use super::*;
     use crate::source::DenseSource;
     use crate::train::BlockSource as _;
+    use crate::types::{Bin, MISSING_BIN};
     use arrow::array::{Float32Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -960,13 +1080,13 @@ mod tests {
         let bs = batches();
         let src = ArrowSource::new(|| Ok(feed(&bs)), 16, 3).unwrap();
         // 第 2 列的第 1 行和第 5 行是 null
-        assert_eq!(src.bin_at(1, 1), MISSING_BIN);
-        assert_eq!(src.bin_at(5, 1), MISSING_BIN);
+        assert_eq!(src.bin_at(1, 1), MISSING_BIN as u32);
+        assert_eq!(src.bin_at(5, 1), MISSING_BIN as u32);
         // 其余行不是缺失
         for row in [0usize, 2, 3, 4] {
             assert_ne!(
                 src.bin_at(row, 1),
-                MISSING_BIN,
+                MISSING_BIN as u32,
                 "row {row} should not be missing"
             );
         }
@@ -1026,7 +1146,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("only numeric columns are supported"),
+            msg.contains("only numeric columns"),
             "error should be readable, got: {msg}"
         );
     }
@@ -1154,7 +1274,8 @@ mod tests {
         for sentinel in [-999.0f64, 0.0] {
             let bs = sentinel_batches(sentinel);
             let (with, rows) =
-                build_cuts_and_count_typed(feed(&bs), 16, 1, false, &[], sentinel as f32).unwrap();
+                build_cuts_and_count_typed(feed(&bs), 16, 1, false, &[], sentinel as f32, None)
+                    .unwrap();
             assert_eq!(rows, 6);
             // A sentinel is never a cut point or the observed minimum.
             let col_b = &with.values[with.offsets[1] as usize..with.offsets[2] as usize];
@@ -1162,7 +1283,8 @@ mod tests {
             // Equal to the sketch of the same data with nulls in those places.
             let nan_bs: Vec<RecordBatch> = batches();
             let (reference, _) =
-                build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+                build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN, None)
+                    .unwrap();
             let ref_b =
                 &reference.values[reference.offsets[1] as usize..reference.offsets[2] as usize];
             assert_eq!(col_b, ref_b);
@@ -1174,7 +1296,7 @@ mod tests {
         let bs = sentinel_batches(-999.0);
         let nan_bs = batches();
         let (cuts, _) =
-            build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN).unwrap();
+            build_cuts_and_count_typed(feed(&nan_bs), 16, 1, false, &[], f32::NAN, None).unwrap();
         let (with, n) = quantize_with_nthread(feed(&bs), &cuts, 2, 1, -999.0).unwrap();
         let (without, _) = quantize_with_nthread(feed(&nan_bs), &cuts, 2, 1, f32::NAN).unwrap();
         assert_eq!(n, 6);
@@ -1184,7 +1306,7 @@ mod tests {
                 .find(|b| b.feat_ids.contains(&1))
                 .map(|b| {
                     let local = b.feat_ids.iter().position(|&f| f == 1).unwrap();
-                    b.column(local).to_vec()
+                    b.column(local).as_u8().unwrap().to_vec()
                 })
                 .unwrap()
         };
@@ -1201,13 +1323,126 @@ mod tests {
     fn two_pass_source_with_sentinel_equals_source_with_nulls() {
         let bs = sentinel_batches(-999.0);
         let nan_bs = batches();
-        let a =
-            ArrowSource::new_typed_with_phase_threads(|_| Ok(feed(&bs)), 16, 2, 1, 1, &[], -999.0)
-                .unwrap();
+        let a = ArrowSource::new_typed_with_phase_threads(
+            |_| Ok(feed(&bs)),
+            16,
+            2,
+            1,
+            1,
+            &[],
+            -999.0,
+            None,
+        )
+        .unwrap();
         let b = ArrowSource::new(|| Ok(feed(&nan_bs)), 16, 2).unwrap();
         // Column b matches in bins; columns a / c hold identical data.
         for row in 0..6 {
             assert_eq!(a.bin_at(row, 1), b.bin_at(row, 1), "row {row}");
         }
+    }
+
+    #[test]
+    fn decided_text_columns_build_the_cuts_of_their_reading() {
+        use arrow::array::ArrayRef;
+        // The same fields read as text and decided, or read as numbers / as a
+        // string column from the start, give the same cuts and categories.
+        let col = |name: &str, a: ArrayRef| {
+            RecordBatch::try_from_iter(vec![(name.to_string(), a)]).map_err(anyhow::Error::from)
+        };
+        let as_text = |v: &[Option<&str>]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let bits = |c: &BinCuts| {
+            (
+                c.offsets.clone(),
+                c.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                c.categorical_flags().to_vec(),
+                c.categories().map(|t| {
+                    t.features()
+                        .iter()
+                        .map(|f| f.as_ref().map(|f| format!("{:?}", f.values())))
+                        .collect::<Vec<_>>()
+                }),
+            )
+        };
+        let cases: [(&[Option<&str>], f32); 3] = [
+            (&[Some("3"), None, Some("9"), Some("-1"), Some("0")], -1.0),
+            (&[Some("3"), None, Some("9"), Some("0")], 9.0),
+            (&[Some("3"), None, Some("9"), Some("0")], f32::NAN),
+        ];
+        for (ints, missing) in cases {
+            let as_ints: ArrayRef = Arc::new(Int64Array::from(
+                ints.iter()
+                    .map(|v| v.map(|s| s.parse::<i64>().unwrap()))
+                    .collect::<Vec<_>>(),
+            ));
+            let decided = build_cuts_and_count_deciding(
+                std::iter::once(col("k", as_text(ints))),
+                16,
+                1,
+                false,
+                &[true],
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            let read = build_cuts_and_count_typed(
+                std::iter::once(col("k", as_ints.clone())),
+                16,
+                1,
+                false,
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(bits(&decided), bits(&read));
+            assert!(decided.categories().is_none());
+        }
+        let names: Vec<Option<&str>> = vec![Some("3"), Some("b"), None, Some("3"), Some("a")];
+        for missing in [f32::NAN, 2.0, 1.0] {
+            let decided = build_cuts_and_count_deciding(
+                std::iter::once(col("k", as_text(&names))),
+                16,
+                1,
+                false,
+                &[true],
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            let learned = build_cuts_and_count_typed(
+                std::iter::once(col("k", as_text(&names))),
+                16,
+                1,
+                false,
+                &[true],
+                missing,
+                None,
+            )
+            .unwrap()
+            .0;
+            assert_eq!(bits(&decided), bits(&learned));
+            assert!(decided.categories().is_some());
+        }
+        // An invalid code of a column decided as numbers is the usual error.
+        let bad: Vec<Option<&str>> = vec![Some("3"), Some("2.5")];
+        let Err(err) = build_cuts_and_count_deciding(
+            std::iter::once(col("k", as_text(&bad))),
+            16,
+            1,
+            false,
+            &[true],
+            &[true],
+            f32::NAN,
+            None,
+        ) else {
+            panic!("an invalid code must be rejected")
+        };
+        let err = err.to_string();
+        assert!(err.contains("2.5") && err.contains("integer"), "{err}");
     }
 }

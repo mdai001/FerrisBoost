@@ -71,7 +71,7 @@ fn explain_batch(
     rows: &[f32],
     n_rows: usize,
     workers: usize,
-    pool: &mut Option<rayon::ThreadPool>,
+    pool: &mut Option<std::sync::Arc<rayon::ThreadPool>>,
     margin: Option<&[f32]>,
 ) -> anyhow::Result<Vec<f32>> {
     #[cfg(feature = "cuda")]
@@ -310,6 +310,8 @@ impl PyModel {
                             header,
                             ingest_workers,
                             missing,
+                            &self.inner.feature_types,
+                            self.inner.categories.as_deref(),
                             |batch, n_rows| {
                                 let workers = resolved_predict_workers(
                                     predict_threads,

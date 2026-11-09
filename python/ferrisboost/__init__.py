@@ -114,7 +114,7 @@ _DEFAULTS: dict[str, Any] = {
     # `category` columns and PyArrow dictionary columns be detected as
     # categorical; `feature_types` ("c" / "q" per feature) declares them
     # explicitly for numpy and file inputs. Categories are integer codes in
-    # 0..=253. `max_cat_to_onehot`: features with fewer categories than this are
+    # 0..=65533. `max_cat_to_onehot`: features with fewer categories than this are
     # split one-vs-rest, otherwise by sorted partition; `max_cat_threshold`
     # bounds the partition scan.
     "enable_categorical": False,
@@ -138,6 +138,10 @@ _DEFAULTS: dict[str, Any] = {
     # Private wire field set by `train` from `feature_types` / the frame dtypes:
     # one bool per feature, or None.
     "_feature_types": None,
+    # Private wire field: category names of named categorical columns (pandas
+    # categories, Arrow dictionaries) the data was coded with, one entry per
+    # feature (None or (kind, values)); stored in the model.
+    "_categories": None,
 }
 
 # XGBoost 的别名,两种写法都收
@@ -177,9 +181,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         raise ValueError(
             f"objective {out['objective']!r} is not supported; supported objectives: {', '.join(_OBJECTIVES)}"
         )
-    if not 0 < out["max_bin"] <= 255:
-        # 255 是上限,bin 255 留给缺失哨兵
-        raise ValueError(f"max_bin must be in 1..=255, got {out['max_bin']}")
+    if not 0 < out["max_bin"] <= 65535:
+        # Features with more than 255 bins are stored as 16-bit columns; the
+        # largest 16-bit code is the missing sentinel.
+        raise ValueError(f"max_bin must be in 1..=65535, got {out['max_bin']}")
     if num_boost_round < 1:
         raise ValueError(f"num_boost_round must be >= 1, got {num_boost_round}")
 
@@ -536,16 +541,178 @@ def _codes_to_f32(codes: np.ndarray, missing: np.ndarray) -> np.ndarray:
     return out
 
 
+# XGBoost array-interface type codes of integer categories (XGBoost 3.x `cats`).
+_INT_TYPE_CODES = {"int8": 9, "uint8": 10, "int16": 11, "uint16": 12,
+                   "int32": 13, "uint32": 14, "int64": 15, "uint64": 16}
+_I64_MAX = np.iinfo(np.int64).max
+
+
+def _check_int_categories(values: list, where: str) -> list:
+    if any(v > _I64_MAX for v in values):
+        raise ValueError(f"{where}: integer categories must fit the signed 64-bit range (as in XGBoost)")
+    return values
+
+
+def _pandas_category_values(categories: Any, where: str) -> tuple:
+    """pandas categories -> (kind, values): kind is "str" or an XGBoost integer
+    type code. Other category types are rejected, as in XGBoost."""
+    dtype = categories.dtype
+    if getattr(dtype, "kind", "") in "iu" and getattr(dtype, "kind", "") != "":
+        np_dtype = np.dtype(getattr(dtype, "numpy_dtype", dtype))
+        return _INT_TYPE_CODES[str(np_dtype)], _check_int_categories(
+            [int(v) for v in categories], where)
+    values = list(categories)
+    if all(isinstance(v, str) for v in values):
+        return "str", [str(v) for v in values]
+    raise ValueError(
+        f"{where}: categories must be strings or integers (as in XGBoost), got {dtype} categories; "
+        "convert them, e.g. with .cat.rename_categories(str)"
+    )
+
+
+def _arrow_category_values(dictionary: Any, where: str) -> tuple:
+    """A pyarrow dictionary -> (kind, values), like `_pandas_category_values`."""
+    import pyarrow as pa
+
+    t = dictionary.type
+    if pa.types.is_string(t) or pa.types.is_large_string(t) or (
+        hasattr(pa.types, "is_string_view") and pa.types.is_string_view(t)
+    ):
+        values = dictionary.to_pylist()
+        if any(v is None for v in values):
+            raise ValueError(f"{where}: a dictionary entry is null; categories must be values")
+        return "str", values
+    if pa.types.is_integer(t):
+        values = dictionary.to_pylist()
+        if any(v is None for v in values):
+            raise ValueError(f"{where}: a dictionary entry is null; categories must be values")
+        return _INT_TYPE_CODES[str(t)], _check_int_categories(values, where)
+    raise ValueError(
+        f"{where}: dictionary values must be strings or integers to be categories (as in XGBoost), "
+        f"got {t}"
+    )
+
+
+def _as_ref(level: Any) -> tuple | None:
+    """A category reference -> (kind, values). Accepts (kind, values) pairs,
+    plain lists (a model's `get_categories()` entries) and, for estimators
+    pickled by older versions, a pandas Index / pyarrow array."""
+    if level is None:
+        return None
+    if isinstance(level, tuple) and len(level) == 2:
+        return level
+    if hasattr(level, "dtype") and hasattr(level, "tolist") and not isinstance(level, list):
+        try:
+            return _pandas_category_values(level, "categories")
+        except (TypeError, AttributeError):
+            pass
+    if hasattr(level, "to_pylist"):
+        return _arrow_category_values(level, "categories")
+    values = list(level)
+    if all(isinstance(v, str) for v in values):
+        return "str", values
+    return 15, [int(v) for v in values]
+
+
+def _recode_map(ref: tuple, data_kind: Any, data_values: list, where: str) -> np.ndarray:
+    """Index of every data category in the reference list (-1 = unseen)."""
+    import pandas as pd
+
+    ref_kind, ref_values = ref
+    if (ref_kind == "str") != (data_kind == "str"):
+        theirs = "strings" if data_kind == "str" else "integers"
+        ours = "strings" if ref_kind == "str" else "integers"
+        raise ValueError(
+            f"{where}: its categories are {theirs}, the training categories are {ours}; "
+            "the category data type must match the training data"
+        )
+    if not data_values:
+        return np.empty(0, np.int64)
+    return np.asarray(pd.Index(ref_values).get_indexer(pd.Index(data_values)), np.int64)
+
+
+def _apply_map(mapping: np.ndarray, codes: np.ndarray, data_values: list, where: str) -> np.ndarray:
+    """Data codes (-1 = missing) -> reference codes; a row holding a category
+    outside the reference list is an error (XGBoost rejects it too)."""
+    out = np.full(codes.shape, -1, np.int64)
+    present = codes >= 0
+    out[present] = mapping[codes[present]]
+    unseen = present & (out < 0)
+    if unseen.any():
+        value = data_values[int(codes[np.argmax(unseen)])]
+        raise ValueError(
+            f"{where} holds the category {value!r}, which is not in the training categories "
+            "(categories unseen in training are rejected, as in XGBoost)"
+        )
+    return out
+
+
+def _value_ref(ref: tuple | None, i: int, categorical: Sequence[bool] | None) -> tuple | None:
+    """`ref` when plain integers of feature `i` are category values: the
+    feature has an integer category list and is categorical (`categorical` =
+    the model's flags; None = every feature with a list is)."""
+    if ref is None or ref[0] == "str":
+        return None
+    if categorical is not None and not (i < len(categorical) and categorical[i]):
+        return None
+    return ref
+
+
+def _lookup_int_values(values: np.ndarray, na: np.ndarray, ref: tuple, where: str) -> np.ndarray:
+    """Plain integer values (int64 or uint64; `na` = missing) -> f32 codes by
+    their position in an integer category list, as files read a plain integer
+    column of such a feature. A value outside the list is an error."""
+    ref_values = np.asarray(ref[1], np.int64)
+    order = np.argsort(ref_values, kind="stable")
+    sorted_ref = ref_values[order]
+    big = values > _I64_MAX if values.dtype.kind == "u" else np.zeros(values.shape, bool)
+    v = values.astype(np.int64)
+    codes = np.full(values.shape, -1, np.int64)
+    if len(sorted_ref):
+        pos = np.minimum(np.searchsorted(sorted_ref, v), len(sorted_ref) - 1)
+        hit = (sorted_ref[pos] == v) & ~big
+        codes[hit] = order[pos[hit]]
+    unseen = ~na & (codes < 0)
+    if unseen.any():
+        value = int(values[np.argmax(unseen)])
+        raise ValueError(
+            f"{where} holds the category {value!r}, which is not in the training categories "
+            "(categories unseen in training are rejected, as in XGBoost)"
+        )
+    return _codes_to_f32(codes, na)
+
+
+def _int_category_values(categories: Any, codes: np.ndarray) -> np.ndarray | None:
+    """A pandas integer `category` column's values (int -> f64 -> f32, NaN for
+    a missing value), as a Parquet integer dictionary is read; None for other
+    category types."""
+    import pandas as pd
+
+    if not pd.api.types.is_integer_dtype(categories.dtype):
+        return None
+    values = np.append(np.asarray(categories.to_numpy(), np.float64), np.nan)
+    return values[codes].astype(np.float32)  # code -1 (missing) picks the NaN
+
+
 def _frame_matrix(
-    df: Any, enable_categorical: bool, ref_levels: dict | None = None, what: str = "data"
+    df: Any, enable_categorical: bool, ref_levels: dict | None = None, what: str = "data",
+    scoring: bool = False, categorical: Sequence[bool] | None = None,
 ) -> tuple[np.ndarray, list[str], list[bool], dict]:
     """pandas DataFrame -> (f32 matrix, column names, categorical flags, levels).
 
     A `category` column becomes its integer codes (NaN for a missing value) and
-    is flagged categorical. `ref_levels` (the training frame's levels by column
-    position) re-codes a validation frame's categories onto the training codes;
-    a category unseen in training gets a code past the trained range, which is
-    in no category set and so goes left, as in XGBoost.
+    is flagged categorical; `levels[i]` is its category list as `(kind, values)`
+    (kind "str" or an XGBoost integer type code). `ref_levels` (category lists
+    by column position, e.g. the training data's or a model's) re-codes those
+    columns by value onto the reference codes; a category outside the reference
+    list is an error, as in XGBoost.
+
+    `scoring` (prediction and validation data) reads columns as files read
+    them: a plain integer column of a categorical feature (`categorical`, see
+    `_value_ref`) with an integer list is looked up by value, and an integer
+    `category` column without a list yields its values (the codes, as a
+    Parquet integer dictionary does). A string `category` column without a
+    list keeps its codes.
     """
     import pandas as pd
 
@@ -556,23 +723,36 @@ def _frame_matrix(
     cols, flags, levels = [], [], {}
     for i, name in enumerate(names):
         s = df.iloc[:, i]
+        ref = _as_ref(ref_levels.get(i)) if ref_levels else None
         if isinstance(s.dtype, pd.CategoricalDtype):
             if not enable_categorical:
                 raise ValueError(
                     f"{what} column {name!r} has category dtype; to train it as a categorical feature, "
                     "set params['enable_categorical'] = True"
                 )
-            if ref_levels is not None and i in ref_levels:
-                ref = ref_levels[i]
-                codes = pd.Categorical(s.astype(object), categories=ref).codes.astype(np.int64)
-                unseen = (codes < 0) & s.notna().to_numpy()
-                codes[unseen] = len(ref)
+            where = f"{what} column {name!r}"
+            codes = s.cat.codes.to_numpy().astype(np.int64)
+            if scoring and ref is None:
+                values = _int_category_values(s.cat.categories, codes)
+                if values is not None:
+                    cols.append(values)
+                    flags.append(True)
+                    continue
+            if ref is not None:
+                kind, values = _pandas_category_values(s.cat.categories, where)
+                codes = _apply_map(_recode_map(ref, kind, values, where), codes, values, where)
                 levels[i] = ref
             else:
-                codes = s.cat.codes.to_numpy().astype(np.int64)
-                levels[i] = s.cat.categories
-            cols.append(_codes_to_f32(codes, ~s.notna().to_numpy()))
+                levels[i] = _pandas_category_values(s.cat.categories, where)
+            cols.append(_codes_to_f32(codes, codes < 0))
             flags.append(True)
+        elif (scoring and pd.api.types.is_integer_dtype(s.dtype)
+              and (vref := _value_ref(ref, i, categorical)) is not None):
+            unsigned = np.dtype(getattr(s.dtype, "numpy_dtype", s.dtype)).kind == "u"
+            na = np.asarray(s.isna().to_numpy(), bool)
+            values = s.to_numpy(dtype=np.uint64 if unsigned else np.int64, na_value=0)
+            cols.append(_lookup_int_values(values, na, vref, f"{what} column {name!r}"))
+            flags.append(False)
         else:
             try:
                 cols.append(s.to_numpy(dtype=np.float32, na_value=np.nan))
@@ -592,16 +772,25 @@ def _table_matrix(
     enable_categorical: bool,
     ref_levels: dict | None = None,
     what: str = "data",
+    scoring: bool = False,
+    categorical: Sequence[bool] | None = None,
 ) -> tuple[np.ndarray, list[str], list[bool], dict]:
     """pyarrow Table -> (f32 matrix, names, categorical flags, levels).
 
     A dictionary column is categorical: its codes are the dictionary indices
-    (dictionaries are unified across chunks first). `order` binds columns by
-    name to a training table; `ref_levels` re-codes dictionary columns onto the
-    training dictionary the way `_frame_matrix` does.
+    (dictionaries are unified across chunks first) and `levels[i]` is the
+    dictionary as `(kind, values)`. `order` binds columns by name to a training
+    table; `ref_levels` re-codes dictionary columns by value the way
+    `_frame_matrix` does.
+
+    `scoring` (prediction and validation data) fixes the categories: a column
+    without a reference list keeps them as the model has them, so an integer
+    dictionary yields its values (the codes, as a Parquet file's dictionary
+    does) and a string dictionary its indices. Missing entries become NaN.
+    A plain integer column of a categorical feature with an integer list is
+    looked up by value, as files read it (`_frame_matrix`).
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     names = list(table.column_names)
     dups = sorted({n for n in names if names.count(n) > 1})
@@ -620,37 +809,72 @@ def _table_matrix(
     cols, flags, levels = [], [], {}
     for i, name in enumerate(names):
         col = table.column(name)
+        ref = _as_ref(ref_levels.get(i)) if ref_levels else None
+        if (pa.types.is_dictionary(col.type) and ref is None and scoring
+                and pa.types.is_integer(col.type.value_type)):
+            # No list to re-code onto: the dictionary values are the codes,
+            # read exactly as from a Parquet file (int -> f64 -> f32, a null
+            # index or entry is missing). Range checks are the prediction's.
+            values = pa.chunked_array(
+                [c.dictionary_decode() for c in col.chunks], col.type.value_type
+            ).cast(pa.float64())
+            cols.append(np.asarray(values.to_numpy(zero_copy_only=False), np.float64)
+                        .astype(np.float32))
+            flags.append(True)
+            continue
+        if (scoring and pa.types.is_integer(col.type)
+                and (vref := _value_ref(ref, i, categorical)) is not None):
+            na = np.asarray(col.is_null().to_numpy(zero_copy_only=False), bool)
+            wide = pa.uint64() if pa.types.is_unsigned_integer(col.type) else pa.int64()
+            values = np.asarray(col.cast(wide).fill_null(0).to_numpy(zero_copy_only=False))
+            cols.append(_lookup_int_values(values, na, vref, f"{what} column {name!r}"))
+            flags.append(False)
+            continue
         if pa.types.is_dictionary(col.type):
             if not enable_categorical:
                 raise ValueError(
                     f"{what} column {name!r} has dictionary type; to train it as a categorical feature, "
                     "set params['enable_categorical'] = True"
                 )
+            where = f"{what} column {name!r}"
             chunks = col.chunks
-            dictionary = chunks[0].dictionary if chunks else pa.array([])
-            if ref_levels is not None and i in ref_levels:
-                ref = ref_levels[i]
-                decoded = pa.chunked_array([c.dictionary_decode() for c in chunks], col.type.value_type)
-                idx = pc.index_in(decoded, value_set=ref)
-                arr = idx.cast(pa.float32()).to_numpy(zero_copy_only=False).astype(np.float32)
-                null = np.asarray(decoded.is_null().to_numpy(zero_copy_only=False))
-                arr = np.where(np.isnan(arr) & ~null, np.float32(len(ref)), arr)
-                arr[null] = np.nan
+            dictionary = chunks[0].dictionary if chunks else pa.array([], col.type.value_type)
+            # Dictionary indices may be any integer width (pandas categories
+            # convert to int8 indices); nulls become -1.
+            codes = np.concatenate(
+                [np.asarray(c.indices.cast(pa.int64()).fill_null(-1).to_numpy(zero_copy_only=False),
+                            np.int64) for c in chunks]
+            ) if chunks else np.empty(0, np.int64)
+            if ref is not None:
+                kind, values = _arrow_category_values(dictionary, where)
+                codes = _apply_map(_recode_map(ref, kind, values, where), codes, values, where)
                 levels[i] = ref
             else:
-                # Dictionary indices may be any integer width (pandas categories
-                # convert to int8 indices), so widen each chunk to int32 first.
-                indices = pa.chunked_array([c.indices.cast(pa.int32()) for c in chunks], pa.int32()) \
-                    if chunks else pa.chunked_array([], pa.int32())
-                arr = indices.cast(pa.float32()).to_numpy(zero_copy_only=False).astype(np.float32)
-                levels[i] = dictionary
-            cols.append(np.asarray(arr, dtype=np.float32))
+                levels[i] = _arrow_category_values(dictionary, where)
+            cols.append(_codes_to_f32(codes, codes < 0))
             flags.append(True)
         else:
             cols.append(np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float32))
             flags.append(False)
     x = np.ascontiguousarray(np.stack(cols, axis=1)) if cols else np.empty((table.num_rows, 0), np.float32)
     return x, names, flags, levels
+
+
+def _categories_wire(levels: dict, flags: list[bool] | None, n: int) -> list | None:
+    """Category lists of the final categorical features -> the private
+    `_categories` parameter (None when no categorical feature has names)."""
+    if not levels or not flags:
+        return None
+    wire = [levels[i] if flags[i] and i in levels else None for i in range(n)]
+    return wire if any(w is not None for w in wire) else None
+
+
+def _model_refs(model: Any) -> dict:
+    """A model's category lists by feature position (for re-coding)."""
+    cats = model.get_categories() if model is not None else None
+    if not cats:
+        return {}
+    return {i: _as_ref(c) for i, c in enumerate(cats) if c is not None}
 
 
 def _merge_flags(auto: list[bool] | None, explicit: list[bool] | None, n: int) -> list[bool] | None:
@@ -668,15 +892,23 @@ def _is_named_table(data: Any) -> bool:
     return _is_pandas_frame(data) or _arrow_table(data) is not None
 
 
-def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndarray:
+def _as_predict_matrix(
+    data: Any, names: Sequence[str] | None = None, categories: Sequence[Any] | None = None
+) -> np.ndarray:
     """Convert a pandas DataFrame / PyArrow Table to the f32 matrix `Model.predict` scores.
 
     With `names` (the model's feature names), columns are selected and ordered
     by name, as XGBoost does for a DataFrame; extra columns are ignored and a
     missing one is an error. Without names the columns are taken in order.
-    Categorical columns use their codes, so the frame must carry the same
-    categories (in the same order) as the training data.
+    `categories` (the model's `get_categories()`) re-codes categorical columns
+    by value onto the model's codes, so their categories may be listed in any
+    order; a category the model does not know is an error. Columns are read
+    as files read them: a plain integer column of a feature with integer
+    categories is looked up by value, and an integer `category` / dictionary
+    column of a feature without a list yields its values; a string one keeps
+    its codes.
     """
+    refs = {i: _as_ref(c) for i, c in enumerate(categories or []) if c is not None}
     if _is_pandas_frame(data):
         if names:
             cols = [str(c) for c in data.columns]
@@ -684,7 +916,7 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
             if absent:
                 raise ValueError(f"predict data is missing the model's feature columns {absent}")
             data = data[[c for n in names for c in data.columns if str(c) == n]]
-        return _frame_matrix(data, True, what="predict data")[0]
+        return _frame_matrix(data, True, refs, what="predict data", scoring=True)[0]
     table = _arrow_table(data)
     if table is not None:
         if names:
@@ -692,7 +924,8 @@ def _as_predict_matrix(data: Any, names: Sequence[str] | None = None) -> np.ndar
             if absent:
                 raise ValueError(f"predict data is missing the model's feature columns {absent}")
             table = table.select(list(names))
-        return _table_matrix(table, list(names) if names else None, True, what="predict data")[0]
+        return _table_matrix(table, list(names) if names else None, True, refs,
+                             what="predict data", scoring=True)[0]
     raise ValueError(
         "predict accepts file paths (single / list / directory / glob), a 2-D f32 numpy array, "
         "a pandas DataFrame or a pyarrow Table"
@@ -887,8 +1120,8 @@ def train(
 
     类别特征(XGBoost 语义):`feature_types` 给每个特征 "c"(类别)或 "q"(数值);
     pandas `category` 列和 PyArrow dictionary 列在 `params["enable_categorical"]`
-    为 True 时自动识别。类别值是 0..=253 的整数码(缺失用 NaN / null),超出范围、
-    负数或非整数会报错;每个特征最多 254 个类别。
+    为 True 时自动识别。类别值是 0..=65533 的整数码(缺失用 NaN / null),超出范围、
+    负数或非整数会报错;每个特征最多 65534 个类别(CPU 和 GPU 相同)。`max_bin` 取 1..=65535。
 
     `base_margin`(XGBoost 的 DMatrix `base_margin`):每行的起始 raw margin,训练从它起步
     而不是从 `base_score` 起步(截距仍然按标签估计并存进模型,和 XGBoost 一致)。数组入口给
@@ -1011,9 +1244,12 @@ def train(
         # A continued model indexes features by position: named data is bound to
         # the model's feature names (any column order), like evals are.
         prior_names = list(prior.feature_names) if prior is not None else []
+        # A continued model keeps its category lists: named columns are coded
+        # with them (the other categorical columns bring their own).
+        prior_refs = _model_refs(prior)
         if table is not None:
             x, names, auto_flags, levels = _table_matrix(
-                table, prior_names or None, enable_cat
+                table, prior_names or None, enable_cat, prior_refs
             )
         elif frame is not None:
             if prior_names:
@@ -1022,10 +1258,12 @@ def train(
                 if absent:
                     raise ValueError(f"data is missing the features of init_model: {absent}")
                 frame = frame[[c for n in prior_names for c in frame.columns if str(c) == n]]
-            x, names, auto_flags, levels = _frame_matrix(frame, enable_cat)
+            x, names, auto_flags, levels = _frame_matrix(frame, enable_cat, prior_refs)
         else:
             x = _as_matrix(data)
         p["_feature_types"] = _merge_flags(auto_flags, explicit_types, x.shape[1])
+        if p["_categories"] is None:
+            p["_categories"] = _categories_wire(levels, p["_feature_types"], x.shape[1])
         if isinstance(p["monotone_constraints"], dict):
             if names is None:
                 raise ValueError(
@@ -1057,6 +1295,9 @@ def train(
             _check_prior(prior, p, x.shape[1])
         eval_bms: list[Any] = []
         eval_specs = []
+        # Validation columns are read as the trained model will read them: plain
+        # integers of a categorical feature with an integer list are values.
+        eval_flags = p["_feature_types"] or [False] * x.shape[1]
         for n_eval, item in enumerate(evals):
             if len(item) == 3:
                 ed, el, name = item
@@ -1070,14 +1311,16 @@ def train(
             et = _arrow_table(ed)
             if et is not None:
                 # 训练集也有列名时按列名绑定;否则(numpy 训练集)只能按位置。
-                ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]")[0]
+                ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]", scoring=True,
+                                   categorical=eval_flags)[0]
             elif _is_pandas_frame(ed):
                 if names is not None:
                     missing = [n for n in names if n not in [str(c) for c in ed.columns]]
                     if missing:
                         raise ValueError(f"evals[{name}] is missing training columns {missing}")
                     ed = ed[[c for n in names for c in ed.columns if str(c) == n]]
-                ed = _frame_matrix(ed, enable_cat, levels, f"evals[{name}]")[0]
+                ed = _frame_matrix(ed, enable_cat, levels, f"evals[{name}]", scoring=True,
+                                   categorical=eval_flags)[0]
             ex = _as_matrix(ed, f"evals[{name}]")
             if ew is not None:
                 ew = _as_weights(ew, None if ranking else ex.shape[0],

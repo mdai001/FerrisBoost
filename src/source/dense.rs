@@ -6,10 +6,11 @@
 //!
 //! 缺失值用 NaN 表示,量化成 MISSING_BIN。
 
-use crate::columns::{partition_features, BinCuts, BinningStrategy, ColumnBlock};
+use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
+use crate::columns::{partition_features_by_width, BinCuts, BinningStrategy, ColumnBlock};
 use crate::sketch::FeatureSketch;
 use crate::train::BlockSource;
-use crate::types::{Bin, FeatId, MAX_BIN_LIMIT, MISSING_BIN};
+use crate::types::{FeatId, MAX_BIN_LIMIT};
 use rayon::prelude::*;
 
 pub struct DenseSource {
@@ -130,7 +131,7 @@ impl DenseSource {
             BinningStrategy::Sketch { max_bins } => {
                 assert!(
                     max_bins as u32 <= MAX_BIN_LIMIT,
-                    "max_bin must be at most {MAX_BIN_LIMIT} (255 is reserved for the missing sentinel), got {max_bins}"
+                    "max_bin must be at most {MAX_BIN_LIMIT}, got {max_bins}"
                 );
                 // 第一遍:建草图。**按特征并行** —— 每个特征的草图完全
                 // 由一个线程从头建到尾,线程之间不共享任何东西:
@@ -235,32 +236,21 @@ impl DenseSource {
         cuts: BinCuts,
         cols_per_block: usize,
     ) -> Self {
-        let blocks = partition_features(n_features, cols_per_block)
+        cuts.check_widths().unwrap_or_else(|e| panic!("{e}"));
+        let blocks = partition_features_by_width(&cuts.widths(), cols_per_block)
             .into_iter()
             .map(|feat_ids| {
-                let mut block = vec![0 as Bin; feat_ids.len() * n_rows];
-                for (local, &f) in feat_ids.iter().enumerate() {
-                    debug_assert!(
-                        cuts.n_bins(f) <= MAX_BIN_LIMIT as usize,
-                        "feature {f} has more bins than the space left by the sentinel"
-                    );
-                    let dst = &mut block[local * n_rows..(local + 1) * n_rows];
-                    for (row, slot) in dst.iter_mut().enumerate() {
-                        let v = data[row * n_features + f as usize];
-                        assert!(v != f32::MAX, "feature contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
-                        // NaN 是唯一的缺失表示。find_bin 不接受 NaN
-                        // (partition_point 的比较对 NaN 永远是 false,
-                        // 会静默落到 bin 0),所以必须在这里拦掉。
-                        *slot = if v.is_nan() {
-                            MISSING_BIN
-                        } else {
-                            cuts.find_bin(f, v)
-                        };
-                    }
-                }
+                let data = match cuts.block_width(&feat_ids) {
+                    BinWidth::U8 => BinData::U8(quantize_dense::<u8>(
+                        data, n_rows, n_features, &cuts, &feat_ids,
+                    )),
+                    BinWidth::U16 => BinData::U16(quantize_dense::<u16>(
+                        data, n_rows, n_features, &cuts, &feat_ids,
+                    )),
+                };
                 ColumnBlock {
                     feat_ids,
-                    data: block,
+                    data,
                     n_rows,
                 }
             })
@@ -284,14 +274,37 @@ impl DenseSource {
     }
 
     /// 某一行某个特征的 bin。测试和调试用,训练热路径不走这里。
-    pub fn bin_at(&self, row: usize, feat: FeatId) -> Bin {
+    pub fn bin_at(&self, row: usize, feat: FeatId) -> u32 {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return b.column(local)[row];
+                return b.column(local).get(row);
             }
         }
         panic!("feature {feat} is not in any column block");
     }
+}
+
+/// Column-major bins of `feat_ids` at width `B` from a row-major matrix.
+fn quantize_dense<B: BinCode>(
+    data: &[f32],
+    n_rows: usize,
+    n_features: usize,
+    cuts: &BinCuts,
+    feat_ids: &[FeatId],
+) -> Vec<B> {
+    let mut block = vec![B::default(); feat_ids.len() * n_rows];
+    for (local, &f) in feat_ids.iter().enumerate() {
+        let dst = &mut block[local * n_rows..(local + 1) * n_rows];
+        for (row, slot) in dst.iter_mut().enumerate() {
+            let v = data[row * n_features + f as usize];
+            assert!(v != f32::MAX, "feature contains f32::MAX, reserved for missing-value split boundaries; rescale this feature");
+            // NaN 是唯一的缺失表示。find_bin 不接受 NaN
+            // (partition_point 的比较对 NaN 永远是 false,
+            // 会静默落到 bin 0),所以 quantize_value 先拦掉它。
+            *slot = crate::columns::quantize_value::<B>(cuts, f, v);
+        }
+    }
+    block
 }
 
 impl BlockSource for DenseSource {
@@ -330,10 +343,10 @@ impl BlockSource for DenseSource {
     /// 再切一列」,对全量驻留的 source 就是「为了 1 列克隆整块」。
     /// HIGGS 上 28 列 × 1050 万行 = 每次克隆 294MB,行重分区因此吃掉
     /// 单轮一半的时间(profile 抓出来的,见 CLAUDE.md「6.9× 花在哪」)。
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>> {
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<BinData> {
         for b in &self.blocks {
             if let Some(local) = b.feat_ids.iter().position(|&f| f == feat) {
-                return Ok(b.column(local).to_vec());
+                return Ok(b.column(local).to_owned());
             }
         }
         anyhow::bail!(
@@ -347,7 +360,7 @@ impl BlockSource for DenseSource {
         true
     }
 
-    fn resident_feature_column(&self, feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, feat: FeatId) -> Option<BinSlice<'_>> {
         self.blocks.iter().find_map(|b| {
             b.feat_ids
                 .iter()
@@ -373,6 +386,7 @@ impl BlockSource for DenseSource {
 mod tests {
     use super::*;
     use crate::columns::BinningStrategy;
+    use crate::types::MISSING_BIN;
 
     /// 4 行 3 列,行主序。
     fn toy() -> (Vec<f32>, usize, usize) {
@@ -412,8 +426,15 @@ mod tests {
             assert_eq!(borrowed, src.feature_column(f).unwrap().as_slice());
         }
         assert!(src.resident_feature_column(n_feats as FeatId).is_none());
-        let first = src.blocks()[0].column(0).as_ptr();
-        assert_eq!(src.resident_feature_column(0).unwrap().as_ptr(), first);
+        let first = src.blocks()[0].column(0).as_u8().unwrap().as_ptr();
+        assert_eq!(
+            src.resident_feature_column(0)
+                .unwrap()
+                .as_u8()
+                .unwrap()
+                .as_ptr(),
+            first
+        );
     }
 
     #[test]
@@ -423,8 +444,8 @@ mod tests {
         src.with_block(0, &mut |b| {
             assert_eq!(b.data.len(), b.n_feats() * n_rows);
             // 一整列是连续的一段
-            assert_eq!(b.column(0), &b.data[0..n_rows]);
-            assert_eq!(b.column(1), &b.data[n_rows..2 * n_rows]);
+            assert_eq!(b.column(0), b.bins().slice(0..n_rows));
+            assert_eq!(b.column(1), b.bins().slice(n_rows..2 * n_rows));
         })
         .unwrap();
     }
@@ -471,11 +492,11 @@ mod tests {
         ];
         let src = DenseSource::from_row_major(&data, 3, 2, 16, 8);
 
-        assert_eq!(src.bin_at(0, 1), MISSING_BIN);
-        assert_eq!(src.bin_at(2, 0), MISSING_BIN);
+        assert_eq!(src.bin_at(0, 1), MISSING_BIN as u32);
+        assert_eq!(src.bin_at(2, 0), MISSING_BIN as u32);
         // 非缺失的没有被哨兵污染
-        assert_ne!(src.bin_at(0, 0), MISSING_BIN);
-        assert_ne!(src.bin_at(1, 1), MISSING_BIN);
+        assert_ne!(src.bin_at(0, 0), MISSING_BIN as u32);
+        assert_ne!(src.bin_at(1, 1), MISSING_BIN as u32);
     }
 
     /// 注入外部 cuts:和 `with_cuts` 走同一条路,但入口是正式 API。
@@ -556,7 +577,7 @@ mod tests {
 
         // 每个唯一值各占一个 bin —— 这是"低基数分箱无损"的判据
         for v in 0..8 {
-            assert_eq!(cuts.find_bin(0, v as f32), v as u8);
+            assert_eq!(cuts.find_bin(0, v as f32), v as u32);
         }
 
         // 非递增的输入要报错,不能硬建一个语义错乱的 BinCuts
@@ -574,7 +595,7 @@ mod tests {
             100.0, 1000.0, 1.0, //
             1.5, 15.0, 0.0, //
         ];
-        let expected: Vec<Bin> = (0..2)
+        let expected: Vec<u32> = (0..2)
             .flat_map(|r| (0..n_feats as FeatId).map(move |f| (r, f)))
             .map(|(r, f)| cuts.find_bin(f, valid[r * n_feats + f as usize]))
             .collect();
@@ -582,7 +603,7 @@ mod tests {
         let cuts = DenseSource::from_row_major(&train, n_rows, n_feats, 16, 8).into_cuts();
         let vsrc = DenseSource::with_cuts(&valid, 2, n_feats, cuts, 8);
 
-        let got: Vec<Bin> = (0..2)
+        let got: Vec<u32> = (0..2)
             .flat_map(|r| (0..n_feats as FeatId).map(move |f| (r, f)))
             .map(|(r, f)| vsrc.bin_at(r, f))
             .collect();
@@ -593,7 +614,7 @@ mod tests {
     #[should_panic(expected = "max_bin")]
     fn rejects_max_bin_above_limit() {
         let (data, n_rows, n_feats) = toy();
-        DenseSource::from_row_major(&data, n_rows, n_feats, 256, 8);
+        DenseSource::from_row_major(&data, n_rows, n_feats, 65_536, 8);
     }
 
     fn continuous(n: usize, m: usize, seed: u64) -> Vec<f32> {

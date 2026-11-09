@@ -10,7 +10,7 @@ use crate::types::{FeatId, GradPairFixed, GradQuantizer, TrainParams};
 /// 树白白长深,和 XGBoost 的结构直接对不上。
 const MIN_GAIN_EPS: f32 = 1e-6;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SplitCandidate {
     pub feat: FeatId,
     /// 第一个走右边的 bin:`bin_of(row) < bin` 归左,否则归右。
@@ -260,7 +260,7 @@ fn update_best(best: &mut Option<SplitCandidate>, cand: SplitCandidate) {
     if !(cand.gain > MIN_GAIN_EPS) {
         return;
     }
-    if best.map_or(true, |b| cand.gain > b.gain) {
+    if best.as_ref().is_none_or(|b| cand.gain > b.gain) {
         *best = Some(cand);
     }
 }
@@ -489,24 +489,59 @@ fn enumerate_categorical<F>(
     F: Fn(FeatId, (f64, f64), (f64, f64)) -> Option<f32>,
 {
     let n = bins.len();
-    let mut offer =
-        |left: GradPairFixed, right: GradPairFixed, missing_left: bool, cats: CatBits| {
-            let (lf, rf) = (q.to_f64(left), q.to_f64(right));
-            if let Some(gain) = candidate_gain(feat, lf, rf) {
-                update_best(
-                    best,
-                    SplitCandidate {
-                        feat,
-                        bin: 0,
-                        gain,
-                        left,
-                        right,
-                        missing_left,
-                        cats: Some(cats),
-                    },
-                );
+    // Like XGBoost, each enumeration keeps its own best candidate without a
+    // set and materialises the winner's set once at the end (sized by the
+    // feature's codes), then offers it under the usual rule. Offering the
+    // first maximum of a sequence is the same as offering each candidate in
+    // turn (`update_best` keeps the earlier one on ties), so the result is the
+    // per-candidate one, without building a set per candidate (a 20k-category
+    // feature would otherwise copy a 2.5 KB set for every prefix).
+    struct Local {
+        gain: f32,
+        left: GradPairFixed,
+        right: GradPairFixed,
+        missing_left: bool,
+        /// Which candidate: one-hot category, or prefix length of the order.
+        at: usize,
+    }
+    let mut local: Option<Local> = None;
+    let consider = |local: &mut Option<Local>,
+                    left: GradPairFixed,
+                    right: GradPairFixed,
+                    missing_left: bool,
+                    at: usize| {
+        let (lf, rf) = (q.to_f64(left), q.to_f64(right));
+        if let Some(gain) = candidate_gain(feat, lf, rf) {
+            // Same filter and strict-greater rule as `update_best`.
+            if gain > MIN_GAIN_EPS && local.as_ref().is_none_or(|l| gain > l.gain) {
+                *local = Some(Local {
+                    gain,
+                    left,
+                    right,
+                    missing_left,
+                    at,
+                });
             }
-        };
+        }
+    };
+    let finish = |best: &mut Option<SplitCandidate>,
+                  local: Option<Local>,
+                  set: &dyn Fn(usize) -> CatBits| {
+        if let Some(l) = local {
+            update_best(
+                best,
+                SplitCandidate {
+                    feat,
+                    bin: 0,
+                    gain: l.gain,
+                    left: l.left,
+                    right: l.right,
+                    missing_left: l.missing_left,
+                    cats: Some(set(l.at)),
+                },
+            );
+        }
+    };
 
     if (n as u64) < p.max_cat_to_onehot as u64 {
         let mut feature_sum = GradPairFixed::default();
@@ -515,15 +550,18 @@ fn enumerate_categorical<F>(
         }
         let missing = node_sum - feature_sum;
         for (i, &b) in bins.iter().enumerate() {
-            let mut set = CatBits::empty();
-            set.set(i as u32);
             // Missing rows go with the other categories.
-            offer(node_sum - b, b, true, set);
+            consider(&mut local, node_sum - b, b, true, i);
             // Missing rows go with the chosen category.
             let mut right = b;
             right += missing;
-            offer(node_sum - right, right, false, set);
+            consider(&mut local, node_sum - right, right, false, i);
         }
+        finish(best, local, &|i| {
+            let mut set = CatBits::for_bins(n);
+            set.set(i as u32);
+            set
+        });
         return;
     }
 
@@ -547,27 +585,31 @@ fn enumerate_categorical<F>(
     if n_scan < 2 {
         return;
     }
+    // The set of a prefix: the first `k` sorted categories.
+    let prefix = |k: usize| {
+        let mut set = CatBits::for_bins(n);
+        for &cat in &order[..k] {
+            set.set(cat as u32);
+        }
+        set
+    };
 
     // Forward: the first `k` sorted categories are the set (right); missing left.
-    let mut set = CatBits::empty();
     let mut right = GradPairFixed::default();
-    for &cat in &order[..n_scan - 1] {
+    for (k, &cat) in order[..n_scan - 1].iter().enumerate() {
         right += bins[cat];
-        set.set(cat as u32);
-        offer(node_sum - right, right, true, set);
+        consider(&mut local, node_sum - right, right, true, k + 1);
     }
+    finish(best, local.take(), &prefix);
 
     // Backward: the sorted tail accumulates on the left; its complement (the
     // first `j` sorted categories) is the set, with missing rows on the right.
     let mut left = GradPairFixed::default();
     for j in (n - (n_scan - 1)..n).rev() {
         left += bins[order[j]];
-        let mut set = CatBits::empty();
-        for &cat in &order[..j] {
-            set.set(cat as u32);
-        }
-        offer(left, node_sum - left, false, set);
+        consider(&mut local, left, node_sum - left, false, j);
     }
+    finish(best, local, &prefix);
 }
 
 /// 跨块归约:各块的最优候选里取全局最优。
@@ -575,10 +617,22 @@ fn enumerate_categorical<F>(
 /// 多 GPU 时这一步就是 allreduce 的内容 —— 交换的是候选,不是数据。
 /// 所以并列规则要和块内一致(先来的赢),否则块的划分方式一变,
 /// 同一份数据能训出两棵不同的树。
+///
+/// Equal gains go to the lower feature id (XGBoost `SplitEntry::NeedReplace`),
+/// not to the earlier block: blocks are grouped by bin width
+/// (`columns::partition_features_by_width`), so a 16-bit block can hold a
+/// lower feature than an 8-bit block before it. With contiguous ascending
+/// blocks (every all-8-bit grouping) the two rules pick the same candidate.
+/// Candidates of one feature never come from two blocks.
 pub fn reduce_best(candidates: &[Option<SplitCandidate>]) -> Option<SplitCandidate> {
     let mut best: Option<SplitCandidate> = None;
-    for &c in candidates.iter().flatten() {
-        update_best(&mut best, c);
+    for c in candidates.iter().flatten() {
+        match &best {
+            Some(b) if c.gain == b.gain && c.feat < b.feat && c.gain > MIN_GAIN_EPS => {
+                best = Some(c.clone());
+            }
+            _ => update_best(&mut best, c.clone()),
+        }
     }
     best
 }
@@ -780,7 +834,7 @@ mod tests {
                     }
                     #[allow(clippy::unnecessary_map_or)]
                     // Keep the independent strict-gain reference unchanged.
-                    if best.map_or(true, |b| g > b.gain) {
+                    if best.as_ref().is_none_or(|b| g > b.gain) {
                         best = Some(SplitCandidate {
                             gain: g,
                             left: l,
@@ -1384,7 +1438,10 @@ mod tests {
                 let Some(c) = best_categorical(&case, &p) else {
                     continue;
                 };
-                let cats = c.cats.expect("categorical candidate carries its set");
+                let cats = c
+                    .cats
+                    .clone()
+                    .expect("categorical candidate carries its set");
                 assert!(cats.count() >= 1 && (cats.count() as usize) < 9);
                 // The candidate's sums and gain agree with its own partition.
                 assert_eq!(c.gain, recomputed_gain(&case, &c, &p));

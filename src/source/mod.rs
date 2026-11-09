@@ -5,6 +5,7 @@
 //! 中间内存翻两三倍,几百 GB 的数据光这步就装不下。
 
 pub mod arrow_source;
+mod cat_recode;
 pub mod csv_source;
 pub mod dense;
 pub mod input;
@@ -42,6 +43,9 @@ pub struct Targets<'a> {
     /// model output). Like the label and weight they are excluded from the
     /// features; they are read separately as plain f32 columns.
     pub base_margin: Option<&'a [String]>,
+    /// Category names of a continued model: named categorical columns are
+    /// coded with these lists instead of learning new ones.
+    pub categories: Option<&'a crate::category_names::CategoryTable>,
 }
 
 impl<'a> Targets<'a> {
@@ -58,6 +62,7 @@ impl<'a> Targets<'a> {
             categorical: None,
             missing: f32::NAN,
             base_margin: None,
+            categories: None,
         })
     }
 
@@ -77,6 +82,14 @@ impl<'a> Targets<'a> {
     /// Treat feature values equal to `missing` as missing (see the field docs).
     pub fn with_missing(self, missing: f32) -> Self {
         Self { missing, ..self }
+    }
+
+    /// Code named categorical columns with these lists (training continuation).
+    pub fn with_categories(
+        self,
+        categories: Option<&'a crate::category_names::CategoryTable>,
+    ) -> Self {
+        Self { categories, ..self }
     }
 
     /// Declare categorical features, one flag per feature in the resolved
@@ -168,6 +181,7 @@ impl<'a> From<&'a str> for Targets<'a> {
             categorical: None,
             missing: f32::NAN,
             base_margin: None,
+            categories: None,
         }
     }
 }
@@ -182,6 +196,7 @@ impl<'a> From<&'a String> for Targets<'a> {
             categorical: None,
             missing: f32::NAN,
             base_margin: None,
+            categories: None,
         }
     }
 }

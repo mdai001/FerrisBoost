@@ -336,23 +336,26 @@ fn pow2_scale(max_abs: f64, n_rows: usize) -> f64 {
     scale
 }
 
-/// 量化后的 bin 编号。0..=254 是真实 bin,255 是缺失哨兵。
+/// 量化后的 8-bit bin 编号。0..=254 是真实 bin,255 是缺失哨兵。
+///
+/// This is the storage of almost every column block. Features with more bins
+/// are stored at 16 bits in their own blocks (`crate::bins`); the 8-bit names
+/// below keep their values.
 pub type Bin = u8;
 
-/// 缺失值的哨兵 bin。
+/// 缺失值的哨兵 bin(8-bit blocks; a 16-bit block uses `u16::MAX`).
 ///
 /// 缺失不占真实 bin:直方图累加时直接跳过,缺失的梯度和用
 /// 「节点总和 - 所有非缺失 bin 之和」反推。这正是 split.rs 双向扫描
 /// 需要的形式,也是 XGBoost 的做法。
 ///
-/// 代价:真实 bin 只剩 255 个,所以 max_bin 上限是 255 而不是 256。
-/// 想要 256 得把 Bin 换成 u16,但那样 ColumnBlock.data 就不是
-/// `Vec<u8>` 了,内存翻倍、FFI 契约也要跟着改 —— 不值得。
-/// 和 XGBoost 对拍时两边都设 max_bin=255 即可。
+/// 代价:8-bit 真实 bin 只剩 255 个。A feature with 256 or more bins is
+/// stored at 16 bits (see `crate::bins`); only its own block widens.
 pub const MISSING_BIN: Bin = u8::MAX;
 
-/// 单个特征的真实 bin 数上限。见 MISSING_BIN。
-pub const MAX_BIN_LIMIT: u32 = 255;
+/// Largest accepted `max_bin` (the 16-bit storage tier: 65535 real bins plus
+/// the missing sentinel).
+pub const MAX_BIN_LIMIT: u32 = crate::bins::MAX_BIN_LIMIT_WIDE;
 
 /// `max_depth` 的上限,**两个后端共用一个数**。合法区间是 `0..=14`,
 /// 其中 **0 表示只有根节点的树**(合法,有专门测试)。
@@ -534,12 +537,17 @@ impl TrainParams {
         self.monotone_constraints.iter().any(|&c| c != 0)
     }
 
-    /// split 评估要不要走 XGBoost 的「给定权重」形式
-    /// (`CalcWeight` → 夹界 → `CalcGainGivenWeight`)。单调约束、L1、
-    /// `max_delta_step` 都要它;三者都关时走原来的 `G²/(H+λ)` 路径,
-    /// 和 0.0.4 逐位相同。
+    /// Whether split evaluation uses XGBoost's given-weight form
+    /// (`CalcWeight` -> bounds -> `CalcGainGivenWeight`, each side rounded to
+    /// f32, summed in f32, minus the f32 parent gain). Always: XGBoost 3.4.1's
+    /// scalar `CalcSplitGain` uses it with or without monotone constraints,
+    /// L1 or `max_delta_step`. The algebraically equal f64 `G²/(H+λ)` form
+    /// rounds differently, so when two candidates tie in f32 it can pick a
+    /// different split than XGBoost (seen with many categories and with
+    /// large label offsets). Without constraints the bounds are `±f32::MAX`
+    /// and the leaf values are unchanged.
     pub fn uses_given_weight(&self) -> bool {
-        self.has_monotone() || self.alpha != 0.0 || self.max_delta_step != 0.0
+        true
     }
 
     /// 某个特征的约束方向;超出列表长度的特征不约束。

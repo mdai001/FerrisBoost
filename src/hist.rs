@@ -6,7 +6,8 @@
 
 use rayon::prelude::*;
 
-use crate::types::{Bin, GradPairFixed, RowId, MISSING_BIN};
+use crate::bins::BinCode;
+use crate::types::{GradPairFixed, RowId};
 
 /// 一个节点在一个列块上的直方图。
 ///
@@ -62,8 +63,8 @@ impl Histogram {
 /// 缺失值(bin == MISSING_BIN)整个跳过,不进任何 bin。缺失的梯度和
 /// 由 split.rs 用「节点总和 - 所有 bin 之和」反推 —— 这样这里不用
 /// 为它留槽位,直方图宽度就是真实 bin 数。
-pub fn build(
-    block_data: &[Bin],
+pub fn build<B: BinCode>(
+    block_data: &[B],
     block_n_rows: usize,
     n_feats: usize,
     feat_offsets: &[u32],
@@ -77,7 +78,11 @@ pub fn build(
 }
 
 /// 列主序块按列切开:第 `f` 个切片是块内第 `f` 列的 bin。
-pub fn block_columns(block_data: &[Bin], block_n_rows: usize, n_feats: usize) -> Vec<&[Bin]> {
+pub fn block_columns<B: BinCode>(
+    block_data: &[B],
+    block_n_rows: usize,
+    n_feats: usize,
+) -> Vec<&[B]> {
     (0..n_feats)
         .map(|f| &block_data[f * block_n_rows..(f + 1) * block_n_rows])
         .collect()
@@ -86,8 +91,8 @@ pub fn block_columns(block_data: &[Bin], block_n_rows: usize, n_feats: usize) ->
 /// [`build`] 的列切片形式:`cols[f]` 是直方图第 `f` 个特征的整列 bin
 /// (长度 = 行数)。调用方因此可以只交出块里的一部分列(例如本棵树
 /// colsample 选中的那几列),而不用先物化一个压实块。
-pub fn build_cols(
-    cols: &[&[Bin]],
+pub fn build_cols<B: BinCode>(
+    cols: &[&[B]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     row_idx: Option<&[RowId]>,
@@ -138,10 +143,10 @@ pub fn build_cols(
                     let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
                     for row in start..end {
                         let b = col[row];
-                        if b == MISSING_BIN {
+                        if b == B::MISSING {
                             continue;
                         }
-                        hist[b as usize] += gpair[row];
+                        hist[b.idx()] += gpair[row];
                     }
                 }
                 start = end;
@@ -152,8 +157,8 @@ pub fn build_cols(
 }
 
 /// `build` 的行子集分支:按 tile 分块,块内「外层特征、内层行」。
-fn build_rows(
-    cols: &[&[Bin]],
+fn build_rows<B: BinCode>(
+    cols: &[&[B]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     rows: &[RowId],
@@ -167,10 +172,10 @@ fn build_rows(
             let hist = &mut out[feat_offsets[f] as usize..feat_offsets[f + 1] as usize];
             for &r in chunk {
                 let b = col[r as usize];
-                if b == MISSING_BIN {
+                if b == B::MISSING {
                     continue;
                 }
-                hist[b as usize] += gpair[r as usize];
+                hist[b.idx()] += gpair[r as usize];
             }
         }
     }
@@ -189,8 +194,8 @@ fn build_rows(
 /// 每个节点的 `rows` 必须**升序**(训练里来自稳定分区,恒成立):
 /// 每个节点持有一个游标,按升序推进。定点累加按模 2^64 精确、与顺序无关,
 /// 每个节点自己的累加顺序也和 [`build`] 完全一样,所以结果**逐位相同**。
-pub fn build_nodes(
-    block_data: &[Bin],
+pub fn build_nodes<B: BinCode>(
+    block_data: &[B],
     block_n_rows: usize,
     n_feats: usize,
     feat_offsets: &[u32],
@@ -203,8 +208,8 @@ pub fn build_nodes(
 }
 
 /// [`build_nodes`] 的列切片形式(见 [`build_cols`])。
-pub fn build_nodes_cols(
-    cols: &[&[Bin]],
+pub fn build_nodes_cols<B: BinCode>(
+    cols: &[&[B]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     nodes: &mut [(&[RowId], &mut [GradPairFixed])],
@@ -212,8 +217,8 @@ pub fn build_nodes_cols(
     build_nodes_with_span(cols, feat_offsets, gpair, nodes, node_span_rows(cols.len()));
 }
 
-fn build_nodes_with_span(
-    cols: &[&[Bin]],
+fn build_nodes_with_span<B: BinCode>(
+    cols: &[&[B]],
     feat_offsets: &[u32],
     gpair: &[GradPairFixed],
     nodes: &mut [(&[RowId], &mut [GradPairFixed])],
@@ -398,8 +403,8 @@ pub fn subtract_in_place(parent: &mut Histogram, child: &Histogram) {
 ///
 /// 这就是 internal-docs/ARCHITECTURE.md 里说的「块复用」—— 传输量从
 /// O(深度 × 数据) 降到 O(数据)。
-pub fn build_all_nodes(
-    block_data: &[Bin],
+pub fn build_all_nodes<B: BinCode>(
+    block_data: &[B],
     block_n_rows: usize,
     n_feats: usize,
     feat_offsets: &[u32],
@@ -459,7 +464,7 @@ mod tests {
         );
     }
 
-    use crate::types::{GradPair, GradQuantizer};
+    use crate::types::{Bin, GradPair, GradQuantizer, MISSING_BIN};
 
     /// 3 个特征、每个 4 个 bin 的块,行数 8。
     /// feat 2 里塞了缺失。
@@ -1063,5 +1068,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 16-bit blocks run the same kernels: identical histograms to the 8-bit
+    /// block on the same codes, and correct slots above 255 with the 16-bit
+    /// missing sentinel skipped.
+    #[test]
+    fn sixteen_bit_blocks_accumulate_like_eight_bit_blocks() {
+        let n_rows = 5000usize;
+        let gpair: Vec<GradPairFixed> = (0..n_rows)
+            .map(|r| GradPairFixed {
+                grad: (r as i64 * 37) % 101 - 50,
+                hess: (r as i64 * 11) % 23 + 1,
+            })
+            .collect();
+        let rows: Vec<RowId> = (0..n_rows as RowId).filter(|r| r % 3 != 1).collect();
+        // Same codes in both widths (missing included).
+        let narrow: Vec<u8> = (0..2 * n_rows)
+            .map(|i| {
+                if i % 17 == 0 {
+                    u8::MAX
+                } else {
+                    (i % 200) as u8
+                }
+            })
+            .collect();
+        let wide: Vec<u16> = narrow
+            .iter()
+            .map(|&b| if b == u8::MAX { u16::MAX } else { b as u16 })
+            .collect();
+        let offsets = [0u32, 200, 400];
+        for sel in [None, Some(&rows[..])] {
+            let mut a = vec![GradPairFixed::default(); 400];
+            let mut b = vec![GradPairFixed::default(); 400];
+            build(&narrow, n_rows, 2, &offsets, &gpair, sel, &mut a);
+            build(&wide, n_rows, 2, &offsets, &gpair, sel, &mut b);
+            assert_same(&a, &b);
+        }
+        // Codes above 255.
+        let n_bins = 1000usize;
+        let col: Vec<u16> = (0..n_rows)
+            .map(|r| {
+                if r % 29 == 0 {
+                    u16::MAX
+                } else {
+                    ((r * 7) % n_bins) as u16
+                }
+            })
+            .collect();
+        let mut got = vec![GradPairFixed::default(); n_bins];
+        let mut targets = [(&rows[..], got.as_mut_slice())];
+        build_nodes(&col, n_rows, 1, &[0, n_bins as u32], &gpair, &mut targets);
+        let mut want = vec![GradPairFixed::default(); n_bins];
+        for &r in &rows {
+            let b = col[r as usize];
+            if b != u16::MAX {
+                want[b as usize] += gpair[r as usize];
+            }
+        }
+        assert_same(&got, &want);
+        assert!(want[300..].iter().any(|g| *g != GradPairFixed::default()));
     }
 }

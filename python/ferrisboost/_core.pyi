@@ -97,8 +97,16 @@ class Model:
         pandas DataFrames and PyArrow tables are accepted too. For a model
         trained on named columns they are matched to the model's features by
         name (any order; extra columns ignored; a missing one is an error).
-        Categorical columns are scored through their category codes, so they must carry the
-        training categories in the training order. use_gpu=True scores
+        Categorical input is coded by the model's category lists: a feature
+        with a list re-codes pandas categories, Arrow and Parquet dictionaries
+        and CSV text by value (any order, a subset; an unseen category raises
+        ValueError), and a feature with integer categories looks up plain
+        integer columns (CSV, Parquet, pandas, Arrow) by value too. A feature
+        without a list takes integer values as the codes (CSV, Parquet, pandas
+        and Arrow integers, integer categories and dictionaries by their
+        values), and pandas string categories and Arrow string dictionaries by
+        their codes / indices. A column means the same from a file, pandas or
+        Arrow; NumPy input is always codes. use_gpu=True scores
         models with categorical splits on the GPU too (bit-identical to the CPU).
 
         strict_shape=True (XGBoost's strict_shape) makes the shape independent
@@ -128,6 +136,12 @@ class Model:
         * pred_leaf=True: float32 node index of the leaf reached in each
           tree, shape (n, n_trees).
         """
+        ...
+    def get_categories(self) -> list[list[str] | list[int] | None] | None:
+        """Category names stored in the model, one entry per feature (a list in
+        code order, or None for a numeric / integer-coded feature); None when no
+        feature has names. DataFrame, Arrow table and Parquet input are re-coded
+        by value with these lists."""
         ...
     def get_score(self, importance_type: str = "weight") -> dict[str, float]:
         """Feature importance as in XGBoost's Booster.get_score.

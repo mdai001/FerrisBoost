@@ -621,8 +621,8 @@ use crate::metrics::Metric;
 use crate::split::{self, SplitCandidate};
 use crate::tree::{self, Model, Tree};
 use crate::types::{
-    Bin, FeatId, GradPair, GradPairFixed, GradQuantizer, Objective, PredictionAuthority, RowId,
-    TrainParams, MISSING_BIN,
+    FeatId, GradPair, GradPairFixed, GradQuantizer, Objective, PredictionAuthority, RowId,
+    TrainParams,
 };
 
 pub struct TrainConfig {
@@ -836,7 +836,9 @@ pub trait BlockSource: Send + Sync {
     /// 结果是每个全量驻留的 source 都静默继承了一个 6 倍的性能悬崖 ——
     /// HIGGS 上为了取 1 列克隆 294MB,吃掉单轮一半时间,profile 才看出来。
     /// 现在编译器会逼每个新 source 想清楚这件事。
-    fn feature_column(&self, feat: FeatId) -> anyhow::Result<Vec<Bin>>;
+    ///
+    /// The column comes back at its feature's storage width (`crate::bins`).
+    fn feature_column(&self, feat: FeatId) -> anyhow::Result<crate::bins::BinData>;
 
     /// 直接借出**驻留在内存里的**单个特征整列;拿不到(落盘 cache 等)返回
     /// `None`,调用方退回 `feature_column`。
@@ -847,7 +849,7 @@ pub trait BlockSource: Send + Sync {
     /// 每次一块新分配的缺页)。驻留的 source 覆盖本方法零拷贝借出;
     /// 默认 `None`,所以只能交出拷贝的 source(落盘 cache、测试里的
     /// 包装器)行为和以前完全一样。
-    fn resident_feature_column(&self, _feat: FeatId) -> Option<&[Bin]> {
+    fn resident_feature_column(&self, _feat: FeatId) -> Option<crate::bins::BinSlice<'_>> {
         None
     }
 
@@ -1101,20 +1103,34 @@ fn validate_start_margins(
             == flags(source.cuts().categorical_flags(), n_features),
         "categorical features (feature_types) of the continued training data do not match the existing model"
     );
+    // A continued model keeps its category lists (XGBoost keeps them too);
+    // named training data is coded with them, so a list built from the data
+    // must start from the prior's.
+    if let (Some(theirs), Some(ours)) = (&prior.categories, source.cuts().categories()) {
+        for f in 0..n_features {
+            if let Some(c) = theirs.get(f) {
+                crate::ensure_input!(
+                    ours.get(f) == Some(c),
+                    "the category names of feature {f} differ from the existing model's; continued \
+                     training data must be coded with the model's categories"
+                );
+            }
+        }
+    }
     // The new trees can only split on codes the current training supports
-    // (`MAX_CAT_CODE`); refuse a model that already splits on larger ones rather
-    // than carrying (or truncating) them.
+    // (`MAX_CAT_CODE_WIDE`); refuse a model that already splits on larger ones
+    // rather than carrying (or truncating) them.
     for (t, tree) in prior.trees.iter().enumerate() {
         for node in tree.nodes.iter().filter(|n| !n.is_leaf) {
             let Some(words) = &node.cats else { continue };
             if let Some(&big) = crate::categorical::categories_from_words(words)
                 .iter()
-                .find(|&&c| c > crate::categorical::MAX_CAT_CODE)
+                .find(|&&c| c > crate::categorical::MAX_CAT_CODE_WIDE)
             {
                 crate::bail_input!(
-                    "tree {t} of the existing model splits categorical feature {} on category code {big}, above the training limit {} (MAX_CAT_CODE); cannot continue training",
+                    "tree {t} of the existing model splits categorical feature {} on category code {big}, above the largest code training supports ({}); cannot continue training",
                     node.feat,
-                    crate::categorical::MAX_CAT_CODE
+                    crate::categorical::MAX_CAT_CODE_WIDE
                 );
             }
         }
@@ -1292,7 +1308,9 @@ fn train_with_backend(
     let p = &cfg.params;
     crate::ensure_input!(
         (1..=crate::types::MAX_BIN_LIMIT).contains(&p.max_bin),
-        "max_bin must be in 1..=255"
+        "max_bin must be in 1..={}, got {}",
+        crate::types::MAX_BIN_LIMIT,
+        p.max_bin
     );
     // ⚠️ **必须在共享路径上校验**,不能只在 GPU 里。以前完全没有校验:
     // CPU 会安静地接受 depth 16,GPU 则在训练深处报
@@ -1490,6 +1508,14 @@ fn train_with_backend(
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: source.cuts().categorical_flags().to_vec(),
         rank_bias: None,
+        // Named categories come from the data (a continued model's lists are
+        // the seed of the data's, see `validate_start_margins`); a continued model
+        // trained on bare codes keeps the prior's lists.
+        categories: source
+            .cuts()
+            .categories()
+            .cloned()
+            .or_else(|| cfg.prior_model.as_ref().and_then(|m| m.categories.clone())),
         // 和 XGBoost 一样,续训时旧模型的 best_iteration / best_score 属性原样保留,
         // 本次若开了早停再覆盖。
         best_iteration: cfg.prior_model.as_ref().and_then(|m| m.best_iteration),
@@ -1522,19 +1548,13 @@ fn train_with_backend(
     let gpu = match gpu_device {
         Some(device) => {
             let cuts = source.cuts();
-            let mut max_block_feats = 0usize;
-            let mut max_hist_bins = 0usize;
-            for b in 0..source.n_blocks() {
-                let feats = source.block_features(b)?;
-                max_block_feats = max_block_feats.max(feats.len());
-                let offsets = cuts.block_hist_offsets(&feats);
-                max_hist_bins = max_hist_bins.max(*offsets.last().unwrap() as usize);
-            }
-            let ctx = crate::backend::cuda::GpuTrainCtx::new(
+            // 16-bit blocks run on the device too (column-major, byte-sized
+            // slots); the context allocates for the real block shape.
+            let shape = gpu_block_shape(source)?;
+            let ctx = crate::backend::cuda::GpuTrainCtx::new_with_shape(
                 device,
                 n,
-                max_block_feats,
-                max_hist_bins,
+                shape,
                 source.n_blocks(),
                 crate::gpu_mem_plan::GPU_PARTITION_THREADS,
                 crate::backend::cuda::SharedHistogramConfig {
@@ -1570,6 +1590,17 @@ fn train_with_backend(
                 },
                 prof::enabled(),
             )?;
+            // The histogram kernels tile a block by whole features. A 16-bit
+            // feature wider than one shared-memory tile is accumulated in
+            // global memory; an 8-bit feature always fits a tile unless the
+            // shared-memory budget is tiny, which is a hard error here, before
+            // any launch (never a kernel loop without progress).
+            let max_u8_feature_bins = (0..cuts.n_feats() as FeatId)
+                .filter(|&f| cuts.bin_width(f) == crate::bins::BinWidth::U8)
+                .map(|f| cuts.n_bins(f))
+                .max()
+                .unwrap_or(0);
+            ctx.ensure_features_fit_tile(max_u8_feature_bins)?;
             if prof::enabled() {
                 eprintln!("\n=== GPU memory budget ===\n{}", ctx.budget().report());
                 eprintln!("{}", ctx.host_budget().report());
@@ -2107,7 +2138,7 @@ pub fn train_gpu_one_tree(
             let offsets = cuts.block_hist_offsets(&block.feat_ids);
             let hist = build_histogram_shared(
                 device_ordinal,
-                &block.data,
+                block.bins().require_u8("GPU training")?,
                 block.n_rows,
                 block.n_feats(),
                 &offsets,
@@ -2137,6 +2168,7 @@ pub fn train_gpu_one_tree(
             scale_pos_weight: cfg.params.scale_pos_weight,
             feature_types: Vec::new(),
             rank_bias: None,
+            categories: None,
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
@@ -2168,7 +2200,7 @@ pub fn train_gpu_one_tree(
     let rows: Vec<RowId> = (0..source.n_rows() as RowId).collect();
     let (left_rows, right_rows) = crate::backend::cuda::partition_rows_gpu(
         device_ordinal,
-        &col,
+        col.as_slice().require_u8("GPU training")?,
         source.n_rows(),
         0,
         &rows,
@@ -2186,6 +2218,7 @@ pub fn train_gpu_one_tree(
         scale_pos_weight: cfg.params.scale_pos_weight,
         feature_types: Vec::new(),
         rank_bias: None,
+        categories: None,
         trees: vec![tree],
         base_score,
         objective: cfg.objective,
@@ -2582,9 +2615,13 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         .iter()
         .map(|n| {
             n.cats.as_ref().map(|words| {
-                let mut bits = crate::categorical::CatBits::empty();
+                // Only trained codes (`< n_bins`) can be a bin of this feature;
+                // a larger member (from a continued model) must never match
+                // the width's unseen-category bin.
+                let n_bins = cuts.n_bins(n.feat);
+                let mut bits = crate::categorical::CatBits::for_bins(n_bins);
                 for cat in crate::categorical::categories_from_words(words) {
-                    if cat < 256 {
+                    if (cat as usize) < n_bins {
                         bits.set(cat);
                     }
                 }
@@ -2656,6 +2693,10 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                     "prediction: column block {b} data length does not match rows × features"
                 );
                 anyhow::ensure!(
+                    block.width() == source.cuts().block_width(&block.feat_ids),
+                    "prediction: column block {b} bin width does not match the cuts"
+                );
+                anyhow::ensure!(
                     block.feat_ids == block_feats[b],
                     "prediction: column block {b} features do not match the block_features metadata"
                 );
@@ -2675,8 +2716,9 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                         if local == usize::MAX {
                             break;
                         }
-                        let bin = block.column(local)[row as usize];
-                        let go_left = if bin == MISSING_BIN {
+                        let col = block.column(local);
+                        let bin = col.get(row as usize);
+                        let go_left = if bin == col.width().missing() {
                             n.default_left
                         } else if let Some(cats) = &node_cats[*node as usize] {
                             !cats.contains(bin as u32)
@@ -2837,7 +2879,11 @@ fn build_tree(
     // 直方图只建采样中的列:CPU 恒如此(内核按列切片取列,不需要压实块),
     // column-major GPU 视后端能力而定。没采样的列根本不进 split 枚举,
     // 给它们建直方图是纯白算 —— colsample_bytree=0.6 时那是近一半的累加。
-    let compact_hist = gpu.map_or(true, |c| c.supports_compact_column_histogram());
+    let compact_hist = |physical: usize| {
+        gpu.map_or(true, |c| {
+            c.supports_compact_column_histogram_for(cuts.block_width(&all_block_feats[physical]))
+        })
+    };
     let supports_cols = source.supports_column_selection();
     let plans: Vec<BlockPlan> = match sampled {
         Some(sel) => crate::colsample::required_blocks(sel, &all_block_feats)
@@ -2857,7 +2903,7 @@ fn build_tree(
                 } else {
                     all_block_feats[physical].clone()
                 };
-                let hist_feats = if compact_hist {
+                let hist_feats = if compact_hist(physical) {
                     sampled_global.clone()
                 } else {
                     handed_feats.clone()
@@ -3065,8 +3111,9 @@ fn build_tree(
             let mut submitted = Vec::with_capacity(n_blocks);
             for (b, plan) in plans.iter().enumerate() {
                 let selected_local = sampled.map(|_| plan.orig_local.as_slice());
-                let Some(mut session) = ctx.block_session_resident(
+                let Some(mut session) = ctx.block_session_resident_width(
                     plan.physical,
+                    cuts.block_width(&plan.handed_feats),
                     source.n_rows(),
                     plan.handed_feats.len(),
                     &plan.hist_offsets,
@@ -3149,6 +3196,10 @@ fn build_tree(
                         block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
                         "column block {b} data length does not match rows × features"
                     );
+                    anyhow::ensure!(
+                        block.width() == source.cuts().block_width(&block.feat_ids),
+                        "column block {phys} bin width does not match the cuts"
+                    );
                 }
                 let width = *plan.hist_offsets.last().unwrap() as usize;
                 // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
@@ -3184,9 +3235,9 @@ fn build_tree(
                         Some(session) => session,
                         None => {
                             let block = block.context("GPU cache miss requires source payload")?;
-                            ctx.block_session(
+                            ctx.block_session_bins(
                                 phys,
-                                &block.data,
+                                block.bins(),
                                 block.n_rows,
                                 block.n_feats(),
                                 &plan.hist_offsets,
@@ -3197,8 +3248,8 @@ fn build_tree(
                     // 整层的 Accumulate 节点按容量分批合并 launch。
                     // 容量 1 就是原来的逐节点路径,一个字都没变。
                     let cap = session.hist_nodes_batch_capacity();
-                    // Compact selected-feature maps require the batched ABI
-                    // even when a batch contains only one node.
+                    // Compact feature selection requires the batched kernel,
+                    // including a batch containing only one node.
                     let must_batch = session.requires_batched_hist();
                     #[cfg(feature = "cuda")]
                     if let Some(results) = pre.take() {
@@ -3288,35 +3339,39 @@ fn build_tree(
                     let _t = prof::Timer::new(&prof::HIST);
                     // `hist_feats` 的每一列在交回块里的位置:整块交回时是
                     // 采样列的原始局部下标,压实块或不采样时就是全部列。
-                    let all_cols = hist::block_columns(&block.data, block.n_rows, block.n_feats());
-                    let cols: Vec<&[Bin]> = match selected_local {
-                        Some(sel) => sel.iter().map(|&l| all_cols[l]).collect(),
-                        None => all_cols,
-                    };
-                    debug_assert_eq!(cols.len(), plan.hist_feats.len());
-                    if depth == 0 && !drop_zero_rows {
-                        // 根节点走 None 那条路:少一层行下标的间接寻址,
-                        // 结果和传全部行完全一样(hist.rs 有断言钉着)。
-                        hist::build_cols(
-                            &cols,
-                            &plan.hist_offsets,
-                            gpair,
-                            None,
-                            &mut per_node[0].bins,
-                        );
-                    } else {
-                        // 本层所有要实际累加的节点一起走:行 id 区间在外、
-                        // 节点在内,同一段 bin/gpair 被所有节点复用
-                        // (见 `hist::build_nodes`)。逐位结果与逐节点
-                        // 调 `build` 相同。
-                        let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
-                            .iter()
-                            .zip(per_node.iter_mut())
-                            .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
-                            .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
-                            .collect();
-                        hist::build_nodes_cols(&cols, &plan.hist_offsets, gpair, &mut targets);
-                    }
+                    // Every column of a block has the same width: dispatch once
+                    // per block so the inner loops are monomorphised.
+                    crate::with_bins!(block.bins(), |data| {
+                        let all_cols = hist::block_columns(data, block.n_rows, block.n_feats());
+                        let cols: Vec<&[_]> = match selected_local {
+                            Some(sel) => sel.iter().map(|&l| all_cols[l]).collect(),
+                            None => all_cols,
+                        };
+                        debug_assert_eq!(cols.len(), plan.hist_feats.len());
+                        if depth == 0 && !drop_zero_rows {
+                            // 根节点走 None 那条路:少一层行下标的间接寻址,
+                            // 结果和传全部行完全一样(hist.rs 有断言钉着)。
+                            hist::build_cols(
+                                &cols,
+                                &plan.hist_offsets,
+                                gpair,
+                                None,
+                                &mut per_node[0].bins,
+                            );
+                        } else {
+                            // 本层所有要实际累加的节点一起走:行 id 区间在外、
+                            // 节点在内,同一段 bin/gpair 被所有节点复用
+                            // (见 `hist::build_nodes`)。逐位结果与逐节点
+                            // 调 `build` 相同。
+                            let mut targets: Vec<(&[RowId], &mut [GradPairFixed])> = level
+                                .iter()
+                                .zip(per_node.iter_mut())
+                                .filter(|(ln, _)| matches!(ln.hist_from, HistFrom::Accumulate))
+                                .map(|(ln, h)| (ln.rows.host(&rows_cur), h.bins.as_mut_slice()))
+                                .collect();
+                            hist::build_nodes_cols(&cols, &plan.hist_offsets, gpair, &mut targets);
+                        }
+                    });
                 }
                 // 再用父 - 兄弟补上剩下的。分两趟是为了不依赖兄弟在本层
                 // 里的先后顺序。
@@ -3354,7 +3409,7 @@ fn build_tree(
                     .enumerate()
                     .map(|(i, ln)| {
                         if gpu_done[i] {
-                            return gpu_candidates[i];
+                            return gpu_candidates[i].clone();
                         }
                         split::best_split_in_block_typed(
                             &per_node[i],
@@ -3379,8 +3434,9 @@ fn build_tree(
             // source read/checksum path.
             if !plan.compact {
                 if let Some(ctx) = gpu {
-                    if let Some(session) = ctx.block_session_resident(
+                    if let Some(session) = ctx.block_session_resident_width(
                         phys,
+                        cuts.block_width(&plan.handed_feats),
                         source.n_rows(),
                         plan.handed_feats.len(),
                         &plan.hist_offsets,
@@ -3422,7 +3478,7 @@ fn build_tree(
         let mut hists: Vec<Vec<Histogram>> = Vec::with_capacity(n_blocks);
         for (per_node, cands) in per_block {
             for (i, cand) in cands.into_iter().enumerate() {
-                best[i] = split::reduce_best(&[best[i], cand]);
+                best[i] = split::reduce_best(&[best[i].take(), cand]);
             }
             hists.push(per_node);
         }
@@ -3430,7 +3486,7 @@ fn build_tree(
         // 多机/多卡时各方只看得到自己那几列,全局最优要在这里汇总。
         // 单机 Local 是恒等,但训练逻辑里不能直接挑本地最优 ——
         // 那样换个 Comm 就不对了。
-        let chosen: Vec<Option<SplitCandidate>> = best
+        let mut chosen: Vec<Option<SplitCandidate>> = best
             .into_iter()
             .map(|c| comm.allreduce_best_split(c))
             .collect();
@@ -3492,7 +3548,7 @@ fn build_tree(
             for (block, nodes) in resident_groups {
                 let (cat_nodes, nodes): (Vec<_>, Vec<_>) = nodes
                     .into_iter()
-                    .partition(|&(i, _)| chosen[i].is_some_and(|c| c.cats.is_some()));
+                    .partition(|&(i, _)| chosen[i].as_ref().is_some_and(|c| c.cats.is_some()));
                 numeric.extend(nodes.into_iter().map(|(i, local)| (i, block, local)));
                 if cat_nodes.is_empty() {
                     continue;
@@ -3500,12 +3556,14 @@ fn build_tree(
                 if let Some(mut session) = ctx.partition_session_resident(block, 0)? {
                     let started = std::time::Instant::now();
                     for (i, local) in cat_nodes {
-                        let c = chosen[i].expect("resident group contains chosen nodes");
-                        let cats = c.cats.expect("partitioned by categorical");
+                        let c = chosen[i]
+                            .as_ref()
+                            .expect("resident group contains chosen nodes");
+                        let cats = c.cats.as_ref().expect("partitioned by categorical");
                         part_tokens[i] = Some(session.partition_resident_categorical(
                             level[i].rows.device(),
                             local,
-                            &cats,
+                            cats,
                             c.missing_left,
                         )?);
                     }
@@ -3524,7 +3582,20 @@ fn build_tree(
             }
             let mut blocks: Vec<usize> = numeric.iter().map(|&(_, b, _)| b).collect();
             blocks.dedup(); // `numeric` is grouped by ascending block
-            for block_chunk in blocks.chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS) {
+                            // A batch reads column-major blocks of one bin width:
+                            // U8 blocks first, exactly as before, then U16 blocks.
+            let wide_block = |block: usize| {
+                plans.iter().any(|pl| {
+                    pl.physical == block
+                        && cuts.block_width(&pl.handed_feats) == crate::bins::BinWidth::U16
+                })
+            };
+            let (wide_blocks, narrow_blocks): (Vec<usize>, Vec<usize>) =
+                blocks.into_iter().partition(|&b| wide_block(b));
+            let block_chunks = narrow_blocks
+                .chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS)
+                .chain(wide_blocks.chunks(crate::gpu_mem_plan::PARTITION_MAX_BLOCKS));
+            for block_chunk in block_chunks {
                 let Some(mut session) = ctx.partition_session_resident_blocks(block_chunk)? else {
                     continue; // nonresident: the per-feature fallback below
                 };
@@ -3537,7 +3608,9 @@ fn build_tree(
                     let requests: Vec<_> = chunk
                         .iter()
                         .map(|&&(i, block, local)| {
-                            let c = chosen[i].expect("resident group contains chosen nodes");
+                            let c = chosen[i]
+                                .as_ref()
+                                .expect("resident group contains chosen nodes");
                             (level[i].rows.device(), block, local, c.bin, c.missing_left)
                         })
                         .collect();
@@ -3566,7 +3639,7 @@ fn build_tree(
                 .iter()
                 .zip(&chosen)
                 .filter_map(|(ln, c)| match (&ln.rows, c) {
-                    (NodeRows::Host(span), Some(c)) => Some((*span, *c)),
+                    (NodeRows::Host(span), Some(c)) => Some((*span, c.clone())),
                     _ => None,
                 })
                 .collect();
@@ -3605,11 +3678,11 @@ fn build_tree(
             // source 照旧付那份拷贝(PART_FETCH 只计这部分)。
             let fetch_timer = prof::Timer::new(&prof::PART_FETCH);
             let owned_col;
-            let col: &[Bin] = match source.resident_feature_column(feat) {
+            let col: crate::bins::BinSlice<'_> = match source.resident_feature_column(feat) {
                 Some(col) => col,
                 None => {
                     owned_col = source.feature_column(feat)?;
-                    &owned_col
+                    owned_col.as_slice()
                 }
             };
             drop(fetch_timer);
@@ -3629,9 +3702,11 @@ fn build_tree(
                 // 选中的这一列 H2D **一次**,本层所有选中它的节点共用 ——
                 // 和「外层特征、内层节点」的循环顺序天然对齐。
                 let started = std::time::Instant::now();
-                let mut session = ctx.partition_session(col)?;
+                let mut session = ctx.partition_session_bins(col)?;
                 for i in node_idxs {
-                    let c = chosen[i].expect("by_feat only holds nodes with a candidate");
+                    let c = chosen[i]
+                        .as_ref()
+                        .expect("by_feat only holds nodes with a candidate");
                     part_tokens[i] = Some(match &c.cats {
                         Some(cats) => session.partition_categorical(
                             level[i].rows.device(),
@@ -3679,7 +3754,7 @@ fn build_tree(
         // GPU 终叶整层攒起来,一次 launch 写完(见 `assign_leaf_values`)。
         let mut gpu_leaves: Vec<(crate::backend::cuda::GpuRowSpan, f32)> = Vec::new();
         for (i, ln) in level.into_iter().enumerate() {
-            let Some(c) = chosen[i] else {
+            let Some(c) = chosen[i].take() else {
                 // 这个节点到此就是终叶。行分区已经是答案,现在直接累加
                 // 比训练结束后再沿树下降一遍便宜得多。
                 let value = t.nodes[ln.node].leaf_value;
@@ -3842,8 +3917,50 @@ fn build_tree(
     Ok(t)
 }
 
+/// The bin geometry GPU training allocates for: block widths in features and
+/// bytes per row, the largest block histogram and the widest category set
+/// a partition ships. Both U8 and U16 blocks stay column-major.
+/// Pure metadata: no block payload is read.
+pub(crate) fn gpu_block_shape(
+    source: &dyn BlockSource,
+) -> anyhow::Result<crate::gpu_mem_plan::GpuBlockShape> {
+    use crate::bins::BinWidth;
+    let cuts = source.cuts();
+    let mut shape = crate::gpu_mem_plan::GpuBlockShape::all_u8(0, 0);
+    for b in 0..source.n_blocks() {
+        let feats = source.block_features(b)?;
+        let width = cuts.block_width(&feats);
+        shape.max_block_feats = shape.max_block_feats.max(feats.len());
+        shape.max_block_row_bytes = shape.max_block_row_bytes.max(feats.len() * width.bytes());
+        let offsets = cuts.block_hist_offsets(&feats);
+        shape.max_hist_bins = shape.max_hist_bins.max(*offsets.last().unwrap() as usize);
+        match width {
+            BinWidth::U8 => {}
+            BinWidth::U16 => {
+                shape.max_cell_bytes = 2;
+                let (mut cat_feats, mut cat_bins, mut set_words) = (0, 0, 0);
+                for &f in &feats {
+                    if cuts.is_categorical(f) {
+                        // Two 32-bit words per 64-bit set word (CatBits::words64).
+                        let words = cuts.n_bins(f).div_ceil(64) * 2;
+                        shape.cat_mask_words = shape.cat_mask_words.max(words);
+                        cat_feats += 1;
+                        cat_bins += cuts.n_bins(f);
+                        set_words += words;
+                    }
+                }
+                // Device split buffers of the block's categorical features.
+                shape.wide_cat_feats = shape.wide_cat_feats.max(cat_feats);
+                shape.wide_cat_bins = shape.wide_cat_bins.max(cat_bins);
+                shape.wide_cat_set_words = shape.wide_cat_set_words.max(set_words);
+            }
+        }
+    }
+    Ok(shape)
+}
+
 /// `apply_dropped_rows` 需要的、和分区完全同一套的分裂判定。
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct DropSplit {
     feat: FeatId,
     bin: u32,
@@ -3879,15 +3996,18 @@ fn apply_dropped_rows(
     }
     // 扁平下降表。叶子:两个孩子都是自己,列借根节点的(读到什么都不影响)。
     struct Step<'a> {
-        col: &'a [Bin],
+        col: crate::bins::BinSlice<'a>,
+        /// 这一列宽度的缺失哨兵。
+        missing: u32,
         bound: u32,
         missing_left: bool,
-        cats: Option<crate::categorical::CatBits>,
+        /// 类别分裂走右的集合(64 位字)。
+        cats: Option<&'a [u64]>,
         next: [u32; 2],
         value: f32,
     }
-    let root_col: &[Bin] = if t.nodes[0].is_leaf {
-        &[]
+    let root_col = if t.nodes[0].is_leaf {
+        crate::bins::BinSlice::U8(&[])
     } else {
         source
             .resident_feature_column(t.nodes[0].feat)
@@ -3898,6 +4018,7 @@ fn apply_dropped_rows(
         if n.is_leaf {
             steps.push(Step {
                 col: root_col,
+                missing: root_col.width().missing(),
                 bound: 0,
                 missing_left: true,
                 cats: None,
@@ -3906,13 +4027,15 @@ fn apply_dropped_rows(
             });
         } else {
             let sp = &split_info[i];
+            let col = source
+                .resident_feature_column(sp.feat)
+                .context("zero-gradient row descent needs resident columns")?;
             steps.push(Step {
-                col: source
-                    .resident_feature_column(sp.feat)
-                    .context("zero-gradient row descent needs resident columns")?,
+                col,
+                missing: col.width().missing(),
                 bound: sp.bin,
                 missing_left: sp.missing_left,
-                cats: sp.cats,
+                cats: sp.cats.as_ref().map(|c| c.words64()),
                 next: [n.left as u32, n.right as u32],
                 value: 0.0,
             });
@@ -3969,20 +4092,18 @@ fn apply_dropped_rows(
                 for _ in 0..depth {
                     for (k, &i) in lanes.iter().enumerate() {
                         let st = &steps[node[k] as usize];
-                        let bin = st
-                            .col
-                            .get(base + i as usize)
-                            .copied()
-                            .unwrap_or(MISSING_BIN);
+                        // 树深 ≥ 1 时根是分裂节点,叶子借的根列与其它列
+                        // 同长,读取不会越界(树深 0 时根本不进这个循环)。
+                        let bin = st.col.get(base + i as usize);
                         // 与 `fill_partition_bits` 逐条相同:缺失走记下的方向;
                         // 类别分裂里集合走右、其余(含未见过的编码)走左;
                         // 数值分裂比 bin。
-                        let go_left = if bin == MISSING_BIN {
+                        let go_left = if bin == st.missing {
                             st.missing_left
-                        } else if let Some(cats) = &st.cats {
-                            !cats.contains(bin as u32)
+                        } else if let Some(cats) = st.cats {
+                            !crate::categorical::contains_in(cats, bin)
                         } else {
-                            (bin as u32) < st.bound
+                            bin < st.bound
                         };
                         node[k] = st.next[(!go_left) as usize];
                     }
@@ -4363,19 +4484,25 @@ struct PartTask {
 }
 
 /// 一段行的方向 bit:第 `j` 行走左则 `out[j / 8]` 的第 `j % 8` 位为 1。
-fn fill_partition_bits(rows: &[RowId], col: &[Bin], c: &SplitCandidate, out: &mut [u8]) {
+fn fill_partition_bits<B: crate::bins::BinCode>(
+    rows: &[RowId],
+    col: &[B],
+    c: &SplitCandidate,
+    out: &mut [u8],
+) {
     debug_assert_eq!(out.len(), rows.len().div_ceil(8));
+    let cats = c.cats.as_ref().map(|s| s.words64());
     for (byte, chunk) in out.iter_mut().zip(rows.chunks(8)) {
         let mut acc = 0u8;
         for (j, &r) in chunk.iter().enumerate() {
             let bin = col[r as usize];
-            let go_left = if bin == MISSING_BIN {
+            let go_left = if bin == B::MISSING {
                 c.missing_left
-            } else if let Some(cats) = &c.cats {
+            } else if let Some(cats) = cats {
                 // Categorical: the set goes right, every other category left.
-                !cats.contains(bin as u32)
+                !crate::categorical::contains_in(cats, bin.idx() as u32)
             } else {
-                (bin as u32) < c.bin
+                (bin.idx() as u32) < c.bin
             };
             acc |= (go_left as u8) << j;
         }
@@ -4400,7 +4527,7 @@ fn fill_partition_bits(rows: &[RowId], col: &[Bin], c: &SplitCandidate, out: &mu
 /// 分区要读的列从哪来。
 enum PartCols<'a> {
     /// 驻留 source:每个节点分裂特征的列(与 `nodes` 一一对应),零拷贝。
-    Resident(Vec<&'a [Bin]>),
+    Resident(Vec<crate::bins::BinSlice<'a>>),
     /// 只能交出拷贝的 source:按特征分批取,任何时刻只持有一列
     /// (峰值内存同逐列分区)。
     Fetch(&'a dyn BlockSource),
@@ -4462,7 +4589,12 @@ fn partition_level_host(
         match cols {
             PartCols::Resident(cols) => work.into_par_iter().for_each(|(t, out)| {
                 let c = &nodes[t.node].1;
-                fill_partition_bits(&rows[t.rows.clone()], cols[t.node], c, out);
+                crate::with_bins!(cols[t.node], |col| fill_partition_bits(
+                    &rows[t.rows.clone()],
+                    col,
+                    c,
+                    out
+                ));
             }),
             PartCols::Fetch(source) => {
                 let mut feats: Vec<FeatId> = nodes.iter().map(|(_, c)| c.feat).collect();
@@ -4476,9 +4608,15 @@ fn partition_level_host(
                         .into_iter()
                         .partition(|(t, _)| nodes[t.node].1.feat == feat);
                     work = rest;
+                    let col = col.as_slice();
                     this.into_par_iter().for_each(|(t, out)| {
                         let c = &nodes[t.node].1;
-                        fill_partition_bits(&rows[t.rows.clone()], &col, c, out);
+                        crate::with_bins!(col, |col| fill_partition_bits(
+                            &rows[t.rows.clone()],
+                            col,
+                            c,
+                            out
+                        ));
                     });
                 }
                 debug_assert!(work.is_empty());
@@ -4844,6 +4982,7 @@ mod tests {
     use crate::comm::Local;
     use crate::metrics::{LogLoss, Metric, Rmse};
     use crate::source::DenseSource;
+    use crate::types::{Bin, MISSING_BIN};
 
     const MISSING: f32 = f32::NAN;
 
@@ -5364,7 +5503,7 @@ mod tests {
                             &rows,
                             &mut next,
                             &nodes,
-                            PartCols::Resident(vec![&col; nodes.len()]),
+                            PartCols::Resident(vec![crate::bins::BinSlice::U8(&col); nodes.len()]),
                             &Local,
                         )
                     })
@@ -5760,7 +5899,7 @@ mod tests {
                 self.blocks.fetch_add(1, Ordering::Relaxed);
                 self.inner.with_block(i, f)
             }
-            fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+            fn feature_column(&self, f: FeatId) -> anyhow::Result<crate::bins::BinData> {
                 self.cols.fetch_add(1, Ordering::Relaxed);
                 self.inner.feature_column(f)
             }
@@ -5997,7 +6136,7 @@ mod tests {
         fn with_block(&self, i: usize, f: &mut dyn FnMut(&ColumnBlock)) -> anyhow::Result<()> {
             self.0.with_block(i, f)
         }
-        fn feature_column(&self, f: FeatId) -> anyhow::Result<Vec<Bin>> {
+        fn feature_column(&self, f: FeatId) -> anyhow::Result<crate::bins::BinData> {
             self.0.feature_column(f)
         }
     }

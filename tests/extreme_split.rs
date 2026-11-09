@@ -78,7 +78,7 @@ fn predecessor_of_f32_max_and_missing_split_with_one_bin_and_roundtrip() {
     let (model, source) = train_one_feature([below_max, below_max, f32::NAN, f32::NAN], 1);
 
     assert_eq!(source.bin_at(0, 0), source.bin_at(1, 0));
-    assert_eq!(source.bin_at(2, 0), MISSING_BIN);
+    assert_eq!(source.bin_at(2, 0), MISSING_BIN as u32);
     assert_eq!(source.cuts().n_bins(0), 1);
     assert_binary_split(&model, below_max, f32::NAN);
 

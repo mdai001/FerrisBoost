@@ -69,7 +69,7 @@ impl BlockSource for CountedDenseSource {
     fn feature_column(
         &self,
         feat: ferrisboost::types::FeatId,
-    ) -> anyhow::Result<Vec<ferrisboost::types::Bin>> {
+    ) -> anyhow::Result<ferrisboost::bins::BinData> {
         self.inner.feature_column(feat)
     }
 
@@ -507,7 +507,6 @@ fn resident_block_session_reuses_exact_metadata_and_refreshes_selected_mapping()
         );
         expected
     };
-
     if compact_column {
         // First use uploads compact offsets and the selected-local map.
         let (first, first_timing) = run(Some(&selected_a), &[0, 2, 4]);
@@ -1153,11 +1152,6 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
             let mut session = ctx
                 .block_session(0, &bins, n_rows, n_feats, offsets, None)
                 .unwrap();
-            // Compact selection requires the batched entry point even for
-            // a single-node batch.
-            if session.requires_batched_hist() {
-                break;
-            }
             session.histogram_device(span, &mut got).unwrap();
             timing = session.timing();
         }
@@ -1479,11 +1473,11 @@ fn gpu_math_fast_keeps_structure_and_stays_deterministic() {
     }
 }
 
-/// Column-major histograms must include every feature in blocks wider than 32.
+/// A wide physical block must preserve every feature and match the CPU model.
 #[test]
-fn wide_column_major_blocks_do_not_drop_features() {
+fn wide_blocks_keep_all_features_on_gpu() {
     let n_rows = 3000usize;
-    // Use a physical block wider than 32 features.
+    // One wide block holds all 64 features.
     let n_feats = 64usize;
     let data: Vec<f32> = (0..n_rows)
         .flat_map(|row| (0..n_feats).map(move |feat| ((row * 7 + feat * 13) % 43) as f32))
@@ -1492,7 +1486,7 @@ fn wide_column_major_blocks_do_not_drop_features() {
         .map(|row| if (row * 11) % 19 < 9 { 1.0 } else { 0.0 })
         .collect();
     // cols_per_block = 64 => 一个列块就装下全部 64 个特征。
-    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 64, 64);
+    let source = DenseSource::from_row_major(&data, n_rows, n_feats, 64, 3);
     let params = ferrisboost::types::TrainParams {
         n_rounds: 2,
         max_depth: 4,
@@ -1505,11 +1499,11 @@ fn wide_column_major_blocks_do_not_drop_features() {
     assert_eq!(
         serde_json::to_vec(&gpu).unwrap(),
         serde_json::to_vec(&cpu).unwrap(),
-        "wide column-major blocks must match CPU byte-for-byte"
+        "宽列块下 GPU 必须和 CPU 逐字节相同"
     );
 }
 
-/// Narrow resident and streaming blocks use the column-major training layout.
+/// Every GPU training shape uses column-major blocks, including narrow blocks.
 #[test]
 fn narrow_blocks_use_the_column_major_layout() {
     for resident_blocks in [Some(0), Some(2)] {
@@ -1518,20 +1512,18 @@ fn narrow_blocks_use_the_column_major_layout() {
             hist_streams: Some(1),
             ..Default::default()
         };
+        // Eight features per block is also a valid narrow column-major block.
         let ctx = GpuTrainCtx::new(0, 4096, 8, 64, 2, 8, config, false).unwrap();
         let path = ctx.path_summary();
         assert!(path.contains("layout_gpu=col_major"), "{path}");
-        assert!(ctx.supports_compact_column_histogram());
+        assert!(!path.contains("layout_gpu=row_major"), "{path}");
+        assert!(!path.contains("rm_stage_per_slot="), "{path}");
     }
 }
 
-/// 运行时用的是**签入的 PTX**,不是 `.cu`。改了 `.cu` 却忘记跑 nvcc,
-/// 训练会拿旧 kernel 跑并且**没有任何报错**。
-///
-/// ⚠️ 已经踩过一次:把行主序 kernel 的 `start` 从 `local * blockDim.x` 改成
-/// `local * (blockDim.x >> 1)`,host 侧同步改了每 block 行数,但那一轮只跑了
-/// `cargo build` 没跑 nvcc —— 于是 kernel 每个 block 跳过一半的行,
-/// 直方图**静默少算约一半**,而两边代码看起来都是对的。
+/// Runtime uses the checked-in PTX rather than compiling the `.cu` source.
+/// This fingerprint check catches source/PTX drift that could otherwise make
+/// tests exercise an older histogram kernel.
 ///
 /// mtime 在 clean checkout 里没有语义,所以 PTX 生成器嵌入源文件的稳定
 /// FNV-1a64;测试比较内容指纹,不再靠 checkout 恰好先写了哪个文件。
@@ -1808,9 +1800,8 @@ fn subsample_shapes_the_tree_without_masking_predictions() {
     }
 }
 
-/// Physical resident metadata must describe the narrower final block rather
-/// than the capacity reserved for the widest block. Resident and streaming
-/// plans must produce identical models for unequal block widths.
+/// Uneven physical block widths must not change the trained model when the
+/// final, narrower block is resident.
 #[test]
 fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     let n_rows = 3000usize;
@@ -1845,21 +1836,23 @@ fn resident_narrow_last_block_keeps_the_model_bit_exact() {
     assert_eq!(streaming, partial, "部分常驻不该改变模型");
     assert_eq!(
         streaming, full,
-        "a narrower last resident block must preserve the model"
+        "the narrower final resident block must match pure streaming"
     );
 
-    // 等宽切分作为对照:这一档**过去也是通过的**,所以它不能证明修复,
-    // 只用来说明上面那条失败确实来自"不等宽",不是来自"常驻"本身。
+    // Equal-width blocks provide a second residency-invariance case.
     let even_streaming = run(15, 0); // 30 / 15 = [15, 15]
     let even_full = run(15, 2);
     assert_eq!(even_streaming, even_full, "等宽切分下全常驻本来就该一致");
 }
 
-/// Resident split-cache results match the host split path across narrow and
-/// wide column-major blocks, missing values, sampling and repeated tree resets.
-/// The final resident block is narrower than the first.
+/// The resident split cache is an exact, bounded alternative to the existing
+/// host split path. Cover wide and narrow column-major blocks and both objectives with
+/// missing values, row and column sampling, tree resets, and depth beyond the
+/// two-generation cache capacity. The 40-column first block always selects the
+/// column-major path; the 16+14 split makes the final resident block narrower
+/// than the first.
 #[test]
-fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {
+fn gpu_split_cache_matches_cpu_for_block_shapes_and_objectives() {
     let n_rows = 768usize;
     let fixtures = [(70usize, 40usize), (30usize, 16usize)];
     let bytes = |m: &ferrisboost::tree::Model| serde_json::to_vec(m).unwrap();

@@ -419,7 +419,7 @@ def test_parquet_dictionary_of_integers_is_categorical(tmp_path):
     np.testing.assert_array_equal(m.predict(x, output_margin=True), ref.predict(x, output_margin=True))
 
 
-def test_parquet_dictionary_of_strings_is_rejected(tmp_path):
+def test_parquet_dictionary_of_strings_is_a_named_categorical(tmp_path):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     table = pa.table({"a": pa.array([1.0, 2.0, 3.0, 4.0]),
@@ -427,9 +427,13 @@ def test_parquet_dictionary_of_strings_is_rejected(tmp_path):
                       "label": pa.array([0.0, 1.0, 0.0, 1.0])})
     path = tmp_path / "s.parquet"
     pq.write_table(table, str(path))
-    with pytest.raises(Exception, match="integer category codes"):
-        fb.train({"objective": "reg:squarederror"}, str(path), label="label",
+    m = fb.train({"objective": "reg:squarederror"}, str(path), label="label",
                  num_boost_round=1, quiet=True)
+    assert m.get_categories() == [None, ["x", "y", "z"]]
+    # Declared numeric, a string dictionary cannot be read.
+    with pytest.raises(ValueError, match="category names"):
+        fb.train({"objective": "reg:squarederror"}, str(path), label="label",
+                 feature_types=["q", "q"], num_boost_round=1, quiet=True)
 
 
 def test_quantized_cache_keeps_categorical_binning(tmp_path):
@@ -452,14 +456,16 @@ def test_quantized_cache_keeps_categorical_binning(tmp_path):
 # --------------------------------------------------------------------------- validation of values
 def test_invalid_categories_are_rejected():
     x, y, ft = make_data(cat_levels=(5,), seed=18)
-    for bad in (-1.0, 2.5, 254.0, 255.0, 1000.0):
+    for bad in (-1.0, 2.5, 65534.0, 70000.0):
         x2 = x.copy()
         x2[3, 2] = bad
         with pytest.raises(ValueError, match="categor"):
             fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
-    x2 = x.copy()
-    x2[3, 2] = 253.0  # the largest supported code is fine
-    fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
+    # 253 is the largest 8-bit code; larger codes store the feature at 16 bits.
+    for fine in (253.0, 254.0, 1000.0):
+        x2 = x.copy()
+        x2[3, 2] = fine
+        fb_train(x2, y, ft, {"objective": "reg:squarederror"}, 1)
 
 
 def test_feature_types_length_is_checked():

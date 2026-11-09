@@ -97,6 +97,15 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Changelog</h2>
+      <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
+      <h3>0.0.8 (unreleased)</h3>
+      <ul>
+        <li>Added <code>max_bin</code> above 255 (up to 65535).</li>
+        <li>Up to 65,534 categories per feature (was 254).</li>
+        <li>Wide bins and many categories train on CPU and GPU.</li>
+        <li>GPU speed optimization for wide features.</li>
+        <li>Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.</li>
+      </ul>
       <h3>0.0.7</h3>
       <ul>
         <li>Added <code>base_margin</code>.</li>
@@ -128,7 +137,6 @@ prediction = model.predict("test.parquet")</code></pre>
         <li>Faster CPU training.</li>
         <li>GPU speed optimizations.</li>
       </ul>
-      <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
       <h3>0.0.5</h3>
       <ul>
         <li>Changed: <code>base_score</code> is now estimated from the training labels when not set, as in XGBoost, so default models differ from 0.0.4.</li>
