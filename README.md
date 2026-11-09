@@ -246,7 +246,7 @@ logging, and the complete parameter reference.
 
 ## Changelog
 
-### 0.0.7 (unreleased)
+### 0.0.7
 
 - Added `base_margin`.
 - Added training continuation (`init_model`; `xgb_model` also accepted).
