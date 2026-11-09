@@ -306,8 +306,8 @@ fn run_batch(
 #[test]
 fn resident_partition_batch_matches_stable_cpu_rows_and_rejects_invalid_levels() {
     let _gpu_guard = GPU_PARTITION_TEST_LOCK.lock().unwrap();
-    // The harness runs this single GPU test in isolation. Layout variants are
-    // selected externally: the default column-major mode and FB_ROW_MAJOR=1.
+    // The harness runs this GPU test in isolation; the training layout is
+    // always column-major.
     let bins = bins_for(N_ROWS, N_FEATURES);
     let ctx = make_context(N_ROWS, N_FEATURES, 1, 1);
     assert_partition_scratch_budget(&ctx, N_ROWS);

@@ -3248,8 +3248,8 @@ fn build_tree(
                     // 整层的 Accumulate 节点按容量分批合并 launch。
                     // 容量 1 就是原来的逐节点路径,一个字都没变。
                     let cap = session.hist_nodes_batch_capacity();
-                    // 行主序 kernel 只有 batched 一个入口,批里只有一个
-                    // 节点也必须走它。
+                    // Compact feature selection requires the batched kernel,
+                    // including a batch containing only one node.
                     let must_batch = session.requires_batched_hist();
                     #[cfg(feature = "cuda")]
                     if let Some(results) = pre.take() {
@@ -3582,9 +3582,8 @@ fn build_tree(
             }
             let mut blocks: Vec<usize> = numeric.iter().map(|&(_, b, _)| b).collect();
             blocks.dedup(); // `numeric` is grouped by ascending block
-                            // A batch reads blocks of one bin width (8-bit blocks may be
-                            // row-major on the device, 16-bit ones are column-major): 8-bit
-                            // blocks first, exactly as before, then the 16-bit blocks.
+                            // A batch reads column-major blocks of one bin width:
+                            // U8 blocks first, exactly as before, then U16 blocks.
             let wide_block = |block: usize| {
                 plans.iter().any(|pl| {
                     pl.physical == block
@@ -3919,8 +3918,8 @@ fn build_tree(
 }
 
 /// The bin geometry GPU training allocates for: block widths in features and
-/// bytes per row, the largest block histogram, the widest 8-bit block (the
-/// device row-major gate) and the widest category set a partition ships.
+/// bytes per row, the largest block histogram and the widest category set
+/// a partition ships. Both U8 and U16 blocks stay column-major.
 /// Pure metadata: no block payload is read.
 pub(crate) fn gpu_block_shape(
     source: &dyn BlockSource,
@@ -3936,9 +3935,7 @@ pub(crate) fn gpu_block_shape(
         let offsets = cuts.block_hist_offsets(&feats);
         shape.max_hist_bins = shape.max_hist_bins.max(*offsets.last().unwrap() as usize);
         match width {
-            BinWidth::U8 => {
-                shape.max_u8_block_feats = shape.max_u8_block_feats.max(feats.len());
-            }
+            BinWidth::U8 => {}
             BinWidth::U16 => {
                 shape.max_cell_bytes = 2;
                 let (mut cat_feats, mut cat_bins, mut set_words) = (0, 0, 0);

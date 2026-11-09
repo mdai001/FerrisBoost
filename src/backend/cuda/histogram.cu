@@ -437,282 +437,11 @@ extern "C" __global__ void split_cached_nodes_cat(const SplitPacket* features,
 
 // 每个 block 归约出自己那段的 max|grad| / max|hess|,写进 out_max[2*blockIdx]。
 // host 再对这 n_blocks 对做最终 max —— 很小,而且同样是精确的。
-// ---- GPU-local row-major 原型 ----------------------------------------------
-//
-// **前提**:列主序下 `bins[feat * n_rows + row]` 在 root 上是连续的,但
-// partition 之后 `row` 是**散列的子集**,于是一个 warp 的 32 条 lane 各取
-// 1 个字节、落在最多 32 个不同 sector 上。实测(ncu,wide 10M×300):
-//
-//   depth 0  sector 效率 62.2%   82.0 M sectors   21.7 ms
-//   depth 2  sector 效率 22.3%  102.6 M sectors   11.6 ms
-//   depth 5  sector 效率 **7.1%**  332.9 M sectors  37.6 ms
-//
-// 也就是深层每取 32 B 只用掉约 2.3 B。行主序把同一行的所有特征放连续,
-// **一个线程一次读满一个 sector**,于是效率与行的散列程度无关。
-//
-// ⚠️ 旧的「flattened (row × feature) 更慢」结论**只对列主序成立**
-// (当时 feature lane 相隔 n_rows 字节),这里前提变了,所以可以重开。
-extern "C" __global__ void transpose_bins_to_row_major(
-    const uint8_t* __restrict__ src,
-    uint8_t* __restrict__ dst,
-    uint32_t n_rows,
-    uint32_t n_feats) {
-    // +1 padding 避开 shared bank 冲突。
-    __shared__ uint8_t tile[32][33];
-    const uint32_t r0 = blockIdx.x * 32u;
-    const uint32_t f0 = blockIdx.y * 32u;
+// GPU training remains column-major. The retired U8 row-major path added
+// transpose/staging/synchronization cost and regressed HIGGS by 12–29% with
+// identical models (2026-11-08); partial Epsilon results agreed. U16 row-major
+// was never implemented. See internal-docs/history.md for the removal decision.
 
-    const uint32_t r_in = r0 + threadIdx.x;
-    const uint32_t f_in = f0 + threadIdx.y;
-    if (r_in < n_rows && f_in < n_feats) {
-        tile[threadIdx.y][threadIdx.x] = src[(uint64_t)f_in * n_rows + r_in];
-    }
-    __syncthreads();
-    // 写出时让 threadIdx.x 走 feature 维,保证写也是连续的。
-    const uint32_t f_out = f0 + threadIdx.x;
-    const uint32_t r_out = r0 + threadIdx.y;
-    if (r_out < n_rows && f_out < n_feats) {
-        dst[(uint64_t)r_out * n_feats + f_out] = tile[threadIdx.x][threadIdx.y];
-    }
-}
-
-
-// 行主序 bins 上的多节点 batched histogram。
-//
-// 与 `hist_build_shared_planar32_batched` **逐条对应**:同样只批
-// `Accumulate` 节点、同样一个 block 管一个节点的一段行、同样的 tile 切分、
-// 同样的 Planar32 shared 布局、同样的 `AtomicAdd64As32`、同样的 flush。
-// **shared 大小和 tile 几何一个字节都没变。**
-//
-// 唯一的差别:每个线程**先把自己那一行的全部特征字节一次性读进寄存器**
-// (行主序下是连续的,最多 32 B = 8 个 uint32),之后所有 tile 都从寄存器里取。
-// 于是 global 读取次数从「每 (行, 特征) 一次」变成「每行一次」,
-// 且每次都是满 sector。
-//
-// ⚠️ 原型限制:`n_feats <= 32`(HIGGS 28 / wide cols_per_block=32 都满足)。
-// 超过就回落到列主序路径 —— host 侧负责这个判断。
-//
-// 位精确:读的是同一批字节、加的是同一批定点数、顺序无关,
-// 因此与列主序 kernel 逐位相同。
-#define RM_MAX_FEAT_WORDS 8
-extern "C" __global__ void hist_build_shared_planar32_batched_rm(
-    const uint8_t* bins_rm,
-    const int64_t* gpair,
-    const uint32_t* row_idx,
-    uint32_t n_rows,
-    uint32_t n_feats,
-    const uint32_t* feat_offsets,
-    int64_t* out_hist,
-    uint32_t max_tile_bins,
-    const uint32_t* batch_idx,
-    uint32_t n_nodes,
-    uint32_t hist_stride,
-    // `colsample_bytree`:本列块里被选中的**局部**特征位图。
-    // 行主序一块最多 32 个特征,所以一个 u32 正好装下 —— 不需要额外
-    // buffer,也不改 launch 几何。全 1 = 不采样。
-    //
-    // ⚠️ 这里省的是**计算**(shared 原子加),不是 H2D:块仍然完整常驻,
-    // 整行的 bins 也仍然一次读进寄存器。resident 下**不应该**为采样每棵树
-    // 重新 compact / 上传 —— 那会把行主序常驻的优势直接抵消掉。
-    uint32_t feat_mask) {
-    // One tracked allocation: [blk_ptr(n+1) | node_off(n) | node_len(n)].
-    const uint32_t* blk_ptr = batch_idx;
-    const uint32_t* node_off = batch_idx + n_nodes + 1;
-    const uint32_t* node_len = batch_idx + 2 * n_nodes + 1;
-    extern __shared__ unsigned int fused_hist_rm[];
-    __shared__ uint32_t s_node_rm;
-
-    if (threadIdx.x == 0) {
-        const uint32_t bid = blockIdx.x;
-        uint32_t lo = 0, hi = n_nodes;
-        while (lo + 1 < hi) {
-            const uint32_t mid = (lo + hi) >> 1;
-            if (blk_ptr[mid] <= bid) { lo = mid; } else { hi = mid; }
-        }
-        s_node_rm = lo;
-    }
-    __syncthreads();
-
-    const uint32_t k = s_node_rm;
-    const uint32_t local = blockIdx.x - blk_ptr[k];
-    // 两条 lane 一行,所以一个 block 覆盖 blockDim.x / 2 行。
-    // host 侧的 rows_per_block 必须和这里一致,否则批内节点边界会错位。
-    const uint32_t start = node_off[k] + local * (blockDim.x * ROWS_PER_THREAD);
-    const uint32_t end = node_off[k] + node_len[k];
-    int64_t* out = out_hist + (uint64_t)k * hist_stride;
-
-    // 每线程一行。行主序下这一行的 n_feats 个字节是连续的,按 uint32
-    // 向量读进寄存器 —— 一个线程一次吃满一个 sector。
-    // **两条 lane 负责一行,每条一次 uint4 取 16 B。**
-    //
-    // ⚠️ 上一版是一条 lane 读整行 32 B(两次 uint4),实测 depth 0 的
-    // sector 数**翻倍**(82.0 M → 166.9 M):行主序里相邻行相隔 32 B,
-    // 而一次 uint4 只覆盖 16 B,于是同一个 32 B sector 被取两次,
-    // L1 没能把第二次接住。
-    //
-    // 改成半行/lane 之后:depth 0 上 32 条 lane 覆盖 16 个连续行 ×32 B =
-    // 512 B 连续;深层散列时 lane 2i / 2i+1 读同一行的两半、共享一个
-    // sector。两种情况都是满 sector。
-    // 一条 lane 一行,整行 32 B 用两次 uint4 读进寄存器。
-    //
-    // ⚠️ 试过「两条 lane 一行、各一次 uint4」来修 depth 0 的 sector 翻倍,
-    // **实测 wide 反而慢 22%**:每 block 只覆盖 blockDim.x/2 = 256 行,
-    // 而列主序 R=4 覆盖 2048 行 —— shared 的 init/flush 因此多做 8 倍,
-    // 远超省下来的那点取数。教训是 coalescing 和 init/flush 摊薄在这里
-    // 是**互相拉扯**的,不能只优化一边。
-    // **每线程 4 行,和列主序 R=4 完全一致** —— 于是每 block 覆盖的行数、
-    // shared 的 init/flush 次数、barrier 次数都和参照臂一模一样,
-    // 两条路径**只剩布局和取数方式的差别**。
-    //
-    // R=1 那一版每 block 只覆盖 blockDim.x 行,init/flush 要多做 4 倍;
-    // 实测深层快 2.27× 却被浅层和这笔固定开销吃回去,整轮只有 −1.8%。
-    unsigned int g_lo[ROWS_PER_THREAD], g_hi[ROWS_PER_THREAD];
-    unsigned int h_lo[ROWS_PER_THREAD], h_hi[ROWS_PER_THREAD];
-    uint32_t feat_words[ROWS_PER_THREAD][RM_MAX_FEAT_WORDS];
-    bool ok[ROWS_PER_THREAD];
-#pragma unroll
-    for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-        const uint32_t sel = start + threadIdx.x + (uint32_t)r * blockDim.x;
-        ok[r] = sel < end;
-        g_lo[r] = 0; g_hi[r] = 0; h_lo[r] = 0; h_hi[r] = 0;
-#pragma unroll
-        for (int w = 0; w < RM_MAX_FEAT_WORDS; ++w) { feat_words[r][w] = 0xFFFFFFFFu; }
-        if (ok[r]) {
-            uint32_t row = row_idx == nullptr ? sel : row_idx[sel];
-            const uint32_t orig_row = row;
-            const unsigned long long gr =
-                static_cast<unsigned long long>(gpair[(uint64_t)orig_row * 2]);
-            const unsigned long long hr =
-                static_cast<unsigned long long>(gpair[(uint64_t)orig_row * 2 + 1]);
-            g_lo[r] = static_cast<unsigned int>(gr);
-            g_hi[r] = static_cast<unsigned int>(gr >> 32);
-            h_lo[r] = static_cast<unsigned int>(hr);
-            h_hi[r] = static_cast<unsigned int>(hr >> 32);
-            // `row` 此时是压实下标(未压实时就是原始行号)。
-            const uint8_t* rowp = bins_rm + (uint64_t)row * n_feats;
-            // 取数分三档,按对齐能力**逐级降级**。
-            //
-            // ⚠️ 只有 uint4 一条快路的话,`n_feats % 16 != 0` 会整个掉进
-            // 逐字节循环 —— HIGGS 是 28 列,于是每行 28 次单字节取数,
-            // **实测整轮回退 32~45%**。宽表(32 列)看不到这个坑,
-            // 因为它正好整除。
-            //
-            // 对齐前提:行首偏移是 `row * n_feats`,所以
-            // `n_feats % 16 == 0` 才能保证 16 B 对齐,`n_feats % 4 == 0`
-            // 保证 4 B 对齐。不满足就只能按字节。
-            if ((n_feats & 15u) == 0u && (((uintptr_t)rowp & 15u) == 0u)) {
-                const uint4* v4 = reinterpret_cast<const uint4*>(rowp);
-                const uint32_t n4 = n_feats >> 4;
-#pragma unroll
-                for (uint32_t q = 0; q < (RM_MAX_FEAT_WORDS >> 2); ++q) {
-                    if (q < n4) {
-                        const uint4 v = v4[q];
-                        feat_words[r][q * 4 + 0] = v.x; feat_words[r][q * 4 + 1] = v.y;
-                        feat_words[r][q * 4 + 2] = v.z; feat_words[r][q * 4 + 3] = v.w;
-                    }
-                }
-            } else if ((n_feats & 3u) == 0u && (((uintptr_t)rowp & 3u) == 0u)) {
-                const uint32_t* v1 = reinterpret_cast<const uint32_t*>(rowp);
-                const uint32_t nw = n_feats >> 2;
-#pragma unroll
-                for (uint32_t q = 0; q < RM_MAX_FEAT_WORDS; ++q) {
-                    if (q < nw) { feat_words[r][q] = v1[q]; }
-                }
-            } else {
-                for (uint32_t j = 0; j < n_feats; ++j) {
-                    feat_words[r][j >> 2] =
-                        (feat_words[r][j >> 2] & ~(0xFFu << ((j & 3u) * 8u)))
-                        | ((uint32_t)rowp[j] << ((j & 3u) * 8u));
-                }
-            }
-        }
-    }
-
-    uint32_t f0 = 0;
-    while (f0 < n_feats) {
-        const uint32_t hist_begin = feat_offsets[f0];
-        uint32_t f1 = f0;
-        while (f1 < n_feats && feat_offsets[f1 + 1] - hist_begin <= max_tile_bins) { ++f1; }
-        const uint32_t n_slots = feat_offsets[f1] - hist_begin;
-
-        // 整个 tile 都没有选中的特征就**彻底跳过** —— 连 shared 的清零和
-        // flush 都不做。只屏蔽原子加是不够的:flush 仍会把整块零写回
-        // global,而 `colsample` 越小,这部分零就越多。
-        //
-        // `feat_mask`、`f0`、`f1` 在整个 block 内一致,所以这个分支是
-        // block-uniform 的,跳过 `__syncthreads()` 是安全的。
-        // 跳过的 tile 在 out_hist 里保持调用方 memset 出来的 0,而枚举侧
-        // 本来就不看这些特征。
-        const uint32_t tile_bits = (f1 - f0 >= 32u)
-            ? 0xFFFFFFFFu
-            : (((1u << (f1 - f0)) - 1u) << f0);
-        if ((feat_mask & tile_bits) == 0u) {
-            f0 = f1;
-            continue;
-        }
-
-        unsigned int* grad_lo = fused_hist_rm;
-        unsigned int* grad_hi = fused_hist_rm + n_slots;
-        unsigned int* hess_lo = fused_hist_rm + (uint64_t)n_slots * 2;
-        unsigned int* hess_hi = fused_hist_rm + (uint64_t)n_slots * 3;
-
-        for (uint32_t word = threadIdx.x; word < n_slots * 4; word += blockDim.x) {
-            fused_hist_rm[word] = 0;
-        }
-        __syncthreads();
-
-        for (uint32_t feat = f0; feat < f1; ++feat) {
-            if (((feat_mask >> feat) & 1u) == 0u) { continue; }
-            const uint32_t off = feat_offsets[feat] - hist_begin;
-#pragma unroll
-            for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-                if (!ok[r]) { continue; }
-                const uint32_t bin =
-                    (feat_words[r][feat >> 2] >> ((feat & 3u) * 8u)) & 0xFFu;
-                if (bin == 255u) { continue; }
-                const uint32_t s = off + bin;
-                const unsigned int go = atomicAdd(&grad_lo[s], g_lo[r]);
-                atomicAdd(&grad_hi[s], g_hi[r] + ((go > (0xFFFFFFFFu - g_lo[r])) ? 1u : 0u));
-                const unsigned int ho = atomicAdd(&hess_lo[s], h_lo[r]);
-                atomicAdd(&hess_hi[s], h_hi[r] + ((ho > (0xFFFFFFFFu - h_lo[r])) ? 1u : 0u));
-            }
-        }
-        __syncthreads();
-
-        const uint32_t out_words = n_slots * 2;
-        for (uint32_t word = threadIdx.x; word < out_words; word += blockDim.x) {
-            const uint32_t s = word >> 1;
-            const bool is_hess = (word & 1) != 0;
-            const unsigned int lo = is_hess ? hess_lo[s] : grad_lo[s];
-            const unsigned int hi = is_hess ? hess_hi[s] : grad_hi[s];
-            const unsigned long long v = ((unsigned long long)hi << 32) | (unsigned long long)lo;
-            atomicAdd(reinterpret_cast<unsigned long long*>(out) + (uint64_t)hist_begin * 2 + word, v);
-        }
-        __syncthreads();
-
-        f0 = f1;
-    }
-}
-
-
-// XGBoost 式 **flattened (row × feature)** 映射,跑在行主序 bins 上。
-//
-// **和 R=4 行主序的区别只有一个:warp 内先走 feature 维,不是 row 维。**
-//
-// R=4 行主序里一条 lane 管一整行,于是一个 warp 同时追 **32 个离散 row**
-// —— 它修好了「每个 sector 只用 1 B」,却没修「一个 warp 摸 32 个地址」。
-// 实测:wide(32 列,整除 16)−15%,但 HIGGS(28 列)**回退 32~45%**。
-//
-// flattened 之后 `linear = row_slot * gf + feature`,连续 lane 先变 feature:
-// `gf = 8` 时一个 warp 覆盖 **4 行 × 8 特征**,每行 8 个连续字节 ——
-// 一个 warp 只摸 4 个地址,而不是 32 个。离散 row 只决定这一小段连续
-// 读取的基址。
-//
-// feature group 放到 **blockIdx.y**,不再在 block 内顺序扫 tile ——
-// 深层 row 数下降时,feature 维仍然提供并行度。
-//
-// 位精确:仍是同一批定点数按模 2^64 相加,顺序无关。
-#define FLAT_ROWS_PER_BLOCK 512u
 // `gpu_math = "fast"` 专用:prediction apply + objective gradient 全部留在
 // device 上,于是每轮消掉 prediction D2H(4 B/行)、host 的按行 gradient
 // 扫描,以及 gpair H2D(8 B/行)。
@@ -1782,7 +1511,7 @@ __device__ __forceinline__ void hist_batched_body(
     uint32_t hist_stride,
     const uint32_t* feature_select,
     uint32_t selection_active) {
-    // Match the row-major ABI and retain one safe dependency per allocation.
+    // Use the packed node-index ABI and retain one safe dependency per allocation.
     const uint32_t* blk_ptr = batch_idx;
     const uint32_t* node_off = batch_idx + n_nodes + 1;
     const uint32_t* node_len = batch_idx + 2 * n_nodes + 1;
@@ -2298,7 +2027,7 @@ __device__ __forceinline__ uint32_t partition_batch_node(
 
 extern "C" __global__ void partition_count_batched(
     const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
-    uint32_t nodes, uint32_t n_rows, uint32_t row_major,
+    uint32_t nodes, uint32_t n_rows,
     uint8_t* flags, uint32_t* counts) {
     const uint32_t node = partition_batch_node(descriptors, nodes, blockIdx.x);
     const uint32_t* d = descriptors + node * PART_DESC_WORDS;
@@ -2307,11 +2036,9 @@ extern "C" __global__ void partition_count_batched(
     uint32_t left = 0;
     if (idx < d[1]) {
         const uint8_t* bins = (const uint8_t*)blocks.base[d[10]];
-        const uint32_t n_feats = blocks.n_feats[d[10]];
         const uint32_t arena = d[0] + idx;
         const uint32_t row = rows[arena];
-        const uint64_t address = row_major ? (uint64_t)row * n_feats + d[2]
-                                          : (uint64_t)d[2] * n_rows + row;
+        const uint64_t address = (uint64_t)d[2] * n_rows + row;
         const uint8_t bin = bins[address];
         left = bin == UINT8_MAX ? d[4] : (uint32_t)(bin < d[3]);
         flags[arena] = (uint8_t)left;
@@ -2326,9 +2053,8 @@ extern "C" __global__ void partition_count_batched(
     if (threadIdx.x == 0) counts[blockIdx.x] = sums[0];
 }
 
-// `partition_count_batched` over resident 16-bit blocks (column-major only:
-// 16-bit blocks never take the device row-major layout). A batch holds blocks
-// of one width; the host launches 8-bit and 16-bit nodes as separate batches.
+// `partition_count_batched` over resident column-major 16-bit blocks. A batch
+// holds one width; the host launches U8 and U16 nodes separately.
 extern "C" __global__ void partition_count_batched_u16(
     const PartBlocks blocks, const uint32_t* rows, const uint32_t* descriptors,
     uint32_t nodes, uint32_t n_rows, uint8_t* flags, uint32_t* counts) {
@@ -2393,54 +2119,6 @@ extern "C" __global__ void partition_scatter_batched(
         next_rows[d[7] + dst] = rows[d[0] + idx];
     }
 }
-
-// 行主序下的 partition 分类:**直接按 active row 取 split feature**,
-// 不再物化整列。
-//
-// ⚠️ 上一版为了不改 partition,先把整列 gather 进 `part_col`
-// (每个 split feature、每层一次,每次扫满 n_rows)。nsys 实测那个
-// gather 占 **GPU 总时间的 43.3%(HIGGS 34.5 ms/轮)**,比 histogram
-// kernel 本身还大,把行主序省下的 9 ms 吃干净还倒欠 —— 而且它落在所有
-// `FB_PROFILE` 计时段之外,表面上完全看不出来。
-//
-// 这里的代价改成**只随 active row 走**,不再是
-// `n_rows × 不同 split feature 数`。
-//
-// 除了取 bin 的地址算法,其余(missing 路由、flags 语义、block 局部
-// 归约)与 `partition_count` **逐字相同**,所以稳定分区的行顺序契约不变。
-extern "C" __global__ void partition_count_rm(
-    const uint8_t* __restrict__ bins_rm,
-    uint32_t n_feats,
-    uint32_t feat,
-    const uint32_t* rows,
-    uint32_t n_selected,
-    uint32_t split_bin,
-    uint32_t missing_left,
-    uint8_t* flags,
-    uint32_t* block_left_counts,
-    const uint32_t* cat_mask) {
-    extern __shared__ uint32_t counts_rm[];
-    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t left = 0;
-    if (idx < n_selected) {
-        const uint32_t row = rows[idx];
-        const uint8_t bin = bins_rm[(uint64_t)row * n_feats + feat];
-        left = partition_goes_left(bin, split_bin, missing_left, cat_mask);
-        flags[idx] = (uint8_t)left;
-    }
-    counts_rm[threadIdx.x] = left;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            counts_rm[threadIdx.x] += counts_rm[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        block_left_counts[blockIdx.x] = counts_rm[0];
-    }
-}
-
 
 extern "C" __global__ void partition_scatter(
     const uint32_t* rows,

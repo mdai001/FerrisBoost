@@ -1608,7 +1608,7 @@ memory budget, without manual chunk or batch tuning:
   by default and included in the GPU memory plan. Cache overflow and pure
   streaming use the exact host fallback. This is managed internally and is not
   a public Python parameter.
-- **`hist_streams`**: Defaults to automatic (`None`), resolved by the GPU planner based on execution path, block width, and VRAM budget (selects 2 streams for chunked row-major streaming when memory allows, and 1 stream for resident or column-major paths); can be explicitly set to `1` or `2`.
+- **`hist_streams`**: Defaults to automatic (`None`); the GPU planner resolves the stream count from the execution path, block width, and VRAM budget. The current column-major path uses one stream by default; set `1` or `2` to override it.
 - **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU scaling is in progress (WIP).
 - **`max_depth`**: Depth-wise tree growth on GPU is constrained to `0..=14` by partition buffer limits.
 
