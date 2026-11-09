@@ -942,6 +942,9 @@ but not byte-identical to the CPU (the same caveat as fast ranking in general).
 Every round it makes two passes over the pairs, the first finding the exact
 maximum of what will be added so the fixed-point scale fits the bias-divided
 gradients, and a gradient or statistic that is not finite is an error.
+In fast unbiased ranking, a sigmoid that rounds to 1 uses a minimum
+`1 - sigmoid` of `2^-24` when estimating position bias. This keeps that cost
+finite; saturated scores can therefore differ from XGBoost and exact mode.
 
 **Metrics.** `ndcg`, `map` and `pre`, with XGBoost's syntax and values: `ndcg@k`
 and `map@k` truncate at `k`, a trailing `-` (`ndcg-`, `ndcg@5-`) scores a group
