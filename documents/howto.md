@@ -837,7 +837,8 @@ appeared in training is "not in any set" and goes to the left child, as it does
 in XGBoost. Named validation data (pandas, PyArrow, Parquet string
 dictionaries, CSV text columns) is first re-coded by value onto the training
 categories, and a category the training data did not have raises `ValueError`
-(see *Named categories*).
+(see *Named categories*). The rules for every input type are in
+[How categorical input is coded](#how-categorical-input-is-coded).
 
 ### Named categories
 
@@ -862,8 +863,11 @@ layout, and every later read re-codes by **value**:
   and CSV files with the stored lists, so their categories may be listed in any
   order or be a subset. String and integer categories do not mix: the category
   data type must match the training data. NumPy input is taken as integer
-  codes. A model without stored lists (trained on integer codes) scores the
-  codes of a DataFrame or table as they are, as before.
+  codes. A feature without a stored list (trained on integer codes) takes
+  integer values as its codes, including an Arrow table's integer dictionary
+  values, and a pandas category or Arrow string dictionary by its codes. The
+  full rules per input type are in
+  [How categorical input is coded](#how-categorical-input-is-coded).
 - **Unseen categories raise `ValueError`**, as in XGBoost: a validation or
   prediction row holding a category the model does not know is an error, not a
   silent left turn. The message names the column and the value, for example
@@ -925,12 +929,13 @@ model.get_categories()  # [['Oslo', 'Lima', ...], None]
 
 #### Integer dictionaries: Arrow tables and Parquet files
 
-An integer dictionary column means different things in memory and in a file:
+An integer dictionary column trains differently in memory and in a file, but
+is scored the same way:
 
-| Input | Category list stored in the model | Codes trained on |
-|---|---|---|
-| PyArrow table / record batch, integer dictionary | the dictionary values in dictionary order (chunks are unified first: the first chunk's dictionary, then values new in later chunks), with the dictionary's integer type, like a pandas integer category | dictionary indices |
-| Parquet file, integer dictionary | none (no `cats`) | the dictionary **values**, which must be codes in `0..=65533` |
+| Input | Category list stored in the model | Codes trained on | Read by a model without a list for the feature |
+|---|---|---|---|
+| PyArrow table / record batch, integer dictionary | the dictionary values in dictionary order (chunks are unified first: the first chunk's dictionary, then values new in later chunks), with the dictionary's integer type, like a pandas integer category | dictionary indices | the dictionary **values** |
+| Parquet file, integer dictionary | none (no `cats`) | the dictionary **values**, which must be codes in `0..=65533` | the dictionary **values** |
 
 - An Arrow table's integer dictionary is a named categorical feature: later
   input is re-coded by value, so `[40, 3, 17]` and `[3, 17, 40]` dictionaries
@@ -944,11 +949,16 @@ An integer dictionary column means different things in memory and in a file:
   list is its (unified) dictionary order, a Parquet file's list is the order of
   first appearance in the rows. Either way the codes are consistent and later
   input is re-coded by value.
-- Prediction re-codes integer dictionaries (and plain integer columns of
-  files) by value only when the model has integer categories. A model without
-  lists takes a Parquet dictionary's values as codes, but an Arrow table's
-  dictionary **indices** as codes, so score a model trained from a Parquet
-  integer dictionary with Parquet files or with plain integer codes.
+- Prediction and validation re-code integer dictionaries by value when the
+  model has integer categories for the feature. Without a list (a model
+  trained on integer codes, NumPy codes or a Parquet integer dictionary), an
+  Arrow table's integer dictionary is read by its **values**, exactly as the
+  same column in a Parquet file: `[30, 10, 20]` and `[10, 20, 30]`
+  dictionaries, any chunking, the Parquet file and the plain codes all score
+  alike. The values are taken as codes under the usual prediction rules (a
+  null index or entry is missing; a negative value, or one the feature never
+  had in training, goes left at a categorical split). A string dictionary has
+  no values such a model could look up and is read by its indices.
 
 Split search follows XGBoost:
 
@@ -1253,9 +1263,13 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   [Missing values](#missing-values-and-the-missing-sentinel) for the rules.
 - Categorical features: `enable_categorical`, `feature_types`,
   `max_cat_to_onehot`, and `max_cat_threshold` are constructor parameters that
-  go to `ferrisboost.train`. pandas `category` columns work in `fit`,
-  `predict`, `predict_proba`, and `apply`, with `feature_names_in_` set as for
-  any frame; with `enable_categorical=False` such a column raises
+  go to `ferrisboost.train`. pandas `category` columns and PyArrow dictionary
+  columns work in `fit`, `eval_set`, `predict`, `predict_proba`, and `apply`,
+  with `feature_names_in_` set as for any frame, and are coded as
+  `ferrisboost.train` and `Model.predict` code them (see
+  [How categorical input is coded](#how-categorical-input-is-coded); a model
+  fitted on plain arrays reads an Arrow integer dictionary by its values);
+  with `enable_categorical=False` such a column in `fit` raises
   `ValueError`. The training categories are stored in the booster and later
   frames are re-coded by value, so a different category order is harmless; a
   category unseen in training raises `ValueError`, as in XGBoost. A model
@@ -1698,7 +1712,7 @@ always included. It works for arrays, files, and `predict_to_parquet`, and
 cannot be combined with `n_trees`. With `begin > 0` the call scores a copy of
 the selected trees, so repeated calls with a nonzero `begin` are best batched.
 
-C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become their category codes; see the Categorical section). For a model trained on named columns (a DataFrame, a PyArrow table, Parquet, or a CSV with a header), their columns are matched to the model's features by name: order does not matter, extra columns are ignored, and a missing one is an error. This also applies to the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`).
+C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become the model's category codes; see [How categorical input is coded](#how-categorical-input-is-coded)). For a model trained on named columns (a DataFrame, a PyArrow table, Parquet, or a CSV with a header), their columns are matched to the model's features by name: order does not matter, extra columns are ignored, and a missing one is an error. This also applies to the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`).
 
 For GPU prediction, the first eligible call includes CUDA context initialization and one model upload; subsequent calls reuse the cached model. Staging memory remains per-call and bounded to available VRAM. GPU 0 is the only inference target in this version; multi-GPU prediction is intentionally not enabled.
 
@@ -1711,6 +1725,41 @@ print(model.best_iteration)
 print(model.best_score)
 print(model.evals_result())
 ```
+
+### How categorical input is coded
+
+Prediction (`predict` with every option, `predict_to_parquet`, CPU or GPU),
+validation sets (`evals`, `eval_set`) and the scikit-learn estimators'
+`predict`, `predict_proba` and `apply` turn a categorical feature's input into
+the model's category codes by the same rules. What applies depends on whether
+the model stores a category list for the feature (`Model.get_categories()`):
+
+| Input for a categorical feature | Feature with string categories | Feature with integer categories | Feature without a list |
+|---|---|---|---|
+| NumPy array | codes as given | codes as given | codes as given |
+| pandas `category` column | re-coded by value | re-coded by value | the column's codes (positions in its categories), string or integer categories |
+| PyArrow string dictionary | re-coded by value | `ValueError` (type mismatch) | the dictionary indices |
+| PyArrow integer dictionary | `ValueError` (type mismatch) | re-coded by value | the dictionary **values** as codes |
+| pandas / PyArrow numeric column | codes as given | codes as given | codes as given |
+| Parquet string dictionary or string column | re-coded by value | `ValueError` (type mismatch) | `ValueError` |
+| Parquet integer dictionary | `ValueError` (type mismatch) | re-coded by value | the dictionary **values** as codes |
+| Parquet plain integer column | codes as given | looked up **by value** | codes as given |
+| CSV column | read as text and re-coded by value (`1` is the category `"1"`) | integers looked up **by value** | integers as codes; text raises `ValueError` |
+
+- **Re-coded / looked up by value**: the value's position in the model's list
+  is the code, so input may list its categories in any order or a subset. A
+  category not in the list raises `ValueError`, as in XGBoost; a missing value
+  (null, `NaN`, an empty CSV field) stays missing.
+- **Codes**: integers `0..` taken as the category codes the model was trained
+  on. A null or `NaN` is missing; a negative value, a value the feature never
+  had in training, or a value at or above 2^24 goes left at a categorical
+  split, and a fractional value is truncated toward zero. An Arrow integer
+  dictionary on a feature without a list is read exactly like the same column
+  in a Parquet file, so dictionary order and chunking do not matter.
+- The `missing` sentinel applies to the codes (after decoding a dictionary).
+- A model with integer categories looks up plain integers **in files** by
+  value (CSV integers, plain Parquet integer columns), not as codes; numeric
+  columns of an in-memory DataFrame or table and NumPy arrays are codes.
 
 ## Feature importance, SHAP values, and leaf indices
 
@@ -1887,7 +1936,7 @@ Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), e
 - `init_model` (alias `xgb_model`): a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-init_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
-Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
+Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction) (categorical input: [How categorical input is coded](#how-categorical-input-is-coded)), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
 ## Common errors
 

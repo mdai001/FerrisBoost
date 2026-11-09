@@ -704,6 +704,7 @@ def _table_matrix(
     enable_categorical: bool,
     ref_levels: dict | None = None,
     what: str = "data",
+    scoring: bool = False,
 ) -> tuple[np.ndarray, list[str], list[bool], dict]:
     """pyarrow Table -> (f32 matrix, names, categorical flags, levels).
 
@@ -712,6 +713,11 @@ def _table_matrix(
     dictionary as `(kind, values)`. `order` binds columns by name to a training
     table; `ref_levels` re-codes dictionary columns by value the way
     `_frame_matrix` does.
+
+    `scoring` (prediction and validation data) fixes the categories: a column
+    without a reference list keeps them as the model has them, so an integer
+    dictionary yields its values (the codes, as a Parquet file's dictionary
+    does) and a string dictionary its indices. Missing entries become NaN.
     """
     import pyarrow as pa
 
@@ -732,6 +738,19 @@ def _table_matrix(
     cols, flags, levels = [], [], {}
     for i, name in enumerate(names):
         col = table.column(name)
+        ref = _as_ref(ref_levels.get(i)) if ref_levels else None
+        if (pa.types.is_dictionary(col.type) and ref is None and scoring
+                and pa.types.is_integer(col.type.value_type)):
+            # No list to re-code onto: the dictionary values are the codes,
+            # read exactly as from a Parquet file (int -> f64 -> f32, a null
+            # index or entry is missing). Range checks are the prediction's.
+            values = pa.chunked_array(
+                [c.dictionary_decode() for c in col.chunks], col.type.value_type
+            ).cast(pa.float64())
+            cols.append(np.asarray(values.to_numpy(zero_copy_only=False), np.float64)
+                        .astype(np.float32))
+            flags.append(True)
+            continue
         if pa.types.is_dictionary(col.type):
             if not enable_categorical:
                 raise ValueError(
@@ -747,7 +766,6 @@ def _table_matrix(
                 [np.asarray(c.indices.cast(pa.int64()).fill_null(-1).to_numpy(zero_copy_only=False),
                             np.int64) for c in chunks]
             ) if chunks else np.empty(0, np.int64)
-            ref = _as_ref(ref_levels.get(i)) if ref_levels else None
             if ref is not None:
                 kind, values = _arrow_category_values(dictionary, where)
                 codes = _apply_map(_recode_map(ref, kind, values, where), codes, values, where)
@@ -825,7 +843,7 @@ def _as_predict_matrix(
                 raise ValueError(f"predict data is missing the model's feature columns {absent}")
             table = table.select(list(names))
         return _table_matrix(table, list(names) if names else None, True, refs,
-                             what="predict data")[0]
+                             what="predict data", scoring=True)[0]
     raise ValueError(
         "predict accepts file paths (single / list / directory / glob), a 2-D f32 numpy array, "
         "a pandas DataFrame or a pyarrow Table"
@@ -1208,7 +1226,7 @@ def train(
             et = _arrow_table(ed)
             if et is not None:
                 # 训练集也有列名时按列名绑定;否则(numpy 训练集)只能按位置。
-                ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]")[0]
+                ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]", scoring=True)[0]
             elif _is_pandas_frame(ed):
                 if names is not None:
                     missing = [n for n in names if n not in [str(c) for c in ed.columns]]

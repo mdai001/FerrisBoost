@@ -88,8 +88,8 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import (Model, _categories_wire, _frame_matrix, _is_pandas_frame, _load_prior,
-               _model_refs, train)
+from . import (Model, _arrow_table, _categories_wire, _frame_matrix, _is_pandas_frame,
+               _load_prior, _model_refs, _table_matrix, train)
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 
@@ -154,6 +154,18 @@ def _has_category_column(frame: Any) -> bool:
     import pandas as pd
 
     return any(isinstance(dt, pd.CategoricalDtype) for dt in frame.dtypes)
+
+
+def _dictionary_table(X: Any) -> Any:
+    """A PyArrow Table / RecordBatch with a dictionary column, else None."""
+    if _is_pandas_frame(X) or not hasattr(X, "column_names"):  # not a stream reader either
+        return None
+    table = _arrow_table(X)
+    if table is None:
+        return None
+    import pyarrow as pa
+
+    return table if any(pa.types.is_dictionary(t) for t in table.schema.types) else None
 
 
 def _seed_of(random_state: Any) -> int | None:
@@ -299,12 +311,13 @@ class _FerrisBoostBase(BaseEstimator):
         (None when the frame has no category column). Training stores the
         categories (in the booster too); later calls re-code onto them by
         value. A continued model (`prior`) codes the training frame with its
-        own categories.
+        own categories. PyArrow tables with dictionary columns are coded as
+        `ferrisboost.train` and `Model.predict` code them (an integer
+        dictionary of a feature without categories is read by its values).
         """
         flags = None
-        if _is_pandas_frame(X) and _has_category_column(X):
-            import pandas as pd
-
+        table = _dictionary_table(X)
+        if table is not None or (_is_pandas_frame(X) and _has_category_column(X)):
             if reset:
                 if hasattr(prior, "get_booster"):
                     prior = prior.get_booster()
@@ -314,13 +327,23 @@ class _FerrisBoostBase(BaseEstimator):
                 # booster exists); a loaded model brings its own.
                 levels = getattr(self, "_cat_levels_", None) or _model_refs(
                     getattr(self, "_Booster", None))
-            matrix, _, flag_list, new_levels = _frame_matrix(
-                X, bool(self.enable_categorical), levels, "X"
-            )
+            if table is not None:
+                import pyarrow as pa
+
+                matrix, names, flag_list, new_levels = _table_matrix(
+                    table, None, bool(self.enable_categorical), levels, "X", scoring=not reset
+                )
+                X = pa.table({n: matrix[:, i] for i, n in enumerate(names)})
+            else:
+                import pandas as pd
+
+                matrix, _, flag_list, new_levels = _frame_matrix(
+                    X, bool(self.enable_categorical), levels, "X"
+                )
+                # A numeric stand-in with the same labels: sklearn then sets
+                # `n_features_in_` / `feature_names_in_` exactly as for any frame.
+                X = pd.DataFrame(matrix, columns=X.columns, index=X.index)
             flags = ["c" if f else "q" for f in flag_list]
-            # A numeric stand-in with the same labels: sklearn then sets
-            # `n_features_in_` / `feature_names_in_` exactly as for any frame.
-            X = pd.DataFrame(matrix, columns=X.columns, index=X.index)
             new = new_levels if reset else None
         else:
             new = {} if reset else None
