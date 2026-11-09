@@ -390,11 +390,12 @@ def test_csv_and_multi_file_parquet_stream_like_a_single_parquet(tmp_path, capfd
     table.to_pandas().to_csv(csv, index=False, na_rep="")
     for src in (str(parts), csv):
         assert _bytes(fb.train(p, src, quiet=True, **kw), tmp_path, "cpu_src") == ref
+        # The quantized cache (and its cache_budget_bytes spill) is single-file
+        # Parquet only; these inputs are held quantized in memory.
         for resident in (total, 1, 0):
-            for spill in ({}, {"cache_budget_bytes": 0}):
-                model, info = _gpu(capfd, {**p, **spill}, src, kw, resident_blocks=resident)
-                _check_plan(info, "row_major", resident, total)
-                assert _bytes(model, tmp_path, "gpu") == ref, (src, resident, spill)
+            model, info = _gpu(capfd, p, src, kw, resident_blocks=resident)
+            _check_plan(info, "row_major", resident, total)
+            assert _bytes(model, tmp_path, "gpu") == ref, (src, resident)
 
 
 @cuda

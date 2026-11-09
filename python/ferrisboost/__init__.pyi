@@ -142,5 +142,9 @@ def train(
     categorical columns. The model does not store it (XGBoost does not either):
     pass the same `missing` to Model.predict / predict_to_parquet. A quantized
     cache_path is only reused with the same `missing`.
+
+    params["cache_path"] and params["cache_budget_bytes"] apply only to training
+    on a single Parquet file; several files, CSV and in-memory data raise
+    ValueError instead of ignoring them.
     """
     ...

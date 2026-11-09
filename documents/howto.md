@@ -1451,6 +1451,18 @@ rather than silently reused.
 `cache_path` applies only to the training set. Validation sets reuse the
 training cuts but do not share the training cache directory.
 
+Which inputs use the cache:
+
+| Training input | `cache_path` / `cache_budget_bytes` |
+|---|---|
+| One Parquet file (also a directory or glob that matches exactly one file), CPU or GPU, with or without validation sets or `init_model` | Supported |
+| Several Parquet files (a list, directory, or glob) | `ValueError`: merge them into one file or drop the option |
+| CSV (one or several files, with or without a header) | `ValueError`: convert the data to one Parquet file or drop the option |
+| numpy, pandas, PyArrow `Table` / `RecordBatch` / `RecordBatchReader` | `ValueError`: write the data to one Parquet file or drop the option |
+
+The scikit-learn estimators train on in-memory data and do not take these
+options. Several Parquet files and CSV are quantized once and held in memory.
+
 ## Train from PyArrow
 
 PyArrow `Table`, `RecordBatch`, and `RecordBatchReader` inputs are accepted with labels supplied
@@ -1844,8 +1856,8 @@ empty `evals_result()`.
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
 | `seed` | `0` | Alias: `random_state` |
 | `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
-| `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget |
-| `cache_path` | `None` | Persistent Parquet cache directory |
+| `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
+| `cache_path` | `None` | Persistent Parquet cache directory; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 | `missing` | `NaN` | Feature value treated exactly like `NaN` (XGBoost's `DMatrix` `missing`), in training, validation, and prediction. Finite `float32` or `NaN`; `inf` and `float32` max are rejected. Not stored in the model: pass the same `missing` to `predict`. See [Missing values](#missing-values-and-the-missing-sentinel) |
@@ -2020,6 +2032,13 @@ matrix there.
 `iteration_range=(begin, end)` counts boosting rounds. It raises `ValueError`
 when `end` is beyond the model's rounds, when `begin > end`, or when `n_trees`
 is also given.
+
+### `cache_path` supports a single Parquet file
+
+The quantized cache is built only when training on one Parquet file. With
+several Parquet files, CSV, or in-memory data, `cache_path` and
+`cache_budget_bytes` would have no effect, so they raise instead of being
+ignored. Merge the files into one Parquet file, or drop the option.
 
 ### A persistent cache is rejected with a `missing` message
 
