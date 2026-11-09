@@ -924,7 +924,10 @@ sampled after the group gradients are computed.
 With `lambdarank_pair_method="mean"` the sampled pairs come from XGBoost's
 generator (one draw of the training `std::mt19937` per round, `seed` selects
 the stream), so models match XGBoost's on losslessly binned data when
-`subsample` and `colsample_*` are 1.
+`subsample` and `colsample_*` are 1. The integer sampling adapter follows the
+native XGBoost platform (libstdc++ on Linux, MSVC STL on Windows), so `mean`
+training can produce different models across operating systems. Saved models
+remain portable; CPU and GPU exact remain byte-identical on each platform.
 
 **Unbiased learning to rank.** With `lambdarank_unbiased=True` the rows of a
 query group are taken to be in the order the documents were **displayed**, and

@@ -419,9 +419,8 @@ def test_streaming_multi_output_parquet_single_row_and_headerless_csv(tmp_path):
 
 
 def test_streaming_multi_output_parquet_memory_is_bounded(tmp_path):
-    # The output of 3M rows x 8 outputs is 96 MB per copy (the in-memory 0.0.6 path grew
-    # the peak RSS by about 60 MB here, streaming by about 0). Building it in memory needs
-    # several copies. The streaming path must stay far below that, whatever the row count.
+    # A full 3M-row x 8-output result needs 96 MB per copy. After warming fixed
+    # buffers, tripling the rows must add less than 30 MiB to the peak RSS.
     import subprocess
     import sys
     import textwrap
@@ -438,19 +437,71 @@ def test_streaming_multi_output_parquet_memory_is_bounded(tmp_path):
     src = str(tmp_path / "big.parquet")
     pq.write_table(pa.table({f"f{i}": big[:, i] for i in range(big.shape[1])}), src,
                    row_group_size=100_000)
+    # Warm the same writer/prediction path at 1M rows, then measure growth from 1M to 3M.
+    # This excludes first-use staging and fixed setup while retaining the row-scaling check.
+    warm_rows = 1_000_000
+    warm_src = str(tmp_path / "warm.parquet")
+    pq.write_table(pa.table({f"f{i}": big[:warm_rows, i] for i in range(big.shape[1])}),
+                   warm_src, row_group_size=100_000)
     del big
     code = textwrap.dedent(f"""
-        import resource, ferrisboost as fb
+        import sys, ferrisboost as fb
+
+        def peak_rss_bytes():
+            if sys.platform == "win32":
+                import ctypes
+                from ctypes import wintypes
+
+                class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                    _fields_ = [
+                        ("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t),
+                    ]
+
+                psapi = ctypes.WinDLL("psapi", use_last_error=True)
+                get_memory = psapi.GetProcessMemoryInfo
+                get_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+                get_memory.restype = wintypes.BOOL
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+                counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(counters)
+                if not get_memory(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                return counters.PeakWorkingSetSize
+
+            import resource
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # Linux reports KiB; macOS reports bytes.
+            return peak if sys.platform == "darwin" else peak * 1024
+
         m = fb.Model.load_model({model_path!r}, quiet=True)
-        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        warm_n = m.predict_to_parquet({warm_src!r}, {str(tmp_path / "warm-out.parquet")!r})
+        if warm_n != {warm_rows}:
+            raise RuntimeError(f"warmup wrote {{warm_n}} rows, expected {warm_rows}")
+        before = peak_rss_bytes()
         n = m.predict_to_parquet({src!r}, {str(tmp_path / "o.parquet")!r})
-        after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        print(n, (after - before) // 1024)
+        after = peak_rss_bytes()
+        print(n, (after - before) // (1024 * 1024))
     """)
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    rows, growth_mb = map(int, out.stdout.split())
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, (
+        f"child exited {out.returncode}; stdout:\n{out.stdout}\nstderr:\n{out.stderr}"
+    )
+    try:
+        rows, growth_mb = map(int, out.stdout.split())
+    except ValueError as exc:
+        pytest.fail(f"could not parse child output {out.stdout!r}: {exc}; stderr:\n{out.stderr}")
     assert rows == n_rows
-    assert growth_mb < 30, f"peak RSS grew by {growth_mb} MB"
+    assert growth_mb < 30, f"peak RSS grew by {growth_mb} MB; child stderr:\n{out.stderr}"
 
 
 @pytest.mark.parametrize("objective, k", [("multi:softprob", 3), ("multi:softmax", 3),

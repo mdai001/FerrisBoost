@@ -295,9 +295,22 @@ impl MinStd {
         self.0 = self.0 * 48271 % Self::M;
         self.0
     }
-    /// `std::uniform_int_distribution<size_t>(0, n - 1)(rng)` as libstdc++ computes it
-    /// for a 31-bit engine: rejection sampling on `urngrange / n` buckets.
+    /// Match the native XGBoost CPU toolchain's bounded-integer adapter.
+    /// The engine is standardized, but C++ uniform distributions are not.
     fn below(&mut self, n: u64) -> u64 {
+        #[cfg(windows)]
+        {
+            self.below_msvc(n)
+        }
+        #[cfg(not(windows))]
+        {
+            self.below_libstd(n)
+        }
+    }
+
+    /// libstdc++: rejection sampling on `urngrange / n` buckets.
+    #[cfg(any(not(windows), test))]
+    fn below_libstd(&mut self, n: u64) -> u64 {
         // engine range: [1, M - 1], so range = M - 2.
         let urange = n - 1;
         let urngrange = Self::M - 2;
@@ -309,6 +322,42 @@ impl MinStd {
             let ret = self.next() - 1;
             if ret < past {
                 return ret / scaling;
+            }
+        }
+    }
+
+    /// MSVC STL VS 2022 17.14: Lemire multiply-and-reject after drawing
+    /// full 30-bit limbs from minstd_rand. Match size_t's 64-bit accumulator,
+    /// including truncation when a third limb is needed. Independent integer
+    /// implementation of the distribution's observable mapping; see
+    /// https://github.com/microsoft/STL/blob/vs-2022-17.14/stl/inc/random
+    /// (`_Rng_from_urng_v2`). GPU fast uses its own existing hash sampler.
+    #[cfg(any(windows, test))]
+    fn below_msvc(&mut self, n: u64) -> u64 {
+        debug_assert!(n > 0);
+        const LIMB_MASK: u64 = (1 << 30) - 1;
+        let mut mask = LIMB_MASK;
+        let mut limbs = 1;
+        while mask < n - 1 {
+            mask = (mask << 30) | LIMB_MASK;
+            limbs += 1;
+        }
+        let bits = mask.count_ones();
+        let threshold = (((mask as u128 + 1) - n as u128) % n as u128) as u64;
+        loop {
+            let mut random = 0u64;
+            for _ in 0..limbs {
+                let limb = loop {
+                    let candidate = self.next() - 1;
+                    if candidate <= LIMB_MASK {
+                        break candidate;
+                    }
+                };
+                random = (random << 30) | limb;
+            }
+            let product = random as u128 * n as u128;
+            if (product as u64 & mask) >= threshold {
+                return (product >> bits) as u64;
             }
         }
     }
@@ -1549,6 +1598,118 @@ mod tests {
         assert_eq!(last, 399_268_537);
         // seed 0 is mapped to 1
         assert_eq!(MinStd::new(0).next(), MinStd::new(1).next());
+    }
+
+    #[test]
+    fn minstd_msvc_bounded_samples_match_reference_vectors() {
+        // Independent C++ distribution oracle, including rejection, engine
+        // consumption for n=1, and limb-width boundaries (MSVC STL VS 2022 17.14).
+        let cases: &[(u32, u64, &[u64], u64)] = &[
+            (0, 1, &[0, 0, 0, 0, 0, 0, 0, 0], 1931656580),
+            (1, 31, &[0, 5, 11, 24, 16, 5, 18, 26], 1931656580),
+            (7, 1000, &[0, 418, 482, 655, 409, 151, 286, 272], 2073592676),
+            (
+                4294967295,
+                65536,
+                &[2, 11145, 24863, 52167, 34459, 11737, 38941, 55843],
+                1931656580,
+            ),
+            (
+                7,
+                1073741824,
+                &[
+                    337896, 449829613, 518142576, 704006133, 439347581, 162366640, 308016802,
+                    292996900,
+                ],
+                2073592676,
+            ),
+            (
+                7,
+                1073741825,
+                &[
+                    337896, 518142577, 439347581, 308016802, 179276525, 636694178, 328544662,
+                    747135242,
+                ],
+                1189072809,
+            ),
+            (
+                5,
+                1152921504606846977,
+                &[
+                    781848277288868294,
+                    333559045448595483,
+                    343450922139145191,
+                    504041205770663163,
+                    572156138990466530,
+                    499813026059329375,
+                    1025817652395496195,
+                    820623187015022829,
+                ],
+                1169189267,
+            ),
+            (
+                5,
+                18446744073709551615,
+                &[
+                    12509572436621892703,
+                    5336944727177527725,
+                    5495214754226323059,
+                    8064659292330610612,
+                    9154498223847464484,
+                    7997008416949269999,
+                    17811800668283854608,
+                    16413082438327939115,
+                ],
+                1947157580,
+            ),
+        ];
+        for &(seed, n, expected, next) in cases {
+            let mut rng = MinStd::new(seed);
+            let got: Vec<_> = (0..expected.len()).map(|_| rng.below_msvc(n)).collect();
+            assert_eq!(got.as_slice(), expected, "seed={seed}, n={n}");
+            assert_eq!(rng.next(), next, "engine consumption: seed={seed}, n={n}");
+        }
+    }
+
+    #[test]
+    fn minstd_libstd_bounded_samples_match_reference_vectors() {
+        // System libstdc++ uniform_int_distribution<size_t> oracle. Preserve
+        // the Linux sequence and engine consumption at range boundaries.
+        let cases: &[(u32, u64, &[u64], u64)] = &[
+            (0, 1, &[0, 0, 0, 0, 0, 0, 0, 0], 564586691),
+            (1, 31, &[0, 2, 18, 27, 30, 5, 15, 12], 564586691),
+            (7, 1000, &[0, 595, 209, 241, 775, 327, 604, 786], 1804623190),
+            (
+                4294967295,
+                65536,
+                &[1, 5572, 39411, 58434, 63437, 12431, 33750, 26084],
+                564586691,
+            ),
+            (
+                7,
+                1073741824,
+                &[
+                    337896, 449829613, 518142576, 704006133, 439347581, 162366640, 308016802,
+                    292996900,
+                ],
+                2073592676,
+            ),
+            (
+                7,
+                1073741825,
+                &[
+                    337896, 449829613, 518142576, 704006133, 439347581, 162366640, 308016802,
+                    292996900,
+                ],
+                2073592676,
+            ),
+        ];
+        for &(seed, n, expected, next) in cases {
+            let mut rng = MinStd::new(seed);
+            let got: Vec<_> = (0..expected.len()).map(|_| rng.below_libstd(n)).collect();
+            assert_eq!(got.as_slice(), expected, "seed={seed}, n={n}");
+            assert_eq!(rng.next(), next, "engine consumption: seed={seed}, n={n}");
+        }
     }
 
     #[test]
