@@ -865,22 +865,19 @@ impl GpuTrainCtx {
         // four rows. A row can cover at most **32 features**; exceeding that
         // bound would silently omit later features. This hard width gate keeps
         // the tested fallback to column-major whenever the shape is unsupported.
-        // **默认开启**(2026-09-04)。判据全部满足:wide fast −22.4%、
-        // wide exact −15.6%,HIGGS 两种模式在真实轮数下打平,
-        // exact 仍与 CPU 逐字节相同,常驻显存只多 32 MB。
-        //
-        // `FB_ROW_MAJOR` 现在是**三态**:未设 = 默认开;`0`/`false` = 关
-        // (列主序参照臂);`1`/`true` = 开。
-        // ⚠️ 不能用 `env_flag`:那样「未设」和「显式关掉」会变成同一个值,
-        // 参照臂就再也测不出来了。
-        let row_major_requested = match std::env::var("FB_ROW_MAJOR") {
-            Ok(v) => match v.trim() {
-                "0" | "false" => false,
-                "1" | "true" => true,
-                other => bail!("FB_ROW_MAJOR accepts only 0/1/true/false, got {other:?}"),
-            },
-            Err(_) => true,
-        };
+        // **OFF by default since 2026-11-08; column-major is the default on
+        // every path.** It was the default from 2026-09-04 (wide fast −22.4%,
+        // wide exact −15.6% at the time), but the 0.0.7 release benchmark A/B
+        // measured column-major faster in every arm on HIGGS and Epsilon with
+        // byte-identical models (row-major +12..30% on HIGGS, +15..33% on
+        // Epsilon c=32), and row-major goes against the column-first design.
+        // The 16-bit row-major layout was dropped for the same reasons.
+        // Opt in (internal, undocumented, benchmarking only) with
+        // `FB_ROW_MAJOR=1`; unset or `FB_ROW_MAJOR=0` selects column-major.
+        // The full rationale and numbers live at the shared switch
+        // `gpu_mem_plan::gpu_row_major_opt_in`, which the memory planner reads
+        // too, so a plan charges row-major staging only when it is used.
+        let row_major_requested = crate::gpu_mem_plan::gpu_row_major_opt_in()?;
         // 一行最多 32 个特征是 kernel 的硬上界,超过就明确回退到列主序。
         // ⚠️ 上界用 `gpu_mem_plan` 里那个**共享常量** —— 显存规划器要靠同一个
         // 值预测运行时会不会开第二条流,两边各写一个 32 就会悄悄漂移。

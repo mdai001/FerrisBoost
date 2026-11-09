@@ -201,7 +201,10 @@ pub struct StreamingMemModel {
     pub resident_extra_fixed_bytes: u64,
     /// Training row count for the bounded row-major staging allocation.
     pub staging_rows: u64,
-    /// Nominal staging charge already included in fixed_bytes; zero disables it.
+    /// Nominal row-major staging charge already included in fixed_bytes; zero
+    /// (the column-major default) disables it. Only the `FB_ROW_MAJOR=1` opt-in
+    /// sets it, and [`Self::peak_for_layout`] drops it for blocks wider than
+    /// [`ROW_MAJOR_MAX_FEATS`], which run column-major.
     pub staging_budget: u64,
 }
 
@@ -413,7 +416,18 @@ impl StreamingMemModel {
         // Keep the original conservative fixed allowance for small layouts.
         // The row cap can make two pinned buffers larger than one pageable
         // buffer, so plan the maximum of both supported buffering modes.
-        let extra_stage = if self.staging_budget > 0 && cols <= ROW_MAJOR_MAX_FEATS {
+        //
+        // Blocks wider than ROW_MAJOR_MAX_FEATS run column-major even under the
+        // row-major opt-in, and allocate no staging: drop the nominal charge.
+        if self.staging_budget > 0 && cols > ROW_MAJOR_MAX_FEATS {
+            return Self {
+                fixed_bytes: self.fixed_bytes.saturating_sub(self.staging_budget),
+                staging_budget: 0,
+                ..*self
+            }
+            .peak_for_layout(cols, streams, resident);
+        }
+        let extra_stage = if self.staging_budget > 0 {
             [1, 2]
                 .into_iter()
                 .map(|buffers| {
@@ -626,6 +640,42 @@ pub fn resolve_gpu_streaming_cols_per_block(
 /// 规划器按双流算了预算,运行时却跑单流(或者反过来,直接 OOM)。
 pub const ROW_MAJOR_MAX_FEATS: u64 = 32;
 
+/// Whether the GPU-local 8-bit row-major layout was explicitly requested.
+///
+/// **Column-major is the default on every GPU path** (resident, hybrid, pure
+/// streaming; exact and fast; every objective, ranking included). Row-major is
+/// an internal, undocumented opt-in kept only for future benchmarking:
+///
+/// - `FB_ROW_MAJOR=1` / `true`: try row-major (it still falls back to
+///   column-major when a block is wider than [`ROW_MAJOR_MAX_FEATS`] or the
+///   fused kernel is unavailable);
+/// - unset, `FB_ROW_MAJOR=0` / `false`: column-major.
+///
+/// Why it is off by default (decided 2026-11-08 from the 0.0.7 release
+/// benchmark A/B; models were byte-identical between the layouts in every
+/// arm): column-major was faster in **every** arm. Row-major cost on HIGGS 1M
+/// (4 runs each) +12% exact resident, +13% exact streaming, +30% fast
+/// resident, +15% fast streaming; on Epsilon at `cols_per_block=32` +15%
+/// exact resident, +33% exact streaming, +17% fast resident, +33% fast
+/// streaming. It also needs a device transpose plus 32 MiB+ of row-major
+/// staging, and it goes against the column-first design (a block is columns
+/// end to end: host cache, upload, device). The 16-bit row-major layout was
+/// dropped for the same reasons and is not implemented.
+///
+/// The Python planner (`StreamingMemModel::new`'s `row_major`) and the runtime
+/// (`GpuTrainCtx::new`) both read this one function, so a column-major plan
+/// never reserves row-major staging.
+pub fn gpu_row_major_opt_in() -> anyhow::Result<bool> {
+    match std::env::var("FB_ROW_MAJOR") {
+        Ok(v) => match v.trim() {
+            "0" | "false" => Ok(false),
+            "1" | "true" => Ok(true),
+            other => anyhow::bail!("FB_ROW_MAJOR accepts only 0/1/true/false, got {other:?}"),
+        },
+        Err(_) => Ok(false),
+    }
+}
+
 /// GPU streaming 的**完整**计划:块宽 + stream 数一起解。
 ///
 /// stream 数**按执行路径分派**,不是按 resident/streaming 分派:
@@ -694,6 +744,10 @@ pub fn resolve_gpu_streaming_plan(
     ) {
         // 双流只在**行主序分块**那条路上有收益,而走不走行主序由块宽决定。
         // 宽度必须两档都 ≤ 上界:双流解出来的那个宽度才是运行时真正用的。
+        // Since column-major became the default (2026-11-08) this width rule
+        // still selects two streams for narrow column-major blocks: that is the
+        // configuration the 0.0.7 column-major A/B arms ran (and won) with.
+        // Whether one stream is enough there has not been measured yet.
         Ok(mut two)
             if two.resolved_cols_per_block >= one.resolved_cols_per_block
                 && two.resolved_cols_per_block <= ROW_MAJOR_MAX_FEATS =>

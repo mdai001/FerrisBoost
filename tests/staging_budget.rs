@@ -115,6 +115,26 @@ fn column_major_layout_has_no_row_major_staging_charge() {
 }
 
 #[test]
+fn blocks_wider_than_the_row_major_limit_carry_no_row_major_staging() {
+    // Under the FB_ROW_MAJOR=1 opt-in, blocks wider than 32 features still run
+    // column-major and allocate no staging, so the plan must match column-major.
+    for (cols, streams, resident) in [(33, 1, 0), (33, 2, 3), (64, 1, 5)] {
+        let opt_in = model(10_500_000, true, streams);
+        let column_major = model(10_500_000, false, streams);
+        assert_eq!(
+            opt_in.peak_for_layout(cols, streams, resident),
+            column_major.peak_for_layout(cols, streams, resident),
+            "cols={cols} streams={streams} resident={resident}"
+        );
+    }
+    // At 32 features the opt-in does charge its staging.
+    assert!(
+        model(10_500_000, true, 1).peak_for_layout(32, 1, 0)
+            >= model(10_500_000, false, 1).peak_for_layout(32, 1, 0) + RM_STAGE_BUDGET
+    );
+}
+
+#[test]
 fn resolved_higgs_plans_stay_inside_the_safe_budget_for_math_and_cache_modes() {
     let rows = 10_500_000;
     let features = 28;
