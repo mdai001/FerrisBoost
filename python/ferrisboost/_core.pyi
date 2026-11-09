@@ -97,8 +97,15 @@ class Model:
         pandas DataFrames and PyArrow tables are accepted too. For a model
         trained on named columns they are matched to the model's features by
         name (any order; extra columns ignored; a missing one is an error).
-        Categorical columns are scored through their category codes, so they must carry the
-        training categories in the training order. use_gpu=True scores
+        Categorical input is coded by the model's category lists: a feature
+        with a list re-codes pandas categories, Arrow and Parquet dictionaries
+        and CSV text by value (any order, a subset; an unseen category raises
+        ValueError), and a feature with integer categories looks up plain
+        integer file columns (CSV, Parquet) by value too. A feature without a
+        list takes integer values as the codes (NumPy, CSV and Parquet
+        integers, Arrow and Parquet integer dictionaries), and pandas
+        categories and Arrow string dictionaries by their codes / indices.
+        NumPy input is always codes. use_gpu=True scores
         models with categorical splits on the GPU too (bit-identical to the CPU).
 
         strict_shape=True (XGBoost's strict_shape) makes the shape independent

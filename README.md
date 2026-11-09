@@ -256,6 +256,7 @@ logging, and the complete parameter reference.
 - Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost `cats` layout); named input is re-coded by value, and unseen categories raise `ValueError`.
 - CSV text columns declared categorical train as named categories.
 - Changed: models with integer categories now look up plain integer input by value, not as codes.
+- Changed: Arrow integer dictionaries are read by value for models without category lists, as Parquet files are.
 
 ### 0.0.7 (unreleased)
 
