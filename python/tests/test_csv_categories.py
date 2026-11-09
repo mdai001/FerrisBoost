@@ -323,3 +323,114 @@ def test_gpu_csv_training_and_prediction_match_the_cpu(tmp_path, k):
     df = frame(v, x1, sorted(cats))
     np.testing.assert_array_equal(cpu.predict(df, use_gpu=True, output_margin=True),
                                   cpu.predict(path, output_margin=True))
+
+
+# ------------------------------------------------- past the type inference sample
+def _late_text(n, late, seed):
+    """Integer-looking fields for the first `late` rows, then text mixed in."""
+    rng = np.random.default_rng(seed)
+    v = rng.choice([str(i) for i in range(12)], n).astype(object)
+    tail = np.arange(late, n)
+    v[tail[rng.random(len(tail)) < 0.5]] = rng.choice(["a", "bb", "c c"], 1)[0]
+    v[tail[rng.random(len(tail)) < 0.3]] = "zz"
+    v[rng.random(n) < 0.03] = None
+    x1 = rng.integers(0, 8, n).astype(np.float32)
+    effect = {s: rng.normal() for s in set(v) - {None}}
+    y = (np.array([effect.get(s, 0.0) for s in v]) + 0.3 * x1
+         + rng.normal(0, 0.1, n)).astype(np.float32)
+    return v, x1, y
+
+
+def _parquet(path, v, x1, y):
+    pq.write_table(pa.table({"x1": x1.astype(np.int64), "c": pa.array(v, pa.string()),
+                             "label": y}), str(path), row_group_size=7000)
+    return str(path)
+
+
+@pytest.mark.parametrize("late", [10_050, 100_050])
+def test_text_first_appearing_past_the_inference_sample(tmp_path, late):
+    """The codes-or-names decision for a declared "c" column reads every field,
+    not the 10,000-record inference sample."""
+    n = late + 2000
+    v, x1, y = _late_text(n, late, seed=late)
+    path = write_csv(tmp_path / "late.csv", v, x1, y)
+    m = fb.train(FB, path, label="label", feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert m.get_categories()[1] == first_seen(v)
+    want = model_json(m, tmp_path, "m")
+    for threads in (1, 4):
+        other = fb.train({**FB, "nthread": threads}, path, label="label",
+                         feature_types=TYPES, num_boost_round=3, quiet=True)
+        assert model_json(other, tmp_path, "t") == want
+    # The same rows as a Parquet string column train the same model.
+    from_pq = fb.train(FB, _parquet(tmp_path / "late.parquet", v, x1, y), label="label",
+                       feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert model_json(from_pq, tmp_path, "pq") == want
+    # Text only in the second of three files, past its own sample.
+    parts = tmp_path / "parts"
+    parts.mkdir()
+    head, _, _ = _late_text(3000, 3000, seed=1)  # integers only
+    hx, hy = x1[:3000] + 1, y[:3000] - 1
+    write_csv(parts / "a.csv", head, hx, hy)
+    write_csv(parts / "b.csv", v, x1, y)
+    write_csv(parts / "c.csv", head, hx, hy)
+    allv = np.concatenate([head, v, head])
+    allx, ally = np.concatenate([hx, x1, hx]), np.concatenate([hy, y, hy])
+    multi = fb.train(FB, str(parts), label="label", feature_types=TYPES, num_boost_round=3,
+                     quiet=True)
+    assert multi.get_categories()[1] == first_seen(allv)
+    single = fb.train(FB, _parquet(tmp_path / "all.parquet", allv, allx, ally), label="label",
+                      feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert model_json(multi, tmp_path, "multi") == model_json(single, tmp_path, "single")
+    np.testing.assert_array_equal(multi.predict(str(parts), output_margin=True),
+                                  single.predict(_parquet(tmp_path / "p.parquet", allv, allx,
+                                                          ally), output_margin=True))
+
+
+def test_all_integer_column_past_the_sample_stays_codes(tmp_path):
+    """Integers in every field keep their values as the codes (no names), larger
+    codes past the sample included, as from a Parquet integer column."""
+    rng = np.random.default_rng(11)
+    n = 30_000
+    k = rng.integers(0, 20, n).astype(object)
+    k[20_000:][rng.random(n - 20_000) < 0.2] = 300
+    k[rng.random(n) < 0.03] = None
+    x1 = rng.integers(0, 8, n).astype(np.float32)
+    y = (np.array([0.0 if c is None else (c % 5) for c in k]) + 0.2 * x1).astype(np.float32)
+    path = write_csv(tmp_path / "ints.csv", k, x1, y)
+    m = fb.train(FB, path, label="label", feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert m.get_categories() is None
+    kp = str(tmp_path / "ints.parquet")
+    pq.write_table(pa.table({"x1": x1.astype(np.int64), "c": pa.array(list(k), pa.int64()),
+                             "label": y}), kp)
+    from_pq = fb.train(FB, kp, label="label", feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert model_json(m, tmp_path, "csv") == model_json(from_pq, tmp_path, "pq")
+
+
+def test_unnamed_codes_with_a_bad_field_past_the_sample(tmp_path):
+    """A model without names reads its categorical CSV columns as codes; a field
+    that is not a number past the inference sample names the file, the column,
+    the value and its row instead of failing inside the CSV parser."""
+    rng = np.random.default_rng(12)
+    n = 20_000
+    k = rng.integers(0, 9, n)
+    x1 = rng.integers(0, 8, n).astype(np.float32)
+    y = (k % 4 + 0.2 * x1).astype(np.float32)
+    train = write_csv(tmp_path / "t.csv", k.astype(object), x1, y)
+    m = fb.train(FB, train, label="label", feature_types=TYPES, num_boost_round=3, quiet=True)
+    assert m.get_categories() is None
+    bad_k = k.astype(object)
+    bad_k[15_000] = "oops"
+    bad = write_csv(tmp_path / "bad.csv", bad_k, x1, y)
+    pattern = r'bad\.csv.*"c".*"oops".*data row 15001.*integer category codes'
+    with pytest.raises(ValueError, match=pattern):
+        m.predict(bad)
+    with pytest.raises(ValueError, match=pattern):
+        fb.train(FB, train, label="label", feature_types=TYPES, num_boost_round=1, quiet=True,
+                 evals=[(bad, "v")])
+    # A fractional code past the sample is its integer part, as everywhere at
+    # prediction time.
+    frac_k = k.astype(object)
+    frac_k[15_000] = f"{k[15_000]}.5"
+    frac = write_csv(tmp_path / "frac.csv", frac_k, x1)
+    np.testing.assert_array_equal(m.predict(frac, output_margin=True),
+                                  m.predict(train, output_margin=True))

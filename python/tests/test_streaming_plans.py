@@ -428,6 +428,49 @@ def test_csv_text_categories_stream_like_parquet_string_dictionaries(tmp_path, c
     assert _bytes(model_csv, tmp_path, "a") == _bytes(model_pq, tmp_path, "b")
 
 
+@cuda
+@pytest.mark.parametrize("kind", ["late_text", "integers"])
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_csv_categories_decided_past_the_inference_sample_stream_like_parquet(
+        tmp_path, capfd, layout, kind):
+    """A declared "c" CSV column is codes or names by every field, not the 10,000-record
+    inference sample: text first appearing past it trains the names of the same rows
+    as a Parquet string column, integers everywhere the codes of a Parquet integer
+    column, on the CPU and under every GPU plan; the CSV plan made after the first
+    pass matches the Parquet plan."""
+    n, late = 12_000, 10_500
+    path, p, kw, _ = _setup(tmp_path, "binary:logistic", layout, n=n, n_cat=2)
+    table = pq.read_table(path)
+    for c in CAT_FEATURES:
+        codes = table.column(f"f{c}").to_numpy(zero_copy_only=False)
+        if kind == "late_text":
+            col = pa.array([None if np.isnan(v) else (f"v{int(v)}" if i >= late and v % 3 == 0
+                                                      else str(int(v)))
+                            for i, v in enumerate(codes)], pa.string())
+        else:
+            col = pa.array([None if np.isnan(v) else int(v) for v in codes], pa.int64())
+        table = table.set_column(table.schema.get_field_index(f"f{c}"), f"f{c}", col)
+    path = str(tmp_path / "decided.parquet")
+    pq.write_table(table, path, row_group_size=1000)
+    ref_model = fb.train(p, path, quiet=True, **kw)
+    assert (ref_model.get_categories() is None) == (kind == "integers")
+    ref = _bytes(ref_model, tmp_path, "cpu")
+    csv = str(tmp_path / "decided.csv")
+    table.to_pandas().to_csv(csv, index=False, na_rep="")
+    assert _bytes(fb.train(p, csv, quiet=True, **kw), tmp_path, "cpu_csv") == ref
+    _, probe = _gpu(capfd, p, path, kw, resident_blocks=0)
+    total = probe["total"]
+    for resident in _plans(total):
+        model, info = _gpu(capfd, p, csv, kw, gpu_math="exact", resident_blocks=resident)
+        _check_plan(info, probe["layout"], resident, total)
+        assert _bytes(model, tmp_path, "gpu") == ref, (info["residency"], resident, total)
+    auto = {k: v for k, v in p.items() if k != "cols_per_block"}
+    model_pq, info_pq = _gpu(capfd, auto, path, kw)
+    model_csv, info_csv = _gpu(capfd, auto, csv, kw)
+    assert _planned(info_csv) == _planned(info_pq)
+    assert _bytes(model_csv, tmp_path, "a") == _bytes(model_pq, tmp_path, "b")
+
+
 # ------------------------------------------------- 16-bit column blocks (0.0.8 wide bins)
 
 # Features with more than 255 bins (max_bin > 255) or more than 254 categories are
