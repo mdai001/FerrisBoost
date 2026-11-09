@@ -616,8 +616,6 @@ def _as_ref(level: Any) -> tuple | None:
 
 def _recode_map(ref: tuple, data_kind: Any, data_values: list, where: str) -> np.ndarray:
     """Index of every data category in the reference list (-1 = unseen)."""
-    import pandas as pd
-
     ref_kind, ref_values = ref
     if (ref_kind == "str") != (data_kind == "str"):
         theirs = "strings" if data_kind == "str" else "integers"
@@ -628,7 +626,12 @@ def _recode_map(ref: tuple, data_kind: Any, data_values: list, where: str) -> np
         )
     if not data_values:
         return np.empty(0, np.int64)
-    return np.asarray(pd.Index(ref_values).get_indexer(pd.Index(data_values)), np.int64)
+    # Do not pull pandas into Arrow-only prediction/evaluation.  Python dicts
+    # preserve exact string and arbitrary-precision integer equality (unlike
+    # a float conversion, which would merge adjacent integers above 2**53).
+    positions = {value: i for i, value in enumerate(ref_values)}
+    return np.fromiter((positions.get(value, -1) for value in data_values),
+                       dtype=np.int64, count=len(data_values))
 
 
 def _apply_map(mapping: np.ndarray, codes: np.ndarray, data_values: list, where: str) -> np.ndarray:
@@ -752,7 +755,8 @@ def _frame_matrix(
             na = np.asarray(s.isna().to_numpy(), bool)
             values = s.to_numpy(dtype=np.uint64 if unsigned else np.int64, na_value=0)
             cols.append(_lookup_int_values(values, na, vref, f"{what} column {name!r}"))
-            flags.append(False)
+            flags.append(True)
+            levels[i] = vref
         else:
             try:
                 cols.append(s.to_numpy(dtype=np.float32, na_value=np.nan))
@@ -828,7 +832,8 @@ def _table_matrix(
             wide = pa.uint64() if pa.types.is_unsigned_integer(col.type) else pa.int64()
             values = np.asarray(col.cast(wide).fill_null(0).to_numpy(zero_copy_only=False))
             cols.append(_lookup_int_values(values, na, vref, f"{what} column {name!r}"))
-            flags.append(False)
+            flags.append(True)
+            levels[i] = vref
             continue
         if pa.types.is_dictionary(col.type):
             if not enable_categorical:
@@ -1244,12 +1249,14 @@ def train(
         # A continued model indexes features by position: named data is bound to
         # the model's feature names (any column order), like evals are.
         prior_names = list(prior.feature_names) if prior is not None else []
+        prior_categorical = explicit_types
         # A continued model keeps its category lists: named columns are coded
         # with them (the other categorical columns bring their own).
         prior_refs = _model_refs(prior)
         if table is not None:
             x, names, auto_flags, levels = _table_matrix(
-                table, prior_names or None, enable_cat, prior_refs
+                table, prior_names or None, enable_cat, prior_refs,
+                scoring=prior is not None, categorical=prior_categorical,
             )
         elif frame is not None:
             if prior_names:
@@ -1258,7 +1265,10 @@ def train(
                 if absent:
                     raise ValueError(f"data is missing the features of init_model: {absent}")
                 frame = frame[[c for n in prior_names for c in frame.columns if str(c) == n]]
-            x, names, auto_flags, levels = _frame_matrix(frame, enable_cat, prior_refs)
+            x, names, auto_flags, levels = _frame_matrix(
+                frame, enable_cat, prior_refs, scoring=prior is not None,
+                categorical=prior_categorical,
+            )
         else:
             x = _as_matrix(data)
         p["_feature_types"] = _merge_flags(auto_flags, explicit_types, x.shape[1])

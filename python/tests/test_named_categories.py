@@ -153,6 +153,47 @@ def test_integer_categories_are_stored_with_their_dtype(tmp_path):
     np.testing.assert_array_equal(ours.predict(resorted, output_margin=True), xgb_margin(bst, df))
 
 
+@pytest.mark.parametrize("as_arrow", [False, True])
+def test_continuation_plain_integer_category_values_reuse_prior_codes(as_arrow, tmp_path):
+    rng = np.random.default_rng(41)
+    n = 500
+    cats = [10, 20]
+    raw = rng.choice(cats, n)
+    raw[::37] = 10
+    numeric = rng.integers(0, 5, n).astype(np.float32)
+    y = (raw / 10 + numeric + rng.normal(0, .1, n)).astype(np.float32)
+    train = pd.DataFrame({"cat": pd.Categorical(raw, categories=cats), "num": numeric})
+    plain = pd.DataFrame({"num": numeric, "cat": pd.array(raw, dtype="Int64")})
+    plain.loc[::29, "cat"] = pd.NA
+    named = pd.DataFrame({"cat": pd.Categorical(plain["cat"], categories=cats),
+                          "num": numeric})
+    prior = fb.train({**FB, "enable_categorical": True}, train, label=y,
+                     num_boost_round=2, quiet=True)
+    if as_arrow:
+        plain = pa.Table.from_pandas(plain, preserve_index=False)
+    baseline = fb.train({**FB, "enable_categorical": True}, named, label=y,
+                        num_boost_round=2, init_model=prior, quiet=True)
+    continued = fb.train({**FB, "enable_categorical": True}, plain, label=y,
+                         num_boost_round=2, init_model=prior, quiet=True)
+    baseline.save_model(str(tmp_path / "baseline.json"), quiet=True)
+    continued.save_model(str(tmp_path / "continued.json"), quiet=True)
+    assert (tmp_path / "continued.json").read_bytes() == (tmp_path / "baseline.json").read_bytes()
+    if as_arrow:
+        unseen = pa.table({"num": [1.0], "cat": [99]})
+    else:
+        unseen = pd.DataFrame({"num": [1.0], "cat": [99]})
+    with pytest.raises(ValueError, match="not in the training categories"):
+        fb.train({**FB, "enable_categorical": True}, unseen, label=[0.],
+                 num_boost_round=1, init_model=prior, quiet=True)
+
+
+def test_recode_map_does_not_round_large_integer_categories():
+    from ferrisboost import _recode_map
+
+    large = 2**53
+    mapping = _recode_map((15, [large, large + 1]), 15,
+                          [large + 1, large, large + 2], "test")
+    np.testing.assert_array_equal(mapping, [1, 0, -1])
 def test_float_categories_are_rejected_like_xgboost():
     df = pd.DataFrame({"c": pd.Categorical([1.5, 2.5, 1.5, 2.5])})
     with pytest.raises(ValueError, match="strings or integers"):

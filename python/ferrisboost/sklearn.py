@@ -322,13 +322,54 @@ class _FerrisBoostBase(BaseEstimator):
         flags = None
         table = _dictionary_table(X)
         frame = _is_pandas_frame(X) and _has_category_column(X)
+        prior_model = None
+        prior_feature_names = None
+        prior_levels = None
+        if reset and prior is not None:
+            # A continuation may receive plain integer columns whose values
+            # are categories in the prior model. Route those frames through
+            # the same value-to-code adapters used by prediction/eval.
+            prior_levels = getattr(prior, "_cat_levels_", None)
+            estimator_names = getattr(prior, "feature_names_in_", None)
+            if estimator_names is not None:
+                prior_feature_names = [str(n) for n in estimator_names]
+            if hasattr(prior, "get_booster"):
+                prior = prior.get_booster()
+            prior_model = _load_prior(prior)
+            if prior_feature_names is None:
+                prior_feature_names = list(prior_model.feature_names or []) or None
+            if prior_levels is None:
+                prior_levels = _model_refs(prior_model)
+        eval_levels = None
+        if not reset:
+            eval_levels = getattr(self, "_cat_levels_", None)
+            if eval_levels is None:
+                eval_levels = _model_refs(getattr(self, "_Booster", None))
+        has_category_refs = bool(prior_levels if reset else eval_levels)
+        if reset and prior is not None and has_category_refs:
+            if _is_pandas_frame(X):
+                frame = True
+            elif hasattr(X, "column_names"):
+                table = _arrow_table(X)
+        feature_order = ((prior_feature_names if reset else
+                          [str(n) for n in self.feature_names_in_]
+                          if hasattr(self, "feature_names_in_") else None)
+                         if has_category_refs else None)
+        if feature_order and _is_pandas_frame(X):
+            columns = [str(c) for c in X.columns]
+            missing = [name for name in feature_order if name not in columns]
+            extra = [name for name in columns if name not in feature_order]
+            if missing or extra:
+                raise ValueError(
+                    f"feature names do not match the training data: missing {missing}, extra {extra}"
+                )
+            X = X[[c for name in feature_order for c in X.columns if str(c) == name]]
+            frame = True
         categorical = levels = None
         if not reset:
             # This fit's categories first (eval sets are prepared before the
             # booster exists); a loaded model brings its own.
-            levels = getattr(self, "_cat_levels_", None)
-            if levels is None:
-                levels = _model_refs(getattr(self, "_Booster", None))
+            levels = eval_levels
             if self.feature_types is not None:
                 categorical = [t == "c" for t in self.feature_types]
             if table is None and not frame:
@@ -347,14 +388,15 @@ class _FerrisBoostBase(BaseEstimator):
                     table = _arrow_table(X)
         if table is not None or frame:
             if reset:
-                if hasattr(prior, "get_booster"):
-                    prior = prior.get_booster()
-                levels = _model_refs(_load_prior(prior)) if prior is not None else None
+                levels = prior_levels
+                if self.feature_types is not None:
+                    categorical = [t == "c" for t in self.feature_types]
             if table is not None:
                 import pyarrow as pa
 
                 matrix, names, flag_list, new_levels = _table_matrix(
-                    table, None, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    table, feature_order, bool(self.enable_categorical), levels, "X",
+                    scoring=(not reset or prior is not None),
                     categorical=categorical,
                 )
                 X = pa.table({n: matrix[:, i] for i, n in enumerate(names)})
@@ -362,7 +404,8 @@ class _FerrisBoostBase(BaseEstimator):
                 import pandas as pd
 
                 matrix, _, flag_list, new_levels = _frame_matrix(
-                    X, bool(self.enable_categorical), levels, "X", scoring=not reset,
+                    X, bool(self.enable_categorical), levels, "X",
+                    scoring=(not reset or prior is not None),
                     categorical=categorical,
                 )
                 # A numeric stand-in with the same labels: sklearn then sets

@@ -529,3 +529,32 @@ def test_negative_n_jobs_means_all_cores():
     assert est.get_ferrisboost_params()["nthread"] == 0
     est.fit(x, y)
     np.testing.assert_array_equal(est.predict(x), FerrisBoostRegressor(n_estimators=3, n_jobs=1).fit(x, y).predict(x))
+
+
+def test_sklearn_continuation_reuses_integer_category_values(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(71)
+    n = 240
+    raw = rng.choice([10, 20], n)
+    numeric = rng.integers(0, 4, n).astype(np.float32)
+    y = (raw / 10 + numeric + rng.normal(0, .1, n)).astype(np.float32)
+    category = pd.DataFrame({"cat": pd.Categorical(raw, categories=[10, 20]),
+                             "num": numeric})
+    plain = pd.DataFrame({"num": numeric, "cat": raw})
+    plain_arrow = pa.Table.from_pandas(plain, preserve_index=False)
+    prior = FerrisBoostRegressor(n_estimators=2, max_depth=3, n_jobs=1,
+                                 enable_categorical=True).fit(category, y)
+    baseline = FerrisBoostRegressor(n_estimators=2, max_depth=3, n_jobs=1,
+                                    enable_categorical=True).fit(
+        category, y, init_model=prior, eval_set=[(category, y)])
+    for i, data in enumerate((plain, plain_arrow)):
+        continued = FerrisBoostRegressor(n_estimators=2, max_depth=3, n_jobs=1,
+                                         enable_categorical=True).fit(
+            data, y, init_model=prior, eval_set=[(data, y)])
+        assert continued.evals_result() == baseline.evals_result()
+        np.testing.assert_array_equal(continued.predict(category), baseline.predict(category))
+        baseline.get_booster().save_model(str(tmp_path / f"sk-baseline-{i}.json"), quiet=True)
+        continued.get_booster().save_model(str(tmp_path / f"sk-continued-{i}.json"), quiet=True)
+        assert (tmp_path / f"sk-continued-{i}.json").read_bytes() == (
+            tmp_path / f"sk-baseline-{i}.json").read_bytes()
