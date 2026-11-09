@@ -1206,8 +1206,8 @@ fn reused_histogram_slot_overwrites_growing_and_shrinking_d2h_slices() {
             let mut session = ctx
                 .block_session(0, &bins, n_rows, n_feats, offsets, None)
                 .unwrap();
-            // The optional row-major path requires the batched entry point,
-            // even when the batch contains just one node.
+            // The opt-in row-major path (FB_ROW_MAJOR=1) requires the batched
+            // entry point, even when the batch contains just one node.
             if session.requires_batched_hist() {
                 break;
             }
@@ -1544,8 +1544,9 @@ fn gpu_math_fast_keeps_structure_and_stays_deterministic() {
 /// 把不支持的形状伪装成支持**。将来要支持 64+ 特征/块,应当单独设计
 /// lanes_per_row / 多段映射,而不是放宽这里的判断。
 ///
-/// 在 `FB_ROW_MAJOR=1` 下运行时这条用例才真正走到 fallback;不设该变量时
-/// 它退化成一个普通的宽列块正确性用例,两种情况都应该通过。
+/// 在 `FB_ROW_MAJOR=1`(内部 opt-in;默认是列主序)下运行时这条用例才真正
+/// 走到 fallback;不设该变量时它退化成一个普通的宽列块正确性用例,两种情况
+/// 都应该通过。
 #[test]
 fn wide_blocks_fall_back_from_row_major_without_dropping_features() {
     let n_rows = 3000usize;
@@ -1573,6 +1574,41 @@ fn wide_blocks_fall_back_from_row_major_without_dropping_features() {
         serde_json::to_vec(&cpu).unwrap(),
         "宽列块下 GPU 必须和 CPU 逐字节相同 —— 行主序要么正确处理,要么明确回退"
     );
+}
+
+/// Column-major is the default GPU layout on every path, including blocks
+/// narrow enough for the row-major kernel; row-major only runs under the
+/// internal `FB_ROW_MAJOR=1` opt-in. A process that sets `FB_ROW_MAJOR` (the
+/// external layout runner) checks that layout instead.
+#[test]
+fn narrow_blocks_default_to_the_column_major_layout() {
+    let opt_in = match std::env::var("FB_ROW_MAJOR").as_deref() {
+        Ok("1") | Ok("true") => true,
+        Ok(_) | Err(_) => false,
+    };
+    for resident_blocks in [Some(0), Some(2)] {
+        let config = SharedHistogramConfig {
+            resident_blocks,
+            hist_streams: Some(1),
+            ..Default::default()
+        };
+        // Eight features per block: inside the 32-feature row-major limit.
+        let ctx = GpuTrainCtx::new(0, 4096, 8, 64, 2, 8, config, false).unwrap();
+        let path = ctx.path_summary();
+        let expected = if opt_in {
+            "layout_gpu=row_major"
+        } else {
+            "layout_gpu=col_major"
+        };
+        assert!(path.contains(expected), "{path}");
+        // Column-major allocates no row-major staging, so the budget has none.
+        assert_eq!(
+            ctx.budget().rm_stage_bytes == 0,
+            !opt_in,
+            "{}",
+            ctx.budget().report()
+        );
+    }
 }
 
 /// 运行时用的是**签入的 PTX**,不是 `.cu`。改了 `.cu` 却忘记跑 nvcc,
@@ -1918,8 +1954,9 @@ fn resident_narrow_last_block_keeps_the_model_bit_exact() {
 /// The resident split cache is an exact, bounded alternative to the existing
 /// host split path. Cover both GPU histogram layouts and both objectives with
 /// missing values, row and column sampling, tree resets, and depth beyond the
-/// two-generation cache capacity. The 40-column first block selects the
-/// column-major kernel; the 16+14 split selects row-major and makes the final
+/// two-generation cache capacity. The 40-column first block always selects the
+/// column-major kernel; the 16+14 split runs column-major by default and
+/// row-major under the internal FB_ROW_MAJOR=1 opt-in, and makes the final
 /// resident block narrower than the first.
 #[test]
 fn gpu_split_cache_matches_cpu_for_layouts_and_objectives() {

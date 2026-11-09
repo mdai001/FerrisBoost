@@ -278,8 +278,8 @@ fn run_plan(
 fn packed_index_batch_histograms_match_cpu_across_layouts_and_reused_slots() {
     let (bins, gpair) = fixture();
 
-    // The environment-controlled runner exercises the default row-major ABI
-    // and FB_ROW_MAJOR=0 column-major ABI in separate processes.
+    // The environment-controlled runner exercises the default column-major
+    // ABI and the internal FB_ROW_MAJOR=1 row-major ABI in separate processes.
     let probe = make_context(0, false);
     let path = probe.path_summary();
     let row_major = path.contains("layout_gpu=row_major");

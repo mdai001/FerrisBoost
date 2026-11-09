@@ -249,6 +249,7 @@ fn resolve_blocking(
                     "GPU planning for fast ranking needs the query groups, but none were resolved before planning",
                 ));
             }
+            crate::gpu_mem_plan::gpu_row_major_opt_in().map_err(to_py_err)?;
             let p = resolve_gpu_streaming_plan(
                 cfg.requested_cols_per_block,
                 cfg.params.hist_streams,
@@ -324,6 +325,18 @@ fn gpu_plan_model(
     let max_bin = cfg.params.max_bin as u64;
     let cap = cfg.params.hist_nodes_per_batch.unwrap_or(16) as u64;
     let device_quantize = cfg.params.device_quantize.unwrap_or(true);
+    // Share the runtime default and reserve staging only for the explicit
+    // legacy opt-in. The opened shape still decides whether U8 blocks fit.
+    let row_major = crate::gpu_mem_plan::gpu_row_major_opt_in().unwrap_or(false)
+        && !matches!(
+            std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    let stage_bytes = if row_major {
+        crate::gpu_mem_plan::RM_STAGE_BYTES
+    } else {
+        0
+    };
     let model = match shape {
         None => StreamingMemModel::new(
             rows,
@@ -332,8 +345,8 @@ fn gpu_plan_model(
             cap,
             device_quantize,
             fast,
-            true,
-            crate::gpu_mem_plan::RM_STAGE_BYTES,
+            row_major,
+            stage_bytes,
         ),
         Some((shape, cols)) => StreamingMemModel::new_for_shape(
             rows,
@@ -343,7 +356,7 @@ fn gpu_plan_model(
             cap,
             device_quantize,
             fast,
-            crate::gpu_mem_plan::RM_STAGE_BYTES,
+            stage_bytes,
         ),
     };
     // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
@@ -462,6 +475,7 @@ fn refine_gpu_plan_for_source(
             .map_or(free as u64, |b| (b as u64).min(free as u64));
         let rows = source.n_rows() as u64;
         let cols = params.cols_per_block.max(1);
+        crate::gpu_mem_plan::gpu_row_major_opt_in().map_err(to_py_err)?;
         let model = |streams| gpu_plan_model(cfg, rows, streams, Some((&shape, cols as u64)));
         let plan = |streams: Option<usize>| {
             crate::gpu_mem_plan::resolve_gpu_streaming_plan_for_blocks(
