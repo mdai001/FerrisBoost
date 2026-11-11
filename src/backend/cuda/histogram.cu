@@ -162,6 +162,28 @@ __device__ bool split_better(SplitPacket a, uint32_t ao, SplitPacket b, uint32_t
         (a.gain == b.gain && ao < bo));
 }
 
+// Numeric candidates retain their payload in the originating thread.
+struct SplitWinnerKey {
+    float gain;
+    uint32_t ordinal;
+    uint32_t thread;
+};
+__device__ __forceinline__ SplitWinnerKey split_warp_winner(SplitWinnerKey key) {
+    uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t step = 16; step; step /= 2) {
+        SplitWinnerKey other{
+            __shfl_down_sync(0xffffffffu, key.gain, step),
+            __shfl_down_sync(0xffffffffu, key.ordinal, step),
+            __shfl_down_sync(0xffffffffu, key.thread, step)};
+        if (lane + step < 32 && other.thread != 0xffffffffu &&
+            (key.thread == 0xffffffffu || other.gain > key.gain ||
+             (other.gain == key.gain && other.ordinal < key.ordinal))) {
+            key = other;
+        }
+    }
+    return key;
+}
+
 // Inclusive two-stage CTA scan of one SplitPair per thread. Integer addition
 // is modulo 2^64, so this has exactly the serial prefix. Shuffle operands never
 // cross a warp; shared cross-warp data is protected by full CTA barriers before
@@ -244,8 +266,9 @@ __device__ __forceinline__ void split_features_body(
     // `winners` doubles as scratch for the categorical sort (weights, sorted
     // bins); the scratch is dead before the first winners[] write, which is
     // separated from the last scratch read by the scan's CTA barrier.
-    __shared__ SplitPacket winners[256];
-    __shared__ uint32_t ordinals[256];
+    __shared__ SplitPacket winners[CAT ? 256 : 1];
+    __shared__ uint32_t ordinals[CAT ? 256 : 1];
+    __shared__ SplitWinnerKey warp_winners[CAT ? 1 : 8];
     __shared__ uint16_t cat_order[CAT ? 256 : 1];
     __shared__ uint32_t cat_words[CAT ? CAT_SET_WORDS : 1];
     uint32_t t = threadIdx.x, f = blockIdx.x, n = blockIdx.y;
@@ -390,6 +413,26 @@ __device__ __forceinline__ void split_features_body(
                 if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
             }
         }
+    }
+    if (!CAT) {
+        uint32_t lane = t & 31u, warp = t >> 5;
+        SplitWinnerKey key{best.gain, ordinal,
+            (best.flags & 1u) ? t : 0xffffffffu};
+        key = split_warp_winner(key);
+        if (!lane) warp_winners[warp] = key;
+        __syncthreads();
+        if (!warp) {
+            key = lane < 8 ? warp_winners[lane]
+                : SplitWinnerKey{0.0f, 0xffffffffu, 0xffffffffu};
+            key = split_warp_winner(key);
+            if (!lane) warp_winners[0] = key;
+        }
+        __syncthreads();
+        uint32_t winner = warp_winners[0].thread;
+        if (t == winner) output[(size_t)n * features + f] = best;
+        if (!t && winner == 0xffffffffu)
+            output[(size_t)n * features + f] = SplitPacket{};
+        return;
     }
     winners[t] = best; ordinals[t] = ordinal; __syncthreads();
     for (uint32_t step = 128; step; step /= 2) {
