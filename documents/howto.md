@@ -1284,7 +1284,9 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   `ValueError`. The training categories are stored in the booster and later
   frames are re-coded by value, so a different category order is harmless; a
   category unseen in training raises `ValueError`, as in XGBoost. A model
-  restored with `load_model` keeps its categories.
+  restored with `load_model` keeps its categories. Each fresh `fit` learns a
+  new category state and does not reuse lists from a previous fit; use
+  `init_model` to continue from that model and its categories.
   For plain arrays, mark categorical columns with `feature_types=["c", "q", ...]`.
   `GridSearchCV`, `cross_val_score`, and `clone` work with categorical frames.
 - `apply(X, iteration_range=None)` returns the leaf node reached in every tree,
@@ -1492,6 +1494,9 @@ The scikit-learn estimators train on in-memory data and do not take these
 options. Several Parquet files and CSV are quantized once and held in memory.
 
 ## Train from PyArrow
+
+PyArrow is optional, and Arrow table training, evaluation, and prediction work
+without pandas installed; the Arrow input path does not import pandas.
 
 PyArrow `Table`, `RecordBatch`, and `RecordBatchReader` inputs are accepted with labels supplied
 separately:

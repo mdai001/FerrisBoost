@@ -98,13 +98,22 @@ prediction = model.predict("test.parquet")</code></pre>
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
-      <h3>0.0.8 (unreleased)</h3>
+      <h3>0.0.8</h3>
       <ul>
         <li>Added <code>max_bin</code> above 255 (up to 65535).</li>
         <li>Up to 65,534 categories per feature (was 254).</li>
         <li>Wide bins and many categories train on CPU and GPU.</li>
-        <li>GPU speed optimization for wide features.</li>
+        <li>GPU speed optimizations.</li>
         <li>Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.</li>
+        <li>Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost <code>cats</code> layout); named input is re-coded by value, and unseen categories raise <code>ValueError</code>.</li>
+        <li>CSV text columns declared categorical train as named categories.</li>
+        <li>Changed: models with integer categories now look up plain integer input by value, not as codes.</li>
+        <li>Changed: Arrow integer dictionaries are read by value for models without category lists, as Parquet files are.</li>
+        <li>Changed: pandas and Arrow integer columns are read by value like files (NumPy stays codes).</li>
+        <li>Fixed: sklearn estimators handle Arrow dictionary columns like <code>train</code> (nulls are missing).</li>
+        <li>Fixed: <code>cache_path</code> / <code>cache_budget_bytes</code> with unsupported input (such as several Parquet files) now raise instead of being ignored.</li>
+        <li>Fixed: integer category values are mapped by value during continuation, without stale category state on estimator refit.</li>
+        <li>Fixed: Arrow dictionary training, evaluation and prediction work without pandas installed.</li>
       </ul>
       <h3>0.0.7</h3>
       <ul>

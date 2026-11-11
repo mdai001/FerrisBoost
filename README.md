@@ -248,12 +248,12 @@ logging, and the complete parameter reference.
 
 See the [Python API How-To](documents/howto.md) for details.
 
-### 0.0.8 (unreleased)
+### 0.0.8
 
 - Added `max_bin` above 255 (up to 65535).
 - Up to 65,534 categories per feature (was 254).
 - Wide bins and many categories train on CPU and GPU.
-- GPU speed optimization for wide features.
+- GPU speed optimizations.
 - Fixed: rare split differences from XGBoost when two candidates have nearly equal gain.
 - Named categories: pandas categories and Arrow / Parquet string dictionaries are stored in the model (XGBoost `cats` layout); named input is re-coded by value, and unseen categories raise `ValueError`.
 - CSV text columns declared categorical train as named categories.
@@ -262,6 +262,8 @@ See the [Python API How-To](documents/howto.md) for details.
 - Changed: pandas and Arrow integer columns are read by value like files (NumPy stays codes).
 - Fixed: sklearn estimators handle Arrow dictionary columns like `train` (nulls are missing).
 - Fixed: `cache_path` / `cache_budget_bytes` with unsupported input (such as several Parquet files) now raise instead of being ignored.
+- Fixed: integer category values are mapped by value during continuation, without stale category state on estimator refit.
+- Fixed: Arrow dictionary training, evaluation and prediction work without pandas installed.
 
 ### 0.0.7
 
