@@ -13,6 +13,9 @@ mod packet_tests;
 /// (16-bit blocks: max_bin > 255, more than 254 categories) runs the tiled
 /// `split_cached_features_wide*` kernels instead.
 const SPLIT_KERNEL_MAX_BINS: u32 = 255;
+const SPLIT_SCORE_LEGACY: u32 = 0;
+const SPLIT_SCORE_GIVEN_BOUNDED: u32 = 1;
+const SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS: u32 = 2;
 
 pub(super) struct ResidentSplitBuffers {
     previous: CudaSlice<i64>,
@@ -606,10 +609,25 @@ impl GpuBlockSession<'_> {
             }
             cache.features_ready = true;
         }
-        // Given-weight mode (always on, see `TrainParams::uses_given_weight`).
-        // 没有单调约束时 monotone 缓冲区保持全 0、界是 ±f32::MAX。
-        let has_monotone = u32::from(p.uses_given_weight());
-        if has_monotone != 0 {
+        // Split score mode: 0 = legacy f64, 1 = given-weight with uploaded
+        // bounds, 2 = given-weight with the default ±f32::MAX bounds. Mode 2
+        // is limited to the ordinary narrow numeric cached-split path.
+        let split_score_mode = if !cache.wide
+            && !cache.cat_enabled
+            && !p.has_monotone()
+            && p.alpha.to_bits() == 0.0f32.to_bits()
+            && p.max_delta_step == 0.0
+            && p.uses_given_weight()
+        {
+            SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS
+        } else {
+            if p.uses_given_weight() {
+                SPLIT_SCORE_GIVEN_BOUNDED
+            } else {
+                SPLIT_SCORE_LEGACY
+            }
+        };
+        if split_score_mode == SPLIT_SCORE_GIVEN_BOUNDED {
             stream.memcpy_htod(&bounds, &mut cache.bounds.slice_mut(..bounds.len()))?;
             self.timing.split_metadata_h2d_calls += 1;
             self.timing.split_metadata_h2d_bytes += (bounds.len() * 4) as u64;
@@ -684,7 +702,7 @@ impl GpuBlockSession<'_> {
             .arg(&p.max_delta_step)
             .arg(&cache.bounds)
             .arg(&cache.monotone)
-            .arg(&has_monotone)
+            .arg(&split_score_mode)
             .arg(&mut cache.candidates);
         if node_enabled.is_some() {
             launch.arg(&cache.node_enabled);

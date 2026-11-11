@@ -18,6 +18,11 @@ static_assert(sizeof(SplitPacket) == 64, "split packet ABI");
 // at the end of this file: tiled scans and variable-length category sets.
 #define SPLIT_CTA_THREADS 256
 #define CAT_SET_WORDS 8
+enum SplitScoreMode : uint32_t {
+    SPLIT_SCORE_LEGACY = 0,
+    SPLIT_SCORE_GIVEN_BOUNDED = 1,
+    SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS = 2,
+};
 static_assert(CAT_SET_WORDS * 32 >= SPLIT_CTA_THREADS, "set must cover every bin");
 __device__ SplitPair split_add(SplitPair a, SplitPair b) {
     return {(int64_t)((uint64_t)a.grad + (uint64_t)b.grad),
@@ -50,7 +55,7 @@ __device__ SplitPacket split_candidate(SplitPair l, SplitPair r,
 }
 // Monotone constraints (XGBoost 3.4.1 single-output hist semantics). Each
 // rounding step mirrors src/split.rs `bounded_split_gain` exactly; explicit
-// _rn intrinsics forbid FMA contraction. Unused when has_monotone == 0.
+// _rn intrinsics forbid FMA contraction. Used by score modes 1 and 2.
 // XGBoost ThresholdL1 + CalcWeight (param.h): alpha == 0 and
 // max_delta_step == 0 reduce to -g / (h + lambda) bit for bit.
 __device__ double mono_threshold_l1(double g, float alpha) {
@@ -85,6 +90,34 @@ __device__ float mono_node_gain(SplitPair s, double ig, double ih, float lambda,
     return mono_gain_given_weight(g, h,
         mono_apply(mono_weight(g, h, lambda, alpha, mds), lower, upper), lambda, alpha);
 }
+// Mode 2 is entered only with the positive-zero alpha and max_delta_step.
+// Preserve the same threshold-L1 branches and explicit rounding, while
+// specializing away the two multiplications that form 0 * |w|. Keep the
+// final +0 addition because it preserves the generic path's signed-zero rule.
+__device__ float mono_weight_default(double g, double h, float lambda) {
+    if (h <= 0.0) return 0.0f;
+    double thresholded;
+    if (g > 0.0) thresholded = __dsub_rn(g, 0.0);
+    else if (g < -0.0) thresholded = __dadd_rn(g, 0.0);
+    else thresholded = 0.0;
+    double dw = __ddiv_rn(-thresholded, __dadd_rn(h, (double)lambda));
+    return __double2float_rn(dw);
+}
+__device__ float mono_gain_given_weight_default(double g, double h, float w,
+    float lambda) {
+    if (h <= 0.0) return 0.0f;
+    double square = (double)__fmul_rn(w, w);
+    double a = __dmul_rn(__dmul_rn(2.0, g), (double)w);
+    double b = __dmul_rn(__dadd_rn(h, (double)lambda), square);
+    double gain = __dadd_rn(__dadd_rn(a, b), 0.0);
+    return __double2float_rn(-gain);
+}
+__device__ float mono_node_gain_default(SplitPair s, double ig, double ih,
+    float lambda, float lower, float upper) {
+    double g = split_value(s.grad, ig), h = split_value(s.hess, ih);
+    float w = mono_apply(mono_weight_default(g, h, lambda), lower, upper);
+    return mono_gain_given_weight_default(g, h, w, lambda);
+}
 __device__ SplitPacket mono_candidate(SplitPair l, SplitPair r,
     uint32_t feat, uint32_t bin, bool missing, float parent,
     double ig, double ih, float lambda, float gamma, float mcw,
@@ -98,6 +131,25 @@ __device__ SplitPacket mono_candidate(SplitPair l, SplitPair r,
     if ((constraint > 0 && wl > wr) || (constraint < 0 && wl < wr)) return p;
     float gain = __fadd_rn(mono_gain_given_weight(gl, hl, wl, lambda, alpha),
         mono_gain_given_weight(gr, hr, wr, lambda, alpha));
+    float loss = __fsub_rn(gain, parent);
+    float result = __double2float_rn(__dsub_rn((double)loss, (double)gamma));
+    if (!(result > 1.e-6f)) return p;
+    p.feat = feat; p.bin = bin; p.gain = result;
+    p.flags = 1u | (missing ? 2u : 0u); p.left = l; p.right = r;
+    return p;
+}
+__device__ SplitPacket mono_candidate_default(SplitPair l, SplitPair r,
+    uint32_t feat, uint32_t bin, bool missing, float parent,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float lower, float upper) {
+    SplitPacket p{};
+    double hl = split_value(l.hess, ih), hr = split_value(r.hess, ih);
+    if (!(hl > 0.0 && hr > 0.0 && hl >= (double)mcw && hr >= (double)mcw)) return p;
+    double gl = split_value(l.grad, ig), gr = split_value(r.grad, ig);
+    float wl = mono_apply(mono_weight_default(gl, hl, lambda), lower, upper);
+    float wr = mono_apply(mono_weight_default(gr, hr, lambda), lower, upper);
+    float gain = __fadd_rn(mono_gain_given_weight_default(gl, hl, wl, lambda),
+        mono_gain_given_weight_default(gr, hr, wr, lambda));
     float loss = __fsub_rn(gain, parent);
     float result = __double2float_rn(__dsub_rn((double)loss, (double)gamma));
     if (!(result > 1.e-6f)) return p;
@@ -141,9 +193,12 @@ __device__ __forceinline__ SplitPair split_block_scan(SplitPair v, SplitPair* wa
 __device__ __forceinline__ SplitPacket split_any_candidate(SplitPair l, SplitPair r,
     uint32_t feat, uint32_t bin, bool missing, double parent, float mono_parent_gain,
     double ig, double ih, float lambda, float gamma, float mcw,
-    float alpha, float mds, uint32_t has_monotone, int32_t constraint,
+    float alpha, float mds, uint32_t score_mode, int32_t constraint,
     float lower, float upper) {
-    return has_monotone
+    if (score_mode == SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS)
+        return mono_candidate_default(l, r, feat, bin, missing, mono_parent_gain, ig, ih,
+            lambda, gamma, mcw, lower, upper);
+    return score_mode == SPLIT_SCORE_GIVEN_BOUNDED
         ? mono_candidate(l, r, feat, bin, missing, mono_parent_gain, ig, ih, lambda, gamma,
             mcw, alpha, mds, constraint, lower, upper)
         : split_candidate(l, r, feat, bin, missing, parent, ig, ih, lambda, gamma, mcw);
@@ -152,8 +207,11 @@ __device__ __forceinline__ SplitPacket split_any_candidate(SplitPair l, SplitPai
 // Per-node metadata: working output slot, small-input slot, previous-cache
 // parent slot (UINT32_MAX = direct), next-cache slot (UINT32_MAX = uncached).
 // Cache generations are disjoint; no CTA writes an input used by another CTA.
-// Monotone: `bounds[n*2..]` = node [lower, upper], `monotone[f]` = direction of
-// block-local feature f; both read only when has_monotone != 0 (uniform).
+// Split score mode: 0 = legacy f64 gain, 1 = given-weight with uploaded
+// per-node bounds/monotone directions, 2 = given-weight with implicit default
+// bounds ±f32::MAX and zero monotone direction. Mode 2 specializes positive
+// zero alpha while preserving the same rounded score expression; it is chosen
+// only for unconstrained narrow numeric cached splits.
 //
 // Feature enable: `node_enabled` (nullable) is a per-(node, block-local feature)
 // byte mask for nested column sampling; otherwise the tree-level `enabled[f]`.
@@ -175,7 +233,7 @@ __device__ __forceinline__ void split_features_body(
     uint32_t hist_stride, uint32_t cache_stride,
     double ig, double ih, float lambda, float gamma, float mcw,
     float alpha, float mds,
-    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    const float* bounds, const int32_t* monotone, uint32_t score_mode,
     SplitPacket* output,
     const uint8_t* node_enabled, const uint32_t* cat_info, uint32_t n_cat,
     uint32_t max_onehot, uint32_t max_threshold, uint32_t* cat_out) {
@@ -206,15 +264,20 @@ __device__ __forceinline__ void split_features_body(
     }
     float lower = 0.0f, upper = 0.0f;
     int32_t constraint = 0;
-    if (has_monotone) {
+    if (score_mode == SPLIT_SCORE_GIVEN_BOUNDED) {
         lower = bounds[(size_t)n * 2];
         upper = bounds[(size_t)n * 2 + 1];
         constraint = monotone[f];
+    } else if (score_mode == SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS) {
+        lower = -0x1.fffffep127f;
+        upper = 0x1.fffffep127f;
     }
     if (!t) {
         parent_gain = split_gain(sums[n], ig, ih, lambda);
-        mono_parent = has_monotone
-            ? mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, lower, upper) : 0.0f;
+        mono_parent = score_mode == SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS
+            ? mono_node_gain_default(sums[n], ig, ih, lambda, lower, upper)
+            : score_mode == SPLIT_SCORE_GIVEN_BOUNDED
+                ? mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, lower, upper) : 0.0f;
     }
     const bool on = (node_enabled ? node_enabled[(size_t)n * features + f] : enabled[f]) != 0;
     const uint32_t kind = CAT ? cat_info[f] : 0u;
@@ -239,12 +302,12 @@ __device__ __forceinline__ void split_features_body(
                     // then with the category.
                     best = split_any_candidate(split_sub(sum, v), v, feats[f], cat_ord, true,
                         parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
-                        has_monotone, constraint, lower, upper);
+                        score_mode, constraint, lower, upper);
                     ordinal = 2 * t;
                     SplitPair right = split_add(v, missing);
                     SplitPacket alt = split_any_candidate(split_sub(sum, right), right,
                         feats[f], cat_ord, false, parent_gain, mono_parent, ig, ih, lambda,
-                        gamma, mcw, alpha, mds, has_monotone, constraint, lower, upper);
+                        gamma, mcw, alpha, mds, score_mode, constraint, lower, upper);
                     if (split_better(alt, 2 * t + 1, best, ordinal)) { best = alt; ordinal = 2 * t + 1; }
                 }
             } else {
@@ -282,7 +345,7 @@ __device__ __forceinline__ void split_features_body(
                     SplitPair right = prefix[t];
                     best = split_any_candidate(split_sub(sum, right), right, feats[f], cat_ord,
                         true, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds,
-                        has_monotone, constraint, lower, upper);
+                        score_mode, constraint, lower, upper);
                     ordinal = t;
                     // Backward: sorted tail j.. on the left, missing right; the
                     // first j sorted categories are the set.
@@ -290,7 +353,7 @@ __device__ __forceinline__ void split_features_body(
                     SplitPair left = split_sub(total, prefix[j - 1]);
                     SplitPacket alt = split_any_candidate(left, split_sub(sum, left), feats[f],
                         cat_ord, false, parent_gain, mono_parent, ig, ih, lambda, gamma, mcw,
-                        alpha, mds, has_monotone, constraint, lower, upper);
+                        alpha, mds, score_mode, constraint, lower, upper);
                     uint32_t ro = n_scan - 1 + t;
                     if (split_better(alt, ro, best, ordinal)) { best = alt; ordinal = ro; }
                 }
@@ -303,20 +366,26 @@ __device__ __forceinline__ void split_features_body(
         __syncthreads();
         if (t < count && on) {
             SplitPair sum = sums[n], total = prefix[count - 1];
-            best = has_monotone
-                ? mono_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1, false,
-                    mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
-                : split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
-                    false, parent_gain, ig, ih, lambda, gamma, mcw);
+            best = score_mode == SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS
+                ? mono_candidate_default(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
+                    false, mono_parent, ig, ih, lambda, gamma, mcw, lower, upper)
+                : score_mode == SPLIT_SCORE_GIVEN_BOUNDED
+                    ? mono_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1, false,
+                        mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
+                    : split_candidate(prefix[t], split_sub(sum, prefix[t]), feats[f], t + 1,
+                        false, parent_gain, ig, ih, lambda, gamma, mcw);
             ordinal = t;
             if (total.grad != sum.grad || total.hess != sum.hess) {
                 SplitPair before = t ? prefix[t - 1] : SplitPair{};
                 SplitPair right = split_sub(total, before);
-                SplitPacket reverse = has_monotone
-                    ? mono_candidate(split_sub(sum, right), right, feats[f], t, true,
-                        mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
-                    : split_candidate(split_sub(sum, right), right, feats[f], t,
-                        true, parent_gain, ig, ih, lambda, gamma, mcw);
+                SplitPacket reverse = score_mode == SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS
+                    ? mono_candidate_default(split_sub(sum, right), right, feats[f], t, true,
+                        mono_parent, ig, ih, lambda, gamma, mcw, lower, upper)
+                    : score_mode == SPLIT_SCORE_GIVEN_BOUNDED
+                        ? mono_candidate(split_sub(sum, right), right, feats[f], t, true,
+                            mono_parent, ig, ih, lambda, gamma, mcw, alpha, mds, constraint, lower, upper)
+                        : split_candidate(split_sub(sum, right), right, feats[f], t,
+                            true, parent_gain, ig, ih, lambda, gamma, mcw);
                 uint32_t ro = count + count - 1 - t;
                 if (split_better(reverse, ro, best, ordinal)) { best = reverse; ordinal = ro; }
             }
@@ -354,11 +423,11 @@ extern "C" __global__ void split_cached_features(
     uint32_t hist_stride, uint32_t cache_stride,
     double ig, double ih, float lambda, float gamma, float mcw,
     float alpha, float mds,
-    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    const float* bounds, const int32_t* monotone, uint32_t score_mode,
     SplitPacket* output, const uint8_t* node_enabled) {
     split_features_body<false>(hist, previous, next, offsets, feats, enabled, sums, metadata,
         features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
-        monotone, has_monotone, output, node_enabled, nullptr, 0, 0, 0, nullptr);
+        monotone, score_mode, output, node_enabled, nullptr, 0, 0, 0, nullptr);
 }
 extern "C" __global__ void split_cached_features_cat(
     SplitPair* hist, const SplitPair* previous, SplitPair* next,
@@ -367,27 +436,59 @@ extern "C" __global__ void split_cached_features_cat(
     uint32_t hist_stride, uint32_t cache_stride,
     double ig, double ih, float lambda, float gamma, float mcw,
     float alpha, float mds,
-    const float* bounds, const int32_t* monotone, uint32_t has_monotone,
+    const float* bounds, const int32_t* monotone, uint32_t score_mode,
     SplitPacket* output, const uint8_t* node_enabled,
     const uint32_t* cat_info, uint32_t n_cat, uint32_t max_onehot, uint32_t max_threshold,
     uint32_t* cat_out) {
     split_features_body<true>(hist, previous, next, offsets, feats, enabled, sums, metadata,
         features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
-        monotone, has_monotone, output, node_enabled, cat_info, n_cat, max_onehot,
+        monotone, score_mode, output, node_enabled, cat_info, n_cat, max_onehot,
         max_threshold, cat_out);
 }
 extern "C" __global__ void split_cached_nodes(const SplitPacket* features,
     uint32_t n_features, double ig, double ih, float lambda, SplitPacket* output) {
-    if (threadIdx.x) return;
-    SplitPacket best{};
-    for (uint32_t f = 0; f < n_features; ++f) {
-        SplitPacket p = features[(size_t)blockIdx.x * n_features + f];
-        if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
+    // Host launches exactly one full warp per node. Reduce only the selection
+    // key; copy the original packet once so every payload bit stays unchanged.
+    const uint32_t lane = threadIdx.x;
+    const size_t base = (size_t)blockIdx.x * n_features;
+    uint32_t winner = 0xffffffffu;
+    float gain = 0.0f;
+    bool valid_nan = false;
+    for (size_t f = lane; f < (size_t)n_features; f += 32) {
+        const SplitPacket p = features[base + f];
+        if (p.flags & 1u) {
+            valid_nan |= p.gain != p.gain;
+            if (winner == 0xffffffffu || p.gain > gain) {
+                winner = (uint32_t)f;
+                gain = p.gain;
+            }
+        }
     }
-    // The training consumer uses only winner metadata and fixed-point child
-    // sums. Leaf weights are computed once after the global block reduction;
-    // avoid repeating unused divisions for every block-local candidate.
-    output[blockIdx.x] = best;
+    // Producers reject NaN before setting validity. Still preserve the serial
+    // consumer's behavior for arbitrary packets: a valid NaN is order-sensitive.
+    if (__any_sync(0xffffffffu, valid_nan)) {
+        if (!lane) {
+            SplitPacket best{};
+            for (uint32_t f = 0; f < n_features; ++f) {
+                const SplitPacket p = features[base + f];
+                if ((p.flags & 1u) && (!(best.flags & 1u) || p.gain > best.gain)) best = p;
+            }
+            output[blockIdx.x] = best;
+        }
+        return;
+    }
+    for (uint32_t step = 16; step; step >>= 1) {
+        const uint32_t other = __shfl_down_sync(0xffffffffu, winner, step);
+        const float other_gain = __shfl_down_sync(0xffffffffu, gain, step);
+        if (lane + step < 32 && other != 0xffffffffu &&
+            (winner == 0xffffffffu || other_gain > gain ||
+             (other_gain == gain && other < winner))) {
+            winner = other;
+            gain = other_gain;
+        }
+    }
+    if (!lane) output[blockIdx.x] = winner == 0xffffffffu
+        ? SplitPacket{} : features[base + winner];
 }
 // Node reduction for blocks with categorical features. Packets are `stride`
 // bytes apart: a 64 B packet, then the 256-bit category set of a categorical
@@ -1560,6 +1661,9 @@ __device__ __forceinline__ void hist_batched_body(
                 static_cast<unsigned long long>(gpair[(uint64_t)row * 2]);
             const unsigned long long hr =
                 static_cast<unsigned long long>(gpair[(uint64_t)row * 2 + 1]);
+            // Zero pairs contribute nothing to any histogram, including missing bins.
+            // Keep their rows in partition/routing so every row still gets its prediction.
+            ok[r] = (gr | hr) != 0ULL;
             g_lo[r] = static_cast<unsigned int>(gr);
             g_hi[r] = static_cast<unsigned int>(gr >> 32);
             h_lo[r] = static_cast<unsigned int>(hr);
