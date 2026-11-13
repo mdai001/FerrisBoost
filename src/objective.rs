@@ -1103,7 +1103,8 @@ impl Objective {
     /// `nthread=1` 逐位相同。
     pub fn absolute_gradient(scale: f32, pred: f32, label: f32) -> GradPair {
         let residual = pred - label;
-        let norm = scale.hypot(residual);
+        // Pure Rust math keeps the Linux wheel's existing glibc compatibility floor.
+        let norm = libm::hypotf(scale, residual);
         let curvature = if norm > 0.0 { scale / norm } else { 1.0 };
         GradPair {
             grad: residual * curvature,
