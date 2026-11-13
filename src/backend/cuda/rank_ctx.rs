@@ -559,7 +559,14 @@ impl GpuTrainCtx {
         }
         // The finalize kernel already applied the row sampling; the quantize tail
         // scans gpair_f32 for the maximum (like the quantile path).
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, false)
+        self.quantize_resident_gpair(
+            &mut buf,
+            started,
+            u64::MAX,
+            subsample_seed,
+            subsample_tree,
+            false,
+        )
     }
 
     /// Steps 4 to 6 of a round with `lambdarank_unbiased`: zero the accumulators, bound

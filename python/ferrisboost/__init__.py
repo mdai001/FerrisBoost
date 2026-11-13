@@ -14,7 +14,8 @@
     fb.Model.load_model("m.json")  # 也能读 XGBoost 训的
 
 这一层只做参数解析、dtype 归一化和输入分发,**不碰任何数值**。
-计算全在 Rust 里 —— `python/tests/test_bit_exact.py` 就是守这条的:
+内置数值计算在 Rust/CUDA 中;自定义 metric 只将整批用户函数留在 Python。
+内置路径的正确性由测试验证 —— `python/tests/test_bit_exact.py` 就是守这条的:
 同一份 fixture 从 Python 训出来,预测值要和基准逐位相同。
 """
 
@@ -26,9 +27,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 
 from . import _core
-from ._core import Model
+from ._core import CustomMetric, CustomObjective, Model
 
-__all__ = ["train", "Model", "__version__"]
+__all__ = ["train", "Model", "CustomMetric", "CustomObjective", "__version__"]
 __version__ = _core.__version__
 
 _SKLEARN_NAMES = ("FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker")
@@ -47,6 +48,8 @@ def __getattr__(name: str) -> Any:
 _DEFAULTS: dict[str, Any] = {
     "objective": "binary:logistic",
     "max_depth": 6,
+    # 0 = 不额外限制每棵树的叶子数。
+    "max_leaves": 0,
     "max_bin": 255,
     "eta": 0.3,
     "lambda": 1.0,
@@ -57,14 +60,18 @@ _DEFAULTS: dict[str, Any] = {
     "max_delta_step": None,
     "tweedie_variance_power": 1.5,
     "huber_slope": 1.0,
+    "aft_loss_distribution": "normal",
+    "aft_loss_distribution_scale": 1.0,
     # reg:quantileerror 必须给:[0, 1] 内的分位数,标量或升序列表
     # (多个值 = 多输出模型,每个分位数一棵树)。
     "quantile_alpha": None,
+    "expectile_alpha": None,
     # multi:softprob / multi:softmax 必须给;其它 objective 忽略。
     "num_class": None,
     "scale_pos_weight": 1.0,
     "min_child_weight": 1.0,
     "subsample": 1.0,
+    "sampling_method": "uniform",
     "colsample_bytree": 1.0,
     # XGBoost 的嵌套采样(bytree → bylevel → bynode)。只限制 split 枚举。
     "colsample_bylevel": 1.0,
@@ -107,9 +114,13 @@ _DEFAULTS: dict[str, Any] = {
     # XGBoost 同名参数:字符串或字符串列表。None = objective 的默认指标。
     # 多个时 early stopping 盯最后一个(和 XGBoost 一致)。
     "eval_metric": None,
+    "custom_objective": None,
+    "feature_weights": None,
     # XGBoost 同名参数:元组/列表(按特征位置)、"(1,0,-1)" 字符串,或
     # {特征名: 方向} 字典(需要列名)。1 递增、-1 递减、0 不约束;只看符号。
     "monotone_constraints": None,
+    # None 或按全局特征 ID / 特征名分组的列表;名称输入需要带列名的数据源。
+    "interaction_constraints": None,
     # Categorical features (XGBoost semantics). `enable_categorical` lets pandas
     # `category` columns and PyArrow dictionary columns be detected as
     # categorical; `feature_types` ("c" / "q" per feature) declares them
@@ -154,13 +165,12 @@ _ALIASES = {
     "max_leaves": "max_leaves",
 }
 
-_OBJECTIVES = ("binary:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
+_OBJECTIVES = ("reg:absoluteerror", "reg:expectileerror", "binary:logitraw", "binary:hinge", "reg:squaredlogerror", "binary:logistic", "reg:logistic", "reg:squarederror", "count:poisson", "reg:gamma",
                "reg:tweedie", "reg:pseudohubererror", "reg:quantileerror", "multi:softprob",
-               "multi:softmax", "rank:ndcg", "rank:pairwise", "rank:map")
+               "multi:softmax", "rank:ndcg", "rank:pairwise", "rank:map", "survival:aft", "survival:cox")
 
 # 认识但还没实现的:显式报错,别让用户以为设了就生效了
 _UNIMPLEMENTED = {
-    "max_leaves": "leaf-wise growth is not implemented yet (trees grow depthwise)",
     "tree_method": "hist is the only tree method; do not set it",
     "num_parallel_tree": "random forest mode is not supported",
 }
@@ -190,10 +200,12 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
 
     out["num_boost_round"] = int(num_boost_round)
     for key in (
-        "max_depth", "max_bin", "nthread", "ingest_threads", "model_io_threads",
+        "max_depth", "max_leaves", "max_bin", "nthread", "ingest_threads", "model_io_threads",
         "seed", "num_boost_round"
     ):
         out[key] = int(out[key])
+    if out["max_leaves"] < 0:
+        raise ValueError(f"max_leaves must be >= 0, got {out['max_leaves']}")
     if out["ingest_threads"] < 0:
         raise ValueError(f"ingest_threads must be >= 0, got {out['ingest_threads']}")
     if out["model_io_threads"] < 0:
@@ -271,7 +283,7 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         out["max_delta_step"] = float(out["max_delta_step"])
     out["quantile_alpha"] = _normalize_quantile_alpha(out["quantile_alpha"], out["objective"])
     for key in ("eta", "lambda", "gamma", "min_child_weight", "alpha", "tweedie_variance_power",
-                "huber_slope", "scale_pos_weight", "subsample",
+                "huber_slope", "aft_loss_distribution_scale", "scale_pos_weight", "subsample",
                 "colsample_bytree", "colsample_bylevel", "colsample_bynode"):
         out[key] = float(out[key])
     if out["base_score"] is not None:
@@ -284,12 +296,12 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
         out["cache_path"] = os.fspath(out["cache_path"])
     if out["eval_metric"] is not None:
         m = out["eval_metric"]
-        names = [m] if isinstance(m, str) else (
+        names = [m] if isinstance(m, (str, CustomMetric)) else (
             list(m) if isinstance(m, (list, tuple)) else None
         )
-        if not names or not all(isinstance(n, str) for n in names):
+        if not names or not all(isinstance(n, (str, CustomMetric)) for n in names):
             raise ValueError(
-                f"eval_metric must be a string or a list of strings, got {m!r}"
+                f"eval_metric must be a string, CustomMetric, or a list of them, got {m!r}"
             )
         # 名字和 objective 的组合由 Rust 校验(唯一一份规则)。
         out["eval_metric"] = names
@@ -432,6 +444,14 @@ def _as_labels(y: Any, n_rows: int) -> np.ndarray:
     if np.isnan(arr).any():
         raise ValueError("label contains NaN; handle missing labels upstream "
                          "(filling them with 0 would train on 0 as a real label)")
+    return arr
+
+
+def _as_aft_bound(y: Any, n_rows: int, name: str) -> np.ndarray:
+    """Normalize an AFT bound while leaving interval validity to the native objective."""
+    arr = np.ascontiguousarray(np.asarray(y, dtype=np.float32).ravel())
+    if arr.size != n_rows:
+        raise ValueError(f"{name} has {arr.size} entries, the data has {n_rows} rows")
     return arr
 
 
@@ -1084,6 +1104,8 @@ def train(
     group: Any = None,
     eval_qid: Sequence[Any] | None = None,
     eval_group: Sequence[Any] | None = None,
+    label_lower_bound: Any = None,
+    label_upper_bound: Any = None,
 ) -> Model:
     """训一个模型。
 
@@ -1098,6 +1120,12 @@ def train(
 
     `weight` 是每行样本权重(XGBoost 的 DMatrix `weight`):数组入口给
     一维数组,文件入口给**列名**(无表头 CSV 给列下标),该列不进特征。
+
+    `survival:aft` 使用 `label_lower_bound` 和 `label_upper_bound` 两个目标列；
+    数组入口也可将 `label=(lower, upper)` 作为简写。验证数组集的 label 同样给
+    `(lower, upper)`。文件入口给两个列名(或无表头 CSV 的两个列下标),验证文件复用
+    这两列。`aft_loss_distribution` 支持 normal / logistic / extreme,默认 normal；
+    `aft_loss_distribution_scale` 默认 1.0。
 
     `evals` 是 `[(data, label, name)]` 或带权重的 `[(data, label, weight, name)]`;
     数据是路径时写 `[(path, name)]`,标签列名和权重列名都和训练集共用。
@@ -1149,6 +1177,29 @@ def train(
         params = _adopt_prior_params(params, prior)
     p = _normalize_params(params, num_boost_round)
     k_out = _num_outputs(p)
+    specs = _as_path_specs(data)
+    aft = p["objective"] == "survival:aft"
+    if aft:
+        if label_lower_bound is None and label_upper_bound is None and isinstance(label, (tuple, list)) and len(label) == 2:
+            label_lower_bound, label_upper_bound = label
+            label = None
+        elif specs is not None and label is not None and label_lower_bound is None and label_upper_bound is not None:
+            # File shorthand: label names the lower-bound column, with the
+            # upper-bound column supplied separately.
+            label_lower_bound = label
+            label = None
+        if label is not None:
+            raise ValueError(
+                "survival:aft uses label_lower_bound and label_upper_bound; on file inputs label may select the lower-bound column only when label_lower_bound is omitted"
+            )
+        if label_lower_bound is None or label_upper_bound is None:
+            raise ValueError("survival:aft requires both label_lower_bound and label_upper_bound")
+        if p["aft_loss_distribution"] not in ("normal", "logistic", "extreme"):
+            raise ValueError("aft_loss_distribution must be 'normal', 'logistic', or 'extreme'")
+        if p["aft_loss_distribution_scale"] <= 0:
+            raise ValueError("aft_loss_distribution_scale must be positive")
+    elif label_lower_bound is not None or label_upper_bound is not None:
+        raise ValueError("label_lower_bound and label_upper_bound are only supported by survival:aft")
     if base_margin_eval_set is not None and len(base_margin_eval_set) != len(evals):
         raise ValueError(
             f"base_margin_eval_set has {len(base_margin_eval_set)} entries, evals has {len(evals)}"
@@ -1168,12 +1219,21 @@ def train(
     if quiet:
         verbose = None
 
-    specs = _as_path_specs(data)
     if specs is not None:
+        if aft:
+            label = label_lower_bound
         if header and not isinstance(label, str):
             raise ValueError("with header=True, a file label must be a column name string")
         if not header and (not isinstance(label, int) or isinstance(label, bool)):
             raise ValueError("with header=False, a file label must be a zero-based column index")
+        if aft:
+            valid_upper = isinstance(label_upper_bound, str) if header else (
+                isinstance(label_upper_bound, int) and not isinstance(label_upper_bound, bool)
+            )
+            if not valid_upper:
+                raise ValueError("file inputs take label_upper_bound as a column name (or zero-based index with header=False)")
+            if label_upper_bound == label:
+                raise ValueError("label_lower_bound and label_upper_bound must select different file columns")
         if weight is not None:
             if header and not isinstance(weight, str):
                 raise ValueError("file inputs take weight as a column name string (header=True)")
@@ -1240,7 +1300,8 @@ def train(
                                  early_stopping_rounds, verbose, cb_list,
                                  weight=weight, qid=qid, base_margin=base_margin,
                                  start_margin=start, eval_start_margins=eval_start,
-                                 prior_model=prior)
+                                 prior_model=prior,
+                                 **({"label_upper_bound": label_upper_bound} if aft else {}))
     else:
         table = _arrow_table(data)
         frame = data if _is_pandas_frame(data) else None
@@ -1282,7 +1343,8 @@ def train(
                 )
             p["monotone_constraints"] = _resolve_named_monotone(p["monotone_constraints"], names)
         x = _as_matrix(x)
-        y = _as_labels(label, x.shape[0])
+        y = _as_aft_bound(label_lower_bound, x.shape[0], "label_lower_bound") if aft else _as_labels(label, x.shape[0])
+        y_upper = _as_aft_bound(label_upper_bound, x.shape[0], "label_upper_bound") if aft else None
         if isinstance(weight, str):
             raise ValueError("array inputs take weight as a 1-D array; column names are only for file inputs")
         if ranking and qid is None and group is None:
@@ -1305,6 +1367,7 @@ def train(
             _check_prior(prior, p, x.shape[1])
         eval_bms: list[Any] = []
         eval_specs = []
+        eval_upper_bounds: list[np.ndarray] = []
         # Validation columns are read as the trained model will read them: plain
         # integers of a categorical feature with an integer list are values.
         eval_flags = p["_feature_types"] or [False] * x.shape[1]
@@ -1346,7 +1409,16 @@ def train(
                 raise ValueError(
                     f"validation set {name!r} needs query groups: pass eval_qid / eval_group"
                 )
-            eval_specs.append((ex, _as_labels(el, ex.shape[0]), ew, str(name), eq, eg))
+            if aft:
+                if not isinstance(el, (tuple, list)) or len(el) != 2:
+                    raise ValueError(f"evals[{name}] AFT label must be a (lower_bound, upper_bound) pair")
+                eval_label = _as_aft_bound(el[0], ex.shape[0], f"evals[{name}] label_lower_bound")
+                eval_upper_bounds.append(
+                    _as_aft_bound(el[1], ex.shape[0], f"evals[{name}] label_upper_bound")
+                )
+            else:
+                eval_label = _as_labels(el, ex.shape[0])
+            eval_specs.append((ex, eval_label, ew, str(name), eq, eg))
             ebm = None
             if base_margin_eval_set is not None and base_margin_eval_set[n_eval] is not None:
                 ebm = _as_base_margin(
@@ -1371,7 +1443,11 @@ def train(
                                   qid=q, group=g, base_margin=bm,
                                   eval_base_margins=eval_bms if any(
                                       m is not None for m in eval_bms) else None,
-                                  prior_model=prior)
+                                  prior_model=prior,
+                                  **({
+                                      "label_upper_bound": y_upper,
+                                      "eval_upper_bounds": eval_upper_bounds,
+                                  } if aft else {}))
 
     if evals_result is not None:
         evals_result.clear()

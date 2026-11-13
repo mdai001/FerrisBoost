@@ -1,5 +1,7 @@
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from ._core import CustomMetric as CustomMetric
+from ._core import CustomObjective as CustomObjective
 from ._core import Model as Model
 from .sklearn import FerrisBoostClassifier as FerrisBoostClassifier
 from .sklearn import FerrisBoostRegressor as FerrisBoostRegressor
@@ -29,6 +31,8 @@ def train(
     group: Any = ...,
     eval_qid: Sequence[Any] | None = ...,
     eval_group: Sequence[Any] | None = ...,
+    label_lower_bound: Any = ...,
+    label_upper_bound: Any = ...,
 ) -> Model:
     """Train a model from arrays, file paths, a pandas DataFrame, or a PyArrow table.
 

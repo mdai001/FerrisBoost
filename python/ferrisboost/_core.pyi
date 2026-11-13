@@ -7,6 +7,45 @@ from numpy.typing import NDArray
 
 __version__: str
 
+class CustomObjective:
+    """Scalar unweighted derivatives; Rust owns validation, weights and sampling.
+
+    callback(raw_margin, labels) returns two contiguous 1D float32 arrays.
+    Inputs are owned snapshots. CPU and CUDA exact, reg:squarederror only.
+    """
+    def __init__(
+        self,
+        name: str,
+        callback: Callable[[NDArray[np.float32], NDArray[np.float32]],
+                           tuple[NDArray[np.float32], NDArray[np.float32]]],
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def __copy__(self) -> CustomObjective: ...
+    def __deepcopy__(self, memo: Any) -> CustomObjective: ...
+
+
+class CustomMetric:
+    """Batched raw-margin metric executed by the native training loop.
+
+    callback(predictions, labels, sample_weight, group_ptr) returns one finite
+    score. Optional arrays are None when absent. Predictions have shape (n,)
+    or (n, num_outputs); all arrays are owned snapshots safe to retain.
+    The callback must apply any supplied weights itself.
+    """
+    def __init__(
+        self,
+        name: str,
+        callback: Callable[[NDArray[np.float32], NDArray[np.float32],
+                            NDArray[np.float32] | None, NDArray[np.uint32] | None], float],
+        *,
+        greater_is_better: bool = False,
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def greater_is_better(self) -> bool: ...
+
 class Model:
     @property
     def best_iteration(self) -> int | None: ...
@@ -194,6 +233,15 @@ class Model:
     ) -> Model:
         """Load XGBoost-compatible JSON; zero thread counts select auto workers, while JSON parsing remains serial."""
         ...
+    def _survival_score(
+        self,
+        pred: NDArray[np.float32],
+        lower: NDArray[np.float32],
+        upper: NDArray[np.float32] | None = ...,
+        weight: NDArray[np.float32] | None = ...,
+    ) -> float:
+        """Negative weighted survival negative log-likelihood for raw margins."""
+        ...
     def evals_result(self) -> dict[str, dict[str, list[float]]]: ...
 
 def train_dense(
@@ -221,7 +269,7 @@ def train_dense(
     """
     ...
 def rank_score(
-    metric: str,
+    metric: str | CustomMetric,
     pred: NDArray[np.float32],
     label: NDArray[np.float32],
     qid: NDArray[np.uint64],

@@ -56,7 +56,7 @@ pub(super) fn margin_column_names(value: &Bound<'_, PyAny>, k: usize) -> PyResul
 }
 
 /// One whole f32 column of a Parquet / CSV file.
-fn read_column(
+pub(super) fn read_column(
     format: InputFormat,
     path: &std::path::Path,
     name: &str,
@@ -76,6 +76,66 @@ fn read_column(
             Ok(out)
         }
     }
+}
+
+/// Read one target-bound column from all resolved files without filtering
+/// infinities: positive infinity is the AFT right-censoring marker.
+pub(super) fn read_bound_column(
+    resolved: &ResolvedInput,
+    name: &str,
+    header: bool,
+) -> anyhow::Result<Vec<f32>> {
+    let mut out = Vec::new();
+    for path in &resolved.paths {
+        match resolved.format {
+            InputFormat::Parquet => {
+                let names = crate::source::parquet_source::all_column_names(path)?;
+                let index = names.iter().position(|n| n == name).with_context(|| {
+                    format!("{} has no upper bound column {name:?}", path.display())
+                })?;
+                for batch in crate::source::parquet_source::raw_batches(path, &[index])? {
+                    out.extend(crate::source::arrow_source::column_as_f32_allow_inf(
+                        &batch?, 0,
+                    )?);
+                }
+            }
+            InputFormat::Csv => {
+                let (schema, names) = crate::source::csv_source::schema_and_names(path, header)?;
+                let index = names.iter().position(|n| n == name).with_context(|| {
+                    format!("{} has no upper bound column {name:?}", path.display())
+                })?;
+                // CSV inference treats inf as text. Only the declared target
+                // column is forced numeric; regular features keep their rules.
+                let fields: Vec<arrow::datatypes::Field> = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        if i == index {
+                            arrow::datatypes::Field::new(
+                                f.name(),
+                                arrow::datatypes::DataType::Float32,
+                                true,
+                            )
+                        } else {
+                            f.as_ref().clone()
+                        }
+                    })
+                    .collect();
+                let schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                    fields,
+                    schema.metadata().clone(),
+                ));
+                for batch in crate::source::csv_source::raw_batches(path, schema, &[index], header)?
+                {
+                    out.extend(crate::source::arrow_source::column_as_f32_allow_inf(
+                        &batch?, 0,
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Read the margin column(s) of every resolved file, in file order, into

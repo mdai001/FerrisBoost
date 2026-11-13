@@ -886,6 +886,7 @@ mod tests {
             feature_types: Vec::new(),
             rank_bias: None,
             categories: None,
+            custom_objective: None,
         }
     }
 

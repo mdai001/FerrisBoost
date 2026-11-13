@@ -24,6 +24,8 @@ pub use dense::DenseSource;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Targets<'a> {
     pub label: &'a str,
+    /// Optional upper bound of a censored survival target; excluded from features.
+    pub label_upper_bound: Option<&'a str>,
     pub weight: Option<&'a str>,
     /// Optional query-id column (ranking). Excluded from the features like
     /// `label` and `weight`; read separately, never binned.
@@ -56,6 +58,7 @@ impl<'a> Targets<'a> {
         );
         Ok(Self {
             label,
+            label_upper_bound: None,
             weight,
             qid: None,
             features: None,
@@ -64,6 +67,14 @@ impl<'a> Targets<'a> {
             base_margin: None,
             categories: None,
         })
+    }
+
+    /// Name the upper bound column of an AFT target; excluded from features.
+    pub fn with_upper_bound(self, name: Option<&'a str>) -> Self {
+        Self {
+            label_upper_bound: name,
+            ..self
+        }
     }
 
     /// Name the `base_margin` column(s): excluded from the features.
@@ -163,6 +174,7 @@ impl<'a> Targets<'a> {
     /// 这一列是标签、权重、query id 或 base_margin(不进特征)。
     pub fn excludes(&self, name: &str) -> bool {
         name == self.label
+            || self.label_upper_bound == Some(name)
             || self.weight == Some(name)
             || self.qid == Some(name)
             || self
@@ -175,6 +187,7 @@ impl<'a> From<&'a str> for Targets<'a> {
     fn from(label: &'a str) -> Self {
         Self {
             label,
+            label_upper_bound: None,
             weight: None,
             qid: None,
             features: None,
@@ -190,6 +203,7 @@ impl<'a> From<&'a String> for Targets<'a> {
     fn from(label: &'a String) -> Self {
         Self {
             label: label.as_str(),
+            label_upper_bound: None,
             weight: None,
             qid: None,
             features: None,

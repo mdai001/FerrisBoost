@@ -43,14 +43,14 @@ def test_aliases_are_accepted():
 
 def test_unimplemented_param_is_explicit():
     x, y = toy()
-    with pytest.raises(ValueError, match="leaf-wise"):
-        fb.train({**BASE, "max_leaves": 8}, x, label=y, num_boost_round=2)
+    with pytest.raises(ValueError, match="random forest mode"):
+        fb.train({**BASE, "num_parallel_tree": 8}, x, label=y, num_boost_round=2)
 
 
 def test_bad_objective_lists_the_supported_ones():
     x, y = toy()
     with pytest.raises(ValueError) as e:
-        fb.train({**BASE, "objective": "survival:cox"}, x, label=y, num_boost_round=2)
+        fb.train({**BASE, "objective": "survival:bogus"}, x, label=y, num_boost_round=2)
     assert "binary:logistic" in str(e.value)
 
 

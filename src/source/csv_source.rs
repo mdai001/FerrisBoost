@@ -608,11 +608,16 @@ fn open_many_impl(
             .collect()
     };
     for (schema, cols) in schemas.iter().zip(&feat_proj) {
-        let text_cols: Vec<usize> = cols
+        let mut text_cols: Vec<usize> = cols
             .iter()
             .zip(&reads)
             .filter_map(|(&c, r)| r.as_text().then_some(c))
             .collect();
+        if let Some(upper) = targets.label_upper_bound {
+            if let Some(index) = schema.fields().iter().position(|f| f.name() == upper) {
+                text_cols.push(index);
+            }
+        }
         check_numeric(schema, label, &text_cols)?;
     }
     let decide: Vec<bool> = reads.iter().map(|&r| r == CatRead::Decide).collect();

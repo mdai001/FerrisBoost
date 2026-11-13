@@ -213,6 +213,10 @@ pub struct Model {
     pub trees: Vec<Tree>,
     pub base_score: f32,
     pub objective: Objective,
+    /// Stable training derivative-provider name. No executable code is saved.
+    /// Prediction is self-contained; continuation requires the same provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_objective: Option<String>,
     pub n_features: usize,
     /// 早停选中的轮次(0 起)。**预测默认不用它** —— XGBoost 3.4.1 的
     /// `Booster.predict()` 也是拿全部树算的,best_iteration 只是记在
@@ -399,6 +403,7 @@ impl Model {
             feature_types: self.feature_types.clone(),
             rank_bias: None,
             categories: self.categories.clone(),
+            custom_objective: self.custom_objective.clone(),
         }
     }
 
@@ -424,6 +429,7 @@ impl Model {
             feature_types: self.feature_types.clone(),
             rank_bias: self.rank_bias.clone(),
             categories: self.categories.clone(),
+            custom_objective: self.custom_objective.clone(),
         }
     }
 
@@ -545,6 +551,9 @@ impl Model {
                 // XGBoost 把早停结果放在 attributes 里,值是**字符串**
                 attributes: {
                     let mut a = BTreeMap::new();
+                    if let Some(name) = &self.custom_objective {
+                        a.insert("ferrisboost_custom_objective".to_owned(), name.clone());
+                    }
                     if let Some(b) = self.best_iteration {
                         a.insert("best_iteration".to_string(), b.to_string());
                     }
@@ -808,7 +817,19 @@ impl Model {
 
         // 闭包没法泛型,两个字段的目标类型不同,分开写
         let attrs = &learner.attributes;
+        let custom_objective = attrs.get("ferrisboost_custom_objective").cloned();
+        if let Some(name) = &custom_objective {
+            anyhow_like_check(
+                !name.trim().is_empty(),
+                format_args!("custom objective name must not be empty"),
+            )?;
+            anyhow_like_check(
+                matches!(objective, Objective::SquaredError),
+                format_args!("custom objective model requires reg:squarederror metadata"),
+            )?;
+        }
         Ok(Self {
+            custom_objective,
             trees,
             base_score,
             objective,
@@ -1388,6 +1409,7 @@ mod tests {
             feature_types: Vec::new(),
             rank_bias: None,
             categories: None,
+            custom_objective: None,
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1548,6 +1570,7 @@ mod tests {
                 feature_types: Vec::new(),
                 rank_bias: None,
                 categories: None,
+                custom_objective: None,
                 ..fixture_model()
             };
             let json = m.to_xgboost_json().unwrap();
@@ -1583,6 +1606,7 @@ mod tests {
             feature_types: Vec::new(),
             rank_bias: None,
             categories: None,
+            custom_objective: None,
             ..fixture_model()
         }
         .class_view(0);
@@ -1782,7 +1806,7 @@ mod tests {
     fn rejects_what_it_cannot_represent() {
         let cases = [
             ("\"num_class\": \"0\"", "\"num_class\": \"3\"", "multiclass"),
-            ("\"binary:logistic\"", "\"survival:cox\"", "objective"),
+            ("\"binary:logistic\"", "\"survival:bogus\"", "objective"),
             (
                 "\"num_parallel_tree\": \"1\"",
                 "\"num_parallel_tree\": \"4\"",

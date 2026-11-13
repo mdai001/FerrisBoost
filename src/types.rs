@@ -27,6 +27,27 @@ pub enum PredictionAuthority {
     Device,
 }
 
+/// Row selection strategy. Gradient-based sampling operates on current
+/// derivatives on the host (CPU/CUDA exact) or device (CUDA fast).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SamplingMethod {
+    #[default]
+    Uniform,
+    GradientBased,
+}
+impl std::str::FromStr for SamplingMethod {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "uniform" => Ok(Self::Uniform),
+            "gradient_based" => Ok(Self::GradientBased),
+            _ => Err(format!(
+                "sampling_method must be uniform or gradient_based, got {value:?}"
+            )),
+        }
+    }
+}
+
 /// GPU 目标函数数学模式。见 [`TrainParams::gpu_math`]。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GpuMath {
@@ -385,6 +406,9 @@ pub type FeatId = u32;
 pub struct TrainParams {
     pub n_rounds: usize,
     pub max_depth: u32,
+    /// Maximum leaves per tree under depthwise growth; 0 adds no leaf limit.
+    /// A value of 1 produces a root-only tree. The depth limit still applies.
+    pub max_leaves: u32,
     pub max_bin: u32,
     pub learning_rate: f32,
     pub lambda: f32,
@@ -398,12 +422,16 @@ pub struct TrainParams {
     /// 只影响梯度,不影响 metric 和分箱)。1 = 关。
     pub scale_pos_weight: f32,
     pub subsample: f32,
+    pub sampling_method: SamplingMethod,
     pub colsample_bytree: f32,
     /// XGBoost `colsample_bylevel`:每层从 bytree 集合里再采一次(同层所有节点
     /// 共用)。只限制 **split 枚举**,不减少直方图/IO(与 XGBoost 一致)。
     pub colsample_bylevel: f32,
     /// XGBoost `colsample_bynode`:每个节点从层集合里再采一次。同上。
     pub colsample_bynode: f32,
+    /// Per-feature selection weights. Empty disables weighting; only stages
+    /// with colsample < 1 use them. Zero is not a global split prohibition.
+    pub feature_weights: Vec<f32>,
     /// 每个列块包含多少个特征。决定内存工作集和并行粒度。
     ///
     /// 注意它同时是**并行度的上限**:并行维度就是列块,
@@ -522,6 +550,8 @@ pub struct TrainParams {
     /// 全 0 和空完全等价(XGBoost `HasMonotone()` 同样只看有没有非 0),
     /// 走原来的无约束路径,模型逐字节不变。
     pub monotone_constraints: Vec<i8>,
+    /// Allowed feature interaction groups; empty disables path constraints.
+    pub interaction_constraints: Vec<Vec<FeatId>>,
     /// XGBoost `max_cat_to_onehot`: a categorical feature with fewer than this
     /// many categories (bins) is split one-vs-rest; with at least this many it
     /// uses sorted-partition splits. Default 4.
@@ -532,6 +562,13 @@ pub struct TrainParams {
 }
 
 impl TrainParams {
+    /// Shared predicate for GPU mask allocation and planner accounting.
+    pub fn needs_node_feature_masks(&self) -> bool {
+        self.colsample_bylevel < 1.0
+            || self.colsample_bynode < 1.0
+            || !self.interaction_constraints.is_empty()
+    }
+
     /// 有没有任何一个非 0 约束。全 0 等价于没有约束。
     pub fn has_monotone(&self) -> bool {
         self.monotone_constraints.iter().any(|&c| c != 0)
@@ -564,6 +601,7 @@ impl Default for TrainParams {
         Self {
             n_rounds: 100,
             max_depth: 6,
+            max_leaves: 0,
             max_bin: 255,
             learning_rate: 0.3,
             lambda: 1.0,
@@ -573,9 +611,11 @@ impl Default for TrainParams {
             max_delta_step: 0.0,
             scale_pos_weight: 1.0,
             subsample: 1.0,
+            sampling_method: SamplingMethod::Uniform,
             colsample_bytree: 1.0,
             colsample_bylevel: 1.0,
             colsample_bynode: 1.0,
+            feature_weights: Vec::new(),
             cols_per_block: 64,
             nthread: 0,
             hist_streams: None,
@@ -586,6 +626,7 @@ impl Default for TrainParams {
             gpu_math: GpuMath::default(),
             device_quantize: None,
             seed: 0,
+            interaction_constraints: Vec::new(),
             monotone_constraints: Vec::new(),
             max_cat_to_onehot: 4,
             max_cat_threshold: 64,
@@ -656,12 +697,51 @@ impl<'de> serde::Deserialize<'de> for QuantileAlphas {
     }
 }
 
+/// Noise distribution for accelerated failure-time regression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AftDistribution {
+    Normal,
+    Logistic,
+    Extreme,
+}
+impl AftDistribution {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Logistic => "logistic",
+            Self::Extreme => "extreme",
+        }
+    }
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "logistic" => Some(Self::Logistic),
+            "extreme" => Some(Self::Extreme),
+            _ => None,
+        }
+    }
+}
+
 /// 训练目标。带参数的变体存的是 XGBoost 同名参数的**解析后**的值;
 /// 行为(梯度、链接函数、校验、JSON)全部在 `crate::objective` 里。
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Objective {
+    Cox,
+    Aft {
+        distribution: AftDistribution,
+        scale: f32,
+    },
     SquaredError,
     Logistic,
+    /// Probability regression with fractional labels and default RMSE.
+    LogisticRegression,
+    LogisticRaw,
+    SquaredLogError,
+    AbsoluteError,
+    Expectile {
+        alpha: f32,
+    },
+    Hinge,
     /// `count:poisson`。`max_delta_step` 只用于 Hessian 的稳定化
     /// (XGBoost `PoissonRegressionParam`,默认 0.7),和树的
     /// `max_delta_step`(默认 0)是两个量。

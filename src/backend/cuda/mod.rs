@@ -138,6 +138,8 @@ pub struct SharedHistogramConfig {
     /// `TrainParams::gpu_math`。`Fast` 会让 prediction 和 label 常驻 device
     /// (+8 B/行),**改变内存计划**。
     pub gpu_math: crate::types::GpuMath,
+    /// Device importance sampling, in-place with fixed shared scratch.
+    pub gradient_sampling_rate: Option<f32>,
     /// 规划器实际使用的显存预算(字节)。`None` = 没有规划器参与
     /// (显式块宽 / CPU),此时没有"生效预算"可言。
     ///
@@ -194,6 +196,7 @@ impl Default for SharedHistogramConfig {
             gpu_memory_budget: None,
             resident_blocks: None,
             gpu_math: crate::types::GpuMath::Exact,
+            gradient_sampling_rate: None,
             fast_weights: false,
             n_outputs: 1,
             multi_quantile: false,

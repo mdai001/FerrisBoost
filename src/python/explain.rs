@@ -270,8 +270,9 @@ impl PyModel {
                 .min(self.inner.trees.len());
             let explainer = Explainer::new(&self.inner, upto, kind).map_err(to_py_err)?;
             let gpu = self.explain_engine(use_gpu)?;
-            let work_per_row =
-                prediction_work_per_row(&self.inner, upto).saturating_mul(EXPLAIN_WORK_FACTOR);
+            let work_per_row = self
+                .prediction_work_per_row(upto)
+                .saturating_mul(EXPLAIN_WORK_FACTOR);
             let n_features = self.inner.n_features;
 
             if let Some(specs) = path_specs_of(data)? {

@@ -1,14 +1,15 @@
 # FerrisBoost
 
 FerrisBoost is a Rust-backed gradient-boosted tree library for large tabular
-data. It uses a column-blocked histogram engine, XGBoost-compatible training
-semantics for supported objectives, and a Python API with parameter names familiar
-to XGBoost. Training runs on a single GPU today; the architecture is multi-GPU
-ready (WIP).
+data. It uses a column-blocked histogram engine and provides XGBoost-compatible model
+interchange for supported objectives, with a Python API using familiar parameter
+names. Training semantics can differ for some objectives; see the API How-To.
+Training runs on one selected GPU at a time. Multi-GPU support is future 1.0 work
+and is not implemented.
 
 FerrisBoost is an independent, column-blocked gradient boosting implementation
-licensed under Apache 2.0. It provides XGBoost-compatible training semantics and
-model interchange, but does not use or depend on the XGBoost runtime and is not
+licensed under Apache 2.0. It provides XGBoost-compatible model interchange for
+supported objectives, but does not use or depend on the XGBoost runtime and is not
 affiliated with or endorsed by the XGBoost project or its maintainers.
 
 ## Why FerrisBoost
@@ -19,7 +20,7 @@ In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not b
 - **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the rest from the quantized cache every level (hybrid), down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans. On the host, the quantized Parquet cache spills to local disk beyond `cache_budget_bytes`.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
-- **Single-GPU Now, Multi-GPU Ready (WIP)**: Training targets a single selected GPU today (`device="cuda"` or `device="cuda:N"`). The column-blocked architecture is engineered to scale across multiple GPUs, with multi-GPU support currently in progress (WIP).
+- **Single-GPU training**: Training targets one selected GPU per job (`device="cuda"` or `device="cuda:N"`). Multi-GPU support is future 1.0 work.
 - **Deterministic Parity & Flexible Math Modes**: FerrisBoost provides deterministic training semantics. Use `gpu_math="exact"` (default) for byte-identical CPU/GPU models, or `gpu_math="fast"` for maximum GPU throughput; `fast` is deterministic but does not guarantee byte-identical CPU/GPU models.
 - **File-First Rust Data Pipeline**: Train directly from Parquet, CSV, or CSV.gz (single or partitioned files), pandas DataFrames, PyArrow tables, or NumPy arrays without constructing an intermediate `DMatrix`, `QuantileDMatrix`, or custom iterator. **Parquet is the recommended file format** for production and repeated training or prediction because it preserves typed schemas, supports efficient column projection, and avoids CSV text-parsing overhead. CSV and CSV.gz remain fully supported compatibility inputs for existing pipelines. The Rust CSV path reuses schema preflight, computes cuts and the exact row count on its first pass, then extracts labels and quantizes directly into final column-major buffers on its second pass. File prediction can stream deterministic CPU results directly into one Parquet output without materializing a full NumPy result.
 
@@ -133,7 +134,7 @@ model = fb.train(
 )
 ```
 
-- **`device`**: Single GPU today (`device="cuda"` or `device="cuda:N"`); multi-GPU scaling is in progress (WIP).
+- **`device`**: One selected GPU per job (`device="cuda"` or `device="cuda:N"`); multi-GPU support is future 1.0 work.
 - **Adaptive VRAM**: Automatically selects a stable full-residency, hybrid-residency, or streaming plan based on dataset shape and the available VRAM budget.
 - **`colsample_bytree`**: Selects a deterministic feature subset per tree. Column-major GPU execution uses that subset as the logical histogram execution/output width while preserving the physical resident-block layout and model compatibility.
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
@@ -223,14 +224,14 @@ File-to-file CPU scoring is also available through `Model.predict_to_parquet()`;
 
 ### Objectives and metrics
 
-Supported objectives: `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, and the ranking objectives `rank:ndcg`, `rank:pairwise` and `rank:map`. Supported `eval_metric` values: `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, `merror`, and, for ranking, `ndcg`, `map` and `pre` (with `@k`). See the Python API How-To for which metrics apply to which objective.
+Published 0.0.8 supports `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, and `rank:ndcg`, `rank:pairwise`, and `rank:map`. The unreleased 0.0.9 development API adds scalar regression/classification and survival objectives; see the changelog and Python API How-To for exact support and backend limits. Supported `eval_metric` values include `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, `merror`, and, for ranking, `ndcg`, `map` and `pre` (with `@k`).
 
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
 * **Bins and categories:** `max_bin` is at most 65535, and a categorical feature has at most 65,534 categories (codes `0..=65533`).
 * **Explanations:** SHAP values, interactions, and leaf indices run on the GPU with `use_gpu=True` (bit-identical to the CPU); the device path uses GPU 0 only.
-* **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is not yet implemented.
+* **Multi-GPU:** training and prediction currently use at most one selected GPU per job; multi-GPU execution is future 1.0 work and is not implemented.
 
 These are performance and feature limitations, not correctness failures. Future work includes GPU inference pipeline overlap and multi-GPU support.
 
@@ -247,6 +248,20 @@ logging, and the complete parameter reference.
 ## Changelog
 
 See the [Python API How-To](documents/howto.md) for details.
+
+### 0.0.9 (unreleased)
+
+The 0.0.9 API and changes below describe the current development candidate. They
+are not in the published 0.0.8 PyPI wheels or Rust crate; release and platform
+validation are still pending.
+
+- Added path-based `interaction_constraints` and per-tree `max_leaves`; trees remain depthwise, and lossguide is deferred.
+- Added `feature_weights` for nested feature sampling and opt-in `sampling_method="gradient_based"`. Sampling supports CPU and CUDA exact, plus supported native objectives in CUDA fast mode.
+- Added `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, and scalar `reg:expectileerror` on CPU and CUDA exact/fast.
+- Added `survival:cox` and `survival:aft` on CPU and CUDA exact. Survival objectives explicitly reject CUDA fast; AFT supports exact, left-, right-, and interval-censored targets. Cox uses weighted grouped Breslow risk sets and tied-event handling that differ from XGBoost; see the [How-To](documents/howto.md#survival-objectives).
+- Added Rust custom `Metric` and scalar `CustomObjective` extension points with Python batch adapters. Python custom objectives require `objective="reg:squarederror"` and support CPU/CUDA exact; CUDA fast, multiclass, ranking, and arbitrary custom prediction links are unsupported.
+- Prediction scheduling reuses metadata for repeated small-batch predictions. Accepted workload-scoped GPU changes coalesce split-input uploads, mask numeric split candidates at initialization, and parallelize CUDA fast gradient sampling for large rows; these do not imply a general speedup.
+- Full release regression, Windows packaging, and publication validation remain pending.
 
 ### 0.0.8
 

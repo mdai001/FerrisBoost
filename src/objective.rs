@@ -5,14 +5,14 @@
 //! `match`,加一个 objective 要改七八处,漏一处就是「训得出来但对不上」。
 //! 现在加 objective 只改这个文件(外加 metrics 的默认指标和 CUDA fast kernel)。
 //!
-//! 数值逐位照搬 XGBoost 3.4.1:`src/objective/regression_obj.cu`、
-//! `regression_loss.h`、`init_estimation.cc`、`src/common/stats.cc`。
-//! 所有梯度都是 f32 运算,和 XGBoost 一样。
+//! Scalar reference formulas follow the pinned XGBoost 3.4.1 objective sources.
+//! Survival losses use native f64 risk/likelihood arithmetic; weighted Cox ties
+//! follow grouped Breslow semantics (see crate::survival).
 
 use std::collections::BTreeMap;
 
 use crate::rank::{PairMethod, RankKind, RankParams, NOT_SET};
-use crate::types::{GradPair, Objective, QuantileAlphas};
+use crate::types::{AftDistribution, GradPair, Objective, QuantileAlphas};
 
 /// XGBoost `kRtEps`。
 const K_RT_EPS: f32 = 1e-6;
@@ -81,9 +81,10 @@ fn json_param(rest: &BTreeMap<String, serde_json::Value>, block: &str, key: &str
 
 impl Objective {
     /// 全部支持的 objective(参数取默认值),用于报错和测试遍历。
-    pub const ALL: [Objective; 7] = [
+    pub const ALL: [Objective; 13] = [
         Objective::SquaredError,
         Objective::Logistic,
+        Objective::LogisticRegression,
         Objective::Poisson {
             max_delta_step: POISSON_DEFAULT_MAX_DELTA_STEP,
         },
@@ -98,13 +99,26 @@ impl Objective {
         Objective::Quantile {
             alphas: QuantileAlphas::single(0.5),
         },
+        Objective::LogisticRaw,
+        Objective::SquaredLogError,
+        Objective::Hinge,
+        Objective::AbsoluteError,
+        Objective::Expectile { alpha: 0.5 },
     ];
 
     /// XGBoost 的 objective 名字(写进模型 JSON、出现在报错里)。
     pub fn name(self) -> &'static str {
         match self {
+            Objective::Cox => "survival:cox",
+            Objective::Aft { .. } => "survival:aft",
             Objective::SquaredError => "reg:squarederror",
             Objective::Logistic => "binary:logistic",
+            Objective::LogisticRegression => "reg:logistic",
+            Objective::LogisticRaw => "binary:logitraw",
+            Objective::SquaredLogError => "reg:squaredlogerror",
+            Objective::Hinge => "binary:hinge",
+            Objective::AbsoluteError => "reg:absoluteerror",
+            Objective::Expectile { .. } => "reg:expectileerror",
             Objective::Poisson { .. } => "count:poisson",
             Objective::Gamma => "reg:gamma",
             Objective::Tweedie { .. } => "reg:tweedie",
@@ -120,6 +134,13 @@ impl Objective {
     /// 只在读模型时出现。
     pub fn from_name(name: &str) -> Option<Objective> {
         match name {
+            "survival:cox" => return Some(Self::Cox),
+            "survival:aft" => {
+                return Some(Self::Aft {
+                    distribution: AftDistribution::Normal,
+                    scale: 1.0,
+                })
+            }
             "reg:linear" => return Some(Objective::SquaredError),
             // num_class 由 `with_params` / 模型 JSON 填
             "multi:softprob" => return Some(Objective::Softprob { num_class: 0 }),
@@ -146,6 +167,8 @@ impl Objective {
             .iter()
             .map(|o| o.name())
             .chain([
+                "survival:cox",
+                "survival:aft",
                 "multi:softprob",
                 "multi:softmax",
                 "rank:ndcg",
@@ -173,9 +196,18 @@ impl Objective {
         matches!(self, Objective::Softprob { .. } | Objective::Softmax { .. })
     }
 
+    pub fn is_survival(self) -> bool {
+        matches!(self, Self::Cox | Self::Aft { .. })
+    }
+
     /// `reg:quantileerror`:梯度依赖每轮全体行预测归约出的标量 scale。
     pub fn is_quantile(self) -> bool {
         matches!(self, Objective::Quantile { .. })
+    }
+
+    /// Objectives whose scalar derivatives need the current residual scale.
+    pub fn needs_residual_scale(self) -> bool {
+        self.is_quantile() || matches!(self, Self::AbsoluteError)
     }
 
     /// 多个分位数(多目标 `reg:quantileerror`)。
@@ -262,6 +294,14 @@ impl Objective {
     /// 参数合法性(XGBoost 的 `set_range` / `CHECK`)。
     pub fn validate_params(self) -> anyhow::Result<()> {
         match self {
+            Self::Aft { scale, .. } => crate::ensure_input!(
+                scale.is_finite() && scale > 0.0,
+                "aft_loss_distribution_scale must be positive and finite"
+            ),
+            Objective::Expectile { alpha } => crate::ensure_input!(
+                alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+                "expectile_alpha must be in [0, 1]"
+            ),
             Objective::Poisson { max_delta_step } => crate::ensure_input!(
                 max_delta_step.is_finite() && max_delta_step >= 0.0,
                 "count:poisson max_delta_step must be finite and non-negative"
@@ -306,7 +346,12 @@ impl Objective {
     pub fn uses_scale_pos_weight(self) -> bool {
         matches!(
             self,
-            Objective::SquaredError | Objective::Logistic | Objective::Gamma
+            Objective::SquaredError
+                | Objective::Logistic
+                | Objective::LogisticRegression
+                | Objective::LogisticRaw
+                | Objective::SquaredLogError
+                | Objective::Gamma
         )
     }
 
@@ -320,23 +365,30 @@ impl Objective {
             // 多分类的 base_score 本来就在 margin 空间(XGBoost 的
             // ProbToMargin 是恒等)。
             Objective::SquaredError
+            | Objective::AbsoluteError
+            | Objective::Expectile { .. }
+            | Objective::LogisticRaw
+            | Objective::SquaredLogError
+            | Objective::Hinge
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. }
             | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => base_score,
             // logit(0.5) = 0.0
-            Objective::Logistic => {
+            Objective::Logistic | Objective::LogisticRegression => {
                 assert!(
                     (0.0..=1.0).contains(&base_score),
-                    "binary:logistic base_score is a probability and must be in [0, 1], got {base_score}"
+                    "logistic base_score is a probability and must be in [0, 1], got {base_score}"
                 );
                 let x = base_score.clamp(K_RT_EPS, 1.0 - K_RT_EPS);
                 -(1.0f32 / x - 1.0).ln()
             }
-            Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
-                base_score.ln()
-            }
+            Objective::Cox
+            | Objective::Aft { .. }
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => base_score.ln(),
         }
     }
 
@@ -355,6 +407,43 @@ impl Objective {
         grad_weights: Option<&[f32]>,
         scale_pos_weight: f32,
     ) -> f32 {
+        if self == Self::Cox {
+            return 1.0;
+        }
+        if matches!(self, Self::Aft { .. }) {
+            return 0.5;
+        }
+        if matches!(self, Self::AbsoluteError | Self::Expectile { .. }) {
+            let mean = self.estimate_base_score(labels, weights);
+            let scale = if self == Self::AbsoluteError {
+                let mut stat = 0.0f64;
+                let mut total = 0.0f64;
+                for (i, &y) in labels.iter().enumerate() {
+                    let w = weights.map_or(1.0, |w| w[i]);
+                    stat += f64::from(w * (mean - y).abs().sqrt());
+                    total += f64::from(w);
+                }
+                if total.abs() < 1e-6 {
+                    0.0
+                } else {
+                    (stat / total).powi(2) as f32
+                }
+            } else {
+                0.0
+            };
+            let (mut g, mut h) = (0.0f64, 0.0f64);
+            for (i, &y) in labels.iter().enumerate() {
+                let pair = if self == Self::AbsoluteError {
+                    Self::absolute_gradient(scale, mean, y)
+                } else {
+                    self.gradient(mean, y)
+                };
+                let w = weights.map_or(1.0, |w| w[i]);
+                g += f64::from(pair.grad * w);
+                h += f64::from(pair.hess * w);
+            }
+            return mean + (-g / h.max(1e-6)) as f32;
+        }
         if self.is_ranking() {
             unreachable!(
                 "ranking base score needs the query groups: use crate::rank::estimate_base_score"
@@ -366,7 +455,7 @@ impl Objective {
             return quantile_intercepts(&alphas.as_slice()[..1], labels, weights)[0];
         }
         let newton = match self {
-            Objective::PseudoHuber { .. } => true,
+            Objective::PseudoHuber { .. } | Objective::Hinge => true,
             o if o.uses_scale_pos_weight() => (scale_pos_weight - 1.0).abs() > K_RT_EPS,
             _ => false,
         };
@@ -409,15 +498,52 @@ impl Objective {
     #[inline]
     pub fn gradient(self, pred: f32, label: f32) -> GradPair {
         match self {
+            Self::Cox | Self::Aft { .. } => unreachable!(
+                "survival gradients require batch times or interval bounds; use crate::survival"
+            ),
+            Objective::AbsoluteError => {
+                panic!("absoluteerror needs the round residual scale; use absolute_gradient")
+            }
+            Objective::Expectile { alpha } => {
+                let d = pred - label;
+                let w = if d >= 0.0 { 1.0 - alpha } else { alpha };
+                GradPair {
+                    grad: w * d,
+                    hess: w,
+                }
+            }
             Objective::SquaredError => GradPair {
                 grad: pred - label,
                 hess: 1.0,
             },
-            Objective::Logistic => {
+            Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw => {
                 let s = sigmoid(pred);
                 GradPair {
                     grad: s - label,
                     hess: (s * (1.0 - s)).max(1e-16),
+                }
+            }
+            Objective::SquaredLogError => {
+                let p = pred.max(-1.0 + 1e-6);
+                let denom = p + 1.0;
+                let delta = p.ln_1p() - label.ln_1p();
+                GradPair {
+                    grad: delta / denom,
+                    hess: ((1.0 - delta) / (denom * denom)).max(1e-6),
+                }
+            }
+            Objective::Hinge => {
+                let sign = 2.0 * label - 1.0;
+                if pred * sign < 1.0 {
+                    GradPair {
+                        grad: -sign,
+                        hess: 1.0,
+                    }
+                } else {
+                    GradPair {
+                        grad: 0.0,
+                        hess: f32::MIN_POSITIVE,
+                    }
                 }
             }
             // PoissonRegression::GetGradient
@@ -476,15 +602,22 @@ impl Objective {
             // 多分类的变换是按行的(softmax / argmax),在 `transform_row` 里;
             // 单个 margin 原样返回。
             Objective::SquaredError
+            | Objective::AbsoluteError
+            | Objective::Expectile { .. }
+            | Objective::LogisticRaw
+            | Objective::SquaredLogError
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. }
             | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => margin,
-            Objective::Logistic => sigmoid(margin),
-            Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
-                margin.exp()
-            }
+            Objective::Logistic | Objective::LogisticRegression => sigmoid(margin),
+            Objective::Hinge => f32::from(margin > 0.0),
+            Objective::Cox
+            | Objective::Aft { .. }
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => margin.exp(),
         }
     }
 
@@ -493,6 +626,10 @@ impl Objective {
         matches!(
             self,
             Objective::SquaredError
+                | Objective::AbsoluteError
+                | Objective::Expectile { .. }
+                | Objective::LogisticRaw
+                | Objective::SquaredLogError
                 | Objective::PseudoHuber { .. }
                 | Objective::Quantile { .. }
                 | Objective::Rank { .. }
@@ -505,9 +642,20 @@ impl Objective {
     pub fn validate_labels(self, labels: &[f32], what: &str) -> anyhow::Result<()> {
         let name = self.name();
         match self {
-            Objective::SquaredError
+            Objective::Cox
+            | Objective::SquaredError
+            | Objective::AbsoluteError
+            | Objective::Expectile { .. }
             | Objective::PseudoHuber { .. }
             | Objective::Quantile { .. } => {}
+            Self::Aft { .. } => crate::ensure_input!(
+                labels.iter().all(|&y| y >= 0.0 && y.is_finite()),
+                "AFT lower bounds must be finite and non-negative"
+            ),
+            Objective::SquaredLogError => crate::ensure_input!(
+                labels.iter().all(|v| v.is_finite() && *v > -1.0),
+                "{what}: {name} labels must be finite and greater than -1"
+            ),
             Objective::Rank { kind, params } => match kind {
                 RankKind::Ndcg => {
                     crate::rank::check_ndcg_labels(params.ndcg_exp_gain, labels, what)?
@@ -515,7 +663,10 @@ impl Objective {
                 RankKind::Map => crate::rank::check_binary_labels(name, labels, what)?,
                 RankKind::Pairwise => {}
             },
-            Objective::Logistic => crate::ensure_input!(
+            Objective::Logistic
+            | Objective::LogisticRegression
+            | Objective::LogisticRaw
+            | Objective::Hinge => crate::ensure_input!(
                 labels.iter().all(|&v| (0.0..=1.0).contains(&v)),
                 "{what}: {name} labels must be in [0, 1]"
             ),
@@ -544,19 +695,28 @@ impl Objective {
         let name = self.name();
         match self {
             Objective::SquaredError | Objective::PseudoHuber { .. } => {}
-            Objective::Quantile { .. }
+            Objective::AbsoluteError
+            | Objective::Expectile { .. }
+            | Objective::LogisticRaw
+            | Objective::SquaredLogError
+            | Objective::Hinge
+            | Objective::Quantile { .. }
             | Objective::Rank { .. }
             | Objective::Softprob { .. }
             | Objective::Softmax { .. } => {
                 crate::ensure_input!(base_score.is_finite(), "{name} base_score must be finite")
             }
             // XGBoost `CheckIntercept`:闭区间,标签全相同的退化情形可以是 0 或 1。
-            Objective::Logistic => crate::ensure_input!(
+            Objective::Logistic | Objective::LogisticRegression => crate::ensure_input!(
                 base_score.is_finite() && (0.0..=1.0).contains(&base_score),
                 "{name} base_score must be a finite probability in [0, 1]"
             ),
             // log 链接:0 会变成 −inf margin。
-            Objective::Poisson { .. } | Objective::Gamma | Objective::Tweedie { .. } => {
+            Objective::Cox
+            | Objective::Aft { .. }
+            | Objective::Poisson { .. }
+            | Objective::Gamma
+            | Objective::Tweedie { .. } => {
                 crate::ensure_input!(
                     base_score.is_finite() && base_score > 0.0,
                     "{name} base_score must be positive (pass a positive base_score explicitly when all labels are 0)"
@@ -570,8 +730,13 @@ impl Objective {
     /// (`histogram.cu` 的 `apply_pred_grad_quantize`)。两边必须同步改。
     pub fn device_code(self) -> u32 {
         match self {
+            Self::Cox | Self::Aft { .. } => u32::MAX,
             Objective::SquaredError => 0,
-            Objective::Logistic => 1,
+            Objective::AbsoluteError => 9,
+            Objective::Expectile { .. } => 10,
+            Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw => 1,
+            Objective::SquaredLogError => 7,
+            Objective::Hinge => 8,
             Objective::Poisson { .. } => 2,
             Objective::Gamma => 3,
             Objective::Tweedie { .. } => 4,
@@ -592,6 +757,8 @@ impl Objective {
     /// fast kernel 的 objective 参数(没有参数的 objective 传 0)。
     pub fn device_param(self) -> f32 {
         match self {
+            Objective::AbsoluteError => -1.0,
+            Objective::Expectile { alpha } => alpha,
             Objective::Poisson { max_delta_step } => max_delta_step,
             Objective::Tweedie { variance_power } => variance_power,
             Objective::PseudoHuber { slope } => slope,
@@ -609,7 +776,12 @@ impl Objective {
     /// 和其它参数块一致);其它 objective 不带这个参数。
     pub fn json_params(self, scale_pos_weight: f32) -> BTreeMap<String, serde_json::Value> {
         match self {
-            Objective::SquaredError | Objective::Logistic | Objective::Gamma => json_block(
+            Objective::SquaredError
+            | Objective::Logistic
+            | Objective::LogisticRegression
+            | Objective::LogisticRaw
+            | Objective::SquaredLogError
+            | Objective::Gamma => json_block(
                 "reg_loss_param",
                 "scale_pos_weight",
                 scale_pos_weight.to_string(),
@@ -646,6 +818,31 @@ impl Objective {
                 "num_class",
                 num_class.to_string(),
             ),
+            Objective::Cox | Objective::Hinge | Objective::AbsoluteError => BTreeMap::new(),
+            Self::Aft {
+                distribution,
+                scale,
+            } => {
+                let mut rest = json_block(
+                    "aft_loss_param",
+                    "aft_loss_distribution",
+                    distribution.name().into(),
+                );
+                rest.get_mut("aft_loss_param")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(
+                        "aft_loss_distribution_scale".into(),
+                        serde_json::Value::String(scale.to_string()),
+                    );
+                rest
+            }
+            Objective::Expectile { alpha } => json_block(
+                "expectile_loss_param",
+                "expectile_alpha",
+                format!("[{alpha}]"),
+            ),
             Objective::Rank { params, .. } => rank_json_params(&params),
         }
     }
@@ -658,6 +855,37 @@ impl Objective {
     /// 读模型时按 JSON 参数块恢复 objective 参数(缺了就用默认值)。
     pub fn from_json(name: &str, rest: &BTreeMap<String, serde_json::Value>) -> Option<Objective> {
         Some(match Self::from_name(name)? {
+            Self::Aft { .. } => {
+                let distribution = match rest
+                    .get("aft_loss_param")
+                    .and_then(|b| b.get("aft_loss_distribution"))
+                {
+                    Some(v) => AftDistribution::from_name(v.as_str()?)?,
+                    None => AftDistribution::Normal,
+                };
+                let scale = json_param(rest, "aft_loss_param", "aft_loss_distribution_scale")
+                    .unwrap_or(1.0);
+                if !scale.is_finite() || scale <= 0.0 {
+                    return None;
+                }
+                Self::Aft {
+                    distribution,
+                    scale,
+                }
+            }
+            Objective::Expectile { .. } => {
+                let value = rest.get("expectile_loss_param")?.get("expectile_alpha")?;
+                let text = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => value.to_string(),
+                };
+                let values = text.trim().trim_start_matches('[').trim_end_matches(']');
+                let alpha: f32 = values.parse().ok()?;
+                if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                    return None;
+                }
+                Objective::Expectile { alpha }
+            }
             Objective::Poisson { max_delta_step } => Objective::Poisson {
                 max_delta_step: json_param(rest, "poisson_regression_param", "max_delta_step")
                     .unwrap_or(max_delta_step),
@@ -873,6 +1101,16 @@ impl Objective {
     /// 每轮的全局 scale `S`(`reg:quantileerror` 专用)。`preds` 是 raw margin
     /// (恒等链接,即预测值)。串行 f64 累加:结果与线程数无关,并与 XGBoost
     /// `nthread=1` 逐位相同。
+    pub fn absolute_gradient(scale: f32, pred: f32, label: f32) -> GradPair {
+        let residual = pred - label;
+        let norm = scale.hypot(residual);
+        let curvature = if norm > 0.0 { scale / norm } else { 1.0 };
+        GradPair {
+            grad: residual * curvature,
+            hess: curvature,
+        }
+    }
+
     pub fn quantile_scale(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f32 {
         let mut stat = 0.0f64;
         let mut sum_w = 0.0f64;
@@ -1117,7 +1355,10 @@ mod tests {
 
     #[test]
     fn transform_inverts_base_margin() {
-        for o in Objective::ALL {
+        for o in Objective::ALL
+            .into_iter()
+            .filter(|o| *o != Objective::Hinge)
+        {
             for bs in [0.1f32, 0.5, 0.9] {
                 let back = o.transform(o.base_margin(bs));
                 assert!((back - bs).abs() < 1e-6, "{o:?} {bs} -> {back}");
@@ -1126,13 +1367,13 @@ mod tests {
     }
 
     #[test]
-    fn device_codes_are_distinct() {
+    fn device_codes_match_gradient_families() {
         let codes: Vec<u32> = Objective::ALL
             .iter()
             .filter(|o| !o.is_multiclass())
             .map(|o| o.device_code())
             .collect();
-        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(codes, vec![0, 1, 1, 2, 3, 4, 5, 6, 1, 7, 8, 9, 10]);
         assert_eq!(
             Objective::quantile(0.3).device_param(),
             0.3,

@@ -247,7 +247,7 @@ __device__ __forceinline__ SplitPacket split_any_candidate(SplitPair l, SplitPai
 // offer order, so the strict-greater / first-wins tie rule is identical. The
 // winner's category set is written to `cat_out[(n * n_cat + ordinal) * CAT_SET_WORDS ..]`;
 // the winning packet carries the categorical flag (4) and the ordinal in `bin`.
-template <bool CAT>
+template <bool CAT, bool MASKED = false>
 __device__ __forceinline__ void split_features_body(
     SplitPair* hist, const SplitPair* previous, SplitPair* next,
     const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
@@ -284,6 +284,13 @@ __device__ __forceinline__ void split_features_body(
         } else v = hist[i];
         if (m[3] != 0xffffffffu)
             next[(size_t)m[3] * cache_stride + lo + t] = v;
+    }
+    // Preserve histogram/cache writes even for disabled features: descendants
+    // can enable them again. Only the masked specialization takes this exit;
+    // the ordinary numeric and categorical kernels retain their original flow.
+    if (MASKED && !(node_enabled ? node_enabled[(size_t)n * features + f] : enabled[f])) {
+        if (!t) output[(size_t)n * features + f] = SplitPacket{};
+        return;
     }
     float lower = 0.0f, upper = 0.0f;
     int32_t constraint = 0;
@@ -469,6 +476,19 @@ extern "C" __global__ void split_cached_features(
     const float* bounds, const int32_t* monotone, uint32_t score_mode,
     SplitPacket* output, const uint8_t* node_enabled) {
     split_features_body<false>(hist, previous, next, offsets, feats, enabled, sums, metadata,
+        features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
+        monotone, score_mode, output, node_enabled, nullptr, 0, 0, 0, nullptr);
+}
+extern "C" __global__ void split_cached_features_masked(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata, uint32_t features,
+    uint32_t hist_stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw,
+    float alpha, float mds,
+    const float* bounds, const int32_t* monotone, uint32_t score_mode,
+    SplitPacket* output, const uint8_t* node_enabled) {
+    split_features_body<false, true>(hist, previous, next, offsets, feats, enabled, sums, metadata,
         features, hist_stride, cache_stride, ig, ih, lambda, gamma, mcw, alpha, mds, bounds,
         monotone, score_mode, output, node_enabled, nullptr, 0, 0, 0, nullptr);
 }
@@ -712,6 +732,21 @@ extern "C" __global__ void apply_delta_and_gradient(
             const float b = expf((2.0f - rho) * p);
             g = -y * a + b;
             h = -y * (1.0f - rho) * a + (2.0f - rho) * b;
+        } else if (objective == 7u) {
+            const float z = fmaxf(p, -1.0f + 1e-6f);
+            const float denom = z + 1.0f;
+            const float diff = log1pf(z) - log1pf(y);
+            g = diff / denom;
+            h = fmaxf((1.0f - diff) / (denom * denom), 1e-6f);
+        } else if (objective == 10u) {
+            const float d = p-y;
+            h = d >= 0.0f ? 1.0f-obj_param : obj_param;
+            g = h*d;
+        } else if (objective == 8u) {
+            const float sign = 2.0f * y - 1.0f;
+            const bool active = p * sign < 1.0f;
+            g = active ? -sign : 0.0f;
+            h = active ? 1.0f : 1.1754943508222875e-38f;
         } else {
             // reg:pseudohubererror
             const float z = p - y;
@@ -999,7 +1034,14 @@ extern "C" __global__ void quantile_gradient_rows(
          i += (uint32_t)blockDim.x * gridDim.x) {
         float g = 0.0f;
         float h = 0.0f;
-        if (scale > 0.0f) {
+        if (alpha < 0.0f) {
+            // Absolute error shares the fixed weighted residual-scale reduction.
+            const float residual = __fsub_rn(pred[i], label[i]);
+            const float norm = hypotf(scale, residual);
+            h = norm > 0.0f ? scale/norm : 1.0f;
+            g = residual*h;
+            if (has_weight) { g = __fmul_rn(g,weight[i]); h = __fmul_rn(h,weight[i]); }
+        } else if (scale > 0.0f) {
             const float residual = __fsub_rn(pred[i], label[i]);
             const float x = __fdiv_rn(residual, __fmul_rn(0.04f, scale));
             const float t = tanhf(x);
@@ -4135,5 +4177,257 @@ extern "C" __global__ void shx_interactions_apply(
             mat_row[c] = SHX_FADD(mat_row[c],
                                   log[(base + ix_entry_index[e]) * n_rows + row]);
         }
+    }
+}
+
+// Bounded device-only importance sampler. One CTA owns the deterministic
+// reduction order and threshold solve; no row-sized score scratch or D2H pairs.
+extern "C" __global__ void gradient_importance_sample(
+    float* pairs, uint32_t n, float rate,
+    unsigned long long seed, unsigned long long tree) {
+    __shared__ double sums[256], counts[256], mins[256], maxs[256];
+    __shared__ double lo, hi, tau, target;
+    __shared__ int bad, done, keep_all;
+    const unsigned int t = threadIdx.x;
+    if (t == 0) { bad=0; done=0; keep_all=0; }
+    __syncthreads();
+    double sum=0.0, count=0.0, low=1.7976931348623157e308, high=0.0;
+    for (uint64_t i=t; i<n; i+=256) {
+        const double g=pairs[2*i], h=pairs[2*i+1];
+        if (!isfinite(g) || !isfinite(h) || h<0.0) { atomicExch(&bad,1); continue; }
+        const double score=sqrt(g*g+0.1*h*h);
+        if (score>0.0) { sum+=score; count+=1.0; low=fmin(low,score); high=fmax(high,score); }
+    }
+    sums[t]=sum; counts[t]=count; mins[t]=low; maxs[t]=high;
+    __syncthreads();
+    for (unsigned int stride=128; stride; stride>>=1) {
+        if (t<stride) {
+            sums[t]+=sums[t+stride]; counts[t]+=counts[t+stride];
+            mins[t]=fmin(mins[t],mins[t+stride]); maxs[t]=fmax(maxs[t],maxs[t+stride]);
+        }
+        __syncthreads();
+    }
+    if (bad) { if (t==0 && n) pairs[0]=__int_as_float(0x7f800000); return; }
+    if (t==0) {
+        target=(double)rate*(double)n;
+        keep_all=(counts[0]==0.0 || target>=counts[0]);
+        lo=mins[0]; hi=sums[0]/target;
+        tau=hi;
+        done=hi>=maxs[0];
+        // Start at the upper bound for descending active-set Newton steps.
+    }
+    __syncthreads();
+    if (keep_all) return;
+    // Geometric safeguards halve the exponent bracket as well as handling
+    // extreme float32 dynamic ranges. Newton steps use the active saturated set.
+    for (unsigned int iteration=0; iteration<128 && !done; ++iteration) {
+        sum=0.0; count=0.0;
+        for (uint64_t i=t; i<n; i+=256) {
+            const double g=pairs[2*i], h=pairs[2*i+1];
+            const double score=sqrt(g*g+0.1*h*h);
+            if (score>=tau) count+=1.0; else sum+=score;
+        }
+        sums[t]=sum; counts[t]=count;
+        __syncthreads();
+        for (unsigned int stride=128; stride; stride>>=1) {
+            if (t<stride) { sums[t]+=sums[t+stride]; counts[t]+=counts[t+stride]; }
+            __syncthreads();
+        }
+        if (t==0) {
+            const double residual=(counts[0]-target)+sums[0]/tau;
+            if (fabs(residual)<=3.5527136788005009e-15*fmax(target,1.0)) done=1;
+            else {
+                if (residual>0.0) lo=tau; else hi=tau;
+                const double midpoint=sqrt(lo*hi);
+                if (!(midpoint>lo && midpoint<hi)) { tau=midpoint; done=1; }
+                else {
+                    const double remaining=target-counts[0];
+                    const double next=sums[0]/remaining;
+                    // Preserve the alternating safeguard after eight initial steps.
+                    tau=((iteration<8 || (iteration&1u)==0) && remaining>0.0 && next>lo && next<hi) ? next : midpoint;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned long long grid=9007199254740992ULL;
+    const unsigned long long key=tree*0x9E3779B97F4A7C15ULL;
+    for (uint64_t i=t; i<n; i+=256) {
+        const double g=pairs[2*i], h=pairs[2*i+1];
+        const double score=sqrt(g*g+0.1*h*h);
+        if (score==0.0) continue;
+        const double probability=fmin(1.0,score/tau);
+        unsigned long long cutoff=(unsigned long long)(probability*(double)grid);
+        if (cutoff==0) cutoff=1;
+        if (cutoff>grid) cutoff=grid;
+        const unsigned long long hash=fb_mix(seed ^ ((key<<23)|(key>>41)) ^ (i*0xD6E8FEB86659FD93ULL));
+        if ((hash>>11)<cutoff) {
+            const double actual=(double)cutoff/(double)grid;
+            const float out_g=(float)(g/actual), out_h=(float)(h/actual);
+            if (!isfinite(out_g) || !isfinite(out_h)) atomicExch(&bad,1);
+            pairs[2*i]=out_g; pairs[2*i+1]=out_h;
+        } else { pairs[2*i]=0.0f; pairs[2*i+1]=0.0f; }
+    }
+    __syncthreads();
+    // The existing bound validation reports invalid input before a tree is used.
+    if (t==0 && bad && n) pairs[0]=__int_as_float(0x7f800000);
+}
+
+// Fixed scratch: 1032 doubles, including partials, scalar state and flags.
+// Coalesced tiles retain the same 256 logical accumulation lanes and row order.
+extern "C" __global__ void gradient_importance_stats(
+    const float* pairs, uint32_t n, double* scratch, uint32_t initial) {
+    const int* flags=reinterpret_cast<const int*>(scratch+1028);
+    if (!initial && (flags[0] || flags[1] || flags[2])) return;
+    __shared__ double scores[256];
+    const unsigned int t=threadIdx.x;
+    const unsigned int first=blockIdx.x*8;
+    const double tau=initial ? 0.0 : scratch[1026];
+    double sum=0.0,count=0.0,low=1.7976931348623157e308,high=0.0;
+    int bad=0;
+    for (uint64_t base=first; base<n; base+=256ULL*32) {
+        const uint64_t row=base+(t%8)+(uint64_t)(t/8)*256;
+        double score=0.0;
+        if (row<n) {
+            const double g=pairs[2*row],h=pairs[2*row+1];
+            score=(initial && (!isfinite(g) || !isfinite(h) || h<0.0))
+                ? -1.0 : sqrt(g*g+0.1*h*h);
+        }
+        scores[t]=score;
+        __syncthreads();
+        if (t<8) {
+            for (unsigned int k=0;k<32;++k) {
+                const double value=scores[k*8+t];
+                if (initial) {
+                    if (value<0.0) bad=1;
+                    else if (value>0.0) {
+                        sum+=value;count+=1.0;low=fmin(low,value);high=fmax(high,value);
+                    }
+                } else {
+                    if (value>=tau) count+=1.0;else sum+=value;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (t<8) {
+        const unsigned int logical=first+t;
+        scratch[logical]=sum;scratch[256+logical]=bad ? -1.0 : count;
+        if (initial) { scratch[512+logical]=low;scratch[768+logical]=high; }
+    }
+}
+__device__ __forceinline__ void fb_importance_step(
+    double sum, double count, unsigned int iteration, double target,
+    double& lo, double& hi, double& tau, int& done) {
+    const double residual=(count-target)+sum/tau;
+    if (fabs(residual)<=3.5527136788005009e-15*fmax(target,1.0)) done=1;
+    else {
+        if (residual>0.0) lo=tau; else hi=tau;
+        const double midpoint=sqrt(lo*hi);
+        if (!(midpoint>lo && midpoint<hi)) { tau=midpoint; done=1; }
+        else {
+            const double remaining=target-count;
+            const double next=sum/remaining;
+            tau=((iteration<8 || (iteration&1u)==0) && remaining>0.0 && next>lo && next<hi) ? next : midpoint;
+        }
+    }
+}
+
+extern "C" __global__ void gradient_importance_reduce(
+    double* scratch, uint32_t n, float rate, uint32_t initial, uint32_t iteration) {
+    int* flags=reinterpret_cast<int*>(scratch+1028);
+    if (!initial && (flags[0] || flags[1] || flags[2])) return;
+    __shared__ double sums[256], counts[256], mins[256], maxs[256];
+    __shared__ int bad;
+    const unsigned int t=threadIdx.x;
+    if (t==0) bad=0;
+    __syncthreads();
+    sums[t]=scratch[t]; counts[t]=scratch[256+t];
+    if (initial) {
+        if (counts[t]<0.0) { atomicExch(&bad,1); counts[t]=0.0; }
+        mins[t]=scratch[512+t]; maxs[t]=scratch[768+t];
+    }
+    __syncthreads();
+    for (unsigned int stride=128; stride; stride>>=1) {
+        if (t<stride) {
+            sums[t]+=sums[t+stride]; counts[t]+=counts[t+stride];
+            if (initial) {
+                mins[t]=fmin(mins[t],mins[t+stride]); maxs[t]=fmax(maxs[t],maxs[t+stride]);
+            }
+        }
+        __syncthreads();
+    }
+    if (t==0) {
+        if (initial) {
+            const double target=(double)rate*(double)n;
+            const double hi=sums[0]/target;
+            scratch[1024]=mins[0]; scratch[1025]=hi;
+            scratch[1026]=hi; scratch[1027]=target;
+            flags[0]=hi>=maxs[0]; flags[1]=counts[0]==0.0 || target>=counts[0]; flags[2]=bad;
+        } else {
+            double lo=scratch[1024], hi=scratch[1025], tau=scratch[1026];
+            int done=0;
+            fb_importance_step(sums[0],counts[0],iteration,scratch[1027],lo,hi,tau,done);
+            scratch[1024]=lo; scratch[1025]=hi; scratch[1026]=tau; flags[0]=done;
+        }
+    }
+}
+
+// Rare difficult active sets retain the original safeguarded completion path.
+extern "C" __global__ void gradient_importance_finish(
+    const float* pairs, uint32_t n, double* scratch) {
+    int* flags=reinterpret_cast<int*>(scratch+1028);
+    if (flags[0] || flags[1] || flags[2]) return;
+    __shared__ double sums[256], counts[256];
+    __shared__ double lo,hi,tau,target;
+    __shared__ int done;
+    const unsigned int t=threadIdx.x;
+    if (t==0) {
+        lo=scratch[1024]; hi=scratch[1025]; tau=scratch[1026]; target=scratch[1027]; done=0;
+    }
+    __syncthreads();
+    for (unsigned int iteration=8; iteration<128 && !done; ++iteration) {
+        double sum=0.0,count=0.0;
+        for (uint64_t i=t; i<n; i+=256) {
+            const double g=pairs[2*i],h=pairs[2*i+1];
+            const double score=sqrt(g*g+0.1*h*h);
+            if (score>=tau) count+=1.0; else sum+=score;
+        }
+        sums[t]=sum; counts[t]=count;
+        __syncthreads();
+        for (unsigned int stride=128; stride; stride>>=1) {
+            if (t<stride) { sums[t]+=sums[t+stride]; counts[t]+=counts[t+stride]; }
+            __syncthreads();
+        }
+        if (t==0) fb_importance_step(sums[0],counts[0],iteration,target,lo,hi,tau,done);
+        __syncthreads();
+    }
+    if (t==0) { scratch[1026]=tau; flags[0]=1; }
+}
+
+extern "C" __global__ void gradient_importance_apply(
+    float* pairs, uint32_t n, const double* scratch,
+    unsigned long long seed, unsigned long long tree) {
+    const int* flags=reinterpret_cast<const int*>(scratch+1028);
+    const uint64_t first=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if (flags[2]) { if (first==0 && n) pairs[0]=__int_as_float(0x7f800000); return; }
+    if (flags[1]) return;
+    const double tau=scratch[1026];
+    const unsigned long long grid=9007199254740992ULL;
+    const unsigned long long key=tree*0x9E3779B97F4A7C15ULL;
+    for (uint64_t i=first; i<n; i+=(uint64_t)blockDim.x*gridDim.x) {
+        const double g=pairs[2*i],h=pairs[2*i+1];
+        const double score=sqrt(g*g+0.1*h*h);
+        if (score==0.0) continue;
+        unsigned long long cutoff=(unsigned long long)(fmin(1.0,score/tau)*(double)grid);
+        if (cutoff==0) cutoff=1;
+        if (cutoff>grid) cutoff=grid;
+        const unsigned long long hash=fb_mix(seed ^ ((key<<23)|(key>>41)) ^ (i*0xD6E8FEB86659FD93ULL));
+        if ((hash>>11)<cutoff) {
+            const double actual=(double)cutoff/(double)grid;
+            const float out_g=(float)(g/actual),out_h=(float)(h/actual);
+            pairs[2*i]=(!isfinite(out_g) || !isfinite(out_h)) ? __int_as_float(0x7f800000) : out_g;
+            pairs[2*i+1]=out_h;
+        } else { pairs[2*i]=0.0f; pairs[2*i+1]=0.0f; }
     }
 }

@@ -139,6 +139,8 @@ pub struct GpuMemoryBudget {
     /// quantization 时正是漏了这一块(报告仍打 1142.1 MB),导致它的显存代价
     /// 在评估时被整个忽略掉。
     pub gpair_f32_bytes: usize,
+    /// Fixed workspace for the parallel importance sampler; zero on other paths.
+    pub gradient_sampling_bytes: usize,
 }
 
 /// 训练期间锁在物理内存里的 host staging buffer。它不能被 swap，必须和
@@ -189,6 +191,7 @@ impl GpuMemoryBudget {
             + self.multiclass_bytes
             + self.rank_bytes
             + self.hist_feature_select_bytes
+            + self.gradient_sampling_bytes
     }
 
     /// 只随行数走、列分块压不掉的那部分。
@@ -210,7 +213,7 @@ impl GpuMemoryBudget {
         format!(
             "preallocated device memory {:.1} MB ({} histogram streams) = gpair {:.1} + row_idx {:.1} + partition output {:.1} \
              + partition scratch {:.1} + partition column fetch {:.1} + column-block buffers {:.1} \
-             + histograms {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample selection {:.3} + prediction {:.1} + device-quant {:.1} + batch index {:.3} + fast-math {:.1} + multiclass {:.1} + rank {:.1}; O(rows) part {:.1} MB",
+             + histograms {:.1} + GPU split/cache {:.1} + offsets {:.3} + colsample selection {:.3} + prediction {:.1} + device-quant {:.1} + batch index {:.3} + fast-math {:.1} + multiclass {:.1} + rank {:.1} + importance scratch {:.3}; O(rows) part {:.1} MB",
             mb(self.total()),
             self.hist_streams,
             mb(self.gpair_bytes),
@@ -229,6 +232,7 @@ impl GpuMemoryBudget {
             mb(self.fast_math_bytes),
             mb(self.multiclass_bytes),
             mb(self.rank_bytes),
+            mb(self.gradient_sampling_bytes),
             mb(self.per_row_bytes()),
         )
     }
@@ -358,6 +362,13 @@ impl GpuSegmentTiming {
     }
 }
 
+struct ParallelGradientKernels {
+    stats: CudaFunction,
+    reduce: CudaFunction,
+    finish: CudaFunction,
+    apply: CudaFunction,
+}
+
 struct GpuBuffers {
     /// 摊平的交错 [grad, hess, ...],每轮覆写一次。
     gpair: CudaSlice<i64>,
@@ -390,6 +401,7 @@ struct GpuBuffers {
     /// fast quantile:`QUANTILE_REDUCE_BLOCKS` 对 f64 per-block partial + 末尾 1 个 f64 scale。
     /// 训练级一次分配、每轮复用(没有 per-round 分配)。
     qt_scratch: Option<CudaSlice<f64>>,
+    gradient_sampling_scratch: Option<CudaSlice<f64>>,
     /// fast ranking: the device LambdaMART buffers (see `rank_ctx`).
     rank: Option<rank_ctx::RankDevice>,
     /// 当前节点的行索引。
@@ -600,6 +612,8 @@ pub struct GpuTrainCtx {
     qt_partials_fn: Option<CudaFunction>,
     qt_reduce_fn: Option<CudaFunction>,
     qt_grad_fn: Option<CudaFunction>,
+    gradient_sample_fn: Option<CudaFunction>,
+    parallel_gradient_kernels: Option<ParallelGradientKernels>,
     /// 每行输出数 K(多分类 = `num_class`,其余 1)。决定常驻 prediction 的
     /// 形状 `K × n`;规划器按同一个数计费。
     n_outputs: usize,
@@ -811,7 +825,14 @@ impl GpuTrainCtx {
         let split_cache_enabled =
             config.gpu_split_cache && hist_nodes_per_batch >= 2 && !bucket_profile;
         let split_features_fn = if split_cache_enabled {
-            Some(state.module.load_function("split_cached_features")?)
+            // Mask availability is fixed for this context. Select once so the
+            // per-batch launch path and ordinary context layout stay unchanged.
+            let name = if config.node_feature_masks {
+                "split_cached_features_masked"
+            } else {
+                "split_cached_features"
+            };
+            Some(state.module.load_function(name)?)
         } else {
             None
         };
@@ -880,6 +901,36 @@ impl GpuTrainCtx {
         let qt_partials_fn = load_qt("quantile_apply_delta_partials")?;
         let qt_reduce_fn = load_qt("quantile_reduce_scale")?;
         let qt_grad_fn = load_qt("quantile_gradient_rows")?;
+        let gradient_sample_fn = if let Some(rate) = config.gradient_sampling_rate {
+            ensure!(
+                rate.is_finite() && rate > 0.0 && rate <= 1.0,
+                "invalid gradient sampling rate"
+            );
+            load_qt("gradient_importance_sample")?
+        } else {
+            None
+        };
+        let gradient_sampling_bytes = crate::gpu_mem_plan::gradient_sampling_scratch_bytes(
+            n_rows as u64,
+            fast_math,
+            config.gradient_sampling_rate,
+        ) as usize;
+        let parallel_gradient_kernels = if gradient_sampling_bytes != 0 {
+            let load = |name: &str| -> Result<CudaFunction> {
+                state
+                    .module
+                    .load_function(name)
+                    .with_context(|| format!("{name} not found in PTX"))
+            };
+            Some(ParallelGradientKernels {
+                stats: load("gradient_importance_stats")?,
+                reduce: load("gradient_importance_reduce")?,
+                finish: load("gradient_importance_finish")?,
+                apply: load("gradient_importance_apply")?,
+            })
+        } else {
+            None
+        };
         // GPU training is column-major only (2026-11-08). Balanced HIGGS
         // A/B made U8 row-major 12–29% slower with identical models; partial
         // Epsilon results agreed. Remove transpose/staging/synchronization
@@ -1432,6 +1483,15 @@ impl GpuTrainCtx {
         } else {
             None
         };
+        let gradient_sampling_scratch = if gradient_sampling_bytes != 0 {
+            Some(
+                stream
+                    .alloc_zeros::<f64>(crate::gpu_mem_plan::GRADIENT_SAMPLING_SCRATCH_DOUBLES)
+                    .context("allocate parallel importance sampling scratch")?,
+            )
+        } else {
+            None
+        };
         let multiclass_bytes = if fast_math {
             crate::gpu_mem_plan::fast_multi_output_extra_bytes(
                 n_rows as u64,
@@ -1470,6 +1530,7 @@ impl GpuTrainCtx {
         };
 
         let budget = GpuMemoryBudget {
+            gradient_sampling_bytes,
             fast_math_bytes: if fast_math {
                 n_rows * 4 * 2 + crate::gpu_mem_plan::FAST_QUANTILE_SCRATCH_BYTES as usize
             } else {
@@ -1601,6 +1662,8 @@ impl GpuTrainCtx {
             qt_partials_fn,
             qt_reduce_fn,
             qt_grad_fn,
+            gradient_sample_fn,
+            parallel_gradient_kernels,
             n_outputs,
             multi_quantile,
             gpu_math,
@@ -1646,6 +1709,7 @@ impl GpuTrainCtx {
                 mc_wsum,
                 mc_pending_class: None,
                 qt_scratch,
+                gradient_sampling_scratch,
                 rank,
                 gpair,
                 rows,
@@ -1726,6 +1790,10 @@ impl GpuTrainCtx {
         ) + if self.hist_fused_r4_fn.is_some() { " rows_per_thread=4" } else { " rows_per_thread=1" }
             + &format!(" hist_nodes_per_batch={}", if self.hist_batched_fn.is_some() { self.hist_nodes_per_batch } else { 1 })
             + " layout_gpu=col_major hist_map=row_per_lane"
+            + &format!(" gradient_sampler={} gradient_sampling_bytes={}",
+                if self.parallel_gradient_kernels.is_some() { "parallel_tile" }
+                else if self.gradient_sample_fn.is_some() { "single_cta" } else { "none" },
+                self.budget.gradient_sampling_bytes)
             + " partition=resident_block_batched partition_batch_cap=32"
             + match self.gpu_math {
                 crate::types::GpuMath::Exact => " gpu_math=exact",
@@ -2275,7 +2343,7 @@ impl GpuTrainCtx {
         let n_rows_u32 = u32::try_from(self.n_rows).context("row count exceeds u32")?;
         let obj_code: u32 = objective.device_code();
         let obj_param: f32 = objective.device_param();
-        if objective.is_quantile() {
+        if objective.needs_residual_scale() {
             self.launch_quantile_round(
                 &mut buf,
                 obj_param,
@@ -2285,7 +2353,14 @@ impl GpuTrainCtx {
                 subsample_tree,
             )?;
             // The quantile gradient kernel already masked this pair and reduced its max.
-            return self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true);
+            return self.quantize_resident_gpair(
+                &mut buf,
+                started,
+                u64::MAX,
+                subsample_seed,
+                subsample_tree,
+                true,
+            );
         }
         {
             // 梯度 kernel 同时产出每 block 的 max|g| / max|h|,所以 launch 几何就是
@@ -2341,7 +2416,14 @@ impl GpuTrainCtx {
         }
         // The objective kernel already masked this pair and reduced its max.
         // Do not resample it and do not rescan it for the max.
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
+        self.quantize_resident_gpair(
+            &mut buf,
+            started,
+            u64::MAX,
+            subsample_seed,
+            subsample_tree,
+            true,
+        )
     }
 
     /// fast quantile 一轮的三个 kernel(见 `histogram.cu` 的 quantile 一节):
@@ -2625,7 +2707,14 @@ impl GpuTrainCtx {
             unsafe { launch.launch(cfg) }.context("launch softmax_class_gradient")?;
         }
         // gradient kernel 已经按行采样置零并归约了 max;量化尾巴不再采样、不再扫 max。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
+        self.quantize_resident_gpair(
+            &mut buf,
+            started,
+            u64::MAX,
+            subsample_seed,
+            subsample_tree,
+            true,
+        )
     }
 
     /// 多分类 fast:记下刚建完的那棵树(第 `class` 类)的叶子增量**待施加**。
@@ -2682,7 +2771,14 @@ impl GpuTrainCtx {
             subsample_tree,
         )?;
         // 梯度 kernel 已经采样置零并归约出每 block 的 max;和单 alpha 一样不再重扫。
-        self.quantize_resident_gpair(&mut buf, started, u64::MAX, 0, 0, true)
+        self.quantize_resident_gpair(
+            &mut buf,
+            started,
+            u64::MAX,
+            subsample_seed,
+            subsample_tree,
+            true,
+        )
     }
 
     /// 多个 `quantile_alpha`:刚建完的第 `target` 棵树的叶子增量立刻并进它那一列。
@@ -2923,6 +3019,83 @@ impl GpuTrainCtx {
         Ok(())
     }
 
+    /// Apply deterministic importance sampling on the resolved device path.
+    fn sample_gradient_pairs(
+        &self,
+        buf: &mut GpuBuffers,
+        rate: f32,
+        seed: u64,
+        tree: u64,
+    ) -> Result<()> {
+        let pairs = buf.gpair_f32.as_mut().context("gradient buffer missing")?;
+        let rows = u32::try_from(self.n_rows)?;
+        let single = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        if let Some(kernels) = &self.parallel_gradient_kernels {
+            let scratch = buf
+                .gradient_sampling_scratch
+                .as_mut()
+                .context("parallel importance scratch missing")?;
+            let stats = LaunchConfig {
+                grid_dim: (32, 1, 1),
+                ..single
+            };
+            // Initial validation/statistics, then eight fixed Newton passes.
+            // Done flags make converged passes no-ops without a host readback.
+            for pass in 0..=8u32 {
+                let initial = u32::from(pass == 0);
+                let iteration = pass.saturating_sub(1);
+                let mut launch = self.stream.launch_builder(&kernels.stats);
+                launch
+                    .arg(&*pairs)
+                    .arg(&rows)
+                    .arg(&mut *scratch)
+                    .arg(&initial);
+                unsafe { launch.launch(stats) }.context("launch importance statistics")?;
+                let mut launch = self.stream.launch_builder(&kernels.reduce);
+                launch
+                    .arg(&mut *scratch)
+                    .arg(&rows)
+                    .arg(&rate)
+                    .arg(&initial)
+                    .arg(&iteration);
+                unsafe { launch.launch(single) }.context("launch importance reduction")?;
+            }
+            let mut launch = self.stream.launch_builder(&kernels.finish);
+            launch.arg(&*pairs).arg(&rows).arg(&mut *scratch);
+            unsafe { launch.launch(single) }.context("complete importance threshold")?;
+            let mut launch = self.stream.launch_builder(&kernels.apply);
+            launch
+                .arg(&mut *pairs)
+                .arg(&rows)
+                .arg(&*scratch)
+                .arg(&seed)
+                .arg(&tree);
+            let apply = LaunchConfig {
+                grid_dim: (rows.div_ceil(256).clamp(1, 1024), 1, 1),
+                ..single
+            };
+            unsafe { launch.launch(apply) }.context("apply importance sampling")?;
+        } else {
+            let function = self
+                .gradient_sample_fn
+                .as_ref()
+                .context("gradient sampler not loaded")?;
+            let mut launch = self.stream.launch_builder(function);
+            launch
+                .arg(pairs)
+                .arg(&rows)
+                .arg(&rate)
+                .arg(&seed)
+                .arg(&tree);
+            unsafe { launch.launch(single) }.context("launch gradient_importance_sample")?;
+        }
+        Ok(())
+    }
+
     /// exact 与 fast 共用的量化尾巴:max 归约 → host 求 pow2 scale →
     /// 定点量化 → root sum 归约。gpair_f32 此时已经在 device 上,
     /// 两条路径从这里开始逐字相同。
@@ -2935,8 +3108,16 @@ impl GpuTrainCtx {
         subsample_tree: u64,
         // fast:梯度 kernel 已经把每 block 的 max 写进 `gpair_max`,不再扫一遍 gpair_f32。
         // exact:gpair 是 host 上传的,max(及行采样)由 `gpair_max_abs` 完成。
-        max_fused: bool,
+        mut max_fused: bool,
     ) -> Result<(GradQuantizer, GradPairFixed, f32)> {
+        let importance = self
+            .config
+            .gradient_sampling_rate
+            .filter(|_| self.fast_math_enabled());
+        if let Some(rate) = importance {
+            self.sample_gradient_pairs(buf, rate, subsample_seed, subsample_tree)?;
+            max_fused = false;
+        }
         let max_fn = self
             .gpair_max_fn
             .as_ref()
@@ -2978,6 +3159,9 @@ impl GpuTrainCtx {
                 .arg(&subsample_seed)
                 .arg(&subsample_tree);
             unsafe { launch.launch(cfg) }.context("launch gpair_max_abs")?;
+        }
+        if importance.is_some() && self.gpair_scale_fn.is_some() {
+            return self.quantize_fused_device_scale(buf, started, n_rows_u32, blocks);
         }
         {
             let GpuBuffers {

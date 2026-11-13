@@ -35,8 +35,8 @@
     <section class="hero">
       <p class="label">Rust · Python · optional CUDA</p>
       <h1>Gradient boosted trees for large tabular data.</h1>
-      <p class="lead">FerrisBoost is a Rust-backed gradient-boosted tree library with XGBoost-compatible training semantics for supported objectives and a Python API with familiar parameter names.</p>
-      <p>FerrisBoost is an independent, column-blocked gradient boosting implementation licensed under Apache 2.0. It provides XGBoost-compatible training semantics and model interchange, but does not use or depend on the XGBoost runtime and is not affiliated with or endorsed by the XGBoost project or its maintainers.</p>
+      <p class="lead">FerrisBoost is a Rust-backed gradient-boosted tree library with XGBoost-compatible model interchange for supported objectives and a Python API with familiar parameter names. Training semantics can differ for some objectives; see the Python API How-To.</p>
+      <p>FerrisBoost is an independent, column-blocked gradient boosting implementation licensed under Apache 2.0. It provides XGBoost-compatible model interchange for supported objectives, but does not use or depend on the XGBoost runtime and is not affiliated with or endorsed by the XGBoost project or its maintainers.</p>
       <div class="actions">
         <a class="primary" href="https://pypi.org/project/ferrisboost/">Install from PyPI</a>
         <a href="https://github.com/mdai001/FerrisBoost">View source</a>
@@ -98,6 +98,15 @@ prediction = model.predict("test.parquet")</code></pre>
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
+      <h3>0.0.9 (unreleased)</h3>
+      <p>The current development candidate adds the features below. They are not in the published PyPI wheels or Rust crate; release and platform validation are still pending.</p>
+      <ul>
+        <li>Depthwise <code>max_leaves</code>, path-based <code>interaction_constraints</code>, feature sampling weights, and opt-in gradient-based row sampling.</li>
+        <li>Additional scalar regression and classification objectives, plus Cox and AFT survival objectives.</li>
+        <li>Rust custom metric and scalar custom objective extension points with batch adapters for Python.</li>
+        <li>Workload-scoped GPU refinements include coalesced split-input uploads, initialization-selected numeric split masks, and parallel large-row CUDA fast gradient sampling.</li>
+        <li>Single-GPU execution remains the supported device scope. Survival objectives and Python custom objectives support CPU and CUDA exact; CUDA fast is unsupported for them. Lossguide is deferred.</li>
+      </ul>
       <h3>0.0.8</h3>
       <ul>
         <li>Added <code>max_bin</code> above 255 (up to 65535).</li>

@@ -8,6 +8,10 @@ use crate::types::{FeatId, TrainParams};
 #[path = "packet_tests.rs"]
 mod packet_tests;
 
+#[cfg(test)]
+#[path = "split_upload_tests.rs"]
+mod split_upload_tests;
+
 /// Most bins per feature the one-thread-per-bin split kernels take (every
 /// 8-bit feature; `SPLIT_CTA_THREADS` = 256). A block holding a wider feature
 /// (16-bit blocks: max_bin > 255, more than 254 categories) runs the tiled
@@ -16,6 +20,22 @@ const SPLIT_KERNEL_MAX_BINS: u32 = 255;
 const SPLIT_SCORE_LEGACY: u32 = 0;
 const SPLIT_SCORE_GIVEN_BOUNDED: u32 = 1;
 const SPLIT_SCORE_GIVEN_DEFAULT_BOUNDS: u32 = 2;
+
+// One upload contains two contiguous planes: two i64 sums per node followed
+// by four u32 metadata words per node. Preserve native bytes, including sentinels.
+fn write_split_input(inputs: &mut [i64], node: usize, sum: GradPairFixed, metadata: [u32; 4]) {
+    debug_assert_eq!(inputs.len() % 4, 0);
+    let nodes = inputs.len() / 4;
+    assert!(node < nodes, "split input node exceeds capacity");
+    inputs[node * 2] = sum.grad;
+    inputs[node * 2 + 1] = sum.hess;
+    for (i, pair) in metadata.chunks_exact(2).enumerate() {
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&pair[0].to_ne_bytes());
+        bytes[4..].copy_from_slice(&pair[1].to_ne_bytes());
+        inputs[nodes * 2 + node * 2 + i] = i64::from_ne_bytes(bytes);
+    }
+}
 
 pub(super) struct ResidentSplitBuffers {
     previous: CudaSlice<i64>,
@@ -28,8 +48,8 @@ pub(super) struct ResidentSplitBuffers {
     packets_host: PinnedHostSlice<u8>,
     /// Bytes of `packets` already queued into `packets_host`.
     packets_in_flight: Option<usize>,
-    sums: CudaSlice<i64>,
-    metadata: CudaSlice<u32>,
+    /// Packed sums and metadata; exactly 32 bytes per node, as before.
+    split_inputs: CudaSlice<i64>,
     feats: CudaSlice<u32>,
     enabled: CudaSlice<u32>,
     /// 单调约束:每节点 `[lower, upper]`(和 `sums` 同序),每个块内特征的方向。
@@ -124,8 +144,7 @@ impl ResidentSplitBuffers {
             packets: stream.alloc_zeros::<u8>(packet_bytes)?,
             packets_host,
             packets_in_flight: None,
-            sums: stream.alloc_zeros::<i64>(cap * 2)?,
-            metadata: stream.alloc_zeros::<u32>(cap * 4)?,
+            split_inputs: stream.alloc_zeros::<i64>(cap * 4)?,
             feats: stream.alloc_zeros::<u32>(feats.max(1))?,
             enabled: stream.alloc_zeros::<u32>(feats.max(1))?,
             bounds: stream.alloc_zeros::<f32>(cap * 2)?,
@@ -472,8 +491,7 @@ impl GpuBlockSession<'_> {
         let cache = split_cache
             .as_mut()
             .context("resident split cache unavailable")?;
-        let mut metadata = Vec::with_capacity(nodes * 4);
-        let mut sums = Vec::with_capacity(nodes * 2);
+        let mut split_inputs = vec![0i64; nodes * 4];
         let mut bounds = Vec::with_capacity(nodes * 2);
         let mut indices = Vec::with_capacity(nodes);
         let mut working_slots = Vec::with_capacity(nodes);
@@ -498,8 +516,12 @@ impl GpuBlockSession<'_> {
                 } else {
                     u32::MAX
                 };
-                metadata.extend_from_slice(&[work as u32, small_slot as u32, parent, destination]);
-                sums.extend_from_slice(&[sum.grad, sum.hess]);
+                write_split_input(
+                    &mut split_inputs,
+                    indices.len(),
+                    sum,
+                    [work as u32, small_slot as u32, parent, destination],
+                );
                 bounds.extend_from_slice(&[node_bounds.lower, node_bounds.upper]);
                 indices.push(index);
                 working_slots.push(work);
@@ -646,10 +668,12 @@ impl GpuBlockSession<'_> {
             self.timing.split_metadata_h2d_calls += 1;
             self.timing.split_metadata_h2d_bytes += mask.len() as u64;
         }
-        stream.memcpy_htod(&sums, &mut cache.sums.slice_mut(..sums.len()))?;
-        stream.memcpy_htod(&metadata, &mut cache.metadata.slice_mut(..metadata.len()))?;
-        self.timing.split_metadata_h2d_calls += 2;
-        self.timing.split_metadata_h2d_bytes += (metadata.len() * 4 + sums.len() * 8) as u64;
+        stream.memcpy_htod(
+            &split_inputs,
+            &mut cache.split_inputs.slice_mut(..split_inputs.len()),
+        )?;
+        self.timing.split_metadata_h2d_calls += 1;
+        self.timing.split_metadata_h2d_bytes += (split_inputs.len() * 8) as u64;
         self.timing.split_evaluated_nodes += nodes as u64;
         self.timing.cache_admitted_nodes += cached.iter().filter(|x| **x).count() as u64;
         if keep_next {
@@ -680,6 +704,14 @@ impl GpuBlockSession<'_> {
             (false, true) => self.ctx.split_features_cat_fn.as_ref(),
             (false, false) => self.ctx.split_features_fn.as_ref(),
         };
+        let sums_view = cache.split_inputs.slice(..nodes * 2);
+        let metadata_words = cache.split_inputs.slice(nodes * 2..nodes * 4);
+        // SAFETY: the trailing plane contains exactly four initialized u32 words
+        // per node. Its i64-aligned base satisfies u32 alignment. Both read-only
+        // views retain the allocation's event tracking and lifetime; the next
+        // upload waits for their consumers through the original slot stream.
+        let metadata_view = unsafe { metadata_words.transmute::<u32>(nodes * 4) }
+            .context("packed split metadata view exceeds allocation")?;
         let mut launch = stream.launch_builder(split_fn.context("GPU split kernel unavailable")?);
         launch
             .arg(&mut *hist_out)
@@ -688,8 +720,8 @@ impl GpuBlockSession<'_> {
             .arg(offsets)
             .arg(&cache.feats)
             .arg(&cache.enabled)
-            .arg(&cache.sums)
-            .arg(&cache.metadata)
+            .arg(&sums_view)
+            .arg(&metadata_view)
             .arg(&features)
             .arg(&stride)
             .arg(&cache_stride)

@@ -628,6 +628,10 @@ use crate::types::{
 pub struct TrainConfig {
     pub params: TrainParams,
     pub objective: Objective,
+    /// Optional scalar derivative provider. Currently uses squared-error
+    /// metadata (identity prediction, RMSE default metric), CPU or CUDA exact.
+    /// Defaults to a zero intercept unless base_score is explicitly supplied.
+    pub custom_objective: Option<Box<dyn crate::custom_objective::CustomObjective>>,
     /// Suppress normal runtime summaries. Explicit profiling remains controlled
     /// by `FB_PROFILE` and is intentionally independent.
     pub quiet: bool,
@@ -651,6 +655,10 @@ pub struct TrainConfig {
     /// (same layout as `base_margin`). A missing tail or a `None` entry means
     /// that set starts from the intercept.
     pub eval_base_margins: Vec<Option<Vec<f32>>>,
+    /// AFT upper bounds; the ordinary labels hold the lower bounds.
+    pub label_upper_bound: Option<Vec<f32>>,
+    /// AFT upper bounds parallel to validation sets.
+    pub eval_upper_bounds: Vec<Option<Vec<f32>>>,
     /// Training continuation: the model whose trees, intercept (`base_score` /
     /// class margins), feature names and best-iteration metadata are carried
     /// into the result, with the newly trained trees appended. The caller must
@@ -672,14 +680,41 @@ impl TrainConfig {
         Self {
             params,
             objective,
+            custom_objective: None,
             quiet: false,
             eval_metrics: vec![crate::metrics::default_metric(objective)],
             base_score: None,
             base_margin: None,
             eval_base_margins: Vec::new(),
+            label_upper_bound: None,
+            eval_upper_bounds: Vec::new(),
             prior_model: None,
             group_ptr: None,
         }
+    }
+
+    pub(crate) fn validate_sampling_method(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn validate_custom_objective(&self) -> anyhow::Result<()> {
+        if let Some(custom) = &self.custom_objective {
+            crate::ensure_input!(
+                !custom.name().trim().is_empty(),
+                "custom objective name must not be empty"
+            );
+            crate::ensure_input!(matches!(self.objective, Objective::SquaredError),
+                "custom_objective currently requires objective=reg:squarederror (identity-link scalar regression)");
+            crate::ensure_input!(
+                self.params.gpu_math != crate::types::GpuMath::Fast,
+                "custom_objective does not support gpu_math=fast; use exact explicitly"
+            );
+            crate::ensure_input!(
+                self.params.scale_pos_weight == 1.0,
+                "custom_objective requires scale_pos_weight=1; row weights are applied by Rust"
+            );
+        }
+        Ok(())
     }
 
     /// The starting margins of validation set `i`, if it has any.
@@ -690,6 +725,9 @@ impl TrainConfig {
     /// 解析 base_score:用户给的值,或从训练标签/权重估计。
     pub fn resolve_base_score(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
         self.base_score.unwrap_or_else(|| {
+            if self.custom_objective.is_some() {
+                return 0.0;
+            }
             let spw = self.params.scale_pos_weight;
             let g = gradient_weights(self.objective, labels, weights, spw);
             self.objective
@@ -1046,6 +1084,14 @@ fn validate_start_margins(
     let Some(prior) = &cfg.prior_model else {
         return Ok(());
     };
+    let custom_name = cfg.custom_objective.as_ref().map(|o| o.name());
+    crate::ensure_input!(
+        prior.custom_objective.as_deref() == custom_name,
+        "continued training requires the same custom objective provider (custom_objective): model {:?}, supplied {:?}",
+        prior.custom_objective,
+        custom_name
+    );
+
     // XGBoost refuses to continue unbiased LambdaMART (`CHECK_EQ(iter, 0)` in
     // lambdarank_obj.cc): the position biases are estimated from round 0 and
     // restarting them would silently change the model.
@@ -1060,6 +1106,14 @@ fn validate_start_margins(
         cfg.objective.name(),
         prior.objective.name()
     );
+    if matches!(
+        cfg.objective,
+        Objective::Aft { .. } | Objective::Expectile { .. }
+    ) {
+        crate::ensure_input!(prior.objective == cfg.objective,
+            "continued training must retain the existing objective parameters: model {:?}, supplied {:?}",
+            prior.objective, cfg.objective);
+    }
     // Each output of a quantile model is tied to its alpha: continuing with other
     // quantiles would silently mix two different targets.
     crate::ensure_input!(
@@ -1187,6 +1241,10 @@ fn train_with_backend(
     comm: &dyn Comm,
     gpu_device: Option<usize>,
 ) -> anyhow::Result<Model> {
+    cfg.validate_custom_objective()?;
+    cfg.validate_sampling_method()?;
+    let feature_weights =
+        crate::colsample::validated_weights(&cfg.params.feature_weights, source.n_features())?;
     let n = source.n_rows();
     crate::ensure_input!(n > 0, "training data must have at least one row");
     // 行号是 u32(`RowId`):超过就会静默截断成错的行。
@@ -1209,6 +1267,46 @@ fn train_with_backend(
         labels.iter().all(|v| v.is_finite()),
         "labels must all be finite"
     );
+    let aft = matches!(cfg.objective, Objective::Aft { .. });
+    crate::ensure_input!(
+        !(gpu_device.is_some()
+            && cfg.params.gpu_math == crate::types::GpuMath::Fast
+            && cfg.objective.is_survival()),
+        "survival objectives support CPU and CUDA exact; gpu_math=fast is not supported"
+    );
+    if aft {
+        crate::ensure_input!(
+            cfg.label_upper_bound.is_some(),
+            "survival:aft requires label_upper_bound"
+        );
+        let upper = cfg.label_upper_bound.as_deref().unwrap();
+        crate::survival::validate_bounds(labels, upper, n)?;
+        crate::ensure_input!(
+            cfg.eval_upper_bounds.len() == evals.len(),
+            "survival:aft needs upper bounds for every evaluation set"
+        );
+        for (ev, upper) in evals.iter().zip(&cfg.eval_upper_bounds) {
+            crate::ensure_input!(
+                upper.is_some(),
+                "survival:aft evaluation set requires upper bounds"
+            );
+            let upper = upper.as_deref().unwrap();
+            crate::survival::validate_bounds(ev.labels, upper, ev.source.n_rows())?;
+        }
+        for metric in &cfg.eval_metrics {
+            crate::ensure_input!(metric.supports_intervals(), "survival:aft requires an interval-aware metric; {:?} does not support interval targets", metric.name());
+        }
+    } else {
+        crate::ensure_input!(
+            cfg.label_upper_bound.is_none() && cfg.eval_upper_bounds.iter().all(Option::is_none),
+            "interval upper bounds require survival:aft"
+        );
+    }
+    let mut cox_state = if cfg.objective == Objective::Cox {
+        Some(crate::survival::CoxState::new(labels)?)
+    } else {
+        None
+    };
     let ranking = cfg.objective.rank();
     match (ranking.is_some(), cfg.group_ptr.as_deref()) {
         (true, None) => crate::bail_input!(
@@ -1325,6 +1423,18 @@ fn train_with_backend(
         crate::types::MAX_DEPTH_LIMIT,
         p.max_depth
     );
+    // Normalize once per training call; all trees/backends share these rules.
+    let interactions = if p.interaction_constraints.is_empty() {
+        None
+    } else {
+        Some(
+            crate::interaction::InteractionConstraints::new(
+                source.n_features(),
+                Some(p.interaction_constraints.clone()),
+            )
+            .map_err(|e| crate::error::input_error(e.to_string()))?,
+        )
+    };
     crate::ensure_input!(p.cols_per_block > 0, "cols_per_block must be > 0");
     // XGBoost:约束比特征多是错误;比特征少的部分视为 0。
     crate::ensure_input!(
@@ -1499,6 +1609,7 @@ fn train_with_backend(
         },
         base_score,
         objective: cfg.objective,
+        custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
         n_features: source.n_features(),
         // 训练层不认识"列名"这个概念(它只见到量化后的块),所以留空,
         // 由知道 schema 的入口层填。空 = 位置模式,也是 numpy 入口的正解。
@@ -1570,9 +1681,13 @@ fn train_with_backend(
                     // flag adds their set outputs to the cache allocation.
                     gpu_split_cache: cfg.params.gpu_split_cache,
                     has_categorical: source.cuts().has_categorical(),
-                    node_feature_masks: cfg.params.colsample_bylevel < 1.0
-                        || cfg.params.colsample_bynode < 1.0,
+                    node_feature_masks: cfg.params.needs_node_feature_masks(),
                     gpu_math: cfg.params.gpu_math,
+                    gradient_sampling_rate: (cfg.params.gpu_math == crate::types::GpuMath::Fast
+                        && cfg.params.sampling_method
+                            == crate::types::SamplingMethod::GradientBased
+                        && cfg.params.subsample < 1.0)
+                        .then_some(cfg.params.subsample),
                     fast_weights: grad_weights.is_some(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
                     n_outputs: num_class,
@@ -1681,6 +1796,8 @@ fn train_with_backend(
                 comm,
                 gpu: gpu.as_ref(),
                 pool: &pool,
+                interactions: interactions.as_ref(),
+                feature_weights,
             },
             model,
             callbacks,
@@ -1735,6 +1852,66 @@ fn train_with_backend(
             (!fast_math).then(|| crate::diagnostic::Phase::new(b"fb.host.exact.gradient\0"));
         let gpair_f32 = if fast_math {
             Vec::new()
+        } else if cfg.objective.is_survival() {
+            pool.install(|| -> anyhow::Result<Vec<GradPair>> {
+                if fuse {
+                    gpu.as_ref()
+                        .expect("pending delta requires GPU")
+                        .with_prediction_delta(&mut |delta| {
+                            predictions
+                                .par_iter_mut()
+                                .zip(delta.par_iter())
+                                .for_each(|(p, d)| *p += *d);
+                        })?;
+                    pending_delta = false;
+                }
+                if let Some(state) = cox_state.as_mut() {
+                    state.gradients(&predictions, labels, weights)
+                } else if let Objective::Aft {
+                    distribution,
+                    scale,
+                } = cfg.objective
+                {
+                    let upper = cfg.label_upper_bound.as_deref().unwrap();
+                    Ok(predictions
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, &p)| {
+                            let mut pair = crate::survival::aft_loss_and_gradient(
+                                distribution,
+                                scale,
+                                p,
+                                labels[i],
+                                upper[i],
+                            )
+                            .1;
+                            let w = weights.map_or(1.0, |w| w[i]);
+                            pair.grad *= w;
+                            pair.hess *= w;
+                            pair
+                        })
+                        .collect())
+                } else {
+                    unreachable!()
+                }
+            })?
+        } else if let Some(custom) = cfg.custom_objective.as_ref() {
+            pool.install(|| -> anyhow::Result<Vec<GradPair>> {
+                let _t = prof::Timer::new(&prof::GRAD);
+                if fuse {
+                    let ctx = gpu.as_ref().expect("pending_delta implies a GPU context");
+                    ctx.with_prediction_delta(&mut |delta| {
+                        predictions
+                            .par_iter_mut()
+                            .zip(delta.par_iter())
+                            .for_each(|(p, d)| *p += *d);
+                    })?;
+                    pending_delta = false;
+                }
+                custom_gradients(custom.as_ref(), &predictions, labels, grad_weights).with_context(
+                    || format!("custom objective {:?}, round {}", custom.name(), round),
+                )
+            })?
         } else if fuse {
             let ctx = gpu.as_ref().expect("pending_delta implies a GPU context");
             let obj = cfg.objective;
@@ -1752,7 +1929,7 @@ fn train_with_backend(
                         rg.gradients(&predictions, round_seed, &mut out);
                         return;
                     }
-                    if obj.is_quantile() {
+                    if obj.needs_residual_scale() {
                         // 梯度依赖全体行的更新后预测(全局 scale):先施加 delta
                         // 再整体求梯度,不能边施加边算。
                         predictions
@@ -1800,7 +1977,7 @@ fn train_with_backend(
                 }
                 // quantile 的 scale 是对全体行预测的串行 f64 归约(其它
                 // objective 不用,传 0)。
-                let qs = if cfg.objective.is_quantile() {
+                let qs = if cfg.objective.needs_residual_scale() {
                     Objective::quantile_scale(&predictions, labels, weights)
                 } else {
                     0.0
@@ -1823,6 +2000,7 @@ fn train_with_backend(
         //
         // uniform 采样**不做 `1/p` 加权**(那是 gradient-based 采样才需要的)。
         let mut gpair_f32 = gpair_f32;
+        let uniform_rate = prepare_row_sampling(&mut gpair_f32, cfg, key_round as u64)?;
         let device_quant = gpu.as_ref().is_some_and(|c| c.device_quantize_enabled());
         // Device quantization masks in its existing max scan before selecting
         // scale. CPU and explicit host quantization mask in `mask_and_bounds`
@@ -1844,14 +2022,14 @@ fn train_with_backend(
             let (q, root, _ms) = if rank_grad.is_some() {
                 ctx.fast_rank_round(
                     round_seed,
-                    crate::subsample::threshold_for(cfg.params.subsample),
+                    crate::subsample::threshold_for(uniform_rate),
                     cfg.params.seed,
                     key_round as u64,
                 )?
             } else {
                 ctx.fast_gradient_and_quantize(
                     cfg.objective,
-                    crate::subsample::threshold_for(cfg.params.subsample),
+                    crate::subsample::threshold_for(uniform_rate),
                     cfg.params.seed,
                     key_round as u64,
                 )?
@@ -1864,7 +2042,7 @@ fn train_with_backend(
             let _t = prof::Timer::new(&prof::QUANTIZE);
             let (q, root, ms) = ctx.upload_and_quantize_gpair_sampled(
                 &gpair_f32,
-                crate::subsample::threshold_for(cfg.params.subsample),
+                crate::subsample::threshold_for(uniform_rate),
                 cfg.params.seed,
                 key_round as u64,
             )?;
@@ -1885,9 +2063,9 @@ fn train_with_backend(
             pool.install(|| {
                 // 采样掩码和求 scale 的 max 合成一趟(以前是采样一趟、max 一趟)。
                 // f32 侧置零:量化在这之后发生,所以 scale 也只看选中的行。
-                let mask = (cfg.params.subsample < 1.0).then(|| {
+                let mask = (uniform_rate < 1.0).then(|| {
                     (
-                        crate::subsample::threshold_for(cfg.params.subsample),
+                        crate::subsample::threshold_for(uniform_rate),
                         cfg.params.seed,
                         key_round as u64,
                     )
@@ -1942,11 +2120,12 @@ fn train_with_backend(
         // 语义对齐 XGBoost(count = max(1, floor(rate * n)),升序),
         // 但序列是 FerrisBoost 自己的确定性实现 —— 见 `colsample` 模块。
         let sampled: Option<Vec<FeatId>> = if cfg.params.colsample_bytree < 1.0 {
-            Some(crate::colsample::sample_features(
+            Some(crate::colsample::sample_features_weighted(
                 source.n_features(),
                 cfg.params.colsample_bytree,
                 cfg.params.seed,
                 key_round,
+                feature_weights,
             ))
         } else {
             None
@@ -1963,12 +2142,14 @@ fn train_with_backend(
                 comm,
                 gpu.as_ref(),
                 sampled.as_deref(),
+                interactions.as_ref(),
                 crate::colsample::NestedSampler::new(
                     cfg.params.colsample_bylevel,
                     cfg.params.colsample_bynode,
                     cfg.params.seed,
                     key_round,
-                ),
+                )
+                .map(|sampler| sampler.with_weights(feature_weights)),
             )
         })?;
         fixed_buf = fixed;
@@ -1985,7 +2166,7 @@ fn train_with_backend(
         }
         model.trees.push(tree);
 
-        let m = evaluate(&eval_preds, evals, round, cfg);
+        let m = evaluate(&eval_preds, evals, round, cfg)?;
         // 任一 callback 返回 false 就停 —— early stopping 走这条路。
         // Every callback must run even after an earlier callback requests stopping.
         #[allow(clippy::unnecessary_fold)]
@@ -2112,12 +2293,30 @@ pub fn train_gpu_one_tree(
     let base_score = cfg.resolve_base_score(labels, None);
     let margin = base_margin(cfg.objective, base_score);
     let predictions = vec![margin; source.n_rows()];
-    let qs = if cfg.objective.is_quantile() {
+    let qs = if cfg.objective.needs_residual_scale() {
         Objective::quantile_scale(&predictions, labels, None)
     } else {
         0.0
     };
-    let gpair = compute_gradients(&predictions, labels, cfg.objective, qs);
+    cfg.validate_custom_objective()?;
+    cfg.validate_sampling_method()?;
+    crate::ensure_input!(
+        cfg.params.sampling_method == crate::types::SamplingMethod::Uniform,
+        "train_gpu_one_tree does not support sampling_method=gradient_based; use train_gpu"
+    );
+    crate::ensure_input!(
+        cfg.params.feature_weights.is_empty(),
+        "train_gpu_one_tree does not support feature_weights; use train_gpu"
+    );
+    crate::ensure_input!(
+        !cfg.objective.is_survival(),
+        "train_gpu_one_tree does not support survival objectives; use train_gpu"
+    );
+    let gpair = if let Some(custom) = &cfg.custom_objective {
+        custom_gradients(custom.as_ref(), &predictions, labels, None)?
+    } else {
+        compute_gradients(&predictions, labels, cfg.objective, qs)
+    };
     let quantizer = GradQuantizer::try_new(&gpair, source.n_rows())?;
     let fixed: Vec<GradPairFixed> = gpair.iter().map(|&g| quantizer.to_fixed(g)).collect();
     let root_sum = hist::node_sum(&fixed, None);
@@ -2159,7 +2358,9 @@ pub fn train_gpu_one_tree(
         best = split::reduce_best(&[best, block_best]);
     }
 
-    let Some(chosen) = comm.allreduce_best_split(best) else {
+    let chosen = comm.allreduce_best_split(best);
+    let chosen = chosen.filter(|_| cfg.params.max_leaves != 1);
+    let Some(chosen) = chosen else {
         return Ok(Model {
             // 训练层没有列名概念;由知道 schema 的入口层填。
             feature_names: Vec::new(),
@@ -2172,6 +2373,7 @@ pub fn train_gpu_one_tree(
             trees: vec![tree],
             base_score,
             objective: cfg.objective,
+            custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
             n_features: source.n_features(),
             best_iteration: None,
             best_score: None,
@@ -2222,6 +2424,7 @@ pub fn train_gpu_one_tree(
         trees: vec![tree],
         base_score,
         objective: cfg.objective,
+        custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
         n_features: source.n_features(),
         best_iteration: None,
         best_score: None,
@@ -2238,6 +2441,8 @@ struct MulticlassRun<'a> {
     comm: &'a dyn Comm,
     gpu: Option<&'a crate::backend::cuda::GpuTrainCtx>,
     pool: &'a rayon::ThreadPool,
+    interactions: Option<&'a crate::interaction::InteractionConstraints>,
+    feature_weights: Option<&'a [f32]>,
 }
 
 /// 多分类(`multi:softprob` / `multi:softmax`,XGBoost `one_output_per_tree`)。
@@ -2268,6 +2473,8 @@ fn train_multiclass_rounds(
         comm,
         gpu,
         pool,
+        interactions,
+        feature_weights,
     } = run;
     let n = source.n_rows();
     let k_count = cfg.objective.num_outputs();
@@ -2341,6 +2548,7 @@ fn train_multiclass_rounds(
             };
             // 行采样:和单输出相同的确定性掩码,键是树序号。host 量化路径上
             // 掩码与求 scale 的 max 合成一趟(见 `mask_and_bounds`)。
+            let uniform_rate = prepare_row_sampling(&mut gpair_f32, cfg, tree_index as u64)?;
             let (quantizer, fixed, dev_root_sum, host_nonzero) = if fast_math {
                 // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
                 // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
@@ -2354,14 +2562,14 @@ fn train_multiclass_rounds(
                             .quantile_alphas()
                             .expect("multi quantile")
                             .as_slice()[class],
-                        crate::subsample::threshold_for(cfg.params.subsample),
+                        crate::subsample::threshold_for(uniform_rate),
                         cfg.params.seed,
                         tree_index,
                     )?
                 } else {
                     ctx.fast_multiclass_gradient_and_quantize(
                         class,
-                        crate::subsample::threshold_for(cfg.params.subsample),
+                        crate::subsample::threshold_for(uniform_rate),
                         cfg.params.seed,
                         tree_index,
                     )?
@@ -2372,16 +2580,16 @@ fn train_multiclass_rounds(
                 let _t = prof::Timer::new(&prof::QUANTIZE);
                 let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
                     &gpair_f32,
-                    crate::subsample::threshold_for(cfg.params.subsample),
+                    crate::subsample::threshold_for(uniform_rate),
                     cfg.params.seed,
                     tree_index,
                 )?;
                 (q, Vec::new(), Some(root), None)
             } else {
                 pool.install(|| {
-                    let mask = (cfg.params.subsample < 1.0).then(|| {
+                    let mask = (uniform_rate < 1.0).then(|| {
                         (
-                            crate::subsample::threshold_for(cfg.params.subsample),
+                            crate::subsample::threshold_for(uniform_rate),
                             cfg.params.seed,
                             tree_index,
                         )
@@ -2403,11 +2611,12 @@ fn train_multiclass_rounds(
                 ctx.upload_gpair(&fixed)?;
             }
             let sampled: Option<Vec<FeatId>> = if cfg.params.colsample_bytree < 1.0 {
-                Some(crate::colsample::sample_features(
+                Some(crate::colsample::sample_features_weighted(
                     source.n_features(),
                     cfg.params.colsample_bytree,
                     cfg.params.seed,
                     tree_index as usize,
+                    feature_weights,
                 ))
             } else {
                 None
@@ -2430,12 +2639,14 @@ fn train_multiclass_rounds(
                     comm,
                     gpu,
                     sampled.as_deref(),
+                    interactions,
                     crate::colsample::NestedSampler::new(
                         cfg.params.colsample_bylevel,
                         cfg.params.colsample_bynode,
                         cfg.params.seed,
                         tree_index as usize,
-                    ),
+                    )
+                    .map(|sampler| sampler.with_weights(feature_weights)),
                 )
             })?;
             fixed_buf = fixed;
@@ -2476,7 +2687,7 @@ fn train_multiclass_rounds(
             .iter()
             .map(|per_class| interleave_classes(per_class))
             .collect();
-        let m = evaluate(&interleaved, evals, round, cfg);
+        let m = evaluate(&interleaved, evals, round, cfg)?;
         #[allow(clippy::unnecessary_fold)]
         let keep_going = callbacks
             .iter_mut()
@@ -2553,18 +2764,22 @@ fn evaluate(
     evals: &[EvalSet],
     round: usize,
     cfg: &TrainConfig,
-) -> RoundMetrics {
+) -> anyhow::Result<RoundMetrics> {
     let mut entries = Vec::new();
-    for (ev, pred) in evals.iter().zip(eval_preds) {
+    for (i, (ev, pred)) in evals.iter().zip(eval_preds).enumerate() {
         for m in &cfg.eval_metrics {
             entries.push((
                 ev.name.clone(),
                 m.name().to_string(),
-                m.eval_grouped(pred, ev.labels, ev.weights, ev.group_ptr),
+                if let Some(upper) = cfg.eval_upper_bounds.get(i).and_then(Option::as_deref) {
+                    m.try_eval_interval(pred, ev.labels, upper, ev.weights)?
+                } else {
+                    m.try_eval_grouped(pred, ev.labels, ev.weights, ev.group_ptr)?
+                },
             ));
         }
     }
-    RoundMetrics { round, entries }
+    Ok(RoundMetrics { round, entries })
 }
 
 #[cfg(test)]
@@ -2754,6 +2969,7 @@ struct LevelNode {
     /// 梯度总和,**含缺失行** —— split.rs 靠它反推缺失部分
     sum: GradPairFixed,
     hist_from: HistFrom,
+    interaction: Option<std::sync::Arc<crate::interaction::InteractionState>>,
     /// 单调约束下这个节点的权重上下界。无约束时恒为 `UNBOUNDED`、不被读取。
     bounds: split::NodeBounds,
 }
@@ -2821,9 +3037,10 @@ fn build_tree(
     gpu: Option<&crate::backend::cuda::GpuTrainCtx>,
     // 本棵树的采样特征集(全局 id,升序)。`None` = 全选。
     sampled: Option<&[FeatId]>,
+    interactions: Option<&crate::interaction::InteractionConstraints>,
     // `colsample_bylevel` / `colsample_bynode`:只缩小 split 枚举的特征集,
     // 直方图仍按 `sampled` 建。`None` = 两者都是 1。
-    nested: Option<crate::colsample::NestedSampler>,
+    nested: Option<crate::colsample::NestedSampler<'_>>,
 ) -> anyhow::Result<Tree> {
     let p = &cfg.params;
 
@@ -2986,6 +3203,7 @@ fn build_tree(
         rows: root_rows,
         sum: root_sum,
         hist_from: HistFrom::Accumulate,
+        interaction: interactions.map(|rules| std::sync::Arc::new(rules.root())),
         bounds: split::NodeBounds::UNBOUNDED,
     }];
     // 上一层的直方图,[列块][槽位]。兄弟相减要用,所以整层都得留着。
@@ -2997,8 +3215,10 @@ fn build_tree(
         (None, _) => Vec::new(),
     };
 
+    // Count all leaves, including terminal nodes no longer in the active level.
+    let mut leaf_count = 1u32;
     for depth in 0..p.max_depth {
-        if level.is_empty() {
+        if level.is_empty() || (p.max_leaves != 0 && leaf_count >= p.max_leaves) {
             break;
         }
         // ---- 本层每个节点的 split 枚举特征集 ----
@@ -3017,8 +3237,42 @@ fn build_tree(
             ),
             _ => None,
         };
+        // Without column sampling, borrow the immutable path set directly.
+        // Materialize an intersection only when two distinct masks are active.
+        let interaction_sets = (interactions.is_some()
+            && (node_sets.is_some() || level_set.is_some() || sampled.is_some()))
+        .then(|| {
+            level
+                .iter()
+                .enumerate()
+                .map(|(i, node)| {
+                    let allowed = node
+                        .interaction
+                        .as_ref()
+                        .expect("interaction state")
+                        .eligible();
+                    let features = node_sets
+                        .as_ref()
+                        .map(|sets| sets[i].as_slice())
+                        .or(level_set.as_deref())
+                        .or(sampled)
+                        .expect("column sampling mask");
+                    features
+                        .iter()
+                        .copied()
+                        .filter(|feat| allowed.binary_search(feat).is_ok())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
         // 节点 i 枚举用的特征集:节点集 > 层集 > bytree 集。
         let enum_features = |i: usize| -> Option<&[FeatId]> {
+            if let Some(sets) = &interaction_sets {
+                return Some(&sets[i]);
+            }
+            if let Some(state) = &level[i].interaction {
+                return Some(state.eligible());
+            }
             match (&node_sets, &level_set) {
                 (Some(ns), _) => Some(ns[i].as_slice()),
                 (None, Some(ls)) => Some(ls.as_slice()),
@@ -3131,8 +3385,7 @@ fn build_tree(
                     &plan.hist_feats,
                     sampled,
                     cuts.has_categorical().then(|| cuts.categorical_flags()),
-                    nested
-                        .is_some()
+                    (nested.is_some() || interactions.is_some())
                         .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
                     q,
                     p,
@@ -3270,8 +3523,7 @@ fn build_tree(
                             cuts.has_categorical().then(|| cuts.categorical_flags()),
                             // bylevel / bynode: the level node's feature set is
                             // the host's `enum_features`, uploaded as a byte mask.
-                            nested
-                                .is_some()
+                            (nested.is_some() || interactions.is_some())
                                 .then_some(&node_enabled as &dyn Fn(usize, FeatId) -> bool),
                             q,
                             p,
@@ -3490,6 +3742,21 @@ fn build_tree(
             .into_iter()
             .map(|c| comm.allreduce_best_split(c))
             .collect();
+        // Reserve the remaining leaf budget in stable depthwise node order.
+        // Clear rejected candidates before partition submission, so terminal
+        // rows retain their existing span and receive the normal leaf update.
+        if p.max_leaves != 0 {
+            let mut remaining = p.max_leaves.saturating_sub(leaf_count);
+            for candidate in &mut chosen {
+                if candidate.is_some() {
+                    if remaining == 0 {
+                        *candidate = None;
+                    } else {
+                        remaining -= 1;
+                    }
+                }
+            }
+        }
         drop(split_reduce_phase);
         let partition_phase = crate::diagnostic::Phase::new(b"fb.host.partition\0");
 
@@ -3769,6 +4036,17 @@ fn build_tree(
                 continue; // 分不动就留成叶子,值在 push_leaf 时就写好了
             };
 
+            leaf_count += 1;
+            let child_interaction = interactions.map(|rules| {
+                std::sync::Arc::new(
+                    rules
+                        .child_after_split(
+                            ln.interaction.as_ref().expect("interaction state"),
+                            c.feat,
+                        )
+                        .expect("selected split must satisfy interaction constraints"),
+                )
+            });
             let children = child_leaves(&c, q, p, ln.bounds);
             let ln_node = ln.node;
             let (left_node, right_node) = t.split_leaf(
@@ -3817,6 +4095,7 @@ fn build_tree(
                     rows: left_rows,
                     sum: c.left,
                     hist_from: HistFrom::Accumulate,
+                    interaction: child_interaction.clone(),
                     bounds: children.left_bounds,
                 },
                 LevelNode {
@@ -3824,6 +4103,7 @@ fn build_tree(
                     rows: right_rows,
                     sum: c.right,
                     hist_from: HistFrom::Accumulate,
+                    interaction: child_interaction.clone(),
                     bounds: children.right_bounds,
                 },
             ];
@@ -4766,6 +5046,7 @@ pub fn base_margin(obj: Objective, base_score: f32) -> f32 {
 #[inline]
 fn gradient_of(pred: f32, label: f32, obj: Objective, quantile_scale: f32) -> GradPair {
     match obj {
+        Objective::AbsoluteError => Objective::absolute_gradient(quantile_scale, pred, label),
         // 单目标路径(多个 alpha 时按目标拆成单 alpha 的 objective 再调用)。
         Objective::Quantile { alphas } => {
             Objective::quantile_gradient(alphas.as_slice()[0], quantile_scale, pred, label)
@@ -4817,6 +5098,66 @@ fn weighted(g: GradPair, w: f32) -> GradPair {
         grad: g.grad * w,
         hess: g.hess * w,
     }
+}
+
+// Return the uniform-mask rate for the existing host/device quantizers.
+// Importance sampling already modifies the host pairs, so it must not receive
+// a second Bernoulli mask during quantization.
+fn prepare_row_sampling(
+    pairs: &mut [GradPair],
+    cfg: &TrainConfig,
+    tree: u64,
+) -> anyhow::Result<f32> {
+    if cfg.params.sampling_method == crate::types::SamplingMethod::Uniform {
+        return Ok(cfg.params.subsample);
+    }
+    if pairs.is_empty() && cfg.params.gpu_math == crate::types::GpuMath::Fast {
+        // Device gradients are sampled in-place by the shared quantization tail.
+        return Ok(1.0);
+    }
+    if cfg.params.subsample < 1.0 {
+        let _phase = crate::diagnostic::Phase::new(b"fb.host.gradient_sampling\0");
+        let _timer = prof::Timer::new(&prof::SAMPLE);
+        crate::gradient_sampling::sample(pairs, cfg.params.subsample, cfg.params.seed, tree)?;
+    }
+    Ok(1.0)
+}
+
+fn custom_gradients(
+    objective: &dyn crate::custom_objective::CustomObjective,
+    predictions: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+) -> anyhow::Result<Vec<GradPair>> {
+    // Poison unfilled slots so a partial native implementation fails instead
+    // of silently treating forgotten rows as zero-weight samples. This buffer
+    // follows the existing lifetime: released after quantization, before trees.
+    let mut out = vec![
+        GradPair {
+            grad: f32::NAN,
+            hess: f32::NAN
+        };
+        labels.len()
+    ];
+    objective.gradients(predictions, labels, &mut out)?;
+    for (row, pair) in out.iter_mut().enumerate() {
+        crate::ensure_input!(
+            pair.grad.is_finite(),
+            "custom objective gradient at row {row} must be finite"
+        );
+        crate::ensure_input!(
+            pair.hess.is_finite() && pair.hess >= 0.0,
+            "custom objective Hessian at row {row} must be finite and nonnegative"
+        );
+        if let Some(weights) = weights {
+            *pair = weighted(*pair, weights[row]);
+            crate::ensure_input!(
+                pair.grad.is_finite() && pair.hess.is_finite(),
+                "custom objective weighted gradient/Hessian at row {row} must be finite"
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn compute_gradients_weighted(
@@ -5289,7 +5630,12 @@ mod tests {
         let glm_like = Objective::ALL.into_iter().filter(|o| {
             !matches!(
                 o,
-                Objective::Gamma | Objective::PseudoHuber { .. } | Objective::Quantile { .. }
+                Objective::Gamma
+                    | Objective::AbsoluteError
+                    | Objective::Expectile { .. }
+                    | Objective::PseudoHuber { .. }
+                    | Objective::Quantile { .. }
+                    | Objective::Hinge
             )
         });
         for obj in glm_like {

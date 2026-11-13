@@ -167,8 +167,8 @@ def test_invalid_eval_weights_are_rejected():
 @pytest.mark.parametrize("params, match", [
     ({"eval_metric": "ndcg"}, "not supported"),
     ({"eval_metric": "auc", "objective": "reg:squarederror"}, "binary:logistic"),
-    ({"eval_metric": []}, "string or a list of strings"),
-    ({"eval_metric": 3}, "string or a list of strings"),
+    ({"eval_metric": []}, "string, CustomMetric, or a list"),
+    ({"eval_metric": 3}, "string, CustomMetric, or a list"),
 ])
 def test_invalid_eval_metric_is_rejected(params, match):
     x, y, _ = toy()

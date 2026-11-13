@@ -6,7 +6,7 @@
 //! NumPy 的 stride，不能把 F-order/切片视为 C row-major 内存。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -14,7 +14,7 @@ use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUnty
 use pyo3::exceptions::PyNotImplementedError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use rayon::prelude::*;
 
 use crate::callback::{Callback, EarlyStopping, RecordHistory, RoundMetrics, VerboseEval};
@@ -25,6 +25,7 @@ use crate::source::{csv_source, parquet_source, DenseSource};
 use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
 
 mod explain;
+mod feature_weights;
 mod margin;
 
 fn on_off(flag: bool) -> &'static str {
@@ -35,7 +36,7 @@ fn on_off(flag: bool) -> &'static str {
     }
 }
 use crate::tree::Model;
-use crate::types::{Objective, TrainParams};
+use crate::types::{AftDistribution, Objective, TrainParams};
 
 /// anyhow 的错误转 Python 异常。
 ///
@@ -44,6 +45,9 @@ use crate::types::{Objective, TrainParams};
 /// 其余(I/O、CUDA、内部错误)才是 RuntimeError。全都甩成 RuntimeError 的话,调用方没法按类型处理,
 /// 而且 traceback 里只剩一句没头没尾的话。
 fn to_py_err(e: anyhow::Error) -> PyErr {
+    if let Some(original) = e.downcast_ref::<PyErr>() {
+        return Python::attach(|py| original.clone_ref(py));
+    }
     let msg = format!("{e:#}");
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         if io.kind() == std::io::ErrorKind::NotFound {
@@ -330,6 +334,10 @@ fn gpu_plan_model(
             StreamingMemModel::new_for_shape(rows, shape, cols, streams, cap, device_quantize, fast)
         }
     };
+    let gradient_sampling_rate = (cfg.params.sampling_method
+        == crate::types::SamplingMethod::GradientBased)
+        .then_some(cfg.params.subsample);
+    let model = model.with_gradient_sampling(rows, fast, gradient_sampling_rate);
     // fast 模式下梯度权重常驻显存(4 B/行);exact 在 host 上乘,不占显存。
     // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
     // 和训练时的分配用同一个判断。
@@ -376,7 +384,9 @@ fn gpu_plan_model(
     {
         return model;
     }
-    let node_masks = cfg.params.colsample_bylevel < 1.0 || cfg.params.colsample_bynode < 1.0;
+    // Planning can precede schema/name resolution; price the unresolved request too.
+    let node_masks =
+        cfg.params.needs_node_feature_masks() || !cfg.interaction_constraints.is_empty();
     match shape {
         // Categorical set outputs are reserved unconditionally:
         // Arrow dictionary columns make a file input categorical
@@ -1007,7 +1017,7 @@ use crate::threading::effective_threads as effective_nthread;
 /// crossover is benchmarked independently.
 const AUTO_PREDICT_MIN_WORK: usize = 256 * 1024;
 
-fn prediction_work_per_row(model: &Model, n_trees: usize) -> usize {
+fn prediction_work_prefix(model: &Model) -> Box<[usize]> {
     fn tree_path_upper_bound(tree: &crate::tree::Tree) -> usize {
         if tree.nodes.is_empty() {
             return 0;
@@ -1025,11 +1035,12 @@ fn prediction_work_per_row(model: &Model, n_trees: usize) -> usize {
         longest
     }
 
-    model.trees[..n_trees.min(model.trees.len())]
-        .iter()
-        .map(tree_path_upper_bound)
-        .sum::<usize>()
-        .max(1)
+    let mut prefix = Vec::with_capacity(model.trees.len() + 1);
+    prefix.push(0usize);
+    for tree in &model.trees {
+        prefix.push(prefix.last().copied().unwrap() + tree_path_upper_bound(tree));
+    }
+    prefix.into_boxed_slice()
 }
 
 fn resolved_predict_workers(
@@ -1038,14 +1049,15 @@ fn resolved_predict_workers(
     n_rows: usize,
     work_per_row: usize,
 ) -> usize {
-    let resolved = effective_nthread(requested)
-        .min(worker_cap.max(1))
-        .min(n_rows.max(1));
+    // Serial work does not need a topology, affinity or cgroup quota query.
+    // Keep the live query for calls that can actually launch multiple workers.
     if requested == 0 && n_rows.saturating_mul(work_per_row) < AUTO_PREDICT_MIN_WORK {
-        1
-    } else {
-        resolved.max(1)
+        return 1;
     }
+    effective_nthread(requested)
+        .min(worker_cap.max(1))
+        .min(n_rows.max(1))
+        .max(1)
 }
 
 /// Score independent row indices into deterministic, disjoint output chunks.
@@ -1442,11 +1454,7 @@ fn predict_files_to_parquet(
         n_features,
         n_features.max(1),
     );
-    let work_per_row = match (&single, &multi) {
-        (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
-        (None, Some(_)) => prediction_work_per_row(&model.inner, upto),
-        (None, None) => unreachable!("either a single or a multi-output predictor"),
-    };
+    let work_per_row = model.prediction_work_per_row(upto);
     let (ingest_workers, predict_worker_cap, oversubscribed) = prediction_output_pipeline_workers(
         model.ingest_threads,
         predict_threads,
@@ -1854,6 +1862,9 @@ pub struct PyModel {
     quiet: bool,
     model_io_threads: usize,
     ingest_threads: usize,
+    // Model topology is immutable after wrapping. Cache scheduling metadata
+    // once, including all prefixes, without retaining per-node traversal scratch.
+    prediction_work: OnceLock<Box<[usize]>>,
     cpu_predictor: Mutex<Option<Arc<crate::inference::CpuInferenceModel>>>,
     inference_model: Mutex<Option<Arc<crate::inference::CompactInferenceModel>>>,
     #[cfg(feature = "cuda")]
@@ -1873,6 +1884,13 @@ enum IterationPlan {
 }
 
 impl PyModel {
+    fn prediction_work_per_row(&self, n_trees: usize) -> usize {
+        let prefix = self
+            .prediction_work
+            .get_or_init(|| prediction_work_prefix(&self.inner));
+        prefix[n_trees.min(self.inner.trees.len())].max(1)
+    }
+
     /// XGBoost `iteration_range=(begin, end)` 的语义:半开区间 `[begin, end)` 的
     /// **轮次**(多分类一轮 `num_class` 棵树);`end == 0` 表示到最后一轮;
     /// 越界或 `begin > end` 报错;`begin == end` 是空区间,只剩 base_score。
@@ -1919,6 +1937,7 @@ impl PyModel {
             quiet,
             model_io_threads,
             ingest_threads,
+            prediction_work: OnceLock::new(),
             cpu_predictor: Mutex::new(None),
             inference_model: Mutex::new(None),
             #[cfg(feature = "cuda")]
@@ -2001,7 +2020,7 @@ impl PyModel {
             }
         }
         reject_reserved_max(&x)?;
-        let work_per_row = prediction_work_per_row(&self.inner, upto);
+        let work_per_row = self.prediction_work_per_row(upto);
         if use_gpu {
             let inference = self.inference_model().map_err(to_py_err)?;
             if gpu_prediction_selected(use_gpu, n_rows, inference.n_features(), work_per_row) {
@@ -2035,12 +2054,8 @@ impl PyModel {
             gathered = x.as_array().iter().copied().collect();
             &gathered
         };
-        let workers = resolved_predict_workers(
-            predict_threads,
-            effective_nthread(predict_threads),
-            n_rows,
-            work_per_row,
-        );
+        let workers =
+            resolved_predict_workers(predict_threads, n_rows.max(1), n_rows, work_per_row);
         let predictor = self.cpu_predictor().map_err(to_py_err)?;
         let margins = py
             .detach(|| {
@@ -2145,7 +2160,7 @@ impl PyModel {
             // 和训练一样拒绝保留值 f32::MAX(CPU 和 GPU 预测都走这里)。
             reject_reserved_max(&x)?;
             let upto = n_trees.unwrap_or(self.inner.trees.len());
-            let work_per_row = prediction_work_per_row(&self.inner, upto);
+            let work_per_row = self.prediction_work_per_row(upto);
             let inference = if use_gpu {
                 Some(self.inference_model().map_err(to_py_err)?)
             } else {
@@ -2191,9 +2206,8 @@ impl PyModel {
                     return Ok(PyArray1::from_vec(py, out));
                 }
             }
-            let worker_cap = effective_nthread(predict_threads);
             let workers =
-                resolved_predict_workers(predict_threads, worker_cap, n_rows, work_per_row);
+                resolved_predict_workers(predict_threads, n_rows.max(1), n_rows, work_per_row);
             let mut pool = None;
 
             // `as_slice` alone is insufficient: NumPy can return a linear slice
@@ -2300,11 +2314,7 @@ impl PyModel {
             n_features,
             n_features.max(1),
         );
-        let work_per_row = match (&single, &multiclass) {
-            (Some(inference), _) => prediction_work_per_row(inference.model(), upto),
-            (None, Some(_)) => prediction_work_per_row(&self.inner, upto),
-            (None, None) => unreachable!(),
-        };
+        let work_per_row = self.prediction_work_per_row(upto);
         let known_gpu_selection = rows_total
             .and_then(|rows| usize::try_from(rows).ok())
             .map(|rows| gpu_prediction_selected(use_gpu, rows, n_features, work_per_row));
@@ -2903,6 +2913,7 @@ impl PyModel {
                 quiet,
                 model_io_threads,
                 ingest_threads,
+                prediction_work: OnceLock::new(),
                 cpu_predictor: Mutex::new(None),
                 #[cfg(feature = "cuda")]
                 gpu_predictors: Mutex::new(std::collections::HashMap::new()),
@@ -2943,6 +2954,62 @@ impl PyModel {
     #[getter]
     fn objective(&self) -> &'static str {
         self.inner.objective.name()
+    }
+
+    /// Native sklearn survival scoring; uses parameters stored in this model.
+    #[pyo3(signature = (pred, lower, upper=None, weight=None))]
+    fn _survival_score(
+        &self,
+        pred: PyReadonlyArray1<'_, f32>,
+        lower: PyReadonlyArray1<'_, f32>,
+        upper: Option<PyReadonlyArray1<'_, f32>>,
+        weight: Option<PyReadonlyArray1<'_, f32>>,
+    ) -> PyResult<f64> {
+        use crate::metrics::Metric;
+        let p = pred.as_slice()?;
+        let lower = lower.as_slice()?;
+        if p.is_empty() {
+            return Err(PyValueError::new_err(
+                "survival score requires at least one row",
+            ));
+        }
+        let weight = weight.as_ref().map(|w| w.as_slice()).transpose()?;
+        let score = match self.inner.objective {
+            Objective::Cox => {
+                if upper.is_some() {
+                    return Err(PyValueError::new_err(
+                        "Cox targets are signed times, not intervals",
+                    ));
+                }
+                crate::survival::CoxState::new(lower)
+                    .and_then(|mut state| state.loss(p, lower, weight))
+                    .map_err(to_py_err)?
+            }
+            Objective::Aft {
+                distribution,
+                scale,
+            } => {
+                let upper = upper
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("AFT scoring requires upper bounds"))?
+                    .as_slice()?;
+                f64::from(
+                    crate::survival::AftMetric {
+                        distribution,
+                        scale,
+                        accuracy: false,
+                    }
+                    .try_eval_interval(p, lower, upper, weight)
+                    .map_err(to_py_err)?,
+                )
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "survival score requires a survival model",
+                ))
+            }
+        };
+        Ok(-score)
     }
 
     /// `reg:quantileerror` 的 `quantile_alpha` 列表;其它模型是 `None`。
@@ -3039,6 +3106,11 @@ impl PyModel {
 }
 
 /// 规整好的参数(Python 侧已经查过别名和拼写)。
+enum MetricSpec {
+    Builtin(String),
+    Custom(Py<crate::python_metric::PyCustomMetric>),
+}
+
 struct Parsed {
     params: TrainParams,
     /// 用户**显式**传进来的 `cols_per_block`;`None` 表示交给启发式。
@@ -3051,6 +3123,7 @@ struct Parsed {
     /// 那些由 Rust 侧的显存规划器决定,见 `gpu_mem_plan`。
     device: Option<usize>,
     objective: Objective,
+    custom_objective: Option<Py<crate::python_objective::PyCustomObjective>>,
     base_score: Option<f32>,
     cache_budget_bytes: Option<usize>,
     cache_path: Option<String>,
@@ -3059,11 +3132,14 @@ struct Parsed {
     model_io_threads: usize,
     quiet: bool,
     /// XGBoost `eval_metric`,已按 objective 解析。空 = objective 默认指标。
-    eval_metrics: Vec<String>,
+    eval_metrics: Vec<MetricSpec>,
     /// 训练集带样本权重。由入口在规划**之前**设上:fast 模式的显存计划要算它。
     weighted: bool,
     /// XGBoost `monotone_constraints`,还没按 schema 解析。见 `resolve_monotone`。
     monotone: Option<MonotoneSpec>,
+    /// Feature ids/names grouped by the user; names resolve after source schema is known.
+    interaction_constraints: Vec<Vec<InteractionFeature>>,
+    feature_weights: Option<feature_weights::FeatureWeightsSpec>,
     /// Declared categorical features (`feature_types`), one flag per feature in
     /// input order; empty = none declared. Arrow dictionary columns in file
     /// inputs are categorical even when this is empty.
@@ -3082,12 +3158,78 @@ enum MonotoneSpec {
     Named(Vec<(String, i8)>),
 }
 
+enum InteractionFeature {
+    Id(usize),
+    Name(String),
+}
+
+fn parse_interaction_constraints(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Vec<Vec<InteractionFeature>>> {
+    let outer: Vec<Bound<'_, PyAny>> = if let Ok(list) = value.cast::<PyList>() {
+        list.iter().collect()
+    } else if let Ok(tuple) = value.cast::<PyTuple>() {
+        tuple.iter().collect()
+    } else {
+        return Err(PyValueError::new_err(
+            "interaction_constraints must be a list or tuple of feature groups",
+        ));
+    };
+
+    let mut groups = Vec::with_capacity(outer.len());
+    for (group_idx, group) in outer.iter().enumerate() {
+        let features: Vec<Bound<'_, PyAny>> = if let Ok(list) = group.cast::<PyList>() {
+            list.iter().collect()
+        } else if let Ok(tuple) = group.cast::<PyTuple>() {
+            tuple.iter().collect()
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "interaction_constraints group {group_idx} must be a list or tuple"
+            )));
+        };
+        if features.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "interaction_constraints group {group_idx} must not be empty"
+            )));
+        }
+
+        let mut parsed = Vec::with_capacity(features.len());
+        for (feature_idx, feature) in features.iter().enumerate() {
+            if feature.is_instance_of::<PyBool>() {
+                return Err(PyValueError::new_err(format!(
+                    "interaction_constraints feature at group {group_idx}, position {feature_idx} must be an integer ID or feature name, got bool"
+                )));
+            }
+            if let Ok(id) = feature.extract::<i64>() {
+                if id < 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "interaction_constraints feature ID at group {group_idx}, position {feature_idx} must be non-negative, got {id}"
+                    )));
+                }
+                parsed.push(InteractionFeature::Id(id as usize));
+            } else if let Ok(name) = feature.extract::<String>() {
+                parsed.push(InteractionFeature::Name(name));
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "interaction_constraints feature at group {group_idx}, position {feature_idx} must be an integer ID or feature name"
+                )));
+            }
+        }
+        groups.push(parsed);
+    }
+    Ok(groups)
+}
+
 impl Parsed {
     /// 按 schema 解析单调约束,写进 `params.monotone_constraints`。
     ///
     /// `feature_names` 为空 = 位置模式(numpy、无表头 CSV),此时按列名给的
     /// 约束没法解析,直接报错而不是悄悄忽略。
     fn resolve_monotone(&mut self, n_features: usize, feature_names: &[String]) -> PyResult<()> {
+        self.resolve_interaction_constraints(n_features, feature_names)?;
+        if let Some(weights) = &self.feature_weights {
+            self.params.feature_weights = weights.resolve(n_features, feature_names)?;
+        }
         let resolved = match &self.monotone {
             None => return Ok(()),
             Some(MonotoneSpec::Positional(v)) => {
@@ -3121,6 +3263,55 @@ impl Parsed {
         self.params.monotone_constraints = resolved;
         Ok(())
     }
+
+    fn resolve_interaction_constraints(
+        &mut self,
+        n_features: usize,
+        feature_names: &[String],
+    ) -> PyResult<()> {
+        let mut groups = Vec::with_capacity(self.interaction_constraints.len());
+        for group in &self.interaction_constraints {
+            let mut resolved = Vec::with_capacity(group.len());
+            for feature in group {
+                let id = match feature {
+                    InteractionFeature::Id(id) => {
+                        if *id >= n_features {
+                            return Err(PyValueError::new_err(format!(
+                                "interaction_constraints feature id {id} is out of range for {n_features} features"
+                            )));
+                        }
+                        *id
+                    }
+                    InteractionFeature::Name(name) => {
+                        if feature_names.is_empty() {
+                            return Err(PyValueError::new_err(
+                                "interaction_constraints given by name need column names: this input is positional (numpy or headerless CSV); use global feature IDs instead",
+                            ));
+                        }
+                        let mut matches = feature_names
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, candidate)| (candidate == name).then_some(idx));
+                        let Some(idx) = matches.next() else {
+                            return Err(PyValueError::new_err(format!(
+                                "feature {name:?} in interaction_constraints is not a feature column; feature columns: {feature_names:?}"
+                            )));
+                        };
+                        if matches.next().is_some() {
+                            return Err(PyValueError::new_err(format!(
+                                "feature name {name:?} in interaction_constraints is ambiguous because it occurs more than once in feature columns"
+                            )));
+                        }
+                        idx
+                    }
+                };
+                resolved.push(id as crate::types::FeatId);
+            }
+            groups.push(resolved);
+        }
+        self.params.interaction_constraints = groups;
+        Ok(())
+    }
 }
 
 impl Parsed {
@@ -3132,13 +3323,28 @@ impl Parsed {
             group_ptr: self.group_ptr.clone(),
             ..TrainConfig::new(self.params.clone(), self.objective)
         };
+        if let Some(descriptor) = &self.custom_objective {
+            cfg.custom_objective =
+                Some(Python::attach(|py| descriptor.borrow(py).to_objective(py)));
+        }
+        cfg.validate_custom_objective().map_err(to_py_err)?;
+        cfg.validate_sampling_method().map_err(to_py_err)?;
         if !self.eval_metrics.is_empty() {
             cfg.eval_metrics = self
                 .eval_metrics
                 .iter()
-                .map(|name| crate::metrics::for_objective(name, self.objective))
-                .collect::<Result<_, _>>()
-                .map_err(PyValueError::new_err)?;
+                .map(|spec| match spec {
+                    MetricSpec::Builtin(name) => {
+                        crate::metrics::for_objective(name, self.objective)
+                            .map_err(PyValueError::new_err)
+                    }
+                    MetricSpec::Custom(descriptor) => Python::attach(|py| {
+                        Ok(descriptor
+                            .borrow(py)
+                            .to_metric(py, self.objective.num_outputs()))
+                    }),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
         }
         let lower_is_better = cfg.eval_metrics.last().is_none_or(|m| m.lower_is_better());
         Ok((cfg, lower_is_better))
@@ -3273,12 +3479,57 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         )
         .with_quantile_alphas(quantile_alpha.as_deref().unwrap_or(&[0.5]))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let objective = if let Objective::Expectile { .. } = objective {
+        let alpha: Option<f32> = d
+            .get_item("expectile_alpha")?
+            .ok_or_else(|| PyValueError::new_err("expectile_alpha is missing"))?
+            .extract()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "expectile_alpha must be a scalar; multiple expectiles are not supported",
+                )
+            })?;
+        Objective::Expectile {
+            alpha: alpha.ok_or_else(|| {
+                PyValueError::new_err(
+                    "reg:expectileerror requires scalar expectile_alpha in [0, 1]",
+                )
+            })?,
+        }
+    } else {
+        objective
+    };
     let objective = match objective {
         Objective::Rank { kind, .. } => Objective::Rank {
             kind,
             params: parse_rank_params(d)?,
         },
         other => other,
+    };
+    let objective = if matches!(&objective, Objective::Aft { .. }) {
+        let distribution: String = get!("aft_loss_distribution");
+        let distribution = match distribution.as_str() {
+            "normal" => AftDistribution::Normal,
+            "logistic" => AftDistribution::Logistic,
+            "extreme" => AftDistribution::Extreme,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "aft_loss_distribution must be 'normal', 'logistic', or 'extreme'",
+                ))
+            }
+        };
+        let scale: f32 = get!("aft_loss_distribution_scale");
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(PyValueError::new_err(
+                "aft_loss_distribution_scale must be finite and positive",
+            ));
+        }
+        Objective::Aft {
+            distribution,
+            scale,
+        }
+    } else {
+        objective
     };
     objective
         .validate_params()
@@ -3287,6 +3538,8 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         params: TrainParams {
             n_rounds: get!("num_boost_round"),
             max_depth: get!("max_depth"),
+            max_leaves: get!("max_leaves"),
+            interaction_constraints: Vec::new(),
             max_bin: get!("max_bin"),
             learning_rate: get!("eta"),
             lambda: get!("lambda"),
@@ -3296,9 +3549,15 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             max_delta_step: max_delta_step.unwrap_or(objective.default_tree_max_delta_step()),
             scale_pos_weight: get!("scale_pos_weight"),
             subsample: get!("subsample"),
+            sampling_method: {
+                let method: String = get!("sampling_method");
+                method.parse::<crate::types::SamplingMethod>()
+            }
+            .map_err(PyValueError::new_err)?,
             colsample_bytree: get!("colsample_bytree"),
             colsample_bylevel: get!("colsample_bylevel"),
             colsample_bynode: get!("colsample_bynode"),
+            feature_weights: Vec::new(),
             // 占位:真正的值要等拿到 schema 才能定,见 BlockingPlan。
             cols_per_block: 0,
             nthread: get!("nthread"),
@@ -3329,6 +3588,10 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             max_cat_to_onehot: get!("max_cat_to_onehot"),
             max_cat_threshold: get!("max_cat_threshold"),
         },
+        feature_weights: match d.get_item("feature_weights")? {
+            Some(raw) => feature_weights::parse(&raw)?,
+            None => None,
+        },
         requested_cols_per_block: get!("cols_per_block"),
         device: {
             // `device="cuda"` / `"cuda:0"` / `"gpu"` → GPU;不给或 "cpu" → CPU。
@@ -3349,6 +3612,7 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
             }
         },
         objective,
+        custom_objective: get!("custom_objective"),
         base_score: get!("base_score"),
         cache_budget_bytes: get!("cache_budget_bytes"),
         cache_path: get!("cache_path"),
@@ -3356,13 +3620,21 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         model_io_threads: get!("model_io_threads"),
         quiet: get!("_quiet"),
         eval_metrics: {
-            let raw: Option<Vec<String>> = get!("eval_metric");
-            let names = raw.unwrap_or_default();
-            // 提前校验名字和 objective 组合:错了在读数据之前就报。
-            for name in &names {
-                crate::metrics::for_objective(name, objective).map_err(PyValueError::new_err)?;
+            let raw = d.get_item("eval_metric")?;
+            let mut specs = Vec::new();
+            if let Some(raw) = raw.filter(|value| !value.is_none()) {
+                for item in raw.try_iter()? {
+                    let item = item?;
+                    if let Ok(name) = item.extract::<String>() {
+                        crate::metrics::for_objective(&name, objective)
+                            .map_err(PyValueError::new_err)?;
+                        specs.push(MetricSpec::Builtin(name));
+                    } else {
+                        specs.push(MetricSpec::Custom(item.extract()?));
+                    }
+                }
             }
-            names
+            specs
         },
         weighted: false,
         group_ptr: None,
@@ -3396,6 +3668,13 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
                         ))
                     }
                 }
+            }
+        },
+        interaction_constraints: {
+            match d.get_item("interaction_constraints")? {
+                None => Vec::new(),
+                Some(v) if v.is_none() => Vec::new(),
+                Some(v) => parse_interaction_constraints(&v)?,
             }
         },
     };
@@ -3538,6 +3817,7 @@ fn finish(
         quiet,
         model_io_threads,
         ingest_threads,
+        prediction_work: OnceLock::new(),
         cpu_predictor: Mutex::new(None),
         inference_model: Mutex::new(None),
         #[cfg(feature = "cuda")]
@@ -3735,7 +4015,7 @@ fn reject_cache_options(cfg: &Parsed, got: &str, way_out: &str) -> PyResult<()> 
 #[pyo3(signature = (x, y, params, evals=None, early_stopping_rounds=None,
                     verbose_eval=None, callbacks=None, weight=None, feature_names=None,
                     qid=None, group=None, base_margin=None, eval_base_margins=None,
-                    prior_model=None))]
+                    prior_model=None, label_upper_bound=None, eval_upper_bounds=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_dense(
     py: Python<'_>,
@@ -3757,6 +4037,8 @@ fn train_dense(
     eval_base_margins: Option<&Bound<'_, PyList>>,
     // Training continuation: trees, intercept and metadata carried over.
     prior_model: Option<PyRef<'_, PyModel>>,
+    label_upper_bound: Option<PyReadonlyArray1<'_, f32>>,
+    eval_upper_bounds: Option<&Bound<'_, PyList>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
@@ -3772,6 +4054,30 @@ fn train_dense(
     cfg.weighted = weights.is_some() && !ranking;
     let shape = x.shape();
     let (n_rows, n_features) = (shape[0], shape[1]);
+    let is_aft = matches!(&cfg.objective, Objective::Aft { .. });
+    let upper = label_upper_bound
+        .as_ref()
+        .map(|v| v.as_slice().map(<[f32]>::to_vec))
+        .transpose()?;
+    match (is_aft, upper.as_ref()) {
+        (true, None) => {
+            return Err(PyValueError::new_err(
+                "survival:aft requires label_upper_bound",
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(PyValueError::new_err(
+                "label_upper_bound is only supported by survival:aft",
+            ))
+        }
+        (_, Some(values)) if values.len() != n_rows => {
+            return Err(PyValueError::new_err(format!(
+                "label_upper_bound has {} entries, the feature matrix has {n_rows} rows",
+                values.len()
+            )))
+        }
+        _ => {}
+    }
     let labels = y.as_slice()?.to_vec();
     if labels.len() != n_rows {
         return Err(PyValueError::new_err(format!(
@@ -3887,7 +4193,17 @@ fn train_dense(
         Option<Vec<f32>>,
         Option<Vec<u32>>,
     )> = Vec::new();
+    let mut eval_upper: Vec<Option<Vec<f32>>> = Vec::new();
     if let Some(list) = evals {
+        if let Some(bounds) = eval_upper_bounds {
+            if bounds.len() != list.len() {
+                return Err(PyValueError::new_err(format!(
+                    "eval_upper_bounds has {} entries, evals has {}",
+                    bounds.len(),
+                    list.len()
+                )));
+            }
+        }
         for item in list.iter() {
             // Python 层统一成 (data, label, weight-or-None, name, qid-or-None, group-or-None)。
             #[allow(clippy::type_complexity)]
@@ -3922,14 +4238,54 @@ fn train_dense(
                 eshape[0],
             )
             .map_err(|e| PyValueError::new_err(format!("validation set {name}: {e}")))?;
+            let eval_index = eval_data.len();
+            let upper = match eval_upper_bounds {
+                Some(bounds) => {
+                    let item = bounds.get_item(eval_index)?;
+                    if item.is_none() {
+                        None
+                    } else {
+                        let bound: PyReadonlyArray1<f32> = item.extract()?;
+                        let values = bound.as_slice()?.to_vec();
+                        if values.len() != eshape[0] {
+                            return Err(PyValueError::new_err(format!(
+                                "eval_upper_bounds[{}] has {} entries, validation set {name} has {} rows",
+                                eval_index,
+                                values.len(),
+                                eshape[0]
+                            )));
+                        }
+                        Some(values)
+                    }
+                }
+                None => None,
+            };
+            if is_aft && upper.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "survival:aft requires eval_upper_bounds[{}]",
+                    eval_index
+                )));
+            }
+            if !is_aft && upper.is_some() {
+                return Err(PyValueError::new_err(
+                    "eval_upper_bounds are only supported by survival:aft",
+                ));
+            }
+            eval_upper.push(upper);
             eval_data.push((name, src, ey.as_slice()?.to_vec(), ew, egp));
         }
+    } else if eval_upper_bounds.is_some_and(|v| !v.is_empty()) {
+        return Err(PyValueError::new_err(
+            "eval_upper_bounds were given without evals",
+        ));
     }
 
     let device = cfg.device;
-    // numpy 入口没有列名:只接受按位置的约束(Python 层已把 pyarrow 列名解析掉)。
-    cfg.resolve_monotone(n_features, &[])?;
+    // Dense adapters pass optional schema names; resolve native constraints once.
+    cfg.resolve_monotone(n_features, feature_names.as_deref().unwrap_or(&[]))?;
     let (mut train_cfg, lower_is_better) = cfg.train_config()?;
+    train_cfg.label_upper_bound = upper;
+    train_cfg.eval_upper_bounds = eval_upper;
     let k_out = train_cfg.objective.num_outputs();
     if let Some(bm) = &base_margin {
         train_cfg.base_margin = Some(margin::class_major_margin(
@@ -4092,7 +4448,8 @@ fn train_dense(
 #[pyfunction]
 #[pyo3(signature = (path_specs, label, params, header=true, evals=None, early_stopping_rounds=None,
                     verbose_eval=None, callbacks=None, weight=None, qid=None, base_margin=None,
-                    start_margin=None, eval_start_margins=None, prior_model=None))]
+                    start_margin=None, eval_start_margins=None, prior_model=None,
+                    label_upper_bound=None))]
 #[allow(clippy::too_many_arguments)]
 fn train_file(
     py: Python<'_>,
@@ -4117,10 +4474,12 @@ fn train_file(
     start_margin: Option<&Bound<'_, PyAny>>,
     eval_start_margins: Option<&Bound<'_, PyList>>,
     prior_model: Option<PyRef<'_, PyModel>>,
+    label_upper_bound: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyModel> {
     let overall_started = std::time::Instant::now();
     let mut cfg = parse_params(params)?;
     let ranking = cfg.objective.is_ranking();
+    let is_aft = matches!(&cfg.objective, Objective::Aft { .. });
     cfg.weighted = weight.is_some() && !ranking;
     // 先把输入规格解成确定顺序的文件列表。格式也由它判定 ——
     // Python 那边不再靠后缀猜。
@@ -4183,6 +4542,50 @@ fn train_file(
         _ => unreachable!(),
     };
     let label = label_owned.as_str();
+    let label_upper_owned: Option<String> = match (is_aft, label_upper_bound) {
+        (true, None) => {
+            return Err(PyValueError::new_err(
+                "survival:aft requires label_upper_bound for file inputs",
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(PyValueError::new_err(
+                "label_upper_bound is only supported by survival:aft",
+            ))
+        }
+        (true, Some(v)) if header => Some(v.extract::<String>().map_err(|_| {
+            PyValueError::new_err(
+                "with header=True, label_upper_bound must be a column name string",
+            )
+        })?),
+        (true, Some(v)) => {
+            let index = v.extract::<isize>().map_err(|_| {
+                PyValueError::new_err(
+                    "with header=False, label_upper_bound must be a zero-based column index",
+                )
+            })?;
+            if index < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "label_upper_bound column index cannot be negative, got {index}"
+                )));
+            }
+            Some(
+                csv_source::positional_label_name_from_schema(
+                    csv_preflight.as_deref().expect("CSV preflight exists"),
+                    index as usize,
+                )
+                .map_err(|e| PyValueError::new_err(format!("{e}")))?,
+            )
+        }
+        (false, None) => None,
+    };
+    if let Some(upper) = label_upper_owned.as_deref() {
+        if upper == label {
+            return Err(PyValueError::new_err(
+                "label_lower_bound and label_upper_bound must select different columns",
+            ));
+        }
+    }
     // 权重列和标签列同样的写法:有表头给列名,无表头 CSV 给列下标。
     let weight_owned: Option<String> = match weight {
         None => None,
@@ -4257,6 +4660,18 @@ fn train_file(
             "qid column must differ from the weight column",
         ));
     }
+    if let Some(upper) = label_upper_owned.as_deref() {
+        if weight_owned.as_deref() == Some(upper) {
+            return Err(PyValueError::new_err(
+                "label_upper_bound column must differ from the weight column",
+            ));
+        }
+        if qid_owned.as_deref() == Some(upper) {
+            return Err(PyValueError::new_err(
+                "label_upper_bound column must differ from the qid column",
+            ));
+        }
+    }
     let k_out = cfg.objective.num_outputs();
     let margin_names: Vec<String> = match base_margin {
         Some(v) if !v.is_none() => {
@@ -4271,6 +4686,13 @@ fn train_file(
             )));
         }
     }
+    if let Some(upper) = label_upper_owned.as_deref() {
+        if margin_names.iter().any(|n| n == upper) {
+            return Err(PyValueError::new_err(format!(
+                "the base_margin column and label_upper_bound column cannot be the same ({upper:?})"
+            )));
+        }
+    }
     // A continued model with feature names indexes its features by those names:
     // bind the training (and eval) files' columns by name, in the model's order
     // (file column order is free; a missing or surplus column is an error).
@@ -4280,6 +4702,7 @@ fn train_file(
     };
     let mut targets = crate::source::Targets::new(label, weight_owned.as_deref())
         .map_err(|e| PyValueError::new_err(format!("{e}")))?
+        .with_upper_bound(label_upper_owned.as_deref())
         .with_qid(qid_owned.as_deref())
         .with_base_margin(&margin_names);
     if !prior_names.is_empty() {
@@ -4586,6 +5009,37 @@ fn train_file(
                 eval_data.push((name, d, ew, egp));
             }
         }
+        if let Some(upper_name) = label_upper_owned.as_deref() {
+            let upper = margin::read_bound_column(&resolved, upper_name, header)
+                .map_err(|e| PyValueError::new_err(format!("training set:{e:#}")))?;
+            if upper.len() != src.n_rows() {
+                return Err(PyValueError::new_err(format!(
+                    "label_upper_bound has {} rows, the training data has {} rows",
+                    upper.len(),
+                    src.n_rows()
+                )));
+            }
+            train_cfg.label_upper_bound = Some(upper);
+        }
+        for (i, (name, (_, labels), _, _)) in eval_data.iter().enumerate() {
+            if let Some(upper_name) = label_upper_owned.as_deref() {
+                let eval_resolved =
+                    crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
+                        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+                let upper = margin::read_bound_column(&eval_resolved, upper_name, header)
+                    .map_err(|e| PyValueError::new_err(format!("eval set {name:?}:{e:#}")))?;
+                if upper.len() != labels.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "eval set {name:?} label_upper_bound has {} rows, the data has {} rows",
+                        upper.len(),
+                        labels.len()
+                    )));
+                }
+                train_cfg.eval_upper_bounds.push(Some(upper));
+            } else {
+                train_cfg.eval_upper_bounds.push(None);
+            }
+        }
         // Starting margins (see `margin::dataset_margin`): train, then each eval.
         train_cfg.base_margin = margin::dataset_margin(
             start_margin,
@@ -4760,6 +5214,18 @@ fn train_file(
     margin::continued_feature_names(prior_model.as_deref(), ds.feature_names.clone())?;
     let (mut train_cfg, lower_is_better) = cfg.train_config()?;
     train_cfg.prior_model = prior_model.as_ref().map(|p| p.inner.clone());
+    if let Some(upper_name) = label_upper_owned.as_deref() {
+        let upper = margin::read_bound_column(&resolved, upper_name, header)
+            .map_err(|e| PyValueError::new_err(format!("training set:{e:#}")))?;
+        if upper.len() != ds.labels.len() {
+            return Err(PyValueError::new_err(format!(
+                "label_upper_bound has {} rows, the training data has {} rows",
+                upper.len(),
+                ds.labels.len()
+            )));
+        }
+        train_cfg.label_upper_bound = Some(upper);
+    }
     let group_inputs = |ids: Option<Vec<u64>>,
                         w: Option<&[f32]>|
      -> PyResult<(Option<Vec<f32>>, Option<Vec<u32>>)> {
@@ -4822,6 +5288,20 @@ fn train_file(
     for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
         let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
             .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+        if let Some(upper_name) = label_upper_owned.as_deref() {
+            let upper = margin::read_bound_column(&eval_resolved, upper_name, header)
+                .map_err(|e| PyValueError::new_err(format!("eval set {name:?}:{e:#}")))?;
+            if upper.len() != d.labels.len() {
+                return Err(PyValueError::new_err(format!(
+                    "eval set {name:?} label_upper_bound has {} rows, the data has {} rows",
+                    upper.len(),
+                    d.labels.len()
+                )));
+            }
+            train_cfg.eval_upper_bounds.push(Some(upper));
+        } else {
+            train_cfg.eval_upper_bounds.push(None);
+        }
         train_cfg.eval_base_margins.push(margin::dataset_margin(
             margin::list_item(eval_start_margins, i)?.as_ref(),
             &eval_resolved,
@@ -4910,7 +5390,7 @@ fn train_file(
 #[pyfunction]
 #[pyo3(signature = (metric, pred, label, qid, weight=None, ndcg_exp_gain=true))]
 fn rank_score(
-    metric: &str,
+    metric: &Bound<'_, PyAny>,
     pred: PyReadonlyArray1<'_, f32>,
     label: PyReadonlyArray1<'_, f32>,
     qid: PyReadonlyArray1<'_, u64>,
@@ -4940,6 +5420,20 @@ fn rank_score(
             )));
         }
     }
+    if let Ok(descriptor) = metric.extract::<PyRef<'_, crate::python_metric::PyCustomMetric>>() {
+        let adapter = descriptor.to_metric(metric.py(), 1);
+        let score = adapter
+            .try_eval_grouped(pred, label, weight.as_deref(), Some(&group_ptr))
+            .map_err(to_py_err)?;
+        // sklearn score is always oriented so larger is better.
+        return Ok(f64::from(if adapter.lower_is_better() {
+            -score
+        } else {
+            score
+        }));
+    }
+    let metric: String = metric.extract()?;
+    let metric = metric.as_str();
     let auc_kind = match metric {
         "auc" => Some(crate::rank::GroupAucKind::Roc),
         "aucpr" => Some(crate::rank::GroupAucKind::Pr),
@@ -4959,6 +5453,8 @@ fn rank_score(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
+    m.add_class::<crate::python_metric::PyCustomMetric>()?;
+    m.add_class::<crate::python_objective::PyCustomObjective>()?;
     m.add_function(wrap_pyfunction!(rank_score, m)?)?;
     m.add_function(wrap_pyfunction!(train_dense, m)?)?;
     m.add_function(wrap_pyfunction!(train_file, m)?)?;

@@ -20,6 +20,20 @@ pub trait Metric: Send + Sync {
         false
     }
 
+    /// Whether this metric consumes censored interval targets.
+    fn supports_intervals(&self) -> bool {
+        false
+    }
+    fn try_eval_interval(
+        &self,
+        _pred: &[f32],
+        _lower: &[f32],
+        _upper: &[f32],
+        _weight: Option<&[f32]>,
+    ) -> anyhow::Result<f32> {
+        crate::bail_input!("metric {:?} does not support interval targets", self.name())
+    }
+
     /// 加权评估(XGBoost:`sum(w·loss) / sum(w)`)。`None` 走 `eval`。
     ///
     /// 默认实现只接受 `None`;支持权重的 metric 必须同时覆盖这个方法和
@@ -42,6 +56,22 @@ pub trait Metric: Send + Sync {
         _group_ptr: Option<&[u32]>,
     ) -> f32 {
         self.eval_weighted(pred, label, weight)
+    }
+
+    /// Fallible evaluation hook used by training integrations.
+    ///
+    /// Existing native metrics remain source-compatible: by default this
+    /// delegates to [`Self::eval_grouped`]. Custom metrics that can fail may
+    /// override this method and return the error to the caller without
+    /// panicking. Built-in metrics keep their existing scoring behavior.
+    fn try_eval_grouped(
+        &self,
+        pred: &[f32],
+        label: &[f32],
+        weight: Option<&[f32]>,
+        group_ptr: Option<&[u32]>,
+    ) -> anyhow::Result<f32> {
+        Ok(self.eval_grouped(pred, label, weight, group_ptr))
     }
 
     /// Reject labels the metric cannot score (e.g. non-binary labels for `map`).
@@ -470,8 +500,22 @@ impl Metric for AucPr {
 /// objective 决定的默认指标,和 XGBoost 一致。
 pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
     match obj {
+        Objective::Cox => Box::new(crate::survival::CoxMetric),
+        Objective::Aft {
+            distribution,
+            scale,
+        } => Box::new(crate::survival::AftMetric {
+            distribution,
+            scale,
+            accuracy: false,
+        }),
         Objective::SquaredError => Box::new(Rmse),
-        Objective::Logistic => Box::new(LogLoss),
+        Objective::AbsoluteError => Box::new(Elementwise::new(Ew::Mae, obj)),
+        Objective::Expectile { alpha } => Box::new(Elementwise::new(Ew::Expectile(alpha), obj)),
+        Objective::Logistic | Objective::LogisticRaw => Box::new(LogLoss),
+        Objective::SquaredLogError => Box::new(Elementwise::new(Ew::Rmsle, obj)),
+        Objective::Hinge => Box::new(Elementwise::new(Ew::Error(0.5), obj)),
+        Objective::LogisticRegression => Box::new(ProbRmse),
         Objective::Poisson { .. } => Box::new(Elementwise::new(Ew::PoissonNll, obj)),
         Objective::Gamma => Box::new(Elementwise::new(Ew::GammaDeviance, obj)),
         Objective::Tweedie { variance_power } => {
@@ -499,6 +543,24 @@ pub fn default_metric(obj: Objective) -> Box<dyn Metric> {
 /// `binary:logistic`;`rmse` 两个 objective 都接(二分类时和 XGBoost
 /// 一样在概率上算)。不认识或组合不支持时返回说明原因的错误。
 pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, String> {
+    if let Objective::Aft {
+        distribution,
+        scale,
+    } = obj
+    {
+        return match name {
+            "aft-nloglik" | "interval-regression-accuracy" => Ok(Box::new(crate::survival::AftMetric { distribution, scale, accuracy: name == "interval-regression-accuracy" })),
+            _ => Err(format!("survival:aft requires an interval metric: aft-nloglik or interval-regression-accuracy; got {name:?}")),
+        };
+    }
+    if name == "cox-nloglik" {
+        return if obj == Objective::Cox {
+            Ok(Box::new(crate::survival::CoxMetric))
+        } else {
+            Err("cox-nloglik requires survival:cox".into())
+        };
+    }
+
     // Ranking metrics (`ndcg`, `map`, `pre`, with `@k` / `-`) need query groups,
     // so they pair with the ranking objectives and nothing else.
     if let Objective::Rank { params, .. } = obj {
@@ -563,26 +625,38 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
             "eval_metric {name:?} is a multiclass metric and requires objective=\"multi:softprob\" or \"multi:softmax\""
         ));
     }
-    let binary = matches!(obj, Objective::Logistic);
+    let binary = matches!(
+        obj,
+        Objective::Logistic
+            | Objective::LogisticRegression
+            | Objective::LogisticRaw
+            | Objective::Hinge
+    );
     // 新加的逐行指标:和 XGBoost 一样在 objective 变换后的预测上算。
     if let Some(kind) = Ew::parse(name, obj)? {
         if matches!(kind, Ew::Error(_)) && !binary {
             return Err(format!(
-                "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\""
+                "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\" or \"reg:logistic\""
             ));
         }
-        return Ok(Box::new(Elementwise::new(kind, obj)));
+        let link = if matches!(kind, Ew::Error(_)) && obj == Objective::LogisticRaw {
+            Objective::Logistic
+        } else {
+            obj
+        };
+        return Ok(Box::new(Elementwise::new(kind, link)));
     }
     match (name, obj) {
+        ("error", Objective::Hinge) => Ok(Box::new(Elementwise::new(Ew::Error(0.5), obj))),
         ("rmse", Objective::SquaredError) => Ok(Box::new(Rmse)),
-        ("rmse", Objective::Logistic) => Ok(Box::new(ProbRmse)),
+        ("rmse", Objective::Logistic | Objective::LogisticRegression) => Ok(Box::new(ProbRmse)),
         ("rmse", _) => Ok(Box::new(Elementwise::new(Ew::Rmse, obj))),
-        ("logloss", Objective::Logistic) => Ok(Box::new(LogLoss)),
-        ("error", Objective::Logistic) => Ok(Box::new(ClassError)),
-        ("auc", Objective::Logistic) => Ok(Box::new(Auc)),
-        ("aucpr", Objective::Logistic) => Ok(Box::new(AucPr)),
+        ("logloss", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(LogLoss)),
+        ("error", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(ClassError)),
+        ("auc", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(Auc)),
+        ("aucpr", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(AucPr)),
         ("logloss" | "error" | "auc" | "aucpr", _) => Err(format!(
-            "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\""
+            "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\" or \"reg:logistic\""
         )),
         _ => Err(format!(
             "eval_metric {name:?} is not supported; supported metrics: {SUPPORTED_METRICS}"
@@ -592,7 +666,7 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
 
 /// 报错里列出的全部 metric 名字。
 pub const SUPPORTED_METRICS: &str =
-    "rmse / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
+    "rmse / rmsle / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
 poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / quantile / mlogloss / merror";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
@@ -623,6 +697,8 @@ pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ew {
     Rmse,
+    Rmsle,
+    Expectile(f32),
     Mae,
     Mape,
     /// `mphe`,参数是 `huber_slope`(objective 是 pseudohuber 时取它的,否则 1)。
@@ -663,6 +739,11 @@ impl Ew {
             }
         };
         match base {
+            "expectile" => match obj {
+                Objective::Expectile { alpha } => no_param(Ew::Expectile(alpha)),
+                _ => Err("expectile metric requires reg:expectileerror".into()),
+            },
+            "rmsle" => no_param(Ew::Rmsle),
             "mae" => no_param(Ew::Mae),
             "mape" => no_param(Ew::Mape),
             "mphe" => no_param(Ew::Mphe(match obj {
@@ -706,6 +787,8 @@ impl Ew {
     fn name(self) -> String {
         match self {
             Ew::Rmse => "rmse".into(),
+            Ew::Rmsle => "rmsle".into(),
+            Ew::Expectile(_) => "expectile".into(),
             Ew::Mae => "mae".into(),
             Ew::Mape => "mape".into(),
             Ew::Mphe(_) => "mphe".into(),
@@ -726,6 +809,15 @@ impl Ew {
             Ew::Rmse => {
                 let d = y - p;
                 d * d
+            }
+            Ew::Rmsle => {
+                let d = y.ln_1p() - p.ln_1p();
+                d * d
+            }
+            Ew::Expectile(a) => {
+                let d = p - y;
+                let w = if d >= 0.0 { 1.0 - a } else { a };
+                w * d * d
             }
             Ew::Mae => (y - p).abs(),
             Ew::Mape => ((y - p) / y).abs(),
@@ -773,7 +865,7 @@ impl Ew {
     /// `GetFinal(esum, wsum)`。
     fn finish(self, esum: f64, wsum: f64) -> f64 {
         match self {
-            Ew::Rmse => {
+            Ew::Rmse | Ew::Rmsle => {
                 if wsum == 0.0 {
                     esum.sqrt()
                 } else {

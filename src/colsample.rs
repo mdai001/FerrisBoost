@@ -114,6 +114,84 @@ fn sample_subset(base: &[FeatId], rate: f32, key: u64) -> Vec<FeatId> {
     ids
 }
 
+/// Validate once per training run. Equal positive weights use the original
+/// uniform path, preserving its seeded models and avoiding weighted scratch.
+pub(crate) fn validated_weights(
+    weights: &[f32],
+    n_features: usize,
+) -> anyhow::Result<Option<&[f32]>> {
+    if weights.is_empty() {
+        return Ok(None);
+    }
+    crate::ensure_input!(
+        weights.len() == n_features,
+        "feature_weights has {} entries, expected {n_features}",
+        weights.len()
+    );
+    crate::ensure_input!(
+        weights.iter().all(|w| w.is_finite() && *w >= 0.0),
+        "feature_weights must be finite and nonnegative"
+    );
+    crate::ensure_input!(
+        weights.iter().any(|w| *w > 0.0),
+        "feature_weights must contain at least one positive weight"
+    );
+    Ok((!weights.iter().all(|w| *w == weights[0])).then_some(weights))
+}
+
+// Independent exponential clocks implement weighted draws without replacement.
+// All backends use this host sampler. Ties use global feature identity; column
+// block layout and worker scheduling never enter the random key. Scratch is
+// bounded by feature count, not rows, and no weight vector is cloned.
+fn sample_weighted<I>(base: I, n: usize, rate: f32, key: u64, weights: &[f32]) -> Vec<FeatId>
+where
+    I: Iterator<Item = FeatId> + Clone,
+{
+    if rate >= 1.0 {
+        return base.collect();
+    }
+    let positive = base.filter(|id| weights[*id as usize] > 0.0);
+    let available = positive.clone().count();
+    let take = sampled_count(n, rate).min(available);
+    if take == available {
+        return positive.collect();
+    }
+    let mut rng = SplitMix64(key);
+    let mut keys: Vec<(f64, FeatId)> = positive
+        .map(|id| {
+            // 52 random bits and an exactly representable denominator keep U
+            // strictly inside (0, 1), even at either integer endpoint.
+            let u = ((rng.next_u64() >> 12) + 1) as f64 / 4_503_599_627_370_497.0;
+            (-u.ln() / f64::from(weights[id as usize]), id)
+        })
+        .collect();
+    keys.select_nth_unstable_by(take, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut selected: Vec<FeatId> = keys[..take].iter().map(|entry| entry.1).collect();
+    selected.sort_unstable();
+    selected
+}
+
+pub(crate) fn sample_features_weighted(
+    n_features: usize,
+    rate: f32,
+    seed: u64,
+    round: usize,
+    weights: Option<&[f32]>,
+) -> Vec<FeatId> {
+    match weights {
+        None => sample_features(n_features, rate, seed, round),
+        Some(weights) => sample_weighted(
+            0..n_features as FeatId,
+            n_features,
+            rate,
+            seed ^ (round as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(17),
+            weights,
+        ),
+    }
+}
+
 /// `(seed, tree, tag, idx)` → 64 位种子。逐字段过 SplitMix64,相邻的 idx
 /// (节点号、深度)不会给出相关的序列。
 fn subset_key(seed: u64, tree: u64, tag: u64, idx: u64) -> u64 {
@@ -135,17 +213,19 @@ fn subset_key(seed: u64, tree: u64, tag: u64, idx: u64) -> u64 {
 /// **split 枚举**:直方图仍然按 bytree 集合建(和 XGBoost 一致),
 /// 所以 bylevel/bynode 不减少 IO。
 #[derive(Clone, Copy, Debug)]
-pub struct NestedSampler {
+pub struct NestedSampler<'a> {
+    weights: Option<&'a [f32]>,
     bylevel: f32,
     bynode: f32,
     seed: u64,
     tree: u64,
 }
 
-impl NestedSampler {
+impl<'a> NestedSampler<'a> {
     /// bylevel 和 bynode 都是 1 时返回 `None`(没有额外采样)。
     pub fn new(bylevel: f32, bynode: f32, seed: u64, tree: usize) -> Option<Self> {
         (bylevel < 1.0 || bynode < 1.0).then_some(Self {
+            weights: None,
             bylevel,
             bynode,
             seed,
@@ -153,8 +233,22 @@ impl NestedSampler {
         })
     }
 
+    pub(crate) fn with_weights(mut self, weights: Option<&'a [f32]>) -> Self {
+        self.weights = weights;
+        self
+    }
+
     /// 深度 `depth` 这一层的特征集(`tree_set` 的子集,升序)。
     pub fn level_set(&self, tree_set: &[FeatId], depth: u32) -> Vec<FeatId> {
+        if let Some(weights) = self.weights {
+            return sample_weighted(
+                tree_set.iter().copied(),
+                tree_set.len(),
+                self.bylevel,
+                subset_key(self.seed, self.tree, 1, u64::from(depth)),
+                weights,
+            );
+        }
         sample_subset(
             tree_set,
             self.bylevel,
@@ -169,6 +263,15 @@ impl NestedSampler {
 
     /// 节点 `node`(树里的节点下标)的特征集(`level_set` 的子集,升序)。
     pub fn node_set(&self, level_set: &[FeatId], node: usize) -> Vec<FeatId> {
+        if let Some(weights) = self.weights {
+            return sample_weighted(
+                level_set.iter().copied(),
+                level_set.len(),
+                self.bynode,
+                subset_key(self.seed, self.tree, 2, node as u64),
+                weights,
+            );
+        }
         sample_subset(
             level_set,
             self.bynode,
@@ -205,6 +308,60 @@ pub fn required_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_stages_exclude_zero_only_when_sampling() {
+        let weights = [0.0, 2.0, 0.0, 1.0];
+        for seed in 0..32 {
+            assert_eq!(
+                sample_features_weighted(4, 0.75, seed, 0, Some(&weights)),
+                vec![1, 3]
+            );
+            assert_eq!(
+                sample_features_weighted(4, 1.0, seed, 0, Some(&weights)),
+                vec![0, 1, 2, 3]
+            );
+        }
+        let sampler = NestedSampler::new(0.5, 0.5, 7, 0)
+            .unwrap()
+            .with_weights(Some(&weights));
+        assert!(sampler.level_set(&[0, 2], 0).is_empty());
+        assert!(sampler.node_set(&[], 1).is_empty());
+        assert_eq!(sampler.node_set(&[1], 1), vec![1]);
+    }
+
+    #[test]
+    fn weighted_draws_favor_larger_weights_without_duplicates() {
+        let weights = [1.0, 9.0];
+        let heavy = (0..4096)
+            .filter(|seed| sample_features_weighted(2, 0.5, *seed, 0, Some(&weights)) == [1])
+            .count();
+        assert!(
+            (3500..3900).contains(&heavy),
+            "heavy feature selected {heavy}/4096"
+        );
+        let extremes = [f32::from_bits(1), f32::MAX, 1.0, 0.0];
+        for seed in 0..32 {
+            let picked = sample_features_weighted(4, 0.5, seed, 0, Some(&extremes));
+            assert_eq!(picked.len(), 2);
+            assert!(picked[0] < picked[1]);
+            assert!(!picked.contains(&3));
+            assert!(picked.contains(&1));
+        }
+    }
+
+    #[test]
+    fn equal_weights_preserve_uniform_sampler_exactly() {
+        let weights = [3.0; 12];
+        let validated = validated_weights(&weights, 12).unwrap();
+        assert!(validated.is_none());
+        for round in 0..20 {
+            assert_eq!(
+                sample_features_weighted(12, 0.4, 7, round, validated),
+                sample_features(12, 0.4, 7, round)
+            );
+        }
+    }
 
     #[test]
     fn count_truncates_and_keeps_at_least_one() {

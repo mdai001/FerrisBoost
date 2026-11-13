@@ -252,6 +252,28 @@ pub(crate) const QUANTILE_REDUCE_BLOCKS: u32 = 256;
 /// `GpuTrainCtx::new` 用同一个常量计费。
 pub(crate) const FAST_QUANTILE_SCRATCH_BYTES: u64 = (QUANTILE_REDUCE_BLOCKS as u64 * 2 + 1) * 8;
 
+/// Minimum number of rows before fast gradient-based sampling uses parallel
+/// device scratch instead of its small-input fallback.
+pub(crate) const PARALLEL_GRADIENT_MIN_ROWS: u64 = 65_536;
+/// Number of f64 doubles in the parallel gradient-sampling scratch allocation.
+pub(crate) const GRADIENT_SAMPLING_SCRATCH_DOUBLES: usize = 1_032;
+/// Bytes allocated by the parallel fast gradient-sampling path.
+pub(crate) const GRADIENT_SAMPLING_SCRATCH_BYTES: u64 =
+    GRADIENT_SAMPLING_SCRATCH_DOUBLES as u64 * 8;
+
+/// Parallel fast gradient sampling's fixed scratch is allocated only when the
+/// runtime selects that path. Keep this predicate shared by planner and runtime.
+pub(crate) fn gradient_sampling_scratch_bytes(rows: u64, fast: bool, rate: Option<f32>) -> u64 {
+    if fast
+        && rows >= PARALLEL_GRADIENT_MIN_ROWS
+        && rate.is_some_and(|rate| rate.is_finite() && rate > 0.0 && rate < 1.0)
+    {
+        GRADIENT_SAMPLING_SCRATCH_BYTES
+    } else {
+        0
+    }
+}
+
 /// 一次训练的 streaming 显存模型。所有单位都是字节。
 #[derive(Clone, Copy, Debug)]
 pub struct StreamingMemModel {
@@ -420,6 +442,14 @@ impl StreamingMemModel {
     /// `gpu_math = "fast"` 多个 `quantile_alpha`:K 份常驻 prediction,没有 softmax 统计量。
     pub fn with_fast_multi_quantile(mut self, n_rows: u64, n_outputs: u64) -> Self {
         self.fixed_bytes += fast_multi_output_extra_bytes(n_rows, n_outputs, false);
+        self
+    }
+
+    /// Add the fixed scratch used by parallel fast gradient-based sampling.
+    /// The runtime and planner call [`gradient_sampling_scratch_bytes`] with
+    /// the same path-selection inputs.
+    pub fn with_gradient_sampling(mut self, rows: u64, fast: bool, rate: Option<f32>) -> Self {
+        self.fixed_bytes += gradient_sampling_scratch_bytes(rows, fast, rate);
         self
     }
 
@@ -930,6 +960,73 @@ pub fn default_safety_reserve(free_vram: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parallel_gradient_sampling_scratch_uses_the_runtime_predicate() {
+        for (rows, expected) in [
+            (65_535u64, 0u64),
+            (65_536, 8_256),
+            (65_537, 8_256),
+            (1_000_000, 8_256),
+        ] {
+            assert_eq!(
+                super::gradient_sampling_scratch_bytes(rows, true, Some(0.6)),
+                expected,
+                "rows={rows}"
+            );
+        }
+        assert_eq!(super::GRADIENT_SAMPLING_SCRATCH_BYTES, 8_256);
+        assert_eq!(
+            super::GRADIENT_SAMPLING_SCRATCH_DOUBLES as u64 * 8,
+            super::GRADIENT_SAMPLING_SCRATCH_BYTES
+        );
+        for rate in [
+            None,
+            Some(0.0),
+            Some(f32::NAN),
+            Some(-0.1),
+            Some(1.0),
+            Some(1.1),
+        ] {
+            assert_eq!(
+                super::gradient_sampling_scratch_bytes(1_000_000, true, rate),
+                0,
+                "rate={rate:?}"
+            );
+        }
+        assert_eq!(
+            super::gradient_sampling_scratch_bytes(1_000_000, false, Some(0.6)),
+            0
+        );
+    }
+
+    #[test]
+    fn parallel_gradient_sampling_scratch_is_fixed_in_preopen_and_shape_models() {
+        let rows = 1_000_000;
+        let base_preopen = super::StreamingMemModel::new(rows, 255, 2, 16, true, true);
+        let sampled_preopen = base_preopen.with_gradient_sampling(rows, true, Some(0.6));
+        let shape = super::GpuBlockShape::all_u8(64, 256);
+        let base_shape =
+            super::StreamingMemModel::new_for_shape(rows, &shape, 64, 2, 16, true, true);
+        let sampled_shape = base_shape.with_gradient_sampling(rows, true, Some(0.6));
+
+        for (base, sampled) in [(base_preopen, sampled_preopen), (base_shape, sampled_shape)] {
+            assert_eq!(
+                sampled.fixed_bytes - base.fixed_bytes,
+                super::GRADIENT_SAMPLING_SCRATCH_BYTES
+            );
+            assert_eq!(sampled.per_col_bytes, base.per_col_bytes);
+            assert_eq!(sampled.slot_col_bytes, base.slot_col_bytes);
+            assert_eq!(
+                sampled.resident_extra_col_bytes,
+                base.resident_extra_col_bytes
+            );
+            assert_eq!(
+                sampled.resident_extra_fixed_bytes,
+                base.resident_extra_fixed_bytes
+            );
+        }
+    }
+
     #[test]
     fn partition_batch_geometry_bounds_disjoint_segments() {
         for threads in [1, 2, 32, 512, 1024] {

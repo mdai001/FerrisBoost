@@ -12,11 +12,14 @@ pub mod category_names;
 pub mod colsample;
 pub mod columns;
 pub mod comm;
+pub mod custom_objective;
 pub mod error;
 pub mod explain;
 pub mod gpu_mem_plan;
+mod gradient_sampling;
 pub mod hist;
 mod inference;
+mod interaction;
 pub mod metrics;
 pub mod objective;
 pub mod rank;
@@ -36,9 +39,15 @@ mod model_io;
 
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "python")]
+mod python_metric;
+#[cfg(feature = "python")]
+mod python_objective;
 
 pub use callback::{Callback, EarlyStopping, RecordHistory, VerboseEval};
 pub use columns::{BinCuts, BinningStrategy};
 pub use source::DenseSource;
 pub use train::{train, BlockSource, EvalSet, TrainConfig};
 pub use tree::Model;
+
+pub mod survival;

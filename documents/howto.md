@@ -5,8 +5,12 @@ PyArrow, Parquet, and CSV training inputs. Its parameter names and JSON model
 format are designed to be familiar to XGBoost users, but FerrisBoost does not
 use a `DMatrix` object.
 
-The public Python API supports CPU training and CUDA-enabled builds. Select a
-GPU with `device="cuda"` or `device="cuda:N"`.
+The published 0.0.8 packages support CPU training and CUDA-enabled builds. This
+guide also documents APIs implemented for the unreleased 0.0.9 development
+candidate; sections marked **0.0.9 development** are not available from the
+current PyPI wheels or Rust crate. Release and cross-platform validation are
+still pending. Select one GPU with `device="cuda"` or `device="cuda:N"`;
+Multi-GPU support is future 1.0 work.
 
 ## Choose the input form
 
@@ -158,6 +162,52 @@ prediction = model.predict(X)
 
 For squared-error models, normal predictions and raw-margin predictions are
 the same.
+
+### Additional scalar objectives (0.0.9 development)
+
+These scalar objectives are available in development builds on CPU and CUDA
+with `gpu_math="exact"` or `gpu_math="fast"`. They are not in the published
+0.0.8 packages.
+
+| Objective | Use it for | Labels | Prediction | Default metric |
+|---|---|---|---|---|
+| `binary:logitraw` | Binary classification when raw margins are useful | Values in `[0, 1]` | Raw margin | `logloss` (applies sigmoid); `rmse` uses the raw margin |
+| `binary:hinge` | Binary classification decisions without probabilities | Values in `[0, 1]` | Class decision `0` or `1` (`margin > 0` is positive) | `error` |
+| `reg:squaredlogerror` | Regression with squared log error | Finite and `> -1` | Raw margin | `rmsle` |
+| `reg:absoluteerror` | Regression with absolute error | Any finite value | Identity | `mae` |
+| `reg:expectileerror` | Asymmetric squared regression | Any finite value | Identity | `expectile` |
+
+`binary:logitraw` uses logistic gradients but returns the raw margin from
+`predict`; `predict_proba` in the sklearn classifier applies sigmoid. Its
+`logloss` metric also applies sigmoid, while `rmse` measures the raw margin.
+For `binary:hinge`, sklearn `predict_proba` raises `ValueError` because the
+objective produces class decisions, not probabilities.
+
+`reg:squaredlogerror` requires labels greater than `-1`; its predictions stay
+in margin space. The objective's gradient guards its logarithm near `-1`, but
+the `rmsle` metric requires predictions greater than `-1` to compute `log1p`.
+
+`reg:absoluteerror` uses an adaptive, round-level smooth majorization of MAE
+with a weighted residual scale, then passes gradient/Hessian pairs to the
+regular tree fitter. It does not choose leaves by taking a weighted median.
+When `base_score` is unset, its starting score is one Newton correction from
+the weighted label mean.
+
+`reg:expectileerror` requires the scalar parameter `expectile_alpha` in
+`[0, 1]`; arrays are not supported. For residual `prediction - label`, the
+positive-residual side is weighted by `1 - expectile_alpha` and the
+negative-residual side by `expectile_alpha`. Its default `expectile` metric
+uses the same alpha. Its estimated starting score is one Newton correction
+from the weighted label mean.
+
+### Probability regression (0.0.9 development)
+
+Use `objective="reg:logistic"` for continuous targets in `[0, 1]`. Predictions
+are probabilities; `output_margin=True` returns raw margins. It shares the
+native logistic gradients and CPU/CUDA exact/fast paths with `binary:logistic`,
+but keeps its own objective name when saved and uses probability-space `rmse`
+as its default evaluation metric. Explicit `base_score` values also lie in
+`[0, 1]`. Use `FerrisBoostRegressor(objective="reg:logistic")` with sklearn.
 
 ## Count, positive, and robust regression objectives
 
@@ -336,7 +386,7 @@ Notes:
 
 - `scale_pos_weight` only changes the gradients. Evaluation metrics and the
   weighted quantile sketch use the sample weights alone. It applies to
-  `binary:logistic`, `reg:squarederror`, and `reg:gamma`, and is ignored by the
+  `binary:logistic`, `reg:logistic`, `reg:squarederror`, and `reg:gamma`, and is ignored by the
   other objectives, as in XGBoost.
 - Predictions from a model trained with `scale_pos_weight` are shifted toward
   the positive class and are no longer calibrated probabilities.
@@ -346,6 +396,55 @@ Notes:
 - All three parameters work on CPU and GPU. With `gpu_math="exact"`, GPU models
   stay byte-identical to CPU models.
 
+## Survival objectives
+
+Available in 0.0.9 development builds. The losses and derivatives are native
+Rust implementations. Both objectives support CPU and CUDA exact training;
+CUDA fast currently raises an error. Predictions use `exp(raw_margin)`.
+
+`survival:cox` accepts signed times: positive labels indicate events, while
+nonpositive labels indicate censoring at the absolute time. The initial risk
+score is `1`. Tied events use grouped Breslow risk sets. Sample weights enter
+both the risk sets and event counts; zero-weight rows have no effect on the
+loss. This weighted, tied-event training convention differs from XGBoost's
+convention, so model interchange does not imply identical training results.
+The default metric is `cox-nloglik`, normalized by total event weight.
+
+`survival:aft` accepts separate lower and upper time bounds. Lower bounds
+must be finite and nonnegative; upper bounds must be positive and may be
+`+inf`. Equal bounds specify an exact positive event time; `(0, upper)` is
+left-censored, `(lower, +inf)` is right-censored, and finite unequal bounds
+specify interval censoring. `(0, +inf)` is uninformative.
+
+```python
+model = fb.train(
+    {"objective": "survival:aft", "aft_loss_distribution": "normal",
+     "aft_loss_distribution_scale": 1.0},
+    X, label=(lower, upper),
+    evals=[(X_valid, (lower_valid, upper_valid), "valid")],
+)
+```
+
+The explicit form is `label_lower_bound=lower, label_upper_bound=upper`.
+For files, use column names (or indices with `header=False`); both columns
+are excluded from features. `label="lower", label_upper_bound="upper"` is
+also accepted for file input. File evaluation sets use the same column
+selectors. The sklearn regressor accepts targets with shape `(n_samples, 2)`; its
+`score` returns negative AFT log likelihood, including optional sample weights.
+For Cox models, `score` returns negative Cox log likelihood. Both use the
+parameters stored in the fitted model and are maximized during model selection.
+
+`aft_loss_distribution` accepts `normal`, `logistic` or `extreme`; the scale
+must be finite and positive. The initial predicted time is `0.5`. The default
+metric is `aft-nloglik`; `interval-regression-accuracy` is also supported and
+is maximized by early stopping. Point-label and ordinary custom metrics are
+rejected for AFT to avoid silently discarding censoring bounds. AFT gradients
+are clipped to `[-15, 15]`, Hessians to `[1e-16, 15]`, and reported likelihoods
+use a `1e-12` floor. Exact-event likelihoods are densities and may exceed
+`1`, so their negative log likelihood may be negative. Continuation keeps
+the AFT distribution and scale, or the expectile alpha, fixed; changing
+these objective parameters raises an error.
+
 ## Starting prediction (`base_score`)
 
 When `base_score` is not set, FerrisBoost estimates it from the training labels,
@@ -353,9 +452,10 @@ as XGBoost 2.0 and later do:
 
 | Objective | Default `base_score` |
 |---|---|
-| `reg:squarederror`, `binary:logistic`, `count:poisson`, `reg:gamma`, `reg:tweedie` | The label mean (weighted if weights are given) |
-| `reg:pseudohubererror` | One Newton step from margin `0` |
-| `reg:squarederror`, `binary:logistic`, `reg:gamma` with `scale_pos_weight != 1` | One Newton step from margin `0` |
+| `reg:squarederror`, `binary:logistic`, `reg:logistic`, `binary:logitraw`, `reg:squaredlogerror`, `count:poisson`, `reg:gamma`, `reg:tweedie` | The label mean (weighted if weights are given) |
+| `reg:pseudohubererror`, `binary:hinge` | One Newton step from margin `0` |
+| `reg:absoluteerror`, `reg:expectileerror` | One Newton correction from the weighted label mean |
+| `reg:squarederror`, `binary:logistic`, `reg:logistic`, `binary:logitraw`, `reg:squaredlogerror`, `reg:gamma` with `scale_pos_weight != 1` | One Newton step from margin `0` |
 | `multi:softprob`, `multi:softmax` | Per-class log-frequency margins, centered to mean zero |
 | `rank:ndcg`, `rank:pairwise`, `rank:map` | One Newton step from score `0` on the objective's gradients (close to `0`) |
 
@@ -366,9 +466,11 @@ reproduce a 0.0.4 model, set `"base_score": 0.5` explicitly. An explicit
 `base_score` is used as given.
 
 `base_score` is in the space after the objective's transform: a probability for
-`binary:logistic` (any value in `[0, 1]`, so that all-0 or all-1 labels train),
-a mean for the log-link objectives (it must be positive), and a margin for
-multiclass objectives, where a single value is used for every class. The
+`binary:logistic` and `reg:logistic` (any value in `[0, 1]`, so that all-0 or all-1 labels train),
+a raw margin for `binary:logitraw` and `binary:hinge`, a mean for the log-link
+objectives (it must be positive), and a margin for multiclass objectives, where
+a single value is used for every class. Other scalar objectives use their
+identity prediction space. The
 trained value is stored in the model and used again at prediction time.
 
 ## Validation and early stopping
@@ -436,20 +538,25 @@ model = fb.train(
 
 | Metric | Objectives | Definition |
 |---|---|---|
-| `rmse` | all except multiclass | Root mean squared error on the transformed prediction (probabilities for `binary:logistic`, `exp(margin)` for log-link objectives), as in XGBoost |
-| `mae` | all except multiclass | Mean absolute error on the transformed prediction |
-| `mape` | all except multiclass | Mean absolute percentage error, `abs((label - prediction) / label)` |
-| `mphe` | all except multiclass | Mean pseudo-Huber error; uses `huber_slope` for `reg:pseudohubererror` and `1` otherwise |
-| `logloss` | `binary:logistic` | Negative log-likelihood |
-| `error` | `binary:logistic` | Error rate at threshold 0.5 (`p > 0.5` counts as positive) |
-| `error@t` | `binary:logistic` | Error rate at threshold `t`, for example `error@0.7` |
-| `auc` | `binary:logistic`, ranking objectives | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it. With query groups: mean over the groups, see [Learning to rank](#learning-to-rank) |
-| `aucpr` | `binary:logistic`, ranking objectives | Area under the precision-recall curve. Larger is better, so early stopping maximizes it. With query groups: mean over the groups |
+| `rmse` | single-output objectives except AFT and ranking | Root mean squared error on the transformed prediction (probabilities for `binary:logistic` and `reg:logistic`, `exp(margin)` for log-link objectives); `binary:logitraw` uses its raw margin, as in XGBoost |
+| `mae` | single-output objectives except AFT and ranking | Mean absolute error on the transformed prediction; the default for `reg:absoluteerror` |
+| `rmsle` | `reg:squaredlogerror` | Root mean squared error between `log1p` predictions and labels; predictions must be greater than `-1` |
+| `expectile` | `reg:expectileerror` | Expectile loss using `expectile_alpha` |
+| `mape` | single-output objectives except AFT and ranking | Mean absolute percentage error, `abs((label - prediction) / label)` |
+| `mphe` | single-output objectives except AFT and ranking | Mean pseudo-Huber error; uses `huber_slope` for `reg:pseudohubererror` and `1` otherwise |
+| `logloss` | `binary:logistic`, `reg:logistic`, `binary:logitraw` | Negative log-likelihood; `binary:logitraw` margins are passed through sigmoid |
+| `error` | `binary:logistic`, `reg:logistic`, `binary:logitraw`, `binary:hinge` | Error rate at threshold 0.5 for probability outputs; hinge uses its class decisions |
+| `error@t` | `binary:logistic`, `reg:logistic`, `binary:logitraw`, `binary:hinge` | Error rate at threshold `t`, for example `error@0.7` |
+| `auc` | `binary:logistic`, `reg:logistic`, `binary:logitraw`, ranking objectives | Area under the ROC curve; tied predictions share a trapezoid. Larger is better, so early stopping maximizes it. With query groups: mean over the groups, see [Learning to rank](#learning-to-rank) |
+| `aucpr` | `binary:logistic`, `reg:logistic`, `binary:logitraw`, ranking objectives | Area under the precision-recall curve. Larger is better, so early stopping maximizes it. With query groups: mean over the groups |
 | `poisson-nloglik` | `count:poisson` | Negative Poisson log-likelihood |
 | `gamma-nloglik` | `reg:gamma` | Negative gamma log-likelihood |
 | `gamma-deviance` | `reg:gamma` | Gamma residual deviance |
 | `tweedie-nloglik@rho` | `reg:tweedie` | Negative Tweedie log-likelihood at variance power `rho` in `[1, 2)`, for example `tweedie-nloglik@1.5`. The `@rho` part is required |
 | `quantile` | `reg:quantileerror` | Pinball loss at `quantile_alpha` (the mean over all quantiles of a multi-quantile model); the objective's default metric |
+| `cox-nloglik` | `survival:cox` | Weighted grouped Breslow negative log likelihood per event weight |
+| `aft-nloglik` | `survival:aft` | Mean negative interval/event log likelihood |
+| `interval-regression-accuracy` | `survival:aft` | Fraction of predictions inside the target intervals; higher is better |
 | `mlogloss` | `multi:softprob`, `multi:softmax` | Multiclass negative log-likelihood |
 | `merror` | `multi:softprob`, `multi:softmax` | Multiclass error rate |
 | `ndcg`, `ndcg@k`, `ndcg@k-` | ranking objectives | Mean NDCG over the query groups (group weights if given); `@k` truncates, `-` scores a group without relevant documents as 0; see [Learning to rank](#learning-to-rank) |
@@ -459,17 +566,19 @@ model = fb.train(
 The likelihood and deviance metrics are meant for the objective they are listed
 with: they are computed on the transformed prediction and assume it is
 positive. Multiclass objectives accept only `mlogloss` and `merror`, and those
-two are rejected for other objectives. The binary metrics are rejected for
-every other objective, with a `ValueError` before training starts. The key in
+two are rejected for other objectives. Binary metrics are accepted for
+`binary:logistic`, `reg:logistic`, `binary:logitraw`, and `binary:hinge` as
+applicable (`auc` / `aucpr` are also accepted for ranking), and are
+rejected for other objectives with a `ValueError` before training starts. The key in
 `evals_result` is the metric name as written, for example
 `history["valid"]["tweedie-nloglik@1.5"]`.
 
 Without `eval_metric`, the objective selects the default: `logloss` for
-`binary:logistic`, `rmse` for `reg:squarederror`, `poisson-nloglik` for
+`binary:logistic` and `binary:logitraw`, `error` for `binary:hinge`, `rmse` for `reg:logistic` and `reg:squarederror`, `rmsle` for `reg:squaredlogerror`, `mae` for `reg:absoluteerror`, `expectile` for `reg:expectileerror`, `poisson-nloglik` for
 `count:poisson`, `gamma-deviance` for `reg:gamma`, `tweedie-nloglik@rho` (with
 the objective's `tweedie_variance_power`) for `reg:tweedie`, `mphe` for
 `reg:pseudohubererror`, `quantile` for `reg:quantileerror`, `mlogloss` for both multiclass objectives, and `ndcg@32` (`map@32` for `rank:map`) for the ranking objectives. With
-weighted validation data every metric is weighted the same way XGBoost does it.
+weighted validation data the built-in metrics apply their documented weighting rules.
 
 Like `xgboost.Booster.predict`, `Model.predict()` uses all trees by default,
 including trees built after the best iteration. To predict with the early-
@@ -481,6 +590,96 @@ best_prediction = model.predict(
     n_trees=model.best_iteration + 1,
 )
 ```
+
+## Custom evaluation metrics
+
+Available in 0.0.9 development builds. Wrap a batch function in `fb.CustomMetric`
+and pass it through `eval_metric`, alone or in a list with built-in metric names:
+
+```python
+def raw_rmse(predictions, labels, sample_weight, group_ptr):
+    squared_error = (predictions - labels) ** 2
+    return float(np.sqrt(np.average(squared_error, weights=sample_weight)))
+
+metric = fb.CustomMetric("raw_rmse", raw_rmse)
+model = fb.train(
+    {"objective": "reg:squarederror", "eval_metric": ["rmse", metric]},
+    X_train, label=y_train, num_boost_round=200,
+    evals=[(X_valid, y_valid, "valid")], early_stopping_rounds=10,
+)
+```
+
+The function receives **raw margins**, including any base margin. Predictions
+have shape `(rows,)` for one output and `(rows, outputs)` for multiclass or
+multi-quantile models. Labels and predictions are `float32` arrays. Weights are
+`None` or the validation weights: per row for ordinary objectives, per query
+group for ranking. Query groups are `None` or a `uint32` array of row offsets.
+The function applies any weighting it needs and returns one finite scalar;
+FerrisBoost does not weight that scalar again.
+
+Set `greater_is_better=True` for a metric to maximize. The last metric of the
+last validation set still controls early stopping. Rust owns evaluation
+ordering, result validation, history and stopping; Python is called once per
+metric and validation set each round. Built-in metrics stay native. Callback
+exceptions propagate with their original Python type and stop the round before
+it is recorded.
+
+Input arrays are owned snapshots that the callback can retain safely. Creating
+them has a copy cost; Python metric callbacks run on the host and are not
+compiled into CUDA. The descriptor also works with sklearn estimators.
+`FerrisBoostRanker.score` negates a lower-is-better custom metric so that a
+larger sklearn score is always better. Callback code is not stored in model
+files; supply the metric again when continuing training.
+
+Rust users implement the public `ferrisboost::metrics::Metric` trait and pass
+`Box<dyn Metric>` values through `TrainConfig.eval_metrics`. The fallible
+`try_eval_grouped` hook can return evaluation errors to training; implement
+weight/group support explicitly when the metric needs it.
+
+## Custom objectives
+
+Available in 0.0.9 development builds. A custom objective supplies an
+unweighted gradient and Hessian for each row. Pass a descriptor through
+`custom_objective`; `objective="reg:squarederror"` is required alongside it
+to define identity-link prediction and the default evaluation metric. The `fb.train` default remains
+`binary:logistic`.
+
+```python
+def squared_error(raw_margin, labels):
+    grad = np.ascontiguousarray(raw_margin - labels, dtype=np.float32)
+    hess = np.ones(labels.shape, dtype=np.float32)
+    return grad, hess
+
+custom_obj = fb.CustomObjective("squared_error", squared_error)
+model = fb.train(
+    {"objective": "reg:squarederror", "custom_objective": custom_obj},
+    X_train, label=y_train, num_boost_round=200,
+    evals=[(X_valid, y_valid, "valid")],
+)
+```
+
+The callback receives `(raw_margin, labels)` as owned one-dimensional
+`float32` NumPy snapshots and returns exactly `(gradient, hessian)`: two
+one-dimensional, C-contiguous `float32` arrays with one value per row. Return
+unweighted values; FerrisBoost validates finite gradients and non-negative
+finite Hessians, applies sample weights once, then samples rows for the tree.
+The custom objective uses the shared Newton leaf rules. Its default starting
+margin is `0` (set `base_score` to override it), predictions use the identity
+link, and its default metric is RMSE.
+
+Python runs the callback once per boosting round for all training rows
+together; callback code is not compiled. The native extension point is the public Rust
+`ferrisboost::custom_objective::CustomObjective` trait, whose `gradients` method fills a
+`GradPair` slice. The Python adapter implements that same contract. Support is
+limited to `reg:squarederror` on CPU and CUDA with `gpu_math="exact"`; other
+named objectives, fast GPU math, and `scale_pos_weight` values other than `1`
+are rejected.
+
+Model JSON stores the custom objective name, not callback code. Loaded models
+can predict without the callback. Continuing training with `init_model`
+requires passing a custom objective descriptor with the same name again; the
+name does not verify that its callback code is equivalent, which is the user's
+responsibility.
 
 ## Sample weights
 
@@ -687,6 +886,110 @@ other); the semantics, counts, and nesting are the same. The same is true of
 `colsample_bylevel` and `colsample_bynode` only narrow the split search, as in
 XGBoost. Histograms are still built for every feature of the per-tree set, so
 unlike `colsample_bytree` they do not reduce input reads.
+
+### Feature weights
+
+Available in 0.0.9 development builds. `feature_weights` biases feature
+sampling at any stage whose `colsample_*` rate is below `1`:
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "colsample_bytree": 0.7,
+     "feature_weights": {"important_feature": 4.0, "rare_feature": 0.2}},  # named-column input
+    X, label=y, num_boost_round=100,
+)
+```
+
+Pass either a nonempty positional vector with one finite, non-negative
+`float32` weight per feature, or a dictionary from feature names to weights.
+Named weights require a complete named schema; names omitted from the
+dictionary default to `1`. Booleans (including NumPy booleans), nonnumeric
+values, and all-zero weights are rejected. At least one weight must be
+positive, even when every sampling rate is `1`.
+
+At each stage whose rate is below `1`, zero-weight features are ineligible.
+The stage selects without replacement
+`min(max(1, floor(rate * incoming_count)), positive_count)` features. A rate
+of `1` passes every incoming feature through, including zero-weight features,
+so weights are not a global feature ban. The usual nesting and interaction
+constraints still apply; their intersection can leave a leaf with no eligible
+features.
+
+Weights are resolved to feature order once and borrowed by the native nested
+samplers.
+Equal positive weights preserve the existing seeded uniform feature sequence
+exactly; `None` keeps the existing default behavior. Sampling uses FerrisBoost's
+own deterministic sequence, independent of XGBoost's nonuniform sampling
+algorithm. CPU, exact GPU, and fast GPU use the same host sampler. Weighted
+ordering uses host floating-point logarithms, so cross-architecture bitwise
+agreement is not guaranteed.
+Fast mode remains deterministic across repeated fast runs; this does not
+promise CPU/GPU whole-model equality. Feature weights are training parameters
+and are not stored in model metadata. For equivalent continued training, pass
+the same weights and sampling parameters again.
+
+### Gradient-based row sampling
+
+Available in 0.0.9 development builds.
+
+`sampling_method="gradient_based"` changes how `subsample` chooses training
+rows. The default, `"uniform"`, preserves the existing uniform row sampler.
+Gradient-based sampling scores each row from its current gradient and Hessian
+as `sqrt(g² + 0.1 h²)`, after sample weights have been applied once. The
+constant `0.1` does not depend on `reg_lambda`. Rows with larger scores are
+more likely to be sampled. Inclusion probabilities are normalized toward an
+expected sample count of `min(subsample * row_count, nonzero_score_count)`;
+the actual rows are selected independently from a deterministic hash of the
+seed, tree, and row. Sampling is therefore repeatable, but the realized row
+count can vary.
+
+Nonzero probabilities are represented on a 53-bit grid and rounded down, with
+at least one probability-grid slot for each nonzero score. Sampled gradients
+and Hessians are scaled by the inverse of each row's actual inclusion
+probability. Rows with zero score remain zero. Every row still receives a
+prediction from each resulting tree, whether or not it shaped that tree.
+`subsample=1` is an exact no-op for this method as well.
+
+The method is available on CPU and CUDA exact, and for supported native
+objectives in CUDA fast mode. Exact mode uses a fixed 48 KiB histogram;
+fast mode solves the inclusion probabilities on the device with bounded
+shared memory. Neither path adds a row-sized sampling scratch buffer.
+Fast mode is repeatable but need not match CPU sampling bit for bit.
+`subsample=1` remains a no-op. This is a memory bound, not a speedup claim.
+`fb.train`, sklearn estimators and file inputs forward the setting.
+Continuation must use the same sampling parameters to reproduce an
+uninterrupted run.
+
+## Tree growth and feature interactions
+
+Available in 0.0.9 development builds. `max_leaves` limits the total leaves in
+each tree, including branches that stopped growing earlier. The default `0`
+adds no leaf limit; `1` produces a root-only tree. Trees retain depthwise growth,
+with stable node order when a level has more candidates than remaining leaf
+slots. `max_depth` remains an independent limit; its value `0` still means a
+root-only tree. Loss-guided growth is not implemented.
+
+`interaction_constraints` restricts which features may appear together along
+a root-to-leaf path:
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "max_leaves": 16,
+     "interaction_constraints": [[0, 1], [2, 3]]},
+    X_train, label=y_train, num_boost_round=100,
+)
+```
+
+Use global feature indices, or names for inputs with named columns. Groups may
+overlap: a path must remain within an original group containing all features
+already used on that path. Features omitted from every group can only interact
+with themselves. Reusing a feature is allowed. An empty outer list or `None`
+disables constraints; empty inner groups and invalid feature references raise
+an error. Duplicate entries are normalized in Rust.
+
+Both controls apply to numerical and categorical splits and combine with
+column sampling and monotone constraints. Constraints narrow split candidates;
+they do not automatically eliminate histogram reads needed by other nodes.
 
 ## Monotone constraints
 
@@ -1574,20 +1877,16 @@ memory budget, without manual chunk or batch tuning:
   matching CPU training. `"fast"` is deterministic, but CPU and GPU models are
   not guaranteed to be bit-identical; FerrisBoost does not promise universal
   parity with XGBoost GPU training.
-- **Objectives and parameters on GPU**: Every objective (including the
-  multiclass ones, `reg:quantileerror` and the ranking objectives) and the `alpha`, `max_delta_step`,
-  `scale_pos_weight`, sample-weight, `monotone_constraints`, `subsample`, and
-  `colsample_*` options work with `device="cuda"`. `gpu_math="exact"` stays
-  byte-identical to CPU training for all of them.
-- **`gpu_math="fast"`**: supports every objective, including multiclass and
-  `reg:quantileerror`. It is deterministic from run to run but not
-  byte-identical to CPU. The gradient, the fixed-point quantization scale, and
-  the prediction update stay on the device, with one small host round trip per
-  tree. Multiclass computes the softmax statistics once per round and folds
-  each tree's prediction update into the next gradient kernel. For
-  `reg:quantileerror` the per-round global scale is reduced on the device in a
-  fixed order, so it is deterministic but not byte-identical to CPU. Fast mode
-  requires `device_quantize=True` (the default).
+- **Objectives and parameters on GPU**: Built-in objectives, growth constraints,
+  sampling controls and sample weights work with `device="cuda"` and
+  `gpu_math="exact"`. Exact mode computes objective derivatives on the host
+  and preserves CPU/GPU model parity.
+- **`gpu_math="fast"`**: Native scalar, multiclass, quantile and ranking
+  objectives compute derivatives, quantization scales and prediction updates
+  on the device. Runs are deterministic but need not match CPU bit for bit.
+  `reg:absoluteerror` and `reg:quantileerror` reduce their residual scale on
+  the device. Fast mode requires `device_quantize=True`; custom objectives
+  and survival objectives currently require CPU or CUDA exact.
 - **Ranking on the GPU**: with `gpu_math="exact"` the group gradients are
   computed on the host and the model is byte-identical to the CPU model. With
   `gpu_math="fast"` the whole LambdaMART step runs on the device: a stable
@@ -1621,14 +1920,14 @@ memory budget, without manual chunk or batch tuning:
   streaming use the exact host fallback. This is managed internally and is not
   a public Python parameter.
 - **`hist_streams`**: Defaults to automatic (`None`); the GPU planner resolves the stream count from the execution path, block width, and VRAM budget. The current column-major path uses one stream by default; set `1` or `2` to override it.
-- **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU scaling is in progress (WIP).
+- **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU support is future 1.0 work and is not implemented.
 - **`max_depth`**: Depth-wise tree growth on GPU is constrained to `0..=14` by partition buffer limits.
 
 ### What runs where
 
 | Step | Where it runs |
 |---|---|
-| Histograms, row partition, gradients | GPU, for every supported objective and both `gpu_math` modes |
+| Histograms and row partition | GPU for both math modes; objective gradients run on the host in exact mode and on the device in fast mode |
 | Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
 | Feature binning and file ingest | Host |
 | Prediction (`use_gpu=True`) | GPU 0 when worthwhile, including categorical models and `base_margin`; CPU for small batches and `predict_to_parquet` |
@@ -1636,11 +1935,11 @@ memory budget, without manual chunk or batch tuning:
 
 What raises an error instead of falling back: `device="cuda"` on a build without
 CUDA, `max_depth` above 14 (on CPU too), `gpu_math="fast"` together with
-`device_quantize=False`.
+`device_quantize=False`, custom objectives or survival objectives.
 
 ## Prediction
 
-`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is a `float32` `numpy.ndarray`. It is one-dimensional, with shape `(n,)`, except for multiclass models, which return two-dimensional `(n, num_class)` probabilities or margins, and models with several `quantile_alpha` values, which return `(n, n_quantiles)` (each row sorted ascending); `multi:softmax` returns a one-dimensional array of class indices unless `output_margin=True` (see [Multiclass prediction](#multiclass-prediction)). Predictions are in the objective's output space: probabilities for `binary:logistic`, `exp(margin)` for `count:poisson`, `reg:gamma`, and `reg:tweedie`, and the margin itself for the other regression objectives; `output_margin=True` returns the raw margin. Prediction has its own CPU thread control and does not inherit training `nthread`:
+`Model.predict()` supports both file paths (the recommended path for large test sets) and in-memory NumPy arrays. The return value is a `float32` `numpy.ndarray`. It is one-dimensional, with shape `(n,)`, except for multiclass models, which return two-dimensional `(n, num_class)` probabilities or margins, and models with several `quantile_alpha` values, which return `(n, n_quantiles)` (each row sorted ascending); `multi:softmax` returns a one-dimensional array of class indices unless `output_margin=True` (see [Multiclass prediction](#multiclass-prediction)). Predictions are in the objective's output space: probabilities for `binary:logistic` and `reg:logistic`, class decisions for `binary:hinge`, raw margins for `binary:logitraw`, `exp(margin)` for `count:poisson`, `reg:gamma`, `reg:tweedie`, `survival:cox` and `survival:aft`, and the margin itself for other regression objectives; `output_margin=True` returns the raw margin. Prediction has its own CPU thread control and does not inherit training `nthread`:
 
 ```python
 prediction = model.predict(data, predict_threads=0)  # process-aware auto
@@ -1894,13 +2193,17 @@ empty `evals_result()`.
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| `objective` | `binary:logistic` | `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
+| `objective` | `binary:logistic` | 0.0.9 development: `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, `reg:expectileerror`, `survival:cox`, `survival:aft`; also `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
 | `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank) |
 | `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation; see [Learning to rank](#learning-to-rank) |
+| `expectile_alpha` | required | Required scalar for `reg:expectileerror`, in `[0, 1]`; arrays are unsupported |
 | `quantile_alpha` | `None` | Required for `reg:quantileerror`: a quantile in `[0, 1]`, or an ascending list of up to 64 quantiles for one multi-output model (one tree per quantile per round; `predict` returns `(n, n_quantiles)`). Unsorted or out-of-range values raise `ValueError` |
 | `num_class` | `None` | Number of classes, at least 2. Required for `multi:softprob` and `multi:softmax`, ignored otherwise. Labels are integers in `[0, num_class)` |
 | `tweedie_variance_power` | `1.5` | Variance power of `reg:tweedie`, in `[1, 2)` |
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
+| `aft_loss_distribution` | `"normal"` | AFT noise distribution: `"normal"`, `"logistic"`, or `"extreme"` |
+| `aft_loss_distribution_scale` | `1.0` | Positive finite AFT distribution scale |
+| `custom_objective` | `None` | 0.0.9 development: an `fb.CustomObjective` descriptor; requires `objective="reg:squarederror"`. See [Custom objectives](#custom-objectives) |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
 | `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 2 bytes per value instead of 1 (CPU and GPU) |
 | `eta` | `0.3` | Alias: `learning_rate` |
@@ -1909,11 +2212,13 @@ empty `evals_result()`.
 | `min_child_weight` | `1.0` | Minimum child Hessian |
 | `alpha` | `0.0` | L1 regularization on leaf weights; alias: `reg_alpha` |
 | `max_delta_step` | `0.0` | Maximum absolute leaf weight before `eta` (`0` = no limit); can help logistic regression with very unbalanced classes. For `count:poisson` an unset value becomes `0.7`, for the tree and the objective alike |
-| `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. Used by `binary:logistic`, `reg:squarederror`, and `reg:gamma`, ignored by the other objectives. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
+| `scale_pos_weight` | `1.0` | Multiplies the gradient weight of rows with label `1`; metrics and binning are not affected. Used by `binary:logistic`, `reg:logistic`, `binary:logitraw`, `reg:squaredlogerror`, `reg:squarederror`, and `reg:gamma`, ignored by the other objectives. When it is not `1` and `base_score` is unset, the default `base_score` comes from one Newton step, as in XGBoost |
 | `subsample` | `1.0` | Deterministic per-tree row sampling in `(0, 1]`; rows that were not sampled do not shape the tree, but still receive its leaf values |
+| `sampling_method` | `"uniform"` | `"uniform"` or `"gradient_based"`; the latter uses current gradient/Hessian scores for row sampling; see [Gradient-based row sampling](#gradient-based-row-sampling) |
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `colsample_bylevel` | `1.0` | Per-level feature sampling in `(0, 1]` from the per-tree set; see [Feature sampling](#feature-sampling) |
 | `colsample_bynode` | `1.0` | Per-node feature sampling in `(0, 1]` from the per-level set; see [Feature sampling](#feature-sampling) |
+| `feature_weights` | `None` | 0.0.9 development: nonnegative feature sampling weights as a positional vector or named dictionary; see [Feature weights](#feature-weights) |
 | `cols_per_block` | automatic | Positive integer; normally leave unset. On GPU the memory planner chooses it from the row count; for CSV / CSV.gz it uses the exact count of the first reading pass, so CSV and the equivalent Parquet get the same plan |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
@@ -1925,8 +2230,10 @@ empty `evals_result()`.
 | `hist_nodes_per_batch` | automatic | GPU only: number of nodes merged into one histogram launch (`1..=32`, `1` disables merging; the GPU default is 16) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
+| `max_leaves` | `0` | 0.0.9 development: total leaf cap per depthwise tree; zero adds no cap |
+| `interaction_constraints` | `None` | 0.0.9 development: allowed feature groups by index or name |
 | `seed` | `0` | Alias: `random_state` |
-| `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
+| `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic` and `reg:logistic`, a raw margin for `binary:logitraw` and `binary:hinge`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
 | `cache_path` | `None` | Persistent Parquet cache directory; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
@@ -1940,7 +2247,6 @@ Unknown parameters raise `ValueError`; they are not silently ignored.
 
 The following familiar XGBoost parameters are recognized but not implemented:
 
-- `max_leaves`
 - `tree_method` (FerrisBoost currently has only histogram training)
 - `num_parallel_tree`
 
@@ -1981,8 +2287,9 @@ do not include the label as a prediction feature.
 
 ### Labels do not fit the objective
 
-Training validates labels before the first round: `binary:logistic` needs
-labels in `[0, 1]`, `count:poisson` and `reg:tweedie` need non-negative labels,
+Training validates labels before the first round: `binary:logistic`, `binary:logitraw`,
+and `binary:hinge` need labels in `[0, 1]`; `reg:squaredlogerror` needs finite
+labels greater than `-1`; `count:poisson` and `reg:tweedie` need non-negative labels,
 `reg:gamma` needs strictly positive labels, and multiclass objectives need
 integer labels in `[0, num_class)`. `rank:ndcg` with `ndcg_exp_gain=True` needs
 integer relevance in `[0, 31]`, and `rank:map` (and the `map` / `pre` metrics)
@@ -2031,8 +2338,8 @@ when the weights are not one per query group. Validation sets need
 
 ### A metric does not fit the objective
 
-Binary metrics (`logloss`, `error`, `error@t`) require `binary:logistic`; `auc`
-and `aucpr` also accept the ranking objectives. `mlogloss` and `merror` require a multiclass objective, and
+Binary metrics (`logloss`, `error`, `error@t`) require `binary:logistic` or
+`reg:logistic`; `auc` and `aucpr` also accept the ranking objectives. `mlogloss` and `merror` require a multiclass objective, and
 multiclass objectives accept only those two. `quantile` requires
 `reg:quantileerror`. `tweedie-nloglik` must be written with its variance power,
 such as `tweedie-nloglik@1.5`.

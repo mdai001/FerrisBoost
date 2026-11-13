@@ -88,7 +88,7 @@ try:  # scikit-learn >= 1.6
 except ImportError:  # pragma: no cover
     _validate_data = None
 
-from . import (Model, _arrow_table, _as_ref, _categories_wire, _frame_matrix, _is_pandas_frame,
+from . import (CustomMetric, CustomObjective, Model, _arrow_table, _as_ref, _as_weights, _categories_wire, _frame_matrix, _is_pandas_frame,
                _load_prior, _model_refs, _table_matrix, _value_ref, train)
 
 __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
@@ -97,6 +97,7 @@ __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 # 让 FerrisBoost 自己的默认值生效(和 XGBoost 的 `None = 用库默认` 一致)。
 _PARAM_MAP = {
     "max_depth": "max_depth",
+    "max_leaves": "max_leaves",
     "max_bin": "max_bin",
     "learning_rate": "eta",
     "n_jobs": "nthread",
@@ -104,6 +105,7 @@ _PARAM_MAP = {
     "min_child_weight": "min_child_weight",
     "max_delta_step": "max_delta_step",
     "subsample": "subsample",
+    "sampling_method": "sampling_method",
     "colsample_bytree": "colsample_bytree",
     "colsample_bylevel": "colsample_bylevel",
     "colsample_bynode": "colsample_bynode",
@@ -112,13 +114,19 @@ _PARAM_MAP = {
     "scale_pos_weight": "scale_pos_weight",
     "base_score": "base_score",
     "monotone_constraints": "monotone_constraints",
+    "interaction_constraints": "interaction_constraints",
     "eval_metric": "eval_metric",
+    "custom_objective": "custom_objective",
+    "feature_weights": "feature_weights",
     "device": "device",
     "gpu_math": "gpu_math",
     "cols_per_block": "cols_per_block",
     "quantile_alpha": "quantile_alpha",
+    "expectile_alpha": "expectile_alpha",
     "tweedie_variance_power": "tweedie_variance_power",
     "huber_slope": "huber_slope",
+    "aft_loss_distribution": "aft_loss_distribution",
+    "aft_loss_distribution_scale": "aft_loss_distribution_scale",
     "missing": "missing",
     "enable_categorical": "enable_categorical",
     "max_cat_to_onehot": "max_cat_to_onehot",
@@ -179,21 +187,29 @@ def _seed_of(random_state: Any) -> int | None:
 
 
 class _FerrisBoostBase(BaseEstimator):
-    """两个估计器共用的参数、拟合和持久化逻辑。"""
+    """两个估计器共用的参数、拟合和持久化逻辑。
+
+    `max_leaves=0` 表示不额外限制每棵树的叶子数；正值限制每棵树的总叶子数。
+    `interaction_constraints` 接受全局特征 ID 或特征名组成的分组。
+    """
 
     def __init__(
         self,
         *,
         n_estimators: int | None = None,
         max_depth: int | None = None,
+        max_leaves: int | None = None,
         max_bin: int | None = None,
         learning_rate: float | None = None,
         objective: str | None = None,
+        custom_objective: CustomObjective | None = None,
+        feature_weights: Any = None,
         n_jobs: int | None = None,
         gamma: float | None = None,
         min_child_weight: float | None = None,
         max_delta_step: float | None = None,
         subsample: float | None = None,
+        sampling_method: str | None = None,
         colsample_bytree: float | None = None,
         colsample_bylevel: float | None = None,
         colsample_bynode: float | None = None,
@@ -203,15 +219,19 @@ class _FerrisBoostBase(BaseEstimator):
         base_score: float | None = None,
         random_state: Any = None,
         monotone_constraints: Any = None,
-        eval_metric: str | list[str] | tuple[str, ...] | None = None,
+        interaction_constraints: Any = None,
+        eval_metric: str | CustomMetric | list[str | CustomMetric] | tuple[str | CustomMetric, ...] | None = None,
         early_stopping_rounds: int | None = None,
         callbacks: list | None = None,
         device: str | None = None,
         gpu_math: str | None = None,
         cols_per_block: int | None = None,
         quantile_alpha: float | Sequence[float] | None = None,
+        expectile_alpha: float | None = None,
         tweedie_variance_power: float | None = None,
         huber_slope: float | None = None,
+        aft_loss_distribution: str | None = None,
+        aft_loss_distribution_scale: float | None = None,
         importance_type: str | None = None,
         missing: float = np.nan,
         enable_categorical: bool = False,
@@ -228,14 +248,18 @@ class _FerrisBoostBase(BaseEstimator):
     ) -> None:
         self.n_estimators = n_estimators
         self.max_depth = max_depth
+        self.max_leaves = max_leaves
         self.max_bin = max_bin
         self.learning_rate = learning_rate
         self.objective = objective
+        self.custom_objective = custom_objective
+        self.feature_weights = feature_weights
         self.n_jobs = n_jobs
         self.gamma = gamma
         self.min_child_weight = min_child_weight
         self.max_delta_step = max_delta_step
         self.subsample = subsample
+        self.sampling_method = sampling_method
         self.colsample_bytree = colsample_bytree
         self.colsample_bylevel = colsample_bylevel
         self.colsample_bynode = colsample_bynode
@@ -245,6 +269,7 @@ class _FerrisBoostBase(BaseEstimator):
         self.base_score = base_score
         self.random_state = random_state
         self.monotone_constraints = monotone_constraints
+        self.interaction_constraints = interaction_constraints
         self.eval_metric = eval_metric
         self.early_stopping_rounds = early_stopping_rounds
         self.callbacks = callbacks
@@ -252,8 +277,11 @@ class _FerrisBoostBase(BaseEstimator):
         self.gpu_math = gpu_math
         self.cols_per_block = cols_per_block
         self.quantile_alpha = quantile_alpha
+        self.expectile_alpha = expectile_alpha
         self.tweedie_variance_power = tweedie_variance_power
         self.huber_slope = huber_slope
+        self.aft_loss_distribution = aft_loss_distribution
+        self.aft_loss_distribution_scale = aft_loss_distribution_scale
         self.importance_type = importance_type
         self.missing = missing
         self.enable_categorical = enable_categorical
@@ -650,7 +678,10 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
     """回归估计器(对应 `xgboost.XGBRegressor`),默认 `reg:squarederror`。
 
     支持 `reg:squarederror`、`count:poisson`、`reg:gamma`、`reg:tweedie`、
-    `reg:pseudohubererror`、`reg:quantileerror`(需要 `quantile_alpha`:标量,或升序列表得到多输出模型)。
+    `reg:pseudohubererror`、`reg:quantileerror`(需要 `quantile_alpha`:标量,或升序列表得到多输出模型),
+    以及 `survival:aft`(`y` 为 `(n_samples, 2)` 的 lower / upper bounds)。AFT 可用
+    `aft_loss_distribution` (`normal`, `logistic`, `extreme`) 和
+    `aft_loss_distribution_scale` 配置损失分布。
     """
 
     def _default_objective(self) -> str:
@@ -675,17 +706,40 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         init_model = _pick_init_model(init_model, xgb_model)
         if y is None:
             raise ValueError("This FerrisBoostRegressor estimator requires y to be passed, but the target y is None.")
-        X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
         params = self.get_ferrisboost_params()
+        aft = params["objective"] == "survival:aft"
+        if aft:
+            X, _, flags = self._prepare_X(X, reset=True, prior=init_model)
+            bounds = np.asarray(y, dtype=np.float32)
+            if bounds.ndim != 2 or bounds.shape != (X.shape[0], 2):
+                raise ValueError(
+                    f"survival:aft y must have shape ({X.shape[0]}, 2) with lower and upper bounds"
+                )
+            y_train = (
+                np.ascontiguousarray(bounds[:, 0]),
+                np.ascontiguousarray(bounds[:, 1]),
+            )
+
+            def eval_aft_bounds(ey: Any) -> tuple[np.ndarray, np.ndarray]:
+                eb = np.asarray(ey, dtype=np.float32)
+                if eb.ndim != 2 or eb.shape[1] != 2:
+                    raise ValueError("survival:aft eval_set y must have shape (n_samples, 2)")
+                return np.ascontiguousarray(eb[:, 0]), np.ascontiguousarray(eb[:, 1])
+
+            eval_labels = eval_aft_bounds
+        else:
+            X, y, flags = self._prepare_X(X, y, reset=True, prior=init_model, y_numeric=True, dtype=np.float32)
+            y_train = np.asarray(y, dtype=np.float32)
+            eval_labels = lambda ey: np.asarray(ey, dtype=np.float32).ravel()
         self._fit_booster(
             X,
-            np.asarray(y, dtype=np.float32),
+            y_train,
             params,
             sample_weight,
             eval_set,
             sample_weight_eval_set,
             verbose,
-            eval_labels=lambda ey: np.asarray(ey, dtype=np.float32).ravel(),
+            eval_labels=eval_labels,
             feature_types=flags,
             base_margin=base_margin,
             base_margin_eval_set=base_margin_eval_set,
@@ -702,6 +756,40 @@ class FerrisBoostRegressor(RegressorMixin, _FerrisBoostBase):
         base_margin: Any = None,
     ) -> np.ndarray:
         return self._raw_predict(X, output_margin, iteration_range, base_margin)
+
+    def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
+        """Return R² for ordinary regression, or negative survival NLL for Cox/AFT.
+
+        Survival objectives use negative weighted negative log-likelihood so a
+        larger score is better, matching scikit-learn's score convention.
+        AFT targets have shape ``(n_samples, 2)`` (lower and upper bounds);
+        Cox targets are signed event times.
+        """
+        booster = self.get_booster()
+        if booster.objective not in ("survival:aft", "survival:cox"):
+            return super().score(X, y, sample_weight=sample_weight)
+
+        prediction = np.ascontiguousarray(self.predict(X, output_margin=True), dtype=np.float32).ravel()
+        if booster.objective == "survival:aft":
+            bounds = np.asarray(y, dtype=np.float32)
+            if bounds.ndim != 2 or bounds.shape != (prediction.size, 2):
+                raise ValueError(
+                    f"survival:aft y must have shape ({prediction.size}, 2) with lower and upper bounds"
+                )
+            lower = np.ascontiguousarray(bounds[:, 0])
+            upper = np.ascontiguousarray(bounds[:, 1])
+        else:
+            labels = np.asarray(y, dtype=np.float32)
+            if labels.ndim != 1 or labels.size != prediction.size:
+                raise ValueError(
+                    f"survival:cox y must be a 1-D signed-label array with {prediction.size} entries"
+                )
+            lower = np.ascontiguousarray(labels)
+            upper = None
+        weight = None if sample_weight is None else _as_weights(
+            sample_weight, prediction.size, "sample_weight"
+        )
+        return float(self.get_booster()._survival_score(prediction, lower, upper, weight))
 
     @classmethod
     def from_file(cls, fname: str | os.PathLike, **params: Any) -> FerrisBoostRegressor:
@@ -824,7 +912,8 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
             return self._decode(np.argmax(raw, axis=1))
         if self._objective_resolved == "multi:softmax":
             return self._decode(raw.astype(np.intp))
-        return self._decode((raw > 0.5).astype(np.intp))
+        threshold = 0.0 if self._objective_resolved == "binary:logitraw" else 0.5
+        return self._decode((raw > threshold).astype(np.intp))
 
     def predict_proba(
         self,
@@ -840,7 +929,13 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
             shifted = margin - margin.max(axis=1, keepdims=True)
             expd = np.exp(shifted)
             return expd / expd.sum(axis=1, keepdims=True)
+        if self._objective_resolved == "binary:hinge":
+            raise ValueError("binary:hinge produces class decisions, not probabilities; use predict")
         raw = self._raw_predict(X, False, iteration_range, base_margin)
+        if self._objective_resolved == "binary:logitraw":
+            # Stable vectorized link, without Python row loops.
+            e = np.exp(-np.abs(raw))
+            raw = np.where(raw >= 0, 1.0 / (1.0 + e), e / (1.0 + e))
         if raw.ndim == 2:
             return raw
         return np.vstack((1.0 - raw, raw)).T
@@ -849,7 +944,7 @@ class FerrisBoostClassifier(ClassifierMixin, _FerrisBoostBase):
         """读 XGBoost 兼容的 JSON(binary:logistic / multi:softprob / multi:softmax)。"""
         booster = self._load_booster(fname)
         name = booster.objective
-        if name not in ("binary:logistic", "multi:softprob", "multi:softmax"):
+        if name not in ("binary:logistic", "binary:logitraw", "binary:hinge", "multi:softprob", "multi:softmax"):
             raise ValueError(f"{name} is not a classification model; use FerrisBoostRegressor.load_model")
         self._Booster = booster
         self._objective_resolved = name
@@ -995,11 +1090,11 @@ class FerrisBoostRanker(_FerrisBoostBase):
         X, _ = _split_qid(X, None)
         return super().apply(X, iteration_range)
 
-    def _score_metric(self) -> str:
+    def _score_metric(self) -> str | CustomMetric:
         """The metric `score` evaluates: the last `eval_metric`, else XGBoost's default."""
         if self.eval_metric is not None:
-            names = [self.eval_metric] if isinstance(self.eval_metric, str) else list(self.eval_metric)
-            return str(names[-1])
+            names = [self.eval_metric] if isinstance(self.eval_metric, (str, CustomMetric)) else list(self.eval_metric)
+            return names[-1]
         objective = self.objective if self.objective is not None else self._default_objective()
         base = "map" if objective == "rank:map" else "ndcg"
         method = self.lambdarank_pair_method or "topk"
