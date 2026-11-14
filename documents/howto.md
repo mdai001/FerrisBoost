@@ -1783,8 +1783,9 @@ training supplied as a list, directory, or glob.
 
 `cache_budget_bytes` limits how much quantized feature-block data may remain
 in memory (one byte per value, two for features with more than 255 bins or
-categorical codes above 253). Supported list, directory, and glob inputs can
-spill excess blocks to local files:
+categorical codes above 253). If the payload exceeds the budget, FerrisBoost
+stores the quantized cache on disk. With multiple files, it writes one feature
+block at a time.
 
 ```python
 model = fb.train(
@@ -1846,7 +1847,7 @@ Which inputs support these options:
 | Training input | `cache_path` / `cache_budget_bytes` |
 |---|---|
 | One Parquet file (also a directory or glob that matches exactly one file), CPU or GPU, with or without validation sets or `init_model` | Supported |
-| Several Parquet files (a list, directory, or glob) | Supported; excess feature blocks spill beyond the budget |
+| Several Parquet files (a list, directory, or glob) | Supported. The cache moves to disk when the payload exceeds the budget. |
 | CSV (one or several files, with or without a header) | Unsupported; CSV is quantized in memory |
 | numpy, pandas, PyArrow `Table` / `RecordBatch` / `RecordBatchReader` | Unsupported; these inputs are already in memory |
 
