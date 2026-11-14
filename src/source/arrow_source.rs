@@ -106,6 +106,7 @@ pub(crate) fn for_each_feature_f32(
     visit_column_f32::<true, true>(batch, col, missing, visit)
 }
 
+#[cfg(test)]
 pub(crate) fn feature_as_f32(
     batch: &RecordBatch,
     col: usize,

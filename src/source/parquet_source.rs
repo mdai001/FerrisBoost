@@ -2057,13 +2057,19 @@ impl ParquetBlockSource {
             let batch = recoder.recode(batch?, |c| feat_ids.get(c).map(|&f| f as usize))?;
             let n = batch.num_rows();
             for (local, &f) in feat_ids.iter().enumerate() {
-                let values =
-                    crate::source::arrow_source::feature_as_f32(&batch, local, self.missing)?;
                 let dst = &mut out[local * n_rows + row_base..][..n];
-                for (slot, v) in dst.iter_mut().zip(values) {
-                    // null 和 NaN 都是缺失
-                    *slot = quantize_value::<B>(&self.cuts, f, v);
-                }
+                let mut row = 0usize;
+                crate::source::arrow_source::for_each_feature_f32(
+                    &batch,
+                    local,
+                    self.missing,
+                    |v| {
+                        // null 和 NaN 都是缺失
+                        dst[row] = quantize_value::<B>(&self.cuts, f, v);
+                        row += 1;
+                    },
+                )?;
+                debug_assert_eq!(row, n);
             }
             row_base += n;
         }
