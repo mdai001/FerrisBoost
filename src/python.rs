@@ -4114,7 +4114,7 @@ fn check_categorical_codes(
 }
 
 /// `cache_path` / `cache_budget_bytes` configure the quantized column cache,
-/// which only single-file Parquet training builds. Every other input would
+/// which file-based Parquet training builds. Other input formats would
 /// ignore them silently, so they are rejected with the reason and the way out.
 fn reject_cache_options(cfg: &Parsed, got: &str, way_out: &str) -> PyResult<()> {
     let set: Vec<&str> = [
@@ -4134,7 +4134,7 @@ fn reject_cache_options(cfg: &Parsed, got: &str, way_out: &str) -> PyResult<()> 
         "support"
     };
     Err(PyValueError::new_err(format!(
-        "{names} {verb} a single Parquet file; got {got} — {way_out} or drop {}",
+        "{names} {verb} Parquet input; got {got} — {way_out} or drop {}",
         set.join(" / ")
     )))
 }
@@ -4174,7 +4174,7 @@ fn train_dense(
     reject_cache_options(
         &cfg,
         "in-memory data (numpy / pandas / pyarrow)",
-        "write it to one Parquet file and train on that path",
+        "write it to Parquet and train from the file",
     )?;
     let weights: Option<Vec<f32>> = weight
         .map(|w| w.as_slice().map(<[f32]>::to_vec))
@@ -4619,22 +4619,17 @@ fn train_file(
         .map_err(|e| PyValueError::new_err(format!("{e}")))?;
     let paths = resolved.paths.clone();
     let fmt = resolved.format.label();
-    match (fmt, paths.len()) {
-        ("parquet", 1) => {}
-        ("parquet", n) => reject_cache_options(
-            &cfg,
-            &format!("{n} Parquet files"),
-            "merge them into one file",
-        )?,
-        (other, n) => reject_cache_options(
+    if fmt != "parquet" {
+        let n = paths.len();
+        reject_cache_options(
             &cfg,
             &format!(
                 "{n} {} file{}",
-                other.to_uppercase(),
+                fmt.to_uppercase(),
                 if n == 1 { "" } else { "s" }
             ),
-            "convert the data to one Parquet file",
-        )?,
+            "convert the data to Parquet",
+        )?;
     }
     let path_disp = paths[0].display().to_string();
     let path = path_disp.as_str();
@@ -4950,15 +4945,55 @@ fn train_file(
     );
     // 一个入口同时吃单文件和多文件:调用方给的是**已经解析好的路径列表**,
     // 单文件只是 `len() == 1` 的退化情况,不需要第二条代码路径。
+    struct FileDataset {
+        source: Box<dyn BlockSource>,
+        labels: Vec<f32>,
+        weights: Option<Vec<f32>>,
+        feature_names: Vec<String>,
+    }
+
     let max_bin = cfg.params.max_bin;
     let ingest_quiet = cfg.quiet;
+    let cache_budget_bytes = cfg.cache_budget_bytes;
+    let persistent_cache_path = cfg.cache_path.as_ref().map(std::path::PathBuf::from);
     let open_paths = |ps: &[std::path::PathBuf],
                       targets: crate::source::Targets<'_>,
                       cuts: Option<crate::columns::BinCuts>,
                       first_csv_schema: Option<arrow::datatypes::SchemaRef>,
-                      width: csv_source::BlockWidth<'_>|
-     -> anyhow::Result<crate::source::parquet_source::Dataset> {
-        match fmt {
+                      width: csv_source::BlockWidth<'_>,
+                      cache_path: Option<std::path::PathBuf>|
+     -> anyhow::Result<FileDataset> {
+        let observe = |phase, readers, transforms| {
+            if !ingest_quiet {
+                eprintln!("INGEST_PLAN phase={phase} reader_slots={readers} transform_threads={transforms} inline_reader={} total_budget={ingest_threads}", readers == 1);
+            }
+        };
+        if fmt == "parquet" && (cache_budget_bytes.is_some() || cache_path.is_some()) {
+            let csv_source::BlockWidth::Fixed(cols) = width else {
+                anyhow::bail!("Parquet input takes its block width before open");
+            };
+            let (source, labels, weights, feature_names) =
+                parquet_source::open_many_with_cache_observed(
+                    ps,
+                    targets,
+                    cuts,
+                    max_bin,
+                    cols,
+                    QuantizedCacheOptions {
+                        budget_bytes: cache_budget_bytes,
+                        path: cache_path,
+                    },
+                    ingest_threads,
+                    observe,
+                )?;
+            return Ok(FileDataset {
+                source: Box::new(source),
+                labels,
+                weights,
+                feature_names,
+            });
+        }
+        let opened = match fmt {
             "parquet" => parquet_source::open_many_observed(
                 ps,
                 targets,
@@ -4973,11 +5008,7 @@ fn train_file(
                     }
                 },
                 ingest_threads,
-                |phase, readers, transforms| {
-                    if !ingest_quiet {
-                        eprintln!("INGEST_PLAN phase={phase} reader_slots={readers} transform_threads={transforms} inline_reader={} total_budget={ingest_threads}", readers == 1);
-                    }
-                },
+                observe,
             ),
             "csv" => csv_source::open_many_with_header_and_nthread_prepared(
                 ps,
@@ -4990,7 +5021,13 @@ fn train_file(
                 first_csv_schema,
             ),
             other => Err(anyhow::anyhow!("unknown format {other:?}")),
-        }
+        }?;
+        Ok(FileDataset {
+            source: Box::new(opened.source),
+            labels: opened.labels,
+            weights: opened.weights,
+            feature_names: opened.feature_names,
+        })
     };
     // 验证集同样接受多文件规格。
     // ⚠️ 验证集**按列名**绑定到训练集的特征(无表头 CSV 只能按位置):
@@ -4999,7 +5036,7 @@ fn train_file(
                      train_features: &[String],
                      cuts: Option<crate::columns::BinCuts>,
                      cols_per_block: usize|
-     -> anyhow::Result<crate::source::parquet_source::Dataset> {
+     -> anyhow::Result<FileDataset> {
         let r = crate::source::input::resolve(&[spec.to_string()])?;
         anyhow::ensure!(
             r.format == resolved.format,
@@ -5018,21 +5055,14 @@ fn train_file(
             cuts,
             None,
             csv_source::BlockWidth::Fixed(cols_per_block),
+            None,
         )
     };
 
     let device = cfg.device;
 
-    // Parquet 走**按需加载**:列块用时才读,读完就还回去。
-    // CSV 做不到 —— 文本格式没法只取某几列,只能全量量化后驻留。
-    // ⚠️ **单文件 parquet 保持原来的按需加载 / 量化缓存路径**(streaming、
-    // 部分列读、显存规划都挂在它上面);多文件落到下面的 Dataset 路径。
-    // `ParquetBlockSource` 从 path 到 cache manifest 都是单文件形状,
-    // 为多文件重构它不属于 v0.0.1 的范围。
-    // ⚠️ 代价要说清楚:多文件走的是量化后常驻内存的 `Dataset` 路径,
-    // 和单文件的按需加载不是同一条内存曲线。
-    // The cache options only exist on this path; other inputs were rejected
-    // right after resolve (`reject_cache_options`).
+    // Keep the existing single-file Parquet source and persistent cache format.
+    // The dataset path below also supports cache-backed multi-file Parquet.
     if fmt == "parquet" && paths.len() == 1 {
         let names = parquet_source::feature_names_of(&paths[0], targets).map_err(to_py_err)?;
         cfg.resolve_monotone(n_features, &names)?;
@@ -5076,7 +5106,7 @@ fn train_file(
         .map_err(to_py_err)?;
         refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &src, &mut train_cfg.params)?;
         // 权重是单独一列,不进量化缓存;每次 open 都从源文件读。
-        let read_weights = |p: &str| -> PyResult<Option<Vec<f32>>> {
+        let read_weights = |p: &std::path::Path| -> PyResult<Option<Vec<f32>>> {
             let Some(w) = targets.weight else {
                 return Ok(None);
             };
@@ -5085,10 +5115,10 @@ fn train_file(
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             Ok(Some(values))
         };
-        let weights = read_weights(path)?;
+        let weights = read_weights(&paths[0])?;
         // Ranking: the query-id column gives the groups; the weight column must hold
         // one weight per group (repeated on its rows).
-        let read_qid = |p: &str| -> PyResult<Option<Vec<u64>>> {
+        let read_qid = |p: &std::path::Path| -> PyResult<Option<Vec<u64>>> {
             let Some(q) = targets.qid else {
                 return Ok(None);
             };
@@ -5118,23 +5148,58 @@ fn train_file(
             for item in list.iter() {
                 let (p, name): (String, String) = item.extract()?;
                 eval_paths.push(p.clone());
-                // 验证集继承**预算**但绝不继承 **cache_path**:它的量化
-                // 结果和训练集不同,共用一个目录会互相覆盖(而且下次复用
-                // 时校验会直接报错)。给它自己的路径要用户显式指定。
-                let d = ParquetBlockSource::with_cuts_and_cache_and_nthread(
-                    &p,
-                    targets.with_features(&names),
-                    src.cuts().clone(),
-                    cfg.params.cols_per_block,
-                    QuantizedCacheOptions {
-                        budget_bytes: cfg.cache_budget_bytes,
-                        path: None,
-                    },
-                    ingest_threads,
-                )
-                .map_err(to_py_err)?;
-                let ew = read_weights(&p)?;
-                let (ew, egp) = group_inputs(read_qid(&p)?, ew)?;
+                // Validation reuses training cuts and the budget, with its own
+                // temporary cache. Single-file inputs retain their existing path.
+                let spec =
+                    crate::source::input::resolve(std::slice::from_ref(&p)).map_err(to_py_err)?;
+                if spec.format != resolved.format {
+                    return Err(PyValueError::new_err(format!(
+                        "validation set format ({}) differs from the training set ({})",
+                        spec.format.label(),
+                        fmt
+                    )));
+                }
+                let (mut d, ids) = if spec.paths.len() == 1 {
+                    let path = &spec.paths[0];
+                    let (source, labels) = ParquetBlockSource::with_cuts_and_cache_and_nthread(
+                        path,
+                        targets.with_features(&names),
+                        src.cuts().clone(),
+                        cfg.params.cols_per_block,
+                        QuantizedCacheOptions {
+                            budget_bytes: cache_budget_bytes,
+                            path: None,
+                        },
+                        ingest_threads,
+                    )
+                    .map_err(to_py_err)?;
+                    (
+                        FileDataset {
+                            source: Box::new(source),
+                            labels,
+                            weights: read_weights(path)?,
+                            feature_names: names.clone(),
+                        },
+                        read_qid(path)?,
+                    )
+                } else {
+                    let data = open_paths(
+                        &spec.paths,
+                        targets.with_features(&names),
+                        Some(src.cuts().clone()),
+                        None,
+                        csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+                        None,
+                    )
+                    .map_err(to_py_err)?;
+                    let ids = targets
+                        .qid
+                        .map(|q| parquet_source::read_u64_columns(&spec.paths, q))
+                        .transpose()
+                        .map_err(to_py_err)?;
+                    (data, ids)
+                };
+                let (ew, egp) = group_inputs(ids, d.weights.take())?;
                 eval_data.push((name, d, ew, egp));
             }
         }
@@ -5150,7 +5215,8 @@ fn train_file(
             }
             train_cfg.label_upper_bound = Some(upper);
         }
-        for (i, (name, (_, labels), _, _)) in eval_data.iter().enumerate() {
+        for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
+            let labels = &d.labels;
             if let Some(upper_name) = label_upper_owned.as_deref() {
                 let eval_resolved =
                     crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
@@ -5179,7 +5245,7 @@ fn train_file(
             k_out,
             "training set",
         )?;
-        for (i, (name, (_, l), _, _)) in eval_data.iter().enumerate() {
+        for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
             let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
                 .map_err(|e| PyValueError::new_err(format!("{e}")))?;
             train_cfg.eval_base_margins.push(margin::dataset_margin(
@@ -5187,17 +5253,17 @@ fn train_file(
                 &eval_resolved,
                 &margin_names,
                 header,
-                l.len(),
+                d.labels.len(),
                 k_out,
                 &format!("eval set {name:?}"),
             )?);
         }
         let evals_ref: Vec<EvalSet> = eval_data
             .iter()
-            .map(|(name, (s, l), w, gp)| EvalSet {
+            .map(|(name, d, w, gp)| EvalSet {
                 name: name.clone(),
-                source: s,
-                labels: l,
+                source: d.source.as_ref(),
+                labels: &d.labels,
                 weights: w.as_deref(),
                 group_ptr: gp.as_deref(),
             })
@@ -5307,6 +5373,7 @@ fn train_file(
             None,
             csv_preflight.clone(),
             csv_source::BlockWidth::FromRowCount(&mut choose),
+            None,
         );
         if let Some(e) = plan_err {
             return Err(e);
@@ -5324,6 +5391,7 @@ fn train_file(
             None,
             csv_preflight.clone(),
             csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+            persistent_cache_path,
         )
         .map_err(to_py_err)?
     };
@@ -5336,7 +5404,7 @@ fn train_file(
     }
     {
         let mut params = cfg.params.clone();
-        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, &ds.source, &mut params)?;
+        refine_gpu_plan_for_source(&cfg, user_gpu, n_features, ds.source.as_ref(), &mut params)?;
         cfg.params = params;
     }
     cfg.resolve_monotone(n_features, &ds.feature_names)?;
@@ -5445,7 +5513,7 @@ fn train_file(
         .iter()
         .map(|(name, d, w, gp)| EvalSet {
             name: name.clone(),
-            source: &d.source,
+            source: d.source.as_ref(),
             labels: &d.labels,
             weights: w.as_deref(),
             group_ptr: gp.as_deref(),
@@ -5468,7 +5536,7 @@ fn train_file(
             #[cfg(feature = "cuda")]
             Some(ord) => crate::train::train_gpu_weighted(
                 ord,
-                &ds.source,
+                ds.source.as_ref(),
                 &ds.labels,
                 ds_weights.as_deref(),
                 &evals_ref,
@@ -5479,7 +5547,7 @@ fn train_file(
             #[cfg(not(feature = "cuda"))]
             Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
             None => train_weighted(
-                &ds.source,
+                ds.source.as_ref(),
                 &ds.labels,
                 ds_weights.as_deref(),
                 &evals_ref,

@@ -1,9 +1,8 @@
-"""`cache_path` / `cache_budget_bytes` on every input kind.
+"""`cache_path` / `cache_budget_bytes` on supported file and memory inputs.
 
-The quantized column cache is built only by single-file Parquet training.
-Every other input used to ignore the two options silently; it now raises a
-ValueError that names the input and the way out. Where the cache works, a
-second run must reuse it (files untouched) and give the same model.
+Parquet training supports the quantized cache, including multiple files. Other
+input kinds must reject cache options clearly. Reuse must leave cache files
+untouched and produce the same model.
 """
 import numpy as np
 import pytest
@@ -73,28 +72,14 @@ CACHE_OPTIONS = [
 ]
 
 
-# ------------------------------------------------------------- raising inputs
-@pytest.mark.parametrize("name,opts", CACHE_OPTIONS)
-def test_several_parquet_files_raise(tmp_path, name, opts):
+# ------------------------------------------------------------- unsupported inputs
+def test_both_options_are_named_for_unsupported_csv(tmp_path):
     x, y = data()
-    parts = write_parts(tmp_path / "parts", x, y)
-    p = {**BASE, **opts(tmp_path)}
-    for spec in (parts, str(tmp_path / "parts"), str(tmp_path / "parts" / "*.parquet")):
-        with pytest.raises(ValueError, match=rf"{name} supports a single Parquet file; "
-                                             r"got 3 Parquet files .* merge them into one file "
-                                             rf"or drop {name}"):
-            fb.train(p, spec, label="target", num_boost_round=2, quiet=True)
-    assert not (tmp_path / "cache").exists()
-
-
-def test_both_options_are_named(tmp_path):
-    x, y = data()
-    parts = write_parts(tmp_path / "parts", x, y, n_parts=2)
+    path = write_csv(tmp_path / "one.csv", x, y)
     p = {**BASE, "cache_path": str(tmp_path / "cache"), "cache_budget_bytes": 0}
-    with pytest.raises(ValueError, match=r"cache_path and cache_budget_bytes support a single "
-                                         r"Parquet file; got 2 Parquet files .* "
-                                         r"drop cache_path / cache_budget_bytes"):
-        fb.train(p, parts, label="target", num_boost_round=2, quiet=True)
+    with pytest.raises(ValueError, match=r"cache_path and cache_budget_bytes support Parquet input; "
+                                         r"got 1 CSV file .* drop cache_path / cache_budget_bytes"):
+        fb.train(p, path, label="target", num_boost_round=2, quiet=True)
 
 
 @pytest.mark.parametrize("name,opts", CACHE_OPTIONS)
@@ -107,8 +92,7 @@ def test_csv_raises(tmp_path, name, opts):
     for spec, kw, got in ((one, {"label": "target"}, "1 CSV file"),
                           (two, {"label": "target"}, "2 CSV files"),
                           (bare, {"label": x.shape[1], "header": False}, "1 CSV file")):
-        with pytest.raises(ValueError, match=rf"{name} supports a single Parquet file; got {got} "
-                                             r".* convert the data to one Parquet file"):
+        with pytest.raises(ValueError, match=rf"{name} supports Parquet input; got {got} "):
             fb.train(p, spec, num_boost_round=2, quiet=True, **kw)
     assert not (tmp_path / "cache").exists()
 
@@ -131,8 +115,7 @@ def _in_memory_inputs(x):
 def test_in_memory_input_raises(tmp_path, name, opts, kind):
     x, y = data()
     p = {**BASE, **opts(tmp_path)}
-    with pytest.raises(ValueError, match=rf"{name} supports a single Parquet file; got in-memory "
-                                         r"data .* write it to one Parquet file"):
+    with pytest.raises(ValueError, match=rf"{name} supports Parquet input; got in-memory data"):
         fb.train(p, _in_memory_inputs(x)[kind], label=y, num_boost_round=2, quiet=True)
     assert not (tmp_path / "cache").exists()
 
@@ -140,18 +123,24 @@ def test_in_memory_input_raises(tmp_path, name, opts, kind):
 def test_in_memory_continuation_raises(tmp_path):
     x, y = data()
     prior = fb.train(BASE, x, label=y, num_boost_round=2, quiet=True)
-    with pytest.raises(ValueError, match="cache_path supports a single Parquet file"):
+    with pytest.raises(ValueError, match="cache_path supports Parquet input"):
         fb.train({**BASE, "cache_path": str(tmp_path / "cache")}, x, label=y,
                  num_boost_round=2, init_model=prior, quiet=True)
 
 
-def test_several_parquet_files_continuation_raises(tmp_path):
+def test_several_parquet_files_continuation_matches_uninterrupted(tmp_path):
     x, y = data()
     parts = write_parts(tmp_path / "parts", x, y)
+    uninterrupted = fb.train(BASE, parts, label="target", num_boost_round=4, quiet=True)
     prior = fb.train(BASE, parts, label="target", num_boost_round=2, quiet=True)
-    with pytest.raises(ValueError, match="got 3 Parquet files"):
-        fb.train({**BASE, "cache_path": str(tmp_path / "cache")}, parts, label="target",
-                 num_boost_round=2, init_model=prior, quiet=True)
+    cached_prior = fb.train({**BASE, "cache_path": str(tmp_path / "cache"),
+                             "cache_budget_bytes": 0}, parts, label="target",
+                            num_boost_round=2, quiet=True)
+    continued = fb.train({**BASE, "cache_path": str(tmp_path / "cache"),
+                          "cache_budget_bytes": 0}, parts, label="target",
+                         num_boost_round=2, init_model=cached_prior, quiet=True)
+    assert margins(continued, x) == margins(uninterrupted, x)
+    assert margins(prior, x) == margins(cached_prior, x)
 
 
 def test_sklearn_has_no_cache_options():
@@ -260,12 +249,20 @@ def test_single_parquet_file_reuses_on_gpu(tmp_path):
 
 
 @cuda
-def test_gpu_rejects_unsupported_input_too(tmp_path):
+@pytest.mark.parametrize("mode", ["exact", "fast"])
+def test_gpu_multi_file_cache_matches_eager(tmp_path, mode):
     x, y = data()
     parts = write_parts(tmp_path / "parts", x, y)
-    with pytest.raises(ValueError, match="got 3 Parquet files"):
-        fb.train({**BASE, "device": "cuda", "cache_path": str(tmp_path / "cache")}, parts,
-                 label="target", num_boost_round=2, quiet=True)
+    params = {**BASE, "device": "cuda", "gpu_math": mode, "cols_per_block": 2}
+    eager = fb.train(params, parts, label="target", num_boost_round=2, quiet=True)
+    cached = fb.train({**params, "cache_path": str(tmp_path / "cache")}, parts,
+                      label="target", num_boost_round=2, quiet=True)
+    assert margins(cached, x) == margins(eager, x)
+
+
+@cuda
+def test_gpu_rejects_unsupported_input_too(tmp_path):
+    x, y = data()
     with pytest.raises(ValueError, match="got in-memory data"):
         fb.train({**BASE, "device": "cuda", "cache_path": str(tmp_path / "cache")}, x,
                  label=y, num_boost_round=2, quiet=True)

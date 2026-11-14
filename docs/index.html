@@ -56,6 +56,10 @@
           <p>The planner selects full residency, hybrid caching, or streaming execution based on the workload and available VRAM.</p>
         </article>
         <article>
+          <h3>Multi-file Parquet cache</h3>
+          <p>Parquet file lists, directories, and globs support a feature-block cache budget and persistent cache reuse. Zero forces disk spill. The budget covers quantized feature blocks, not total process memory or GPU residency; CSV and in-memory arrays remain on their existing paths.</p>
+        </article>
+        <article>
           <h3>Deterministic modes</h3>
           <p><code>gpu_math="exact"</code> produces byte-identical CPU/GPU models. Fast mode remains deterministic.</p>
         </article>
@@ -88,6 +92,7 @@ model = fb.train(
 )
 
 prediction = model.predict("test.parquet")</code></pre>
+      <p>For lists, directories, or globs of Parquet files, set <code>cache_budget_bytes</code> to bound the in-memory quantized feature-block cache, or set it to <code>0</code> to force spill. <code>cache_path</code> persists and reuses the training cache. Validation reuses the training cuts without using that cache path. The budget does not cap total process RAM or GPU memory. Without these options, multi-file Parquet uses the in-memory route; CSV and in-memory arrays do not support these cache options.</p>
     </section>
 
     <section>
@@ -98,6 +103,13 @@ prediction = model.predict("test.parquet")</code></pre>
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
+      <h3>0.1.0 candidate</h3>
+      <ul>
+        <li>Added cache budget and persistent cache reuse for lists, directories, and globs of Parquet training data.</li>
+        <li>Extended batch custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast. Rust applies row or query weights.</li>
+        <li>Added built-in and named Python prediction links for custom-objective models. Rebind named callbacks after loading or continuing a model.</li>
+        <li>Reduced temporary work in Parquet quantization and single-worker model I/O.</li>
+      </ul>
       <h3>0.0.9</h3>
       <p>FerrisBoost 0.0.9 adds the features below.</p>
       <ul>

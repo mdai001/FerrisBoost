@@ -147,8 +147,8 @@ def train(
     pass the same `missing` to Model.predict / predict_to_parquet. A quantized
     cache_path is only reused with the same `missing`.
 
-    params["cache_path"] and params["cache_budget_bytes"] apply only to training
-    on a single Parquet file; several files, CSV and in-memory data raise
-    ValueError instead of ignoring them.
+    params["cache_path"] and params["cache_budget_bytes"] apply to training
+    from one or more Parquet files. CSV and in-memory data raise ValueError
+    when either option is set.
     """
     ...

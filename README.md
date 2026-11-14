@@ -17,7 +17,8 @@ affiliated with or endorsed by the XGBoost project or its maintainers.
 In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not by GPU compute kernels, but by host-memory overhead, data ingest, and rigid memory limits. FerrisBoost focuses on reducing ingest, memory, and execution overhead in large tabular workflows:
 
 - **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–4× faster** while cutting peak host RAM by **2–3×** (`0.29–0.47× XGBoost`).
-- **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the rest from the quantized cache every level (hybrid), down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans. On the host, the quantized Parquet cache spills to local disk beyond `cache_budget_bytes`.
+- **Memory-bounded multi-file Parquet training**: Lists, directories, and globs of Parquet files can use `cache_budget_bytes` to bound the in-memory quantized feature-block cache; excess blocks spill to local disk, and zero forces spill. `cache_path` persists and reuses the quantized training cache across processes. This budget covers feature blocks, not total process RSS or GPU residency. Multi-file Parquet without these options continues to use the ordinary in-memory quantized route.
+- **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the rest from the quantized cache every level (hybrid), down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU training**: Training targets one selected GPU per job (`device="cuda"` or `device="cuda:N"`). Multi-GPU support is future 1.0 work.
@@ -154,6 +155,27 @@ model = fb.train(
 prediction = model.predict(["test_part_0.parquet", "test_part_1.parquet"])
 ```
 
+For multi-file Parquet training, optionally bound and persist the quantized
+feature-block cache:
+
+```python
+model = fb.train(
+    {
+        "objective": "reg:squarederror",
+        "cache_budget_bytes": 0,       # force feature blocks to spill
+        "cache_path": "./train-cache", # reuse across matching training calls
+    },
+    "data/partitions/",
+    label="target",
+    num_boost_round=200,
+)
+```
+
+Validation reuses the training cuts without using the training cache path.
+The feature-block budget does not cap total process RAM or GPU memory. Without
+these options, multi-file Parquet uses the ordinary in-memory quantization
+route. CSV and in-memory arrays do not support these cache options.
+
 CSV files with no header use positional column indices:
 
 ```python
@@ -249,11 +271,12 @@ logging, and the complete parameter reference.
 
 See the [Python API How-To](documents/howto.md) for details.
 
-### Unreleased development
+### 0.1.0 candidate
 
-- Extending Python custom objectives with `kind="multiclass"` and `kind="ranking"`. Multiclass callbacks receive an `(n_rows, n_classes)` raw-margin array and return same-shaped gradient and diagonal-Hessian arrays. Ranking callbacks receive raw margins, labels, and query `group_ptr`; Rust applies each query weight to its rows. Ranking uses the built-in `rank:*` objective metadata and does not support built-in unbiased position correction.
-- Adding shape-preserving prediction links to custom-objective models: built-ins `identity`, `sigmoid`, `exp`, and `softmax`, or a named Python callback. Raw-margin prediction and SHAP remain in margin space. Built-in links are saved with the model; named callbacks are runtime bindings and must be rebound to a loaded model using the exact stored name.
-- Gradient callbacks run in Python once per boosting round while Rust validates derivatives, applies weights, and builds trees. Named prediction callbacks run in Python once per prediction batch; tree accumulation and native prediction work stay in Rust.
+- Added cache budgets and persistent cache reuse for lists, directories, and globs of Parquet training files. A zero budget forces quantized feature blocks to disk. Validation shares the training cuts and uses its own temporary cache or in-memory blocks.
+- Extended Python custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast, with one batch callback per boosting round. Rust validates derivatives, applies row or query weights, and builds the trees.
+- Added prediction links for custom-objective models. The model stores built-in links or the name of a shape-preserving Python callback. Rebind named callbacks after loading or continuing the model. Raw-margin predictions and SHAP values are unchanged.
+- Reduced temporary work in Parquet quantization and single-worker model I/O.
 
 ### 0.0.9
 

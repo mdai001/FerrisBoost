@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,7 @@ def main() -> None:
         assert not str(Path(fb.__file__).resolve()).startswith(
             str(Path(args.forbid_import_prefix).resolve())
         ), fb.__file__
-    assert fb.__version__ == "0.0.9"
+    assert fb.__version__ == os.environ.get("FB_EXPECT_VERSION", "0.1.0")
 
     rng = np.random.default_rng(7)
     x = rng.integers(0, 20, size=(120, 4)).astype(np.float32)

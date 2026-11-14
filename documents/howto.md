@@ -5,8 +5,9 @@ PyArrow, Parquet, and CSV training inputs. Its parameter names and JSON model
 format are designed to be familiar to XGBoost users, but FerrisBoost does not
 use a `DMatrix` object.
 
-This guide documents the FerrisBoost 0.0.9 Python API. Sections marked
-**0.0.9** describe behavior introduced in this version. Select one GPU with
+This guide documents the FerrisBoost 0.1.0 candidate Python API. Sections marked
+**0.0.9** describe behavior introduced in that historical release. Select one
+GPU with
 `device="cuda"` or `device="cuda:N"`; multi-GPU support is future 1.0 work.
 
 ## Choose the input form
@@ -634,11 +635,18 @@ weight/group support explicitly when the metric needs it.
 
 ## Custom objectives
 
-Available in 0.0.9. A custom objective supplies an
-unweighted gradient and Hessian for each row. Pass a descriptor through
-`custom_objective`; `objective="reg:squarederror"` is required alongside it
-to define identity-link prediction and the default evaluation metric. The `fb.train` default remains
-`binary:logistic`.
+Pass an `fb.CustomObjective` descriptor through `custom_objective`. The
+descriptor kind must match the training objective:
+
+| Kind | Training objective | Callback arguments |
+|---|---|---|
+| `scalar` (default) | `reg:squarederror` | `(raw_margin, labels)` |
+| `multiclass` | `multi:softprob` or `multi:softmax` | `(raw_margin, labels)` |
+| `ranking` | `rank:ndcg`, `rank:pairwise`, or `rank:map` | `(raw_margin, labels, group_ptr)` |
+
+The training API supports all three kinds on CPU and on a single CUDA device
+with `gpu_math="exact"` or `gpu_math="fast"`. Custom objectives require
+`scale_pos_weight=1`.
 
 ```python
 def squared_error(raw_margin, labels):
@@ -663,27 +671,17 @@ The custom objective uses the shared Newton leaf rules. Its default starting
 margin is `0` (set `base_score` to override it), predictions use the identity
 link, and its default metric is RMSE.
 
-Python runs the callback once per boosting round for all training rows
-together; callback code is not compiled. The native extension point is the public Rust
-`ferrisboost::custom_objective::CustomObjective` trait, whose `gradients` method fills a
-`GradPair` slice. The Python adapter implements that same contract. Support is
-limited to `reg:squarederror` on CPU and CUDA with `gpu_math="exact"`; other
-named objectives, fast GPU math, and `scale_pos_weight` values other than `1`
-are rejected.
+The native extension point is the Rust
+`ferrisboost::custom_objective::CustomObjective` trait. Its scalar `gradients`
+method fills a `GradPair` slice. Grouped methods provide the equivalent
+contract for multiclass and ranking.
 
-Model JSON stores the custom objective name, not callback code. Loaded models
-can predict without the callback. Continuing training with `init_model`
+Model JSON stores the custom objective name, not callback code. The objective callback is needed for training. It is not used during prediction. Continuing training with `init_model`
 requires passing a custom objective descriptor with the same name again; the
 name does not verify that its callback code is equivalent, which is the user's
 responsibility.
 
-### Next version development: grouped objectives and prediction links (unreleased)
-
-The following API is under development and is not part of the documented 0.0.9
-release. `CustomObjective` accepts `kind="scalar"` (the existing default),
-`kind="multiclass"`, or `kind="ranking"`. The objective metadata must match:
-scalar regression uses `reg:squarederror`, multiclass uses
-`multi:softprob` / `multi:softmax`, and ranking uses a `rank:*` objective.
+### Multiclass and ranking callbacks
 
 For multiclass, the callback is called once per boosting round with owned,
 C-contiguous `float32` arrays: raw margins shaped `(n_rows, n_classes)` and
@@ -705,7 +703,9 @@ Training callbacks run in Python once per boosting round. Native validation,
 sampling, tree construction, and margin accumulation remain in Rust. Callback
 code is not compiled into the tree-building path.
 
-Custom-objective models can attach a shape-preserving prediction transform:
+### Prediction links
+
+Custom-objective models can attach a shape-preserving prediction transform.
 
 ```python
 model.set_prediction_link("sigmoid")  # built-ins: identity, sigmoid, exp, softmax
@@ -724,8 +724,8 @@ tree accumulation always uses raw margins. Built-in link names are stored in
 model JSON. A named Python callable is not serialized: after loading a model,
 bind the callback again with the exact stored name using
 `set_prediction_link(name, callback=fn)`. Continuation carries link metadata;
-a named callback must be rebound on the returned model. This API is limited to
-custom-objective models.
+a named callback must be rebound on the returned model. Transformed prediction
+raises an error until the named callback is bound.
 
 ## Sample weights
 
@@ -1778,10 +1778,13 @@ individual column blocks efficiently, so it is fully quantized in memory.
 ## Control the Parquet quantized cache
 
 Cache settings belong in the parameter dictionary.
+In the 0.1.0 candidate, the cache options also support multi-file Parquet
+training supplied as a list, directory, or glob.
 
-`cache_budget_bytes` limits how much quantized feature data may remain in
-memory (one byte per value, two for features with more than 255 bins or
-categorical codes above 253). Data beyond the budget spills to local files:
+`cache_budget_bytes` limits how much quantized feature-block data may remain
+in memory (one byte per value, two for features with more than 255 bins or
+categorical codes above 253). Supported list, directory, and glob inputs can
+spill excess blocks to local files:
 
 ```python
 model = fb.train(
@@ -1795,7 +1798,7 @@ model = fb.train(
 )
 ```
 
-Use zero to force the quantized cache to spill:
+Use zero to force quantized feature blocks to spill:
 
 ```python
 params = {
@@ -1804,8 +1807,10 @@ params = {
 }
 ```
 
-When the parameter is omitted, FerrisBoost uses half of Linux
-`MemAvailable`, with a 4 GiB fallback if that value cannot be read.
+When the parameter is omitted, ordinary multi-file Parquet training stays on
+the in-memory quantization route. For supported cache-enabled inputs, the
+automatic budget is half of Linux `MemAvailable`, with a 4 GiB fallback if
+that value cannot be read.
 
 Use `cache_path` to persist and reuse the quantized training cache across
 processes:
@@ -1822,25 +1827,32 @@ first = fb.train(params, "train.parquet", label="target", num_boost_round=100)
 second = fb.train(params, "train.parquet", label="target", num_boost_round=100)
 ```
 
-The second call can reuse cuts and quantized blocks. Cache metadata is checked;
+The second call can reuse cuts and quantized blocks. This works for a single
+Parquet file and for multiple Parquet files supplied as a list, directory, or
+glob. Cache metadata is checked;
 incompatible settings such as a different `max_bin`, `missing`, or set of
 categorical features (from `feature_types` or dictionary columns) are rejected
 rather than silently reused.
 
-`cache_path` applies only to the training set. Validation sets reuse the
-training cuts but do not share the training cache directory.
+The budget applies to the in-memory quantized feature-block cache. It does not
+cap total process RSS, which also includes runtime, metadata, and other
+temporary allocations, and it does not control GPU residency or VRAM use.
 
-Which inputs use the cache:
+`cache_path` applies only to the training data. Validation inputs reuse the
+training cuts and do not read from or write to the training cache directory.
+
+Which inputs support these options:
 
 | Training input | `cache_path` / `cache_budget_bytes` |
 |---|---|
 | One Parquet file (also a directory or glob that matches exactly one file), CPU or GPU, with or without validation sets or `init_model` | Supported |
-| Several Parquet files (a list, directory, or glob) | `ValueError`: merge them into one file or drop the option |
-| CSV (one or several files, with or without a header) | `ValueError`: convert the data to one Parquet file or drop the option |
-| numpy, pandas, PyArrow `Table` / `RecordBatch` / `RecordBatchReader` | `ValueError`: write the data to one Parquet file or drop the option |
+| Several Parquet files (a list, directory, or glob) | Supported; excess feature blocks spill beyond the budget |
+| CSV (one or several files, with or without a header) | Unsupported; CSV is quantized in memory |
+| numpy, pandas, PyArrow `Table` / `RecordBatch` / `RecordBatchReader` | Unsupported; these inputs are already in memory |
 
 The scikit-learn estimators train on in-memory data and do not take these
-options. Several Parquet files and CSV are quantized once and held in memory.
+options. Multi-file Parquet with no cache options and CSV are quantized once
+and held in memory.
 
 ## Train from PyArrow
 
@@ -2254,7 +2266,7 @@ empty `evals_result()`.
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
 | `aft_loss_distribution` | `"normal"` | AFT noise distribution: `"normal"`, `"logistic"`, or `"extreme"` |
 | `aft_loss_distribution_scale` | `1.0` | Positive finite AFT distribution scale |
-| `custom_objective` | `None` | 0.0.9: an `fb.CustomObjective` descriptor; requires `objective="reg:squarederror"`. See [Custom objectives](#custom-objectives) |
+| `custom_objective` | `None` | An `fb.CustomObjective` descriptor for scalar regression, multiclass, or ranking. See [Custom objectives](#custom-objectives) |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
 | `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 2 bytes per value instead of 1 (CPU and GPU) |
 | `eta` | `0.3` | Alias: `learning_rate` |
@@ -2285,8 +2297,8 @@ empty `evals_result()`.
 | `interaction_constraints` | `None` | 0.0.9: allowed feature groups by index or name |
 | `seed` | `0` | Alias: `random_state` |
 | `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic` and `reg:logistic`, a raw margin for `binary:logitraw` and `binary:hinge`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
-| `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
-| `cache_path` | `None` | Persistent Parquet cache directory; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
+| `cache_budget_bytes` | automatic | Quantized Parquet feature-block cache budget; supports lists, directories, and globs; zero forces spill. Does not bound total RSS or GPU memory (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
+| `cache_path` | `None` | Persistent quantized training cache directory for single or multi-file Parquet; validation reuses cuts without using this directory (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
 | `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 | `missing` | `NaN` | Feature value treated exactly like `NaN` (XGBoost's `DMatrix` `missing`), in training, validation, and prediction. Finite `float32` or `NaN`; `inf` and `float32` max are rejected. Not stored in the model: pass the same `missing` to `predict`. See [Missing values](#missing-values-and-the-missing-sentinel) |
@@ -2462,12 +2474,12 @@ matrix there.
 when `end` is beyond the model's rounds, when `begin > end`, or when `n_trees`
 is also given.
 
-### `cache_path` supports a single Parquet file
+### Cache options are rejected for CSV or in-memory input
 
-The quantized cache is built only when training on one Parquet file. With
-several Parquet files, CSV, or in-memory data, `cache_path` and
-`cache_budget_bytes` would have no effect, so they raise instead of being
-ignored. Merge the files into one Parquet file, or drop the option.
+`cache_path` and `cache_budget_bytes` support Parquet file inputs, including
+lists of files, directories, and globs. They remain unsupported for CSV and
+in-memory NumPy, pandas, and PyArrow data. Use Parquet for these cache options,
+or omit them for those input types.
 
 ### A persistent cache is rejected with a `missing` message
 

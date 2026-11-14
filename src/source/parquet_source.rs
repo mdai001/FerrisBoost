@@ -862,6 +862,225 @@ fn dataset_reader(
     ))
 }
 
+/// Native lazy multi-file source with optional in-memory budget or persistent
+/// cache. The existing eager `open_many` route remains unchanged.
+pub(crate) fn open_many_with_cache_observed<'a>(
+    paths: &[PathBuf],
+    targets: impl Into<Targets<'a>>,
+    cuts: Option<BinCuts>,
+    max_bins: u32,
+    cols_per_block: usize,
+    options: QuantizedCacheOptions,
+    nthread: usize,
+    mut observe: impl FnMut(&'static str, usize, usize),
+) -> anyhow::Result<(ParquetBlockSource, Vec<f32>, Option<Vec<f32>>, Vec<String>)> {
+    anyhow::ensure!(!paths.is_empty(), "no input files");
+    let targets = targets.into();
+    let (first_cols, feature_names) = feature_columns(&paths[0], targets)?;
+    let mut file_cols = vec![first_cols];
+    let mut label_cols = vec![column_index(&paths[0], targets.label)?];
+    let mut weight_cols = targets
+        .weight
+        .map(|w| column_index(&paths[0], w).map(|c| vec![c]))
+        .transpose()?
+        .unwrap_or_default();
+    for path in &paths[1..] {
+        let (cols, names) = feature_columns(path, targets)?;
+        crate::ensure_input!(
+            names.len() == feature_names.len(),
+            "schemas differ across files: {} has {} feature columns, {} has {}",
+            paths[0].display(),
+            feature_names.len(),
+            path.display(),
+            names.len()
+        );
+        let mut mapped = Vec::with_capacity(feature_names.len());
+        for name in &feature_names {
+            let at = names.iter().position(|n| n == name).ok_or_else(|| {
+                crate::input_err!(
+                    "schemas differ across files: {} has no feature column {name:?}",
+                    path.display()
+                )
+            })?;
+            mapped.push(cols[at]);
+        }
+        file_cols.push(mapped);
+        label_cols.push(column_index(path, targets.label)?);
+        if let Some(weight) = targets.weight {
+            weight_cols.push(column_index(path, weight)?);
+        }
+    }
+
+    let mut n_rows = 0usize;
+    let mut max_batches = 0usize;
+    for path in paths {
+        let rows = usize::try_from(peek_n_rows(path)?)
+            .map_err(|_| anyhow::anyhow!("Parquet rows exceed usize"))?;
+        n_rows = n_rows
+            .checked_add(rows)
+            .ok_or_else(|| anyhow::anyhow!("row count overflows usize"))?;
+        max_batches = max_batches.max(rows.div_ceil(BATCH_SIZE));
+    }
+    let cuts_plan = crate::source::parquet_pipeline_threads(
+        nthread,
+        paths.len(),
+        max_batches,
+        feature_names.len(),
+        feature_names.len(),
+    );
+    let bins_plan = crate::source::parquet_pipeline_threads(
+        nthread,
+        paths.len(),
+        max_batches,
+        feature_names.len().div_ceil(cols_per_block.max(1)),
+        feature_names.len(),
+    );
+    if cuts.is_none() {
+        observe("cuts", cuts_plan.0, cuts_plan.1);
+    }
+    observe("bins", bins_plan.0, bins_plan.1);
+
+    if let Some(cache_path) = options.path.as_ref() {
+        if cache_path.join("manifest.json").exists() {
+            let (source, labels, weights) = ParquetBlockSource::reuse_many_cache(
+                paths,
+                &file_cols,
+                &label_cols,
+                &weight_cols,
+                targets,
+                max_bins,
+                cols_per_block,
+                cache_path,
+                cuts.as_ref(),
+            )?;
+            return Ok((source, labels, weights, feature_names));
+        }
+        crate::ensure_input!(
+            !cache_path.exists() || std::fs::read_dir(cache_path)?.next().is_none(),
+            "cache path {} exists and is not a valid ferrisboost cache",
+            cache_path.display()
+        );
+    }
+
+    let initial = if options.path.is_some() {
+        file_identities(paths)?
+    } else {
+        Vec::new()
+    };
+    let cuts = match cuts {
+        Some(cuts) => cuts,
+        None if targets.weight.is_some() => {
+            let projections: Vec<Vec<usize>> = file_cols
+                .iter()
+                .zip(&weight_cols)
+                .map(|(f, &w)| {
+                    let mut p = f.clone();
+                    p.push(w);
+                    p
+                })
+                .collect();
+            crate::source::arrow_source::build_cuts_and_count_typed(
+                dataset_reader(paths.to_vec(), projections, BATCH_SIZE, cuts_plan.0),
+                max_bins as usize,
+                cuts_plan.1,
+                true,
+                targets.categorical.unwrap_or(&[]),
+                targets.missing,
+                targets.categories,
+            )?
+            .0
+        }
+        None => {
+            crate::source::arrow_source::build_cuts_and_count_typed(
+                dataset_reader(paths.to_vec(), file_cols.clone(), BATCH_SIZE, cuts_plan.0),
+                max_bins as usize,
+                cuts_plan.1,
+                false,
+                targets.categorical.unwrap_or(&[]),
+                targets.missing,
+                targets.categories,
+            )?
+            .0
+        }
+    };
+    let (labels, weights) = read_many_labels_weights(paths, &label_cols, &weight_cols, targets)?;
+    crate::ensure_input!(
+        cuts.n_feats() == feature_names.len(),
+        "cuts and Parquet features have different widths"
+    );
+    crate::ensure_input!(
+        labels.len() == n_rows && weights.as_ref().is_none_or(|w| w.len() == n_rows),
+        "Parquet label or weight row count differs from the source"
+    );
+    cuts.check_widths()?;
+    let groups = crate::columns::partition_features_by_width(&cuts.widths(), cols_per_block);
+    let cache_bytes = quantized_bytes(&cuts, n_rows)?;
+    let mut source = ParquetBlockSource {
+        path: paths[0].clone(),
+        source_paths: Some(paths.to_vec()),
+        cuts,
+        groups,
+        file_col: file_cols[0].clone(),
+        multi_file_cols: Some(file_cols),
+        n_rows,
+        n_features: feature_names.len(),
+        cache: QuantizedCache::Memory(Vec::new()),
+        cache_bytes,
+        cache_reads: AtomicUsize::new(0),
+        source_bytes: std::sync::atomic::AtomicU64::new(0),
+        parquet_loads: AtomicUsize::new(0),
+        missing: targets.missing,
+    };
+    crate::source::openprof::shape(source.n_rows, source.n_features, source.groups.len());
+    source.build_cache(
+        targets,
+        max_bins,
+        cols_per_block,
+        options,
+        nthread,
+        &initial,
+    )?;
+    Ok((source, labels, weights, feature_names))
+}
+
+fn read_many_labels_weights(
+    paths: &[PathBuf],
+    label_cols: &[usize],
+    weight_cols: &[usize],
+    targets: Targets<'_>,
+) -> anyhow::Result<(Vec<f32>, Option<Vec<f32>>)> {
+    let mut labels = Vec::new();
+    for batch in dataset_reader(
+        paths.to_vec(),
+        label_cols.iter().map(|&c| vec![c]).collect(),
+        BATCH_SIZE,
+        1,
+    ) {
+        labels.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+    }
+    crate::ensure_input!(
+        !labels.iter().any(|v| v.is_nan()),
+        "label column {:?} has missing values",
+        targets.label
+    );
+    let weights = if let Some(name) = targets.weight {
+        let mut values = Vec::new();
+        for batch in dataset_reader(
+            paths.to_vec(),
+            weight_cols.iter().map(|&c| vec![c]).collect(),
+            BATCH_SIZE,
+            1,
+        ) {
+            values.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+        }
+        crate::source::check_weight_column(&values, name)?;
+        Some(values)
+    } else {
+        None
+    };
+    Ok((labels, weights))
+}
+
 /// 按文件顺序惰性串起来的 batch 流。打开失败作为一个 `Err` 元素传下去,
 /// 这样调用方在正常的迭代里就能看见,不需要一条单独的错误通道。
 fn chained_reader(
@@ -904,7 +1123,13 @@ struct CacheManifest {
     source_path: String,
     source_len: u64,
     source_mtime_ns: u64,
+    /// Ordered identities for native multi-file caches. Empty for legacy and
+    /// single-file caches, preserving their on-disk representation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_files: Vec<SourceFileIdentity>,
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label_upper_bound: Option<String>,
     /// 被排除出特征的权重列。旧缓存没有这个字段 = 没有权重列。
     /// 必须进身份校验:换一个权重列,特征集合就变了,而特征**数**可能不变。
     #[serde(default)]
@@ -940,6 +1165,13 @@ struct CacheManifest {
     /// absent when the data has none, so other caches keep their bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     categories: Option<crate::category_names::XgbCats>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceFileIdentity {
+    path: String,
+    len: u64,
+    mtime_ns: u64,
 }
 
 /// Cache format of all-8-bit caches.
@@ -996,15 +1228,52 @@ impl Drop for QuantizedCache {
     }
 }
 
+struct CacheWriteLock(PathBuf);
+
+impl CacheWriteLock {
+    fn acquire(cache_path: &Path) -> anyhow::Result<Self> {
+        let mut name = cache_path.as_os_str().to_os_string();
+        name.push(".lock");
+        let lock = PathBuf::from(name);
+        std::fs::create_dir(&lock).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot acquire cache writer lock {} (another writer may be active): {e}",
+                lock.display()
+            )
+        })?;
+        Ok(Self(lock))
+    }
+}
+
+impl Drop for CacheWriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+struct CacheStage(Option<PathBuf>);
+
+impl Drop for CacheStage {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// Parquet 数据源。原始列只在建 cuts 和量化缓存时读取;训练阶段按需读取
 /// 的是紧凑的 u8 列块,不再回源解压和重复量化。
 pub struct ParquetBlockSource {
     path: PathBuf,
+    /// `None` for legacy single-file sources; otherwise ordered concatenation.
+    source_paths: Option<Vec<PathBuf>>,
     cuts: BinCuts,
     /// 每个块持有哪些**全局特征 id**
     groups: Vec<Vec<FeatId>>,
     /// 全局特征 id → 文件里的列下标(标签列已经排除,所以两者不等)
     file_col: Vec<usize>,
+    /// Canonical feature projection for each source file, in row order.
+    multi_file_cols: Option<Vec<Vec<usize>>>,
     n_rows: usize,
     n_features: usize,
     cache: QuantizedCache,
@@ -1040,12 +1309,20 @@ impl ParquetBlockSource {
         let data = match self.cuts.block_width(&feat_ids) {
             BinWidth::U8 => {
                 let mut data = vec![0u8; len];
-                self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                if let Some(file_cols) = &self.multi_file_cols {
+                    self.read_many_into(file_cols, &feat_ids, self.n_rows, &mut data)?;
+                } else {
+                    self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                }
                 BinData::U8(data)
             }
             BinWidth::U16 => {
                 let mut data = vec![0u16; len];
-                self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                if let Some(file_cols) = &self.multi_file_cols {
+                    self.read_many_into(file_cols, &feat_ids, self.n_rows, &mut data)?;
+                } else {
+                    self.read_into(&cols, &feat_ids, self.n_rows, &mut data)?;
+                }
                 BinData::U16(data)
             }
         };
@@ -1357,9 +1634,11 @@ impl ParquetBlockSource {
         let cache_bytes = quantized_bytes(&cuts, n_rows)?;
         let mut source = Self {
             path,
+            source_paths: None,
             cuts,
             groups,
             file_col: feat_cols,
+            multi_file_cols: None,
             n_rows,
             n_features,
             cache: QuantizedCache::Memory(Vec::new()),
@@ -1370,7 +1649,7 @@ impl ParquetBlockSource {
             missing: targets.missing,
         };
         crate::source::openprof::shape(source.n_rows, source.n_features, source.groups.len());
-        source.build_cache(targets, max_bins, cols_per_block, options, nthread)?;
+        source.build_cache(targets, max_bins, cols_per_block, options, nthread, &[])?;
         Ok((source, labels))
     }
 
@@ -1381,12 +1660,13 @@ impl ParquetBlockSource {
         cols_per_block: usize,
         options: QuantizedCacheOptions,
         nthread: usize,
+        initial: &[SourceFileIdentity],
     ) -> anyhow::Result<()> {
         let budget = options.budget_bytes.unwrap_or_else(default_cache_budget);
-        let pool = crate::threading::build_pool(nthread).map_err(|e| {
-            anyhow::anyhow!("failed to create the Parquet quantize thread pool: {e}")
-        })?;
         if options.path.is_none() && self.cache_bytes <= budget {
+            let pool = crate::threading::build_pool(nthread).map_err(|e| {
+                anyhow::anyhow!("failed to create the Parquet quantize thread pool: {e}")
+            })?;
             let blocks = {
                 let _p = crate::source::openprof::start("quantize");
                 pool.install(|| {
@@ -1401,46 +1681,80 @@ impl ParquetBlockSource {
             return Ok(());
         }
 
-        let (dir, delete_on_drop) = match options.path {
-            Some(path) => (path, false),
-            None => (
-                std::env::temp_dir().join(format!(
+        let (dir, write_dir, _lock) = match options.path {
+            Some(path) => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                std::fs::create_dir_all(parent)?;
+                let lock = CacheWriteLock::acquire(&path)?;
+                crate::ensure_input!(
+                    !path.exists() || std::fs::read_dir(&path)?.next().is_none(),
+                    "cache path {} already exists and is not empty",
+                    path.display()
+                );
+                let stage = parent.join(format!(
+                    ".ferrisboost-cache-{}-{}-staging",
+                    std::process::id(),
+                    TEMP_CACHE_ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                (path, stage, Some(lock))
+            }
+            None => {
+                let path = std::env::temp_dir().join(format!(
                     "ferrisboost-cache-{}-{}",
                     std::process::id(),
                     TEMP_CACHE_ID.fetch_add(1, Ordering::Relaxed)
-                )),
-                true,
-            ),
+                ));
+                (path.clone(), path, None)
+            }
         };
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir(&write_dir)?;
+        let mut staging = CacheStage(Some(write_dir.clone()));
+        let write_block = |i| -> anyhow::Result<String> {
+            let block = self.quantize_block(i)?;
+            let bytes = block.data.to_le_bytes();
+            File::create(write_dir.join(format!("block-{i}.bin")))?.write_all(&bytes)?;
+            Ok(block_hash(&bytes))
+        };
         let block_hashes = {
-            // 每个 worker 只持有自己正在量化的块,写完立即释放。量化和写盘
-            // 在 worker 内相邻发生,两者会重叠,所以 profile 明确报合并墙钟,
-            // 不把重叠的 worker 累计时间冒充阶段 wall。
             let _p = crate::source::openprof::start("quantize+write");
-            pool.install(|| {
+            if self.source_paths.is_some() {
+                // Keep only one multi-file block in memory while writing.
                 (0..self.groups.len())
-                    .into_par_iter()
-                    .map(|i| -> anyhow::Result<String> {
-                        let block = self.quantize_block(i)?;
-                        // Little-endian element bytes: the 8-bit image is the
-                        // block itself, so 8-bit caches are byte-identical.
-                        let bytes = block.data.to_le_bytes();
-                        let hash = block_hash(&bytes);
-                        let tmp = dir.join(format!("block-{i}.bin.tmp"));
-                        let final_path = dir.join(format!("block-{i}.bin"));
-                        File::create(&tmp)?.write_all(&bytes)?;
-                        std::fs::rename(tmp, final_path)?;
-                        Ok(hash)
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })?
+                    .map(write_block)
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            } else {
+                let pool = crate::threading::build_pool(nthread).map_err(|e| {
+                    anyhow::anyhow!("failed to create the Parquet quantize thread pool: {e}")
+                })?;
+                pool.install(|| {
+                    (0..self.groups.len())
+                        .into_par_iter()
+                        .map(write_block)
+                        .collect::<anyhow::Result<Vec<_>>>()
+                })?
+            }
         };
         let _p = crate::source::openprof::start("cache commit");
         let manifest = self.manifest(targets, max_bins, cols_per_block, block_hashes.clone())?;
-        let tmp = dir.join("manifest.json.tmp");
-        File::create(&tmp)?.write_all(&serde_json::to_vec(&manifest)?)?;
-        std::fs::rename(tmp, dir.join("manifest.json"))?;
+        if !initial.is_empty() {
+            crate::ensure_input!(
+                manifest.source_files == initial,
+                "the Parquet files changed while building the quantized cache"
+            );
+        }
+        File::create(write_dir.join("manifest.json"))?
+            .write_all(&serde_json::to_vec(&manifest)?)?;
+        let delete_on_drop = write_dir == dir;
+        if !delete_on_drop {
+            if dir.exists() {
+                std::fs::remove_dir(&dir)?;
+            }
+            std::fs::rename(&write_dir, &dir)?;
+        }
+        staging.0 = None;
         self.cache = QuantizedCache::Disk {
             dir,
             delete_on_drop,
@@ -1461,6 +1775,12 @@ impl ParquetBlockSource {
         block_hashes: Vec<String>,
     ) -> anyhow::Result<CacheManifest> {
         let (source_path, source_len, source_mtime_ns) = source_identity(&self.path)?;
+        let source_files = self
+            .source_paths
+            .as_deref()
+            .map(file_identities)
+            .transpose()?
+            .unwrap_or_default();
         let widths: Vec<u8> = self
             .groups
             .iter()
@@ -1479,7 +1799,9 @@ impl ParquetBlockSource {
             source_path,
             source_len,
             source_mtime_ns,
+            source_files,
             label: targets.label.to_string(),
+            label_upper_bound: targets.label_upper_bound.map(str::to_string),
             weight: targets.weight.map(str::to_string),
             base_margin: targets
                 .base_margin
@@ -1502,6 +1824,218 @@ impl ParquetBlockSource {
         })
     }
 
+    fn reuse_many_cache(
+        paths: &[PathBuf],
+        file_cols: &[Vec<usize>],
+        label_cols: &[usize],
+        weight_cols: &[usize],
+        targets: Targets<'_>,
+        max_bins: u32,
+        cols_per_block: usize,
+        cache_path: &Path,
+        provided_cuts: Option<&BinCuts>,
+    ) -> anyhow::Result<(Self, Vec<f32>, Option<Vec<f32>>)> {
+        let manifest: CacheManifest =
+            serde_json::from_slice(&std::fs::read(cache_path.join("manifest.json"))?)?;
+        crate::ensure_input!(
+            manifest.version == CACHE_VERSION || manifest.version == CACHE_VERSION_WIDE,
+            "unsupported quantized cache version {}",
+            manifest.version
+        );
+        let identities = paths
+            .iter()
+            .map(|p| {
+                let (path, len, mtime_ns) = source_identity(p)?;
+                Ok(SourceFileIdentity {
+                    path,
+                    len,
+                    mtime_ns,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        crate::ensure_input!(
+            manifest.source_files == identities,
+            "the cache's ordered Parquet files have changed or are not the current files"
+        );
+        crate::ensure_input!(
+            manifest.label == targets.label,
+            "cache label column differs"
+        );
+        crate::ensure_input!(
+            manifest.label_upper_bound.as_deref() == targets.label_upper_bound,
+            "cache upper-bound label column differs"
+        );
+        crate::ensure_input!(
+            manifest.weight.as_deref() == targets.weight,
+            "cache weight column differs"
+        );
+        crate::ensure_input!(
+            manifest.base_margin.as_slice() == targets.base_margin.unwrap_or(&[]),
+            "cache base_margin column differs"
+        );
+        crate::ensure_input!(
+            manifest.qid.as_deref() == targets.qid,
+            "cache query-id column differs"
+        );
+        crate::ensure_input!(
+            manifest.cols_per_block == cols_per_block,
+            "cache cols_per_block differs (cached {}, this run {})",
+            manifest.cols_per_block,
+            cols_per_block
+        );
+        if max_bins != 0 {
+            crate::ensure_input!(manifest.max_bins == max_bins, "cache max_bin differs");
+        }
+        crate::ensure_input!(
+            manifest.n_features == file_cols[0].len(),
+            "cache feature count differs"
+        );
+        crate::ensure_input!(
+            manifest.missing_bits == missing_bits(targets.missing),
+            "cache was built with a different missing value"
+        );
+        let resolved = resolve_categorical_flags(&paths[0], &file_cols[0], targets.categorical)?;
+        crate::ensure_input!(
+            (0..manifest.n_features)
+                .all(|f| resolved[f] == manifest.categorical.get(f).copied().unwrap_or(false)),
+            "cached feature types differ from the resolved feature types"
+        );
+        let cuts = BinCuts::new(
+            manifest
+                .cuts_values_bits
+                .iter()
+                .map(|&v| f32::from_bits(v))
+                .collect(),
+            manifest.cuts_offsets.clone(),
+        )
+        .with_categorical(&manifest.categorical)
+        .map_err(|e| anyhow::anyhow!("cached categorical feature metadata is corrupt: {e}"))?;
+        let categories = match &manifest.categories {
+            None => None,
+            Some(c) => crate::category_names::CategoryTable::from_xgb(c, manifest.n_features)
+                .and_then(|t| {
+                    if let Some(t) = &t {
+                        t.check_against(manifest.n_features, &manifest.categorical)?;
+                    }
+                    Ok(t)
+                })
+                .map_err(|e| anyhow::anyhow!("cached category names are corrupt: {e}"))?,
+        };
+        if let Some(seed) = targets.categories {
+            for f in 0..manifest.n_features {
+                if let Some(c) = seed.get(f) {
+                    crate::ensure_input!(
+                        categories.as_ref().and_then(|t| t.get(f)) == Some(c),
+                        "cached category names differ from the existing model at feature {f}"
+                    );
+                }
+            }
+        }
+        let cuts = cuts.with_categories(categories.map(std::sync::Arc::new));
+        anyhow::ensure!(
+            cuts_hash(&cuts) == manifest.cuts_hash,
+            "cache cuts hash differs"
+        );
+        if let Some(given) = provided_cuts {
+            crate::ensure_input!(
+                given.categories().map(|t| &**t) == cuts.categories().map(|t| &**t),
+                "the given category names differ from the cached ones"
+            );
+            crate::ensure_input!(
+                given.values == cuts.values && given.offsets == cuts.offsets,
+                "the given cuts differ from the cached ones; refusing to use stale quantized data"
+            );
+        }
+        cuts.check_widths()?;
+        let groups = crate::columns::partition_features_by_width(&cuts.widths(), cols_per_block);
+        anyhow::ensure!(
+            manifest.groups == groups,
+            "cache column block map is corrupt"
+        );
+        anyhow::ensure!(
+            manifest.block_hashes.len() == groups.len(),
+            "cache block checksum count differs"
+        );
+        let widths: Vec<BinWidth> = groups.iter().map(|g| cuts.block_width(g)).collect();
+        let recorded: Vec<BinWidth> = if manifest.version == CACHE_VERSION {
+            vec![BinWidth::U8; groups.len()]
+        } else {
+            manifest
+                .block_widths
+                .iter()
+                .map(|&w| {
+                    BinWidth::from_bytes(w).ok_or_else(|| {
+                        anyhow::anyhow!("unsupported cache block width of {w} bytes")
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?
+        };
+        anyhow::ensure!(
+            recorded == widths,
+            "cache block bin widths do not match the cuts"
+        );
+        let (labels, weights) = read_many_labels_weights(paths, label_cols, weight_cols, targets)?;
+        let n_rows = labels.len();
+        anyhow::ensure!(
+            weights.as_ref().map_or(true, |w| w.len() == n_rows),
+            "cache weight row count differs"
+        );
+        anyhow::ensure!(n_rows == manifest.n_rows, "cache row count differs");
+        for (i, group) in groups.iter().enumerate() {
+            let expected = group
+                .len()
+                .saturating_mul(n_rows)
+                .saturating_mul(widths[i].bytes()) as u64;
+            anyhow::ensure!(
+                std::fs::metadata(cache_path.join(format!("block-{i}.bin")))?.len() == expected,
+                "cache block {i} length differs"
+            );
+        }
+        let first_identity = source_identity(&paths[0])?;
+        crate::ensure_input!(
+            (
+                manifest.source_path.as_str(),
+                manifest.source_len,
+                manifest.source_mtime_ns
+            ) == (
+                first_identity.0.as_str(),
+                first_identity.1,
+                first_identity.2
+            ),
+            "cache first-file identity differs"
+        );
+        let cache_bytes = quantized_bytes(&cuts, n_rows)?;
+        Ok((
+            Self {
+                path: paths[0].clone(),
+                source_paths: Some(paths.to_vec()),
+                cuts,
+                groups,
+                file_col: file_cols[0].clone(),
+                multi_file_cols: Some(file_cols.to_vec()),
+                n_rows,
+                n_features: file_cols[0].len(),
+                cache: QuantizedCache::Disk {
+                    dir: cache_path.to_path_buf(),
+                    delete_on_drop: false,
+                    verified: manifest
+                        .block_hashes
+                        .iter()
+                        .map(|_| AtomicBool::new(false))
+                        .collect(),
+                    block_hashes: manifest.block_hashes,
+                },
+                cache_bytes,
+                cache_reads: AtomicUsize::new(0),
+                source_bytes: std::sync::atomic::AtomicU64::new(0),
+                parquet_loads: AtomicUsize::new(0),
+                missing: targets.missing,
+            },
+            labels,
+            weights,
+        ))
+    }
+
     fn reuse_cache(
         path: PathBuf,
         feat_cols: Vec<usize>,
@@ -1519,6 +2053,10 @@ impl ParquetBlockSource {
             "unsupported quantized cache version {} (payload checksums start at version 2; rebuild the old cache)",
             manifest.version
         );
+        crate::ensure_input!(
+            manifest.source_files.is_empty(),
+            "the cache was built for multiple Parquet files"
+        );
         let identity = source_identity(&path)?;
         crate::ensure_input!(
             (
@@ -1529,6 +2067,10 @@ impl ParquetBlockSource {
             "the cache's Parquet file has changed or is not the current file"
         );
         crate::ensure_input!(manifest.label == label, "cache label column differs");
+        crate::ensure_input!(
+            manifest.label_upper_bound.as_deref() == targets.label_upper_bound,
+            "cache upper-bound label column differs"
+        );
         crate::ensure_input!(
             manifest.weight.as_deref() == targets.weight,
             "cache weight column differs (cached {:?}, current {:?})",
@@ -1683,9 +2225,11 @@ impl ParquetBlockSource {
         Ok((
             Self {
                 path,
+                source_paths: None,
                 cuts,
                 groups: manifest.groups,
                 file_col: feat_cols,
+                multi_file_cols: None,
                 n_rows: manifest.n_rows,
                 n_features: manifest.n_features,
                 cache: QuantizedCache::Disk {
@@ -1736,6 +2280,20 @@ fn default_cache_budget() -> usize {
         .and_then(|v| v.checked_mul(1024))
         .map(|v| v / 2)
         .unwrap_or(4 * 1024 * 1024 * 1024usize)
+}
+
+fn file_identities(paths: &[PathBuf]) -> anyhow::Result<Vec<SourceFileIdentity>> {
+    paths
+        .iter()
+        .map(|p| {
+            let (path, len, mtime_ns) = source_identity(p)?;
+            Ok(SourceFileIdentity {
+                path,
+                len,
+                mtime_ns,
+            })
+        })
+        .collect()
 }
 
 fn source_identity(path: &Path) -> anyhow::Result<(String, u64, u64)> {
@@ -2056,6 +2614,10 @@ impl ParquetBlockSource {
         for batch in batch_reader(&self.path, file_cols, BATCH_SIZE)? {
             let batch = recoder.recode(batch?, |c| feat_ids.get(c).map(|&f| f as usize))?;
             let n = batch.num_rows();
+            anyhow::ensure!(
+                n <= n_rows - row_base,
+                "Parquet has more than {n_rows} expected rows"
+            );
             for (local, &f) in feat_ids.iter().enumerate() {
                 let dst = &mut out[local * n_rows + row_base..][..n];
                 let mut row = 0usize;
@@ -2065,6 +2627,59 @@ impl ParquetBlockSource {
                     self.missing,
                     |v| {
                         // null 和 NaN 都是缺失
+                        dst[row] = quantize_value::<B>(&self.cuts, f, v);
+                        row += 1;
+                    },
+                )?;
+                debug_assert_eq!(row, n);
+            }
+            row_base += n;
+        }
+        anyhow::ensure!(
+            row_base == n_rows,
+            "read {row_base} rows, metadata says {n_rows}"
+        );
+        Ok(())
+    }
+
+    fn read_many_into<B: BinCode>(
+        &self,
+        file_cols: &[Vec<usize>],
+        feat_ids: &[FeatId],
+        n_rows: usize,
+        out: &mut [B],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            file_cols.len() == self.source_paths.as_ref().map_or(0, Vec::len),
+            "multi-file projection count differs from source file count"
+        );
+        let projections: Vec<Vec<usize>> = file_cols
+            .iter()
+            .map(|cols| feat_ids.iter().map(|&f| cols[f as usize]).collect())
+            .collect();
+        let paths = self
+            .source_paths
+            .as_ref()
+            .expect("multi-file source paths")
+            .clone();
+        let mut row_base = 0usize;
+        let mut recoder =
+            crate::source::cat_recode::Recoder::fixed(self.cuts.categories().map(|t| &**t));
+        for batch in dataset_reader(paths, projections, BATCH_SIZE, 1) {
+            let batch = recoder.recode(batch?, |c| feat_ids.get(c).map(|&f| f as usize))?;
+            let n = batch.num_rows();
+            anyhow::ensure!(
+                n <= n_rows - row_base,
+                "Parquet has more than {n_rows} expected rows"
+            );
+            for (local, &f) in feat_ids.iter().enumerate() {
+                let dst = &mut out[local * n_rows + row_base..][..n];
+                let mut row = 0usize;
+                crate::source::arrow_source::for_each_feature_f32(
+                    &batch,
+                    local,
+                    self.missing,
+                    |v| {
                         dst[row] = quantize_value::<B>(&self.cuts, f, v);
                         row += 1;
                     },
