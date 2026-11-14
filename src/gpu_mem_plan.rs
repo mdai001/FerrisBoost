@@ -26,7 +26,7 @@ pub(crate) const SPLIT_PACKET_WINDOW_BATCHES: usize = 2;
 /// 32-bit words in one categorical winner's category set (a bitset over the
 /// feature's bins). Must equal `CAT_SET_WORDS` in `histogram.cu` (unit-tested).
 /// 16-bit categorical features use variable-length sets instead
-/// ([`wide_categorical_split_cache_bytes`]).
+/// (`wide_categorical_split_cache_bytes`).
 pub(crate) const CAT_SET_WORDS: usize = 8;
 /// One categorical winner's category set, in bytes.
 pub(crate) const CAT_SET_BYTES: u64 = CAT_SET_WORDS as u64 * 4;
@@ -106,7 +106,7 @@ pub struct GpuBlockShape {
     pub cat_mask_words: usize,
     /// Most categorical features in one 16-bit block (0 = none). With the
     /// two fields below it sizes the device split buffers of 16-bit
-    /// categorical features ([`wide_categorical_split_cache_bytes`]).
+    /// categorical features (`wide_categorical_split_cache_bytes`).
     pub wide_cat_feats: usize,
     /// Largest sum of categorical bins in one 16-bit block (one weight key
     /// per category and cache node).
@@ -433,7 +433,7 @@ impl StreamingMemModel {
 
     /// `gpu_math = "fast"` 多分类:K 份常驻 prediction + 每行 softmax 统计量。
     /// 与 `GpuTrainCtx` 的 `multiclass_bytes` 一一对应(同一个
-    /// [`fast_multiclass_extra_bytes`]);单输出或 exact 下不得调用(等价于加 0)。
+    /// `fast_multiclass_extra_bytes`);单输出或 exact 下不得调用(等价于加 0)。
     pub fn with_fast_multiclass(mut self, n_rows: u64, n_outputs: u64) -> Self {
         self.fixed_bytes += fast_multiclass_extra_bytes(n_rows, n_outputs);
         self
@@ -446,7 +446,7 @@ impl StreamingMemModel {
     }
 
     /// Add the fixed scratch used by parallel fast gradient-based sampling.
-    /// The runtime and planner call [`gradient_sampling_scratch_bytes`] with
+    /// The runtime and planner call `gradient_sampling_scratch_bytes` with
     /// the same path-selection inputs.
     pub fn with_gradient_sampling(mut self, rows: u64, fast: bool, rate: Option<f32>) -> Self {
         self.fixed_bytes += gradient_sampling_scratch_bytes(rows, fast, rate);

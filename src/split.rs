@@ -321,7 +321,7 @@ pub fn best_split_in_block_constrained(
 /// `None` or an empty slice means every feature is numeric, and the result is
 /// then bit-identical to the numeric-only path. A categorical feature is
 /// enumerated like XGBoost's `EnumerateOneHot` / `EnumeratePart` (see
-/// [`enumerate_categorical`]) and competes with the numeric features under the
+/// `enumerate_categorical`) and competes with the numeric features under the
 /// same strict-greater, ascending-feature rule.
 #[allow(clippy::too_many_arguments)] // The constrained signature plus the feature types.
 pub fn best_split_in_block_typed(

@@ -92,19 +92,20 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Observed performance</h2>
-      <p>On the standardized HIGGS and Epsilon Parquet workloads reported in the README, FerrisBoost used 0.27–0.46× XGBoost setup time, 0.29–0.47× peak host RAM, and 0.43–0.72× combined RAM plus active VRAM on GPU. CPU training used 0.53–0.84× XGBoost CPU training time and GPU-fast training 0.37–0.73× XGBoost GPU training time. These results describe the tested workloads, not universal guarantees.</p>
+      <p>On the standardized HIGGS and Epsilon Parquet workloads reported in the README, FerrisBoost used 0.27–0.46× XGBoost setup time, 0.29–0.47× peak host RAM, and 0.43–0.72× combined RAM plus active VRAM on GPU. CPU training used 0.53–0.84× XGBoost CPU training time and GPU-fast training 0.37–0.73× XGBoost GPU training time. These results describe the tested workloads, not universal guarantees. These are historical measurements and do not report 0.0.9 performance.</p>
     </section>
 
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
-      <h3>0.0.9 (unreleased)</h3>
-      <p>The current development candidate adds the features below. They are not in the published PyPI wheels or Rust crate; release and platform validation are still pending.</p>
+      <h3>0.0.9</h3>
+      <p>FerrisBoost 0.0.9 adds the features below.</p>
       <ul>
         <li>Depthwise <code>max_leaves</code>, path-based <code>interaction_constraints</code>, feature sampling weights, and opt-in gradient-based row sampling.</li>
         <li>Additional scalar regression and classification objectives, plus Cox and AFT survival objectives.</li>
         <li>Rust custom metric and scalar custom objective extension points with batch adapters for Python.</li>
         <li>Workload-scoped GPU refinements include coalesced split-input uploads, initialization-selected numeric split masks, and parallel large-row CUDA fast gradient sampling.</li>
+        <li>CPU prediction reuses scheduling metadata for repeated small-batch calls and reduces missing-value scan overhead.</li>
         <li>Single-GPU execution remains the supported device scope. Survival objectives and Python custom objectives support CPU and CUDA exact; CUDA fast is unsupported for them. Lossguide is deferred.</li>
       </ul>
       <h3>0.0.8</h3>

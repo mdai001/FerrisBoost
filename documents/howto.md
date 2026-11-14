@@ -5,12 +5,9 @@ PyArrow, Parquet, and CSV training inputs. Its parameter names and JSON model
 format are designed to be familiar to XGBoost users, but FerrisBoost does not
 use a `DMatrix` object.
 
-The published 0.0.8 packages support CPU training and CUDA-enabled builds. This
-guide also documents APIs implemented for the unreleased 0.0.9 development
-candidate; sections marked **0.0.9 development** are not available from the
-current PyPI wheels or Rust crate. Release and cross-platform validation are
-still pending. Select one GPU with `device="cuda"` or `device="cuda:N"`;
-Multi-GPU support is future 1.0 work.
+This guide documents the FerrisBoost 0.0.9 Python API. Sections marked
+**0.0.9** describe behavior introduced in this version. Select one GPU with
+`device="cuda"` or `device="cuda:N"`; multi-GPU support is future 1.0 work.
 
 ## Choose the input form
 
@@ -163,11 +160,10 @@ prediction = model.predict(X)
 For squared-error models, normal predictions and raw-margin predictions are
 the same.
 
-### Additional scalar objectives (0.0.9 development)
+### Additional scalar objectives (0.0.9)
 
-These scalar objectives are available in development builds on CPU and CUDA
-with `gpu_math="exact"` or `gpu_math="fast"`. They are not in the published
-0.0.8 packages.
+In 0.0.9, these scalar objectives are available on CPU and CUDA with
+`gpu_math="exact"` or `gpu_math="fast"`.
 
 | Objective | Use it for | Labels | Prediction | Default metric |
 |---|---|---|---|---|
@@ -200,7 +196,7 @@ negative-residual side by `expectile_alpha`. Its default `expectile` metric
 uses the same alpha. Its estimated starting score is one Newton correction
 from the weighted label mean.
 
-### Probability regression (0.0.9 development)
+### Probability regression (0.0.9)
 
 Use `objective="reg:logistic"` for continuous targets in `[0, 1]`. Predictions
 are probabilities; `output_margin=True` returns raw margins. It shares the
@@ -398,7 +394,7 @@ Notes:
 
 ## Survival objectives
 
-Available in 0.0.9 development builds. The losses and derivatives are native
+Available in 0.0.9. The losses and derivatives are native
 Rust implementations. Both objectives support CPU and CUDA exact training;
 CUDA fast currently raises an error. Predictions use `exp(raw_margin)`.
 
@@ -593,7 +589,7 @@ best_prediction = model.predict(
 
 ## Custom evaluation metrics
 
-Available in 0.0.9 development builds. Wrap a batch function in `fb.CustomMetric`
+Available in 0.0.9. Wrap a batch function in `fb.CustomMetric`
 and pass it through `eval_metric`, alone or in a list with built-in metric names:
 
 ```python
@@ -638,7 +634,7 @@ weight/group support explicitly when the metric needs it.
 
 ## Custom objectives
 
-Available in 0.0.9 development builds. A custom objective supplies an
+Available in 0.0.9. A custom objective supplies an
 unweighted gradient and Hessian for each row. Pass a descriptor through
 `custom_objective`; `objective="reg:squarederror"` is required alongside it
 to define identity-link prediction and the default evaluation metric. The `fb.train` default remains
@@ -889,7 +885,7 @@ unlike `colsample_bytree` they do not reduce input reads.
 
 ### Feature weights
 
-Available in 0.0.9 development builds. `feature_weights` biases feature
+Available in 0.0.9. `feature_weights` biases feature
 sampling at any stage whose `colsample_*` rate is below `1`:
 
 ```python
@@ -930,7 +926,7 @@ the same weights and sampling parameters again.
 
 ### Gradient-based row sampling
 
-Available in 0.0.9 development builds.
+Available in 0.0.9.
 
 `sampling_method="gradient_based"` changes how `subsample` chooses training
 rows. The default, `"uniform"`, preserves the existing uniform row sampler.
@@ -962,7 +958,7 @@ uninterrupted run.
 
 ## Tree growth and feature interactions
 
-Available in 0.0.9 development builds. `max_leaves` limits the total leaves in
+Available in 0.0.9. `max_leaves` limits the total leaves in
 each tree, including branches that stopped growing earlier. The default `0`
 adds no leaf limit; `1` produces a root-only tree. Trees retain depthwise growth,
 with stable node order when a level has more candidates than remaining leaf
@@ -2027,6 +2023,11 @@ always included. It works for arrays, files, and `predict_to_parquet`, and
 cannot be combined with `n_trees`. With `begin > 0` the call scores a copy of
 the selected trees, so repeated calls with a nonzero `begin` are best batched.
 
+On CPU, prediction scheduling metadata is initialized lazily once per model
+and reused on later calls. The first call may take longer, especially with a
+short `iteration_range`. For repeated predictions, reuse the same `Model` and
+measure the first call separately from later calls.
+
 C-contiguous input uses the direct row-major fast path. Fortran-contiguous and strided `float32` arrays are also interpreted correctly. Non-`float32` arrays must be converted explicitly with `np.asarray(..., dtype=np.float32)`. pandas `DataFrame`s and PyArrow `Table`s are accepted directly and converted to `float32` (categorical columns become the model's category codes; see [How categorical input is coded](#how-categorical-input-is-coded)). For a model trained on named columns (a DataFrame, a PyArrow table, Parquet, or a CSV with a header), their columns are matched to the model's features by name: order does not matter, extra columns are ignored, and a missing one is an error. This also applies to the explanation options (`pred_contribs`, `pred_interactions`, `pred_leaf`).
 
 For GPU prediction, the first eligible call includes CUDA context initialization and one model upload; subsequent calls reuse the cached model. Staging memory remains per-call and bounded to available VRAM. GPU 0 is the only inference target in this version; multi-GPU prediction is intentionally not enabled.
@@ -2193,7 +2194,7 @@ empty `evals_result()`.
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| `objective` | `binary:logistic` | 0.0.9 development: `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, `reg:expectileerror`, `survival:cox`, `survival:aft`; also `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
+| `objective` | `binary:logistic` | 0.0.9: `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, `reg:expectileerror`, `survival:cox`, `survival:aft`; also `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, `rank:map` |
 | `lambdarank_pair_method`, `lambdarank_num_pair_per_sample`, `lambdarank_normalization`, `lambdarank_score_normalization`, `ndcg_exp_gain` | `"topk"`, unset, `True`, `True`, `True` | Ranking objectives only; see [Learning to rank](#learning-to-rank) |
 | `lambdarank_unbiased`, `lambdarank_bias_norm` | `False`, `1.0` | Unbiased LambdaMART with position-bias estimation; see [Learning to rank](#learning-to-rank) |
 | `expectile_alpha` | required | Required scalar for `reg:expectileerror`, in `[0, 1]`; arrays are unsupported |
@@ -2203,7 +2204,7 @@ empty `evals_result()`.
 | `huber_slope` | `1.0` | Slope of `reg:pseudohubererror` and its `mphe` metric; must be non-zero |
 | `aft_loss_distribution` | `"normal"` | AFT noise distribution: `"normal"`, `"logistic"`, or `"extreme"` |
 | `aft_loss_distribution_scale` | `1.0` | Positive finite AFT distribution scale |
-| `custom_objective` | `None` | 0.0.9 development: an `fb.CustomObjective` descriptor; requires `objective="reg:squarederror"`. See [Custom objectives](#custom-objectives) |
+| `custom_objective` | `None` | 0.0.9: an `fb.CustomObjective` descriptor; requires `objective="reg:squarederror"`. See [Custom objectives](#custom-objectives) |
 | `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
 | `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 2 bytes per value instead of 1 (CPU and GPU) |
 | `eta` | `0.3` | Alias: `learning_rate` |
@@ -2218,7 +2219,7 @@ empty `evals_result()`.
 | `colsample_bytree` | `1.0` | Deterministic per-tree feature sampling in `(0, 1]`; column-major GPU histograms use compact selected-feature output |
 | `colsample_bylevel` | `1.0` | Per-level feature sampling in `(0, 1]` from the per-tree set; see [Feature sampling](#feature-sampling) |
 | `colsample_bynode` | `1.0` | Per-node feature sampling in `(0, 1]` from the per-level set; see [Feature sampling](#feature-sampling) |
-| `feature_weights` | `None` | 0.0.9 development: nonnegative feature sampling weights as a positional vector or named dictionary; see [Feature weights](#feature-weights) |
+| `feature_weights` | `None` | 0.0.9: nonnegative feature sampling weights as a positional vector or named dictionary; see [Feature weights](#feature-weights) |
 | `cols_per_block` | automatic | Positive integer; normally leave unset. On GPU the memory planner chooses it from the row count; for CSV / CSV.gz it uses the exact count of the first reading pass, so CSV and the equivalent Parquet get the same plan |
 | `nthread` | `0` | Zero selects physical cores; alias: `n_jobs` |
 | `device` | `"cpu"` | Compute device: `"cpu"`, `"cuda"`, or `"cuda:N"` |
@@ -2230,8 +2231,8 @@ empty `evals_result()`.
 | `hist_nodes_per_batch` | automatic | GPU only: number of nodes merged into one histogram launch (`1..=32`, `1` disables merging; the GPU default is 16) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
-| `max_leaves` | `0` | 0.0.9 development: total leaf cap per depthwise tree; zero adds no cap |
-| `interaction_constraints` | `None` | 0.0.9 development: allowed feature groups by index or name |
+| `max_leaves` | `0` | 0.0.9: total leaf cap per depthwise tree; zero adds no cap |
+| `interaction_constraints` | `None` | 0.0.9: allowed feature groups by index or name |
 | `seed` | `0` | Alias: `random_state` |
 | `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic` and `reg:logistic`, a raw margin for `binary:logitraw` and `binary:hinge`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
 | `cache_budget_bytes` | automatic | Parquet quantized-cache memory budget; single Parquet file only, other inputs raise `ValueError` (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |

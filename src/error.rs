@@ -6,7 +6,7 @@
 //! (I/O, CUDA, internal: `RuntimeError`). Sniffing message text is brittle, so
 //! validation errors carry this marker and `python::to_py_err` maps on it.
 //!
-//! Use [`bail_input!`] / [`ensure_input!`] where `anyhow::bail!` /
+//! Use `bail_input!` / `ensure_input!` where `anyhow::bail!` /
 //! `anyhow::ensure!` would reject the caller's input; the message and the
 //! `{:#}` rendering are unchanged.
 

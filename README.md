@@ -41,7 +41,7 @@ The following ratios compare FerrisBoost with the corresponding XGBoost backend 
 
 On these workloads, FerrisBoost used approximately **0.27–0.46×** XGBoost setup time, **0.29–0.47×** peak host RAM, and **0.43–0.72×** combined RAM plus active VRAM on GPU. CPU training used **0.53–0.84×** XGBoost CPU training time and GPU-fast training **0.37–0.73×** XGBoost GPU training time. Accuracy ratios remained within **0.9987–0.9998×** of XGBoost.
 
-These ratios describe the tested workloads and hardware, not universal performance guarantees. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Training uses row and column subsampling of 0.6. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
+These ratios describe the tested workloads and hardware, not universal performance guarantees. They are historical measurements and do not report 0.0.9 performance. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Training uses row and column subsampling of 0.6. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
 
 ## Install
 
@@ -224,7 +224,7 @@ File-to-file CPU scoring is also available through `Model.predict_to_parquet()`;
 
 ### Objectives and metrics
 
-Published 0.0.8 supports `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, and `rank:ndcg`, `rank:pairwise`, and `rank:map`. The unreleased 0.0.9 development API adds scalar regression/classification and survival objectives; see the changelog and Python API How-To for exact support and backend limits. Supported `eval_metric` values include `rmse`, `mae`, `mape`, `mphe`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `mlogloss`, `merror`, and, for ranking, `ndcg`, `map` and `pre` (with `@k`).
+Supported objectives include `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, and `rank:map`, plus `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, `reg:expectileerror`, `survival:cox`, and `survival:aft`. Survival objectives use CPU and CUDA exact; CUDA fast is unsupported. See the Python API How-To for objective details and compatibility. Supported `eval_metric` values include `rmse`, `mae`, `mape`, `mphe`, `rmsle`, `expectile`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `cox-nloglik`, `aft-nloglik`, `interval-regression-accuracy`, `mlogloss`, `merror`, and ranking `ndcg`, `map`, and `pre` (with `@k`).
 
 ### Known limitations
 
@@ -249,19 +249,16 @@ logging, and the complete parameter reference.
 
 See the [Python API How-To](documents/howto.md) for details.
 
-### 0.0.9 (unreleased)
+### 0.0.9
 
-The 0.0.9 API and changes below describe the current development candidate. They
-are not in the published 0.0.8 PyPI wheels or Rust crate; release and platform
-validation are still pending.
+FerrisBoost 0.0.9 adds the API and features below.
 
 - Added path-based `interaction_constraints` and per-tree `max_leaves`; trees remain depthwise, and lossguide is deferred.
 - Added `feature_weights` for nested feature sampling and opt-in `sampling_method="gradient_based"`. Sampling supports CPU and CUDA exact, plus supported native objectives in CUDA fast mode.
 - Added `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, and scalar `reg:expectileerror` on CPU and CUDA exact/fast.
 - Added `survival:cox` and `survival:aft` on CPU and CUDA exact. Survival objectives explicitly reject CUDA fast; AFT supports exact, left-, right-, and interval-censored targets. Cox uses weighted grouped Breslow risk sets and tied-event handling that differ from XGBoost; see the [How-To](documents/howto.md#survival-objectives).
 - Added Rust custom `Metric` and scalar `CustomObjective` extension points with Python batch adapters. Python custom objectives require `objective="reg:squarederror"` and support CPU/CUDA exact; CUDA fast, multiclass, ranking, and arbitrary custom prediction links are unsupported.
-- Prediction scheduling reuses metadata for repeated small-batch predictions. Accepted workload-scoped GPU changes coalesce split-input uploads, mask numeric split candidates at initialization, and parallelize CUDA fast gradient sampling for large rows; these do not imply a general speedup.
-- Full release regression, Windows packaging, and publication validation remain pending.
+- CPU prediction reuses scheduling metadata for repeated small-batch calls and reduces missing-value scan overhead. Accepted workload-scoped GPU changes coalesce split-input uploads, mask numeric split candidates at initialization, and parallelize CUDA fast gradient sampling for large rows; these do not imply a general speedup.
 
 ### 0.0.8
 

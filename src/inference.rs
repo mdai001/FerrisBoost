@@ -10,6 +10,22 @@ use crate::tree::Model;
 
 pub(crate) const CPU_PREDICTION_BLOCK_ROWS: usize = 64;
 
+/// Scan small groups without a branch per value so finite input can use SIMD.
+/// Keep early exit between groups for blocks that contain missing values.
+#[inline]
+fn block_has_nan(values: &[f32]) -> bool {
+    let mut chunks = values.chunks_exact(16);
+    for chunk in &mut chunks {
+        if chunk
+            .iter()
+            .fold(false, |found, value| found | value.is_nan())
+        {
+            return true;
+        }
+    }
+    chunks.remainder().iter().any(|value| value.is_nan())
+}
+
 /// Prediction-only CPU tree. Keeping independently accessed fields in separate
 /// arrays avoids pulling training-only gain/Hessian data through L1 while
 /// traversing a tree.
@@ -411,7 +427,7 @@ impl CpuInferenceModel {
             .chunks(CPU_PREDICTION_BLOCK_ROWS * n_features)
             .zip(out.chunks_mut(CPU_PREDICTION_BLOCK_ROWS))
         {
-            let any_missing = self.needs_missing_check && rows.iter().any(|value| value.is_nan());
+            let any_missing = self.needs_missing_check && block_has_nan(rows);
             for tree in &self.trees[..upto] {
                 if any_missing {
                     tree.add_block::<true>(rows, n_features, margins);
@@ -497,7 +513,7 @@ impl CpuInferenceModel {
                     None => margins[..len].fill(self.output_base_margins[output]),
                 }
             }
-            let any_missing = self.needs_missing_check && rows.iter().any(|value| value.is_nan());
+            let any_missing = self.needs_missing_check && block_has_nan(rows);
             for (index, tree) in self.trees[..upto].iter().enumerate() {
                 let output = index % k;
                 let margins = &mut acc
@@ -628,6 +644,55 @@ mod tests {
     use super::*;
     use crate::tree::{Node, Tree};
     use crate::types::Objective;
+
+    #[test]
+    fn blocked_nan_scan_matches_scalar_oracle_at_chunk_boundaries() {
+        let lengths = [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65];
+        let finite_values = [
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            -f32::MAX,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+        ];
+        let nan_patterns = [
+            0x7fc0_0001, // positive quiet NaN
+            0xffc0_0001, // negative quiet NaN
+            0x7f80_0001, // positive signaling NaN
+            0xff80_0001, // negative signaling NaN
+        ];
+
+        for len in lengths {
+            let finite: Vec<f32> = (0..len)
+                .map(|index| finite_values[index % finite_values.len()])
+                .collect();
+            let scalar_finite = finite.iter().any(|value| value.is_nan());
+            assert!(!scalar_finite);
+            assert_eq!(block_has_nan(&finite), scalar_finite, "finite len={len}");
+
+            // Check each payload/signaling form at every location, including
+            // both sides of each 16-value chunk and the trailing remainder.
+            for (position, &pattern) in (0..len)
+                .flat_map(|position| nan_patterns.iter().map(move |pattern| (position, pattern)))
+            {
+                let mut mixed = finite.clone();
+                mixed[position] = f32::from_bits(pattern);
+                let scalar = mixed.iter().any(|value| value.is_nan());
+                assert!(
+                    scalar,
+                    "oracle missed NaN at len={len}, position={position}"
+                );
+                assert_eq!(
+                    block_has_nan(&mixed),
+                    scalar,
+                    "len={len}, position={position}, bits={pattern:#010x}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn remapping_is_private_and_prediction_is_bit_exact() {
