@@ -11,6 +11,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::columns::BinCuts;
+use crate::prediction_link::PredictionLink;
 use crate::types::{FeatId, Objective};
 
 /// 叶子的左右孩子下标。和 XGBoost 的编码一致。
@@ -217,6 +218,10 @@ pub struct Model {
     /// Prediction is self-contained; continuation requires the same provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_objective: Option<String>,
+    /// Optional built-in output transform for a custom-objective model.
+    /// Named links store only their stable identifier, never executable code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_link: Option<PredictionLink>,
     pub n_features: usize,
     /// 早停选中的轮次(0 起)。**预测默认不用它** —— XGBoost 3.4.1 的
     /// `Booster.predict()` 也是拿全部树算的,best_iteration 只是记在
@@ -286,6 +291,20 @@ impl Model {
     /// Whether any tree has a categorical split.
     pub fn has_categorical_splits(&self) -> bool {
         self.trees.iter().any(Tree::has_categorical)
+    }
+
+    /// Set the optional output transform used when predicting from this custom
+    /// objective model. `None` keeps the original objective transform.
+    pub fn set_prediction_link(&mut self, link: Option<PredictionLink>) -> anyhow::Result<()> {
+        if let Some(link) = &link {
+            crate::ensure_input!(
+                self.custom_objective.is_some(),
+                "prediction links are only supported on custom objective models"
+            );
+            link.validate(self.num_outputs())?;
+        }
+        self.prediction_link = link;
+        Ok(())
     }
 }
 
@@ -404,6 +423,7 @@ impl Model {
             rank_bias: None,
             categories: self.categories.clone(),
             custom_objective: self.custom_objective.clone(),
+            prediction_link: None,
         }
     }
 
@@ -430,6 +450,7 @@ impl Model {
             rank_bias: self.rank_bias.clone(),
             categories: self.categories.clone(),
             custom_objective: self.custom_objective.clone(),
+            prediction_link: self.prediction_link.clone(),
         }
     }
 
@@ -495,21 +516,84 @@ impl Model {
     /// 多分类模型:用 `predict_row`。
     pub fn predict(&self, features: &[f32]) -> f32 {
         let m = self.predict_margin(features);
-        self.objective.transform(m)
+        if let Some(link) = &self.prediction_link {
+            let mut output = [m];
+            link.apply_rows(&mut output, 1).unwrap_or_else(|error| {
+                panic!("{error}; use try_predict_row_with_link for a named provider or predict_margin for raw margins")
+            });
+            output[0]
+        } else {
+            self.objective.transform(m)
+        }
     }
 
     /// 任意 objective 的一行预测,和 XGBoost `Booster.predict()` 同义:
     /// 单输出返回 `[值]`;`multi:softprob` 返回 K 个概率;`multi:softmax`
     /// 返回 `[类别下标]`。
     pub fn predict_row(&self, features: &[f32]) -> Vec<f32> {
+        self.try_predict_row(features).unwrap_or_else(|error| {
+            panic!("{error}; use try_predict_row_with_link for a named provider or raw margin APIs")
+        })
+    }
+
+    /// Fallible counterpart to [`Model::predict_row`]. Named links return an
+    /// error until their native executable provider is installed.
+    pub fn try_predict_row(&self, features: &[f32]) -> anyhow::Result<Vec<f32>> {
         if self.class_base_margins.is_empty() {
-            return vec![self.predict(features)];
+            let margin = self.predict_margin(features);
+            if let Some(link) = &self.prediction_link {
+                let mut output = [margin];
+                link.apply_rows(&mut output, 1)?;
+                return Ok(output.to_vec());
+            }
+            return Ok(vec![self.objective.transform(margin)]);
         }
         let mut m = self.predict_margins_upto(features, self.trees.len());
-        match self.objective.transform_row(&mut m) {
-            Some(class) => vec![class],
-            None => m,
+        if let Some(link) = &self.prediction_link {
+            link.apply_rows(&mut m, self.num_outputs())?;
+            return Ok(m);
         }
+        match self.objective.transform_row(&mut m) {
+            Some(class) => Ok(vec![class]),
+            None => Ok(m),
+        }
+    }
+
+    /// Predict with an executable named link supplied by the caller. The
+    /// provider runs on the complete raw-margin row and must use the stable
+    /// name recorded on this model.
+    pub fn try_predict_row_with_link<F>(
+        &self,
+        features: &[f32],
+        provider_name: &str,
+        provider: F,
+    ) -> anyhow::Result<Vec<f32>>
+    where
+        F: FnOnce(&mut [f32]) -> anyhow::Result<()>,
+    {
+        let expected_name = match self.prediction_link.as_ref() {
+            Some(PredictionLink::Named(name)) => name,
+            Some(_) => anyhow::bail!(
+                "model prediction link is not named; use try_predict_row without a provider"
+            ),
+            None => anyhow::bail!("model has no prediction link provider to apply"),
+        };
+        anyhow::ensure!(
+            expected_name == provider_name,
+            "prediction link provider name mismatch: model requires {expected_name:?}, supplied {provider_name:?}"
+        );
+        let mut output = if self.class_base_margins.is_empty() {
+            vec![self.predict_margin(features)]
+        } else {
+            self.predict_margins_upto(features, self.trees.len())
+        };
+        let original_len = output.len();
+        provider(&mut output)?;
+        anyhow::ensure!(
+            output.len() == original_len,
+            "named prediction link provider changed output shape"
+        );
+        Ok(output)
     }
 
     /// 导出成 XGBoost 兼容的 JSON。
@@ -553,6 +637,13 @@ impl Model {
                     let mut a = BTreeMap::new();
                     if let Some(name) = &self.custom_objective {
                         a.insert("ferrisboost_custom_objective".to_owned(), name.clone());
+                    }
+                    if let Some(link) = &self.prediction_link {
+                        let encoded =
+                            link.attribute_value(self.num_outputs()).map_err(|error| {
+                                unsupported(format_args!("invalid prediction link: {error}"))
+                            })?;
+                        a.insert("ferrisboost_prediction_link".to_owned(), encoded);
                     }
                     if let Some(b) = self.best_iteration {
                         a.insert("best_iteration".to_string(), b.to_string());
@@ -824,12 +915,30 @@ impl Model {
                 format_args!("custom objective name must not be empty"),
             )?;
             anyhow_like_check(
-                matches!(objective, Objective::SquaredError),
-                format_args!("custom objective model requires reg:squarederror metadata"),
+                crate::custom_objective::CustomObjectiveKind::for_objective(objective).is_some(),
+                format_args!(
+                    "custom objective model requires scalar, multiclass, or ranking metadata"
+                ),
             )?;
         }
+        let prediction_link = match attrs.get("ferrisboost_prediction_link") {
+            Some(value) => {
+                anyhow_like_check(
+                    custom_objective.is_some(),
+                    format_args!(
+                        "ferrisboost_prediction_link requires a ferrisboost custom objective"
+                    ),
+                )?;
+                Some(
+                    PredictionLink::from_attribute(value, num_class)
+                        .map_err(|error| unsupported(format_args!("{error}")))?,
+                )
+            }
+            None => None,
+        };
         Ok(Self {
             custom_objective,
+            prediction_link,
             trees,
             base_score,
             objective,
@@ -1410,6 +1519,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
             trees: vec![fixture_tree()],
             base_score: 0.5,
             objective: Objective::SquaredError,
@@ -1417,6 +1527,94 @@ mod tests {
             best_iteration: None,
             best_score: None,
         }
+    }
+
+    #[test]
+    fn prediction_links_are_custom_only_and_round_trip_stably() {
+        let mut plain = fixture_model();
+        let raw = plain.predict_margin(&[0.0, 0.0]);
+        let before = plain.to_xgboost_json().unwrap();
+        assert!(plain
+            .set_prediction_link(Some(PredictionLink::Identity))
+            .is_err());
+        assert_eq!(plain.to_xgboost_json().unwrap(), before);
+
+        let mut custom = fixture_model();
+        custom.custom_objective = Some("test:square".into());
+        custom
+            .set_prediction_link(Some(PredictionLink::Sigmoid))
+            .unwrap();
+        assert_eq!(
+            custom.predict(&[0.0, 0.0]).to_bits(),
+            Objective::Logistic.transform(raw).to_bits()
+        );
+        let json = custom.to_xgboost_json().unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            doc["learner"]["attributes"]["ferrisboost_prediction_link"],
+            "sigmoid"
+        );
+        let loaded = Model::from_xgboost_json(&json).unwrap();
+        assert_eq!(loaded.prediction_link, Some(PredictionLink::Sigmoid));
+        assert_eq!(loaded.to_xgboost_json().unwrap(), json);
+    }
+
+    #[test]
+    fn named_prediction_link_needs_a_matching_native_provider() {
+        let mut custom = fixture_model();
+        custom.custom_objective = Some("test:square".into());
+        custom
+            .set_prediction_link(Some(PredictionLink::Named("test:exp".into())))
+            .unwrap();
+        assert!(custom.try_predict_row(&[0.0, 0.0]).is_err());
+        assert!(custom
+            .try_predict_row_with_link(&[0.0, 0.0], "wrong", |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("provider name mismatch"));
+        let margin = custom.predict_margin(&[0.0, 0.0]);
+        let linked = custom
+            .try_predict_row_with_link(&[0.0, 0.0], "test:exp", |values| {
+                values.iter_mut().for_each(|value| *value = value.exp());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(linked, vec![margin.exp()]);
+        let json = custom.to_xgboost_json().unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            doc["learner"]["attributes"]["ferrisboost_prediction_link"],
+            "named:test:exp"
+        );
+        assert_eq!(
+            Model::from_xgboost_json(&json).unwrap().prediction_link,
+            Some(PredictionLink::Named("test:exp".into()))
+        );
+    }
+
+    #[test]
+    fn prediction_link_validation_and_model_views_are_explicit() {
+        let mut scalar = fixture_model();
+        scalar.custom_objective = Some("test:square".into());
+        assert!(scalar
+            .set_prediction_link(Some(PredictionLink::Softmax))
+            .unwrap_err()
+            .to_string()
+            .contains("at least two outputs"));
+        assert!(scalar
+            .set_prediction_link(Some(PredictionLink::Named("  ".into())))
+            .is_err());
+
+        let mut multi = multiclass_fixture();
+        multi.custom_objective = Some("test:multi".into());
+        multi
+            .set_prediction_link(Some(PredictionLink::Softmax))
+            .unwrap();
+        assert_eq!(multi.predict_row(&[0.0, 0.0]).len(), 3);
+        let slice = multi.slice_rounds(0, 0);
+        assert_eq!(slice.prediction_link, multi.prediction_link);
+        let view = multi.class_view(0);
+        assert_eq!(view.prediction_link, None);
     }
 
     #[test]
@@ -1571,6 +1769,7 @@ mod tests {
                 rank_bias: None,
                 categories: None,
                 custom_objective: None,
+                prediction_link: None,
                 ..fixture_model()
             };
             let json = m.to_xgboost_json().unwrap();
@@ -1607,6 +1806,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
             ..fixture_model()
         }
         .class_view(0);

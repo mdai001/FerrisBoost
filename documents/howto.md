@@ -677,6 +677,56 @@ requires passing a custom objective descriptor with the same name again; the
 name does not verify that its callback code is equivalent, which is the user's
 responsibility.
 
+### Next version development: grouped objectives and prediction links (unreleased)
+
+The following API is under development and is not part of the documented 0.0.9
+release. `CustomObjective` accepts `kind="scalar"` (the existing default),
+`kind="multiclass"`, or `kind="ranking"`. The objective metadata must match:
+scalar regression uses `reg:squarederror`, multiclass uses
+`multi:softprob` / `multi:softmax`, and ranking uses a `rank:*` objective.
+
+For multiclass, the callback is called once per boosting round with owned,
+C-contiguous `float32` arrays: raw margins shaped `(n_rows, n_classes)` and
+one-dimensional labels. It returns `(gradient, hessian)` arrays with that same
+two-dimensional shape. Each pair is the gradient and diagonal Hessian for one
+row and class; a full cross-class Hessian matrix is not supported.
+
+For ranking, the callback receives `(raw_margin, labels, group_ptr)`, where the
+first two arrays are one-dimensional `float32` and `group_ptr` is a one-
+dimensional `uint32` array of query offsets. It returns one-dimensional
+per-row gradient and Hessian arrays. `weight` remains one value per query;
+Rust applies that weight to the derivatives of every row in the query. Ranking
+callbacks use the built-in `rank:*` metadata and cannot use the built-in
+unbiased position correction. Scalar callbacks keep their existing two-array
+contract. All kinds return unweighted derivatives with finite gradients and
+finite, non-negative diagonal Hessians; Rust validates them and applies weights.
+
+Training callbacks run in Python once per boosting round. Native validation,
+sampling, tree construction, and margin accumulation remain in Rust. Callback
+code is not compiled into the tree-building path.
+
+Custom-objective models can attach a shape-preserving prediction transform:
+
+```python
+model.set_prediction_link("sigmoid")  # built-ins: identity, sigmoid, exp, softmax
+
+def link(raw_margin):
+    return np.ascontiguousarray(raw_margin * np.float32(2))
+
+model.set_prediction_link("double", callback=link)
+```
+
+The built-in links and named callbacks preserve `(n,)` for scalar output and
+`(n, n_classes)` for multiclass output. A callback receives raw margins once
+per prediction batch and must return a finite, C-contiguous `float32` NumPy
+array of the same shape. `output_margin=True` and SHAP outputs bypass the link;
+tree accumulation always uses raw margins. Built-in link names are stored in
+model JSON. A named Python callable is not serialized: after loading a model,
+bind the callback again with the exact stored name using
+`set_prediction_link(name, callback=fn)`. Continuation carries link metadata;
+a named callback must be rebound on the returned model. This API is limited to
+custom-objective models.
+
 ## Sample weights
 
 Pass per-row weights with `weight=`. They work like XGBoost's

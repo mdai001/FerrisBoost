@@ -720,6 +720,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
         };
         let before = canonical.to_xgboost_json().unwrap();
         let compact = CompactInferenceModel::new(&canonical).unwrap();
@@ -802,6 +803,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
         };
         let predictor = CpuInferenceModel::new(&model).unwrap();
         let patterns = [
@@ -866,6 +868,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
         };
         let fused = CpuInferenceModel::new(&model).unwrap();
         let rows: Vec<f32> = (0..131 * 3)

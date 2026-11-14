@@ -342,6 +342,7 @@ fn gpu_plan_model(
     // 梯度权重 = 样本权重,或 scale_pos_weight ≠ 1 时的隐式权重 ——
     // 和训练时的分配用同一个判断。
     let model = if fast
+        && cfg.custom_objective.is_none()
         && crate::train::has_gradient_weights(
             cfg.objective,
             cfg.weighted,
@@ -365,7 +366,7 @@ fn gpu_plan_model(
     // groups. Array inputs carry them; file inputs read their query-id
     // column before planning (see `train_file`; `resolve_blocking` rejects
     // fast ranking without resolved groups).
-    let model = match (fast, cfg.objective.rank()) {
+    let model = match (fast && cfg.custom_objective.is_none(), cfg.objective.rank()) {
         (true, Some((kind, params))) => model.with_fast_rank(
             rows,
             &crate::gpu_mem_plan::FastRankShape::for_groups(
@@ -923,6 +924,11 @@ fn parallel_model_write(
     crate::model_io::atomic_write(std::path::Path::new(path), |file| {
         file.set_len(bytes.len() as u64)?;
         let progress = reporter.counter();
+        if workers == 1 {
+            write_all_at(file, bytes, 0)?;
+            progress.store(bytes.len() as u64, Ordering::Relaxed);
+            return Ok(());
+        }
         let chunk_size = bytes.len().max(1).div_ceil(workers);
         std::thread::scope(|scope| -> anyhow::Result<()> {
             let mut handles = Vec::new();
@@ -961,6 +967,12 @@ fn parallel_model_read(path: &str, requested: usize, quiet: bool) -> anyhow::Res
     let reporter = ModelIoReporter::start(quiet, "LOAD", path, total, requested, workers);
     let progress = reporter.counter();
     let mut bytes = vec![0u8; total];
+    if workers == 1 {
+        read_exact_at(&file, &mut bytes, 0)?;
+        progress.store(total as u64, Ordering::Relaxed);
+        reporter.complete();
+        return Ok(bytes);
+    }
     let chunk_size = total.max(1).div_ceil(workers);
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let mut handles = Vec::new();
@@ -1232,13 +1244,11 @@ fn score_contiguous_multi_from(
     Ok(out)
 }
 
-fn predict_value(model: &Model, row: &[f32], n_trees: usize, output_margin: bool) -> f32 {
-    let margin = model.predict_margin_upto(row, n_trees);
-    if output_margin {
-        margin
-    } else {
-        model.objective.transform(margin)
+fn prediction_input_error(error: anyhow::Error) -> PyErr {
+    if let Some(original) = error.downcast_ref::<PyErr>() {
+        return Python::attach(|py| original.clone_ref(py));
     }
+    PyValueError::new_err(format!("{error:#}"))
 }
 
 const PREDICTION_PARQUET_ROW_GROUP_ROWS: usize = 1024 * 1024;
@@ -1378,6 +1388,9 @@ fn predict_files_to_parquet(
     missing: f32,
     init: Option<&[f32]>,
 ) -> PyResult<usize> {
+    model
+        .require_prediction_link(output_margin)
+        .map_err(to_py_err)?;
     if prediction_column.trim().is_empty() {
         return Err(PyValueError::new_err(
             "prediction_column cannot be empty or whitespace only",
@@ -1424,11 +1437,7 @@ fn predict_files_to_parquet(
     let n_features = projected_features.len();
     // `multi:softmax` writes one class-index column; every other multi-output result
     // (probabilities, margins, quantiles) writes `{column}_{k}`.
-    let label_column = !output_margin
-        && matches!(
-            model.inner.objective,
-            crate::types::Objective::Softmax { .. }
-        );
+    let label_column = !output_margin && model.returns_class_indices();
     let column_names: Vec<String> = if multi.is_none() || label_column {
         vec![prediction_column.to_string()]
     } else {
@@ -1563,7 +1572,7 @@ fn predict_files_to_parquet(
                 };
                 row_offset += n_rows;
                 let columns: Vec<Vec<f32>> = match (&single, &multi, &predictor) {
-                    (Some(inference), _, Some(predictor)) => {
+                    (Some(_), _, Some(predictor)) => {
                         let mut batch = score_contiguous_rows_from(
                             predictor,
                             data,
@@ -1574,17 +1583,15 @@ fn predict_files_to_parquet(
                             &mut predict_pool,
                             batch_init,
                         )?;
-                        transform_prediction_margins(inference.model(), &mut batch, output_margin);
+                        model.transform_margins(&mut batch, output_margin)?;
                         vec![batch]
                     }
                     (_, Some(inference), _) => {
                         let mut margins = score_multi_output_batch(
                             model, inference, upto, data, n_rows, false, workers, batch_init,
                         )?;
-                        if output_margin {
-                            deinterleave_columns(&margins, k_out)
-                        } else if let Some(labels) =
-                            model.inner.objective.transform_rows(&mut margins, k_out)
+                        if let Some(labels) =
+                            model.transform_margins(&mut margins, output_margin)?
                         {
                             vec![labels]
                         } else {
@@ -1619,7 +1626,7 @@ fn predict_files_to_parquet(
                 Ok(Ok(_)) => {}
             }
         }
-        return Err(PyValueError::new_err(format!("{input_error:#}")));
+        return Err(prediction_input_error(input_error));
     }
     let rows_read = input_result.expect("checked above");
     if let Some(m) = init {
@@ -1847,17 +1854,10 @@ fn gpu_prediction_selected(
         && n_rows.saturating_mul(work_per_row) >= AUTO_GPU_PREDICT_MIN_WORK
 }
 
-fn transform_prediction_margins(model: &Model, values: &mut [f32], output_margin: bool) {
-    if !output_margin && !model.objective.transform_is_identity() {
-        for value in values {
-            *value = model.objective.transform(*value);
-        }
-    }
-}
-
 #[pyclass(name = "Model", module = "ferrisboost._core")]
 pub struct PyModel {
     inner: Model,
+    prediction_link_callback: Option<Arc<Py<PyAny>>>,
     history: Vec<RoundMetrics>,
     quiet: bool,
     model_io_threads: usize,
@@ -1884,6 +1884,85 @@ enum IterationPlan {
 }
 
 impl PyModel {
+    fn require_prediction_link(&self, output_margin: bool) -> anyhow::Result<()> {
+        if !output_margin {
+            if let Some(crate::prediction_link::PredictionLink::Named(name)) =
+                &self.inner.prediction_link
+            {
+                crate::ensure_input!(self.prediction_link_callback.is_some(),
+                    "prediction link {name:?} needs its callback; call set_prediction_link or use output_margin=True");
+            }
+        }
+        Ok(())
+    }
+
+    fn returns_class_indices(&self) -> bool {
+        self.inner.prediction_link.is_none()
+            && matches!(self.inner.objective, Objective::Softmax { .. })
+    }
+
+    fn transform_margins(
+        &self,
+        margins: &mut [f32],
+        output_margin: bool,
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        if output_margin {
+            return Ok(None);
+        }
+        let k = self.inner.num_outputs();
+        match &self.inner.prediction_link {
+            None if k == 1 => {
+                if !self.inner.objective.transform_is_identity() {
+                    for value in margins {
+                        *value = self.inner.objective.transform(*value);
+                    }
+                }
+            }
+            None => return Ok(self.inner.objective.transform_rows(margins, k)),
+            Some(crate::prediction_link::PredictionLink::Named(name)) => {
+                let callback = self.prediction_link_callback.as_ref().ok_or_else(|| {
+                    crate::error::InputError::new(format!(
+                        "prediction link {name:?} needs its callback"
+                    ))
+                })?;
+                let n = margins.len() / k;
+                Python::attach(|py| -> PyResult<()> {
+                    let array = PyArray1::from_vec(py, margins.to_vec());
+                    let input = if k == 1 {
+                        array.into_any()
+                    } else {
+                        array.reshape([n, k])?.into_any()
+                    };
+                    let result = callback.bind(py).call1((input,))?;
+                    let result = result
+                        .extract::<numpy::PyReadonlyArrayDyn<'_, f32>>()
+                        .map_err(|_| {
+                            PyValueError::new_err(
+                                "prediction link must return a float32 NumPy array",
+                            )
+                        })?;
+                    let shape = if k == 1 { vec![n] } else { vec![n, k] };
+                    if result.shape() != shape || !result.is_c_contiguous() {
+                        return Err(PyValueError::new_err(format!(
+                            "prediction link must return a C-contiguous array of shape {shape:?}"
+                        )));
+                    }
+                    let values = result.as_slice()?;
+                    if !values.iter().all(|v| v.is_finite()) {
+                        return Err(PyValueError::new_err(
+                            "prediction link returned a nonfinite value",
+                        ));
+                    }
+                    margins.copy_from_slice(values);
+                    Ok(())
+                })
+                .map_err(anyhow::Error::new)?;
+            }
+            Some(link) => link.apply_rows(margins, k)?,
+        }
+        Ok(None)
+    }
+
     fn prediction_work_per_row(&self, n_trees: usize) -> usize {
         let prefix = self
             .prediction_work
@@ -1921,12 +2000,16 @@ impl PyModel {
         if begin == 0 {
             return Ok(IterationPlan::Prefix(end * k));
         }
-        Ok(IterationPlan::Slice(PyModel::plain(
+        let mut slice = PyModel::plain(
             self.inner.slice_rounds(begin, end),
             self.quiet,
             self.model_io_threads,
             self.ingest_threads,
-        )))
+        );
+        slice
+            .prediction_link_callback
+            .clone_from(&self.prediction_link_callback);
+        Ok(IterationPlan::Slice(slice))
     }
 
     /// A plain wrapper without training history (`iteration_range` slices).
@@ -1937,6 +2020,7 @@ impl PyModel {
             quiet,
             model_io_threads,
             ingest_threads,
+            prediction_link_callback: None,
             prediction_work: OnceLock::new(),
             cpu_predictor: Mutex::new(None),
             inference_model: Mutex::new(None),
@@ -2107,12 +2191,11 @@ impl PyModel {
             init,
         )?;
         let k = self.inner.num_outputs();
-        if !output_margin {
-            // softprob → 概率,softmax → 类别下标(此时返回一维),
-            // 多分位数 → 每行升序(防交叉)。
-            if let Some(labels) = self.inner.objective.transform_rows(&mut margins, k) {
-                return Ok(PyArray1::from_vec(py, labels).into_any());
-            }
+        if let Some(labels) = self
+            .transform_margins(&mut margins, output_margin)
+            .map_err(to_py_err)?
+        {
+            return Ok(PyArray1::from_vec(py, labels).into_any());
         }
         let arr = PyArray1::from_vec(py, margins)
             .reshape([n, k])
@@ -2135,6 +2218,8 @@ impl PyModel {
         init: Option<&[f32]>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         guard(|| {
+            self.require_prediction_link(output_margin)
+                .map_err(to_py_err)?;
             ensure_gpu_prediction_available(use_gpu)?;
             if self.inner.num_outputs() > 1 {
                 return Err(PyValueError::new_err(
@@ -2202,7 +2287,8 @@ impl PyModel {
                         })
                     }
                     .map_err(to_py_err)?;
-                    transform_prediction_margins(&self.inner, &mut out, output_margin);
+                    self.transform_margins(&mut out, output_margin)
+                        .map_err(to_py_err)?;
                     return Ok(PyArray1::from_vec(py, out));
                 }
             }
@@ -2226,14 +2312,12 @@ impl PyModel {
             } else {
                 None
             };
-            let out = if let Some(data) = contiguous {
+            let mut out = if let Some(data) = contiguous {
                 let predictor = self.cpu_predictor().map_err(to_py_err)?;
                 py.detach(|| {
-                    let mut out = score_contiguous_rows_from(
+                    score_contiguous_rows_from(
                         &predictor, data, n_rows, n_features, upto, workers, &mut pool, init,
-                    )?;
-                    transform_prediction_margins(&self.inner, &mut out, output_margin);
-                    Ok(out)
+                    )
                 })
             } else {
                 let view = x.as_array();
@@ -2241,11 +2325,13 @@ impl PyModel {
                     score_rows(n_rows, workers, &mut pool, |row| {
                         // Materialize only this logical row, never the whole matrix.
                         let values = view.row(row).iter().copied().collect::<Vec<_>>();
-                        predict_value(&self.inner, &values, upto, output_margin)
+                        self.inner.predict_margin_upto(&values, upto)
                     })
                 })
             }
             .map_err(to_py_err)?;
+            self.transform_margins(&mut out, output_margin)
+                .map_err(to_py_err)?;
             Ok(PyArray1::from_vec(py, out))
         })
     }
@@ -2275,6 +2361,8 @@ impl PyModel {
         let names = self.inner.feature_names.clone();
         let canonical_n_features = self.inner.n_features;
         let upto = n_trees.unwrap_or(self.inner.trees.len());
+        self.require_prediction_link(output_margin)
+            .map_err(to_py_err)?;
         let k_out = self.inner.num_outputs();
         // 多分类:文件只读一遍。每个 batch 只读各类别视图用到的特征的**并集**,
         // 然后每个类别视图在内存里 gather 自己(压缩过)的特征子集、用自己的
@@ -2390,10 +2478,8 @@ impl PyModel {
                             let mut margins = score_multi_output_batch(
                                 self, inference, upto, data, n_rows, gpu_batch, workers, batch_init,
                             )?;
-                            if output_margin {
-                                out.extend(margins);
-                            } else if let Some(labels) =
-                                self.inner.objective.transform_rows(&mut margins, k_out)
+                            if let Some(labels) =
+                                self.transform_margins(&mut margins, output_margin)?
                             {
                                 out.extend(labels);
                             } else {
@@ -2402,7 +2488,6 @@ impl PyModel {
                             return Ok(());
                         }
                         let inference = single.as_ref().expect("single-output inference");
-                        let inner = inference.model();
                         #[cfg(feature = "cuda")]
                         if gpu_batch {
                             let predictor = match &gpu_predictor {
@@ -2415,7 +2500,7 @@ impl PyModel {
                             };
                             let mut batch =
                                 predictor.predict_margins_from(data, n_rows, upto, batch_init)?;
-                            transform_prediction_margins(inner, &mut batch, output_margin);
+                            self.transform_margins(&mut batch, output_margin)?;
                             out.extend(batch);
                             return Ok(());
                         }
@@ -2444,7 +2529,7 @@ impl PyModel {
                             &mut predict_pool,
                             batch_init,
                         )?;
-                        transform_prediction_margins(inner, &mut batch, output_margin);
+                        self.transform_margins(&mut batch, output_margin)?;
                         // Batch completion order is irrelevant: the reader yields
                         // batches in canonical file/row order and this callback
                         // commits each complete batch synchronously.
@@ -2453,7 +2538,7 @@ impl PyModel {
                     },
                 )
             })
-            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
+            .map_err(prediction_input_error)?;
         reporter.complete(rows);
         if let Some(m) = init {
             if m.len() != rows * k_out {
@@ -2463,12 +2548,7 @@ impl PyModel {
                 )));
             }
         }
-        let two_d = k_out > 1
-            && (output_margin
-                || !matches!(
-                    self.inner.objective,
-                    crate::types::Objective::Softmax { .. }
-                ));
+        let two_d = k_out > 1 && (output_margin || !self.returns_class_indices());
         if two_d {
             let n = out.len() / k_out;
             return PyArray1::from_vec(py, out)
@@ -2855,6 +2935,53 @@ impl PyModel {
         })
     }
 
+    /// Attach a shape-preserving link, or set None to restore the objective transform.
+    /// A named callback is kept in memory; the model stores only its name.
+    #[pyo3(signature = (name=None, *, callback=None))]
+    fn set_prediction_link(
+        &mut self,
+        py: Python<'_>,
+        name: Option<String>,
+        callback: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        use crate::prediction_link::PredictionLink;
+        if let Some(PredictionLink::Named(saved)) = &self.inner.prediction_link {
+            if self.prediction_link_callback.is_none()
+                && callback.is_some()
+                && name.as_deref() != Some(saved.as_str())
+            {
+                return Err(PyValueError::new_err(format!(
+                    "prediction link callback name must match the saved name {saved:?}"
+                )));
+            }
+        }
+        let link = match (name, callback.as_ref()) {
+            (None, None) => None,
+            (Some(name), Some(callback)) if callback.bind(py).is_callable() => {
+                Some(PredictionLink::Named(name))
+            }
+            (Some(name), None) => Some(match name.as_str() {
+                "identity" => PredictionLink::Identity,
+                "sigmoid" => PredictionLink::Sigmoid,
+                "exp" => PredictionLink::Exp,
+                "softmax" => PredictionLink::Softmax,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "unknown built-in prediction link; supply a callback",
+                    ))
+                }
+            }),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "a prediction link callback must be callable and have a name",
+                ))
+            }
+        };
+        self.inner.set_prediction_link(link).map_err(to_py_err)?;
+        self.prediction_link_callback = callback.map(Arc::new);
+        Ok(())
+    }
+
     #[pyo3(signature = (path, quiet=None, model_io_threads=None))]
     fn save_model(
         &self,
@@ -2913,6 +3040,7 @@ impl PyModel {
                 quiet,
                 model_io_threads,
                 ingest_threads,
+                prediction_link_callback: None,
                 prediction_work: OnceLock::new(),
                 cpu_predictor: Mutex::new(None),
                 #[cfg(feature = "cuda")]
@@ -3817,6 +3945,7 @@ fn finish(
         quiet,
         model_io_threads,
         ingest_threads,
+        prediction_link_callback: None,
         prediction_work: OnceLock::new(),
         cpu_predictor: Mutex::new(None),
         inference_model: Mutex::new(None),

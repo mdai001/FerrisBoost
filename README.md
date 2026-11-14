@@ -249,6 +249,12 @@ logging, and the complete parameter reference.
 
 See the [Python API How-To](documents/howto.md) for details.
 
+### Unreleased development
+
+- Extending Python custom objectives with `kind="multiclass"` and `kind="ranking"`. Multiclass callbacks receive an `(n_rows, n_classes)` raw-margin array and return same-shaped gradient and diagonal-Hessian arrays. Ranking callbacks receive raw margins, labels, and query `group_ptr`; Rust applies each query weight to its rows. Ranking uses the built-in `rank:*` objective metadata and does not support built-in unbiased position correction.
+- Adding shape-preserving prediction links to custom-objective models: built-ins `identity`, `sigmoid`, `exp`, and `softmax`, or a named Python callback. Raw-margin prediction and SHAP remain in margin space. Built-in links are saved with the model; named callbacks are runtime bindings and must be rebound to a loaded model using the exact stored name.
+- Gradient callbacks run in Python once per boosting round while Rust validates derivatives, applies weights, and builds trees. Named prediction callbacks run in Python once per prediction batch; tree accumulation and native prediction work stay in Rust.
+
 ### 0.0.9
 
 FerrisBoost 0.0.9 adds the API and features below.

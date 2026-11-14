@@ -22,6 +22,7 @@ mod inference;
 mod interaction;
 pub mod metrics;
 pub mod objective;
+pub mod prediction_link;
 pub mod rank;
 pub mod sketch;
 pub mod source;
@@ -46,6 +47,7 @@ mod python_objective;
 
 pub use callback::{Callback, EarlyStopping, RecordHistory, VerboseEval};
 pub use columns::{BinCuts, BinningStrategy};
+pub use prediction_link::PredictionLink;
 pub use source::DenseSource;
 pub use train::{train, BlockSource, EvalSet, TrainConfig};
 pub use tree::Model;

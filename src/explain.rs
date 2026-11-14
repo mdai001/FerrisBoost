@@ -887,6 +887,7 @@ mod tests {
             rank_bias: None,
             categories: None,
             custom_objective: None,
+            prediction_link: None,
         }
     }
 

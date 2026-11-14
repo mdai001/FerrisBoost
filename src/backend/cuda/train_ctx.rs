@@ -79,6 +79,9 @@ const GPAIR_SCALE_WORDS: usize = 4;
 /// kernel 要不要加载,和 buffer 要不要分配必须用同一个判断,否则会出现
 /// 「分配了 buffer 但没加载 kernel」这种半开状态。
 fn device_quantize_wanted(config: &SharedHistogramConfig) -> bool {
+    if config.gpu_math == crate::types::GpuMath::Fast {
+        return true;
+    }
     match config.device_quantize {
         Some(v) => v,
         None => !matches!(
@@ -884,7 +887,16 @@ impl GpuTrainCtx {
         };
         let mc_stats_fn = load_mc("softmax_row_stats")?;
         let mc_grad_fn = load_mc("softmax_class_gradient")?;
-        let mc_delta_fn = load_mc("add_class_delta")?;
+        let mc_delta_fn = if fast_math {
+            Some(
+                state
+                    .module
+                    .load_function("add_class_delta")
+                    .context("add_class_delta not found in PTX")?,
+            )
+        } else {
+            None
+        };
         // quantile fast 的三个 kernel:fast 下总是加载(不依赖 objective,几个 handle 而已),
         // 只在 quantile objective 时才被 launch。
         let load_qt = |name: &str| -> Result<Option<CudaFunction>> {

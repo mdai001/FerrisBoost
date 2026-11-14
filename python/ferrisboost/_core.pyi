@@ -8,19 +8,25 @@ from numpy.typing import NDArray
 __version__: str
 
 class CustomObjective:
-    """Scalar unweighted derivatives; Rust owns validation, weights and sampling.
+    """Unweighted derivatives; Rust owns validation, weights and sampling.
 
-    callback(raw_margin, labels) returns two contiguous 1D float32 arrays.
-    Inputs are owned snapshots. CPU and CUDA exact, reg:squarederror only.
+    ``kind="scalar"`` calls ``callback(raw_margin, labels)`` with 1D arrays.
+    ``kind="multiclass"`` calls it with margins shaped ``(n_rows, n_classes)``
+    and 1D labels; derivative arrays have the same 2D shape. ``kind="ranking"``
+    calls ``callback(raw_margin, labels, group_ptr)`` with 1D arrays; derivatives
+    are per row and group weights are applied by Rust. Inputs are owned snapshots.
     """
     def __init__(
         self,
         name: str,
-        callback: Callable[[NDArray[np.float32], NDArray[np.float32]],
-                           tuple[NDArray[np.float32], NDArray[np.float32]]],
+        callback: Callable[..., tuple[NDArray[np.float32], NDArray[np.float32]]],
+        *,
+        kind: str = "scalar",
     ) -> None: ...
     @property
     def name(self) -> str: ...
+    @property
+    def kind(self) -> str: ...
     def __copy__(self) -> CustomObjective: ...
     def __deepcopy__(self, memo: Any) -> CustomObjective: ...
 
@@ -71,6 +77,19 @@ class Model:
     def num_class(self) -> int:
         """Number of outputs: classes for multiclass models, quantiles for a
         multi-quantile model (several quantile_alpha values); 1 otherwise."""
+        ...
+    def set_prediction_link(
+        self,
+        name: str | None = None,
+        *,
+        callback: Callable[[NDArray[np.float32]], NDArray[np.float32]] | None = None,
+    ) -> None:
+        """Set a built-in or named prediction transform for a custom objective model.
+
+        Built-ins are ``identity``, ``sigmoid``, ``exp``, and ``softmax``. A
+        named callback receives raw margins shaped ``(n,)`` or ``(n, outputs)``
+        and must return a C-contiguous float32 array of the same shape.
+        """
         ...
     def predict(
         self,

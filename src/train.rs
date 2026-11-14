@@ -703,11 +703,15 @@ impl TrainConfig {
                 !custom.name().trim().is_empty(),
                 "custom objective name must not be empty"
             );
-            crate::ensure_input!(matches!(self.objective, Objective::SquaredError),
-                "custom_objective currently requires objective=reg:squarederror (identity-link scalar regression)");
+            use crate::custom_objective::CustomObjectiveKind;
             crate::ensure_input!(
-                self.params.gpu_math != crate::types::GpuMath::Fast,
-                "custom_objective does not support gpu_math=fast; use exact explicitly"
+                CustomObjectiveKind::for_objective(self.objective) == Some(custom.kind()),
+                "custom_objective kind {:?} requires matching objective metadata (reg:squarederror, multi:softprob/softmax, or rank:*)",
+                custom.kind()
+            );
+            crate::ensure_input!(
+                !matches!(self.objective, Objective::Rank { params, .. } if params.unbiased),
+                "custom ranking objectives cannot use built-in unbiased position correction"
             );
             crate::ensure_input!(
                 self.params.scale_pos_weight == 1.0,
@@ -1337,20 +1341,17 @@ fn train_with_backend(
     cfg.objective.validate_params()?;
     let fast_requested = cfg.params.gpu_math == crate::types::GpuMath::Fast;
     let rank_grad = match (ranking, cfg.group_ptr.as_deref()) {
-        (Some((kind, params)), Some(groups)) => Some(crate::rank::RankGradient::new(
-            kind,
-            params,
-            labels,
-            groups,
-            group_weights,
-        )?),
+        (Some((kind, params)), Some(groups)) if cfg.custom_objective.is_none() => Some(
+            crate::rank::RankGradient::new(kind, params, labels, groups, group_weights)?,
+        ),
         _ => None,
     };
     // One draw of the training RNG per round (XGBoost seeds the sampled pairs of
     // `lambdarank_pair_method=mean` from it); the base-score estimation takes the
     // first one when the base score is not given.
-    let mut round_seeds =
-        ranking.map(|(_, params)| crate::rank::RoundSeeds::new(&params, cfg.params.seed));
+    let mut round_seeds = ranking
+        .filter(|_| rank_grad.is_some())
+        .map(|(_, params)| crate::rank::RoundSeeds::new(&params, cfg.params.seed));
     // Continuation: skip the draws the earlier rounds (and the base-score
     // estimation) would have consumed, so the pair sampling of N+M rounds equals
     // N continued by M. A first run with an explicit `base_score` drew one less;
@@ -1370,6 +1371,7 @@ fn train_with_backend(
         match (&cfg.prior_model, cfg.base_score) {
             (Some(prior), _) => prior.class_base_margins.clone(),
             (None, Some(b)) => vec![b; num_class],
+            (None, None) if cfg.custom_objective.is_some() => vec![0.0; num_class],
             // 多分位数:每个 alpha 一个标签分位数截距。
             (None, None) if cfg.objective.is_multi_quantile() => {
                 cfg.objective.initial_quantile_margins(labels, weights)
@@ -1610,6 +1612,10 @@ fn train_with_backend(
         base_score,
         objective: cfg.objective,
         custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
+        prediction_link: cfg
+            .prior_model
+            .as_ref()
+            .and_then(|m| m.prediction_link.clone()),
         n_features: source.n_features(),
         // 训练层不认识"列名"这个概念(它只见到量化后的块),所以留空,
         // 由知道 schema 的入口层填。空 = 位置模式,也是 numpy 入口的正解。
@@ -1688,16 +1694,20 @@ fn train_with_backend(
                             == crate::types::SamplingMethod::GradientBased
                         && cfg.params.subsample < 1.0)
                         .then_some(cfg.params.subsample),
-                    fast_weights: grad_weights.is_some(),
+                    fast_weights: grad_weights.is_some() && cfg.custom_objective.is_none(),
                     // 规划器(python.rs)和这里必须用同一个 K 计费。
                     n_outputs: num_class,
                     multi_quantile: cfg.objective.is_multi_quantile(),
                     // Device LambdaMART buffers (fast ranking only); the planner
                     // charges the same shape.
                     fast_rank: match (ranking, cfg.group_ptr.as_deref()) {
-                        (Some((kind, params)), Some(g)) if fast_requested => Some(
-                            crate::gpu_mem_plan::FastRankShape::for_groups(kind, &params, g),
-                        ),
+                        (Some((kind, params)), Some(g))
+                            if fast_requested && rank_grad.is_some() =>
+                        {
+                            Some(crate::gpu_mem_plan::FastRankShape::for_groups(
+                                kind, &params, g,
+                            ))
+                        }
                         _ => None,
                     },
                     device_quantize: cfg.params.device_quantize,
@@ -1758,15 +1768,20 @@ fn train_with_backend(
             None => vec![margin; n],
         };
     }
+    let custom_fast = fast_math && cfg.custom_objective.is_some();
+    if custom_fast && num_class == 1 {
+        predictions.resize(n, 0.0);
+    }
     if fast_math {
         let ctx = gpu.as_ref().expect("fast_math implies a GPU context");
+        let device_weights = if custom_fast { None } else { grad_weights };
         match &cfg.base_margin {
             // device prediction 直接从逐行 margin 起步(class-major,K × n):
             // 缓冲区本来就按 K × n 分配,规划器不用多记一项。
-            Some(m) => ctx.init_fast_math_rows(labels, grad_weights, m)?,
+            Some(m) => ctx.init_fast_math_rows(labels, device_weights, m)?,
             None => ctx.init_fast_math(
                 labels,
-                grad_weights,
+                device_weights,
                 // 多分类:K 个 base margin(class-major 的 K 份 device prediction)。
                 if num_class > 1 {
                     &class_margins
@@ -1850,7 +1865,31 @@ fn train_with_backend(
         // gradient 和量化在 device 上一次做完。
         let exact_gradient_phase =
             (!fast_math).then(|| crate::diagnostic::Phase::new(b"fb.host.exact.gradient\0"));
-        let gpair_f32 = if fast_math {
+        let gpair_f32 = if custom_fast {
+            let _phase = crate::diagnostic::Phase::new(b"fb.host.custom.gradient\0");
+            let _t = prof::Timer::new(&prof::GRAD);
+            let ctx = gpu.as_ref().expect("custom fast requires a GPU context");
+            if pending_delta {
+                ctx.fast_multiclass_apply_delta(0)?;
+                pending_delta = false;
+            }
+            ctx.sync_prediction_to_host(&mut predictions)?;
+            let custom = cfg
+                .custom_objective
+                .as_ref()
+                .expect("custom fast requires a provider");
+            pool.install(|| {
+                custom_round_gradients(
+                    custom.as_ref(),
+                    &predictions,
+                    labels,
+                    grad_weights,
+                    cfg.group_ptr.as_deref(),
+                    group_weights,
+                )
+            })
+            .with_context(|| format!("custom objective {:?}, round {}", custom.name(), round))?
+        } else if fast_math {
             Vec::new()
         } else if cfg.objective.is_survival() {
             pool.install(|| -> anyhow::Result<Vec<GradPair>> {
@@ -1908,9 +1947,15 @@ fn train_with_backend(
                     })?;
                     pending_delta = false;
                 }
-                custom_gradients(custom.as_ref(), &predictions, labels, grad_weights).with_context(
-                    || format!("custom objective {:?}, round {}", custom.name(), round),
+                custom_round_gradients(
+                    custom.as_ref(),
+                    &predictions,
+                    labels,
+                    grad_weights,
+                    cfg.group_ptr.as_deref(),
+                    group_weights,
                 )
+                .with_context(|| format!("custom objective {:?}, round {}", custom.name(), round))
             })?
         } else if fuse {
             let ctx = gpu.as_ref().expect("pending_delta implies a GPU context");
@@ -2000,7 +2045,7 @@ fn train_with_backend(
         //
         // uniform 采样**不做 `1/p` 加权**(那是 gradient-based 采样才需要的)。
         let mut gpair_f32 = gpair_f32;
-        let uniform_rate = prepare_row_sampling(&mut gpair_f32, cfg, key_round as u64)?;
+        let uniform_rate = prepare_row_sampling(&mut gpair_f32, cfg, key_round as u64, fast_math)?;
         let device_quant = gpu.as_ref().is_some_and(|c| c.device_quantize_enabled());
         // Device quantization masks in its existing max scan before selecting
         // scale. CPU and explicit host quantization mask in `mask_and_bounds`
@@ -2011,7 +2056,7 @@ fn train_with_backend(
         let quantize_phase = crate::diagnostic::Phase::new(b"fb.host.quantize\0");
         // `known_root_sum`:根节点的和已经顺手求出(device 量化、或 host 转定点
         // 那一趟);`host_nonzero`:host 转定点时记下的非零行位图。
-        let (quantizer, fixed, known_root_sum, host_nonzero) = if fast_math {
+        let (quantizer, fixed, known_root_sum, host_nonzero) = if fast_math && !custom_fast {
             // prediction D2H、host 按行 gradient、gpair H2D —— 三项都不存在。
             // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
             let ctx = gpu.as_ref().expect("fast_math implies a GPU context");
@@ -2301,6 +2346,10 @@ pub fn train_gpu_one_tree(
     cfg.validate_custom_objective()?;
     cfg.validate_sampling_method()?;
     crate::ensure_input!(
+        !(cfg.custom_objective.is_some() && cfg.params.gpu_math == crate::types::GpuMath::Fast),
+        "train_gpu_one_tree does not support fast custom objectives; use train_gpu"
+    );
+    crate::ensure_input!(
         cfg.params.sampling_method == crate::types::SamplingMethod::Uniform,
         "train_gpu_one_tree does not support sampling_method=gradient_based; use train_gpu"
     );
@@ -2309,8 +2358,9 @@ pub fn train_gpu_one_tree(
         "train_gpu_one_tree does not support feature_weights; use train_gpu"
     );
     crate::ensure_input!(
-        !cfg.objective.is_survival(),
-        "train_gpu_one_tree does not support survival objectives; use train_gpu"
+        !cfg.objective.is_survival()
+            && !cfg.custom_objective.as_ref().is_some_and(|o| o.kind() != crate::custom_objective::CustomObjectiveKind::Scalar),
+        "train_gpu_one_tree does not support survival or grouped/multi-output custom objectives; use train_gpu"
     );
     let gpair = if let Some(custom) = &cfg.custom_objective {
         custom_gradients(custom.as_ref(), &predictions, labels, None)?
@@ -2374,6 +2424,10 @@ pub fn train_gpu_one_tree(
             base_score,
             objective: cfg.objective,
             custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
+            prediction_link: cfg
+                .prior_model
+                .as_ref()
+                .and_then(|m| m.prediction_link.clone()),
             n_features: source.n_features(),
             best_iteration: None,
             best_score: None,
@@ -2425,6 +2479,10 @@ pub fn train_gpu_one_tree(
         base_score,
         objective: cfg.objective,
         custom_objective: cfg.custom_objective.as_ref().map(|o| o.name().to_owned()),
+        prediction_link: cfg
+            .prior_model
+            .as_ref()
+            .and_then(|m| m.prediction_link.clone()),
         n_features: source.n_features(),
         best_iteration: None,
         best_score: None,
@@ -2508,13 +2566,39 @@ fn train_multiclass_rounds(
         })
         .collect();
     let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
+    let mut custom_margins = Vec::new();
+    let mut custom_pairs = Vec::new();
+    if cfg.custom_objective.is_some() {
+        let size = n
+            .checked_mul(k_count)
+            .ok_or_else(|| anyhow::anyhow!("custom multiclass size overflow"))?;
+        custom_margins.resize(size, 0.0);
+        custom_pairs.resize(size, UNSET_CUSTOM_PAIR);
+    }
     let device_quant = gpu.is_some_and(|c| c.device_quantize_enabled());
     let multi_quantile = cfg.objective.is_multi_quantile();
     let mut fixed_buf: Vec<GradPairFixed> = Vec::new();
 
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
-        if fast_math {
+        if let Some(custom) = cfg.custom_objective.as_ref() {
+            let _t = prof::Timer::new(&prof::GRAD);
+            if let Some(ctx) = gpu.filter(|_| fast_math) {
+                ctx.sync_prediction_to_host(&mut custom_margins)?;
+            } else {
+                for (dst, src) in custom_margins.chunks_exact_mut(n).zip(&class_preds) {
+                    dst.copy_from_slice(src);
+                }
+            }
+            custom_pairs.fill(UNSET_CUSTOM_PAIR);
+            pool.install(|| {
+                custom.gradients_multiclass(&custom_margins, labels, k_count, &mut custom_pairs)
+            })
+            .with_context(|| format!("custom objective {:?}, round {}", custom.name(), round))?;
+            for pairs in custom_pairs.chunks_exact_mut(n) {
+                validate_custom_pairs(pairs, weights)?;
+            }
+        } else if fast_math {
             // 多分位数没有每轮的行统计量:每个目标的 scale 在它自己的 kernel 里归约。
             if !multi_quantile {
                 let _t = prof::Timer::new(&prof::GRAD);
@@ -2541,72 +2625,75 @@ fn train_multiclass_rounds(
         }
         for class in 0..k_count {
             let tree_index = ((prior_rounds + round) * k_count + class) as u64;
-            let mut gpair_f32 = if fast_math {
-                Vec::new()
+            let mut native_pairs = Vec::new();
+            let gpair_f32 = if cfg.custom_objective.is_some() {
+                &mut custom_pairs[class * n..(class + 1) * n]
             } else {
-                std::mem::take(&mut grads[class])
+                native_pairs = std::mem::take(&mut grads[class]);
+                native_pairs.as_mut_slice()
             };
             // 行采样:和单输出相同的确定性掩码,键是树序号。host 量化路径上
             // 掩码与求 scale 的 max 合成一趟(见 `mask_and_bounds`)。
-            let uniform_rate = prepare_row_sampling(&mut gpair_f32, cfg, tree_index as u64)?;
-            let (quantizer, fixed, dev_root_sum, host_nonzero) = if fast_math {
-                // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
-                // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
-                // kernel、无条件执行 —— 采样掩码不是预测掩码。
-                let ctx = gpu.expect("fast_math implies a GPU context");
-                let _t = prof::Timer::new(&prof::QUANTIZE);
-                let (q, root, _ms) = if multi_quantile {
-                    ctx.fast_multiquantile_gradient_and_quantize(
-                        class,
-                        cfg.objective
-                            .quantile_alphas()
-                            .expect("multi quantile")
-                            .as_slice()[class],
-                        crate::subsample::threshold_for(uniform_rate),
-                        cfg.params.seed,
-                        tree_index,
-                    )?
-                } else {
-                    ctx.fast_multiclass_gradient_and_quantize(
-                        class,
-                        crate::subsample::threshold_for(uniform_rate),
-                        cfg.params.seed,
-                        tree_index,
-                    )?
-                };
-                (q, Vec::new(), Some(root), None)
-            } else if device_quant {
-                let ctx = gpu.expect("device_quant implies a GPU context");
-                let _t = prof::Timer::new(&prof::QUANTIZE);
-                let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
-                    &gpair_f32,
-                    crate::subsample::threshold_for(uniform_rate),
-                    cfg.params.seed,
-                    tree_index,
-                )?;
-                (q, Vec::new(), Some(root), None)
-            } else {
-                pool.install(|| {
-                    let mask = (uniform_rate < 1.0).then(|| {
-                        (
+            let uniform_rate = prepare_row_sampling(gpair_f32, cfg, tree_index, fast_math)?;
+            let (quantizer, fixed, dev_root_sum, host_nonzero) =
+                if fast_math && cfg.custom_objective.is_none() {
+                    // ⚠️ **不保证 CPU/GPU 逐字节相同**,这是 `gpu_math="fast"` 的定义。
+                    // 行采样在 gradient kernel 里完成;prediction 的更新是另一个
+                    // kernel、无条件执行 —— 采样掩码不是预测掩码。
+                    let ctx = gpu.expect("fast_math implies a GPU context");
+                    let _t = prof::Timer::new(&prof::QUANTIZE);
+                    let (q, root, _ms) = if multi_quantile {
+                        ctx.fast_multiquantile_gradient_and_quantize(
+                            class,
+                            cfg.objective
+                                .quantile_alphas()
+                                .expect("multi quantile")
+                                .as_slice()[class],
                             crate::subsample::threshold_for(uniform_rate),
                             cfg.params.seed,
                             tree_index,
-                        )
-                    });
-                    let (max_grad, max_hess, _) = {
-                        let _t = prof::Timer::new(&prof::SAMPLE);
-                        mask_and_bounds(&mut gpair_f32, mask)
+                        )?
+                    } else {
+                        ctx.fast_multiclass_gradient_and_quantize(
+                            class,
+                            crate::subsample::threshold_for(uniform_rate),
+                            cfg.params.seed,
+                            tree_index,
+                        )?
                     };
+                    (q, Vec::new(), Some(root), None)
+                } else if device_quant {
+                    let ctx = gpu.expect("device_quant implies a GPU context");
                     let _t = prof::Timer::new(&prof::QUANTIZE);
-                    let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, n)?;
-                    // 定点缓冲在各类、各轮之间复用(见 `quantize_host`)。
-                    let mut fixed = std::mem::take(&mut fixed_buf);
-                    let (root, nonzero) = quantize_host(&gpair_f32, &quantizer, &mut fixed);
-                    Ok::<_, anyhow::Error>((quantizer, fixed, Some(root), Some(nonzero)))
-                })?
-            };
-            drop(gpair_f32);
+                    let (q, root, _ms) = ctx.upload_and_quantize_gpair_sampled(
+                        gpair_f32,
+                        crate::subsample::threshold_for(uniform_rate),
+                        cfg.params.seed,
+                        tree_index,
+                    )?;
+                    (q, Vec::new(), Some(root), None)
+                } else {
+                    pool.install(|| {
+                        let mask = (uniform_rate < 1.0).then(|| {
+                            (
+                                crate::subsample::threshold_for(uniform_rate),
+                                cfg.params.seed,
+                                tree_index,
+                            )
+                        });
+                        let (max_grad, max_hess, _) = {
+                            let _t = prof::Timer::new(&prof::SAMPLE);
+                            mask_and_bounds(gpair_f32, mask)
+                        };
+                        let _t = prof::Timer::new(&prof::QUANTIZE);
+                        let quantizer = GradQuantizer::try_from_bounds(max_grad, max_hess, n)?;
+                        // 定点缓冲在各类、各轮之间复用(见 `quantize_host`)。
+                        let mut fixed = std::mem::take(&mut fixed_buf);
+                        let (root, nonzero) = quantize_host(gpair_f32, &quantizer, &mut fixed);
+                        Ok::<_, anyhow::Error>((quantizer, fixed, Some(root), Some(nonzero)))
+                    })?
+                };
+            drop(native_pairs);
             if let (Some(ctx), false) = (gpu, device_quant) {
                 ctx.upload_gpair(&fixed)?;
             }
@@ -5107,11 +5194,12 @@ fn prepare_row_sampling(
     pairs: &mut [GradPair],
     cfg: &TrainConfig,
     tree: u64,
+    device_sampling: bool,
 ) -> anyhow::Result<f32> {
     if cfg.params.sampling_method == crate::types::SamplingMethod::Uniform {
         return Ok(cfg.params.subsample);
     }
-    if pairs.is_empty() && cfg.params.gpu_math == crate::types::GpuMath::Fast {
+    if device_sampling {
         // Device gradients are sampled in-place by the shared quantization tail.
         return Ok(1.0);
     }
@@ -5123,6 +5211,45 @@ fn prepare_row_sampling(
     Ok(1.0)
 }
 
+const UNSET_CUSTOM_PAIR: GradPair = GradPair {
+    grad: f32::NAN,
+    hess: f32::NAN,
+};
+
+fn custom_round_gradients(
+    objective: &dyn crate::custom_objective::CustomObjective,
+    predictions: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    groups: Option<&[u32]>,
+    group_weights: Option<&[f32]>,
+) -> anyhow::Result<Vec<GradPair>> {
+    use crate::custom_objective::CustomObjectiveKind;
+    if objective.kind() != CustomObjectiveKind::Ranking {
+        return custom_gradients(objective, predictions, labels, weights);
+    }
+    let groups = groups.expect("validated custom ranking groups");
+    let mut pairs = vec![UNSET_CUSTOM_PAIR; labels.len()];
+    objective.gradients_ranking(predictions, labels, groups, &mut pairs)?;
+    validate_custom_pairs(&mut pairs, None)?;
+    if let Some(weights) = group_weights {
+        for (range, &weight) in groups.windows(2).zip(weights) {
+            for (offset, pair) in pairs[range[0] as usize..range[1] as usize]
+                .iter_mut()
+                .enumerate()
+            {
+                *pair = weighted(*pair, weight);
+                crate::ensure_input!(
+                    pair.grad.is_finite() && pair.hess.is_finite(),
+                    "custom objective weighted gradient/Hessian at row {} must be finite",
+                    range[0] as usize + offset
+                );
+            }
+        }
+    }
+    Ok(pairs)
+}
+
 fn custom_gradients(
     objective: &dyn crate::custom_objective::CustomObjective,
     predictions: &[f32],
@@ -5132,14 +5259,13 @@ fn custom_gradients(
     // Poison unfilled slots so a partial native implementation fails instead
     // of silently treating forgotten rows as zero-weight samples. This buffer
     // follows the existing lifetime: released after quantization, before trees.
-    let mut out = vec![
-        GradPair {
-            grad: f32::NAN,
-            hess: f32::NAN
-        };
-        labels.len()
-    ];
+    let mut out = vec![UNSET_CUSTOM_PAIR; labels.len()];
     objective.gradients(predictions, labels, &mut out)?;
+    validate_custom_pairs(&mut out, weights)?;
+    Ok(out)
+}
+
+fn validate_custom_pairs(out: &mut [GradPair], weights: Option<&[f32]>) -> anyhow::Result<()> {
     for (row, pair) in out.iter_mut().enumerate() {
         crate::ensure_input!(
             pair.grad.is_finite(),
@@ -5157,7 +5283,7 @@ fn custom_gradients(
             );
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn compute_gradients_weighted(

@@ -455,16 +455,78 @@ def test_cuda_exact_custom_objective_matches_cpu_and_callback_margins():
 
 
 @pytest.mark.skipif(os.environ.get("FB_TEST_CUDA") != "1", reason="requires explicit CUDA test opt-in")
-def test_cuda_fast_custom_objective_is_rejected():
+def test_cuda_fast_custom_objective_applies_weights_once_and_repeats(tmp_path):
     x, y = data(16)
+    weight = np.linspace(0.5, 2.0, len(y), dtype=np.float32)
+
+    def constant_derivatives(_margin, labels):
+        return (
+            np.full(len(labels), 2.0, dtype=np.float32),
+            np.full(len(labels), 4.0, dtype=np.float32),
+        )
+
     params = {
         **BASE,
         "device": "cuda:0",
         "gpu_math": "fast",
-        "custom_objective": fb.CustomObjective("unsupported_gpu_fast", squared_error),
+        "max_depth": 0,
+        "reg_lambda": 1.0,
+        "eta": 0.3,
+        "custom_objective": fb.CustomObjective("fast_weighted_constant", constant_derivatives),
     }
-    with pytest.raises(ValueError):
-        fb.train(params, x, label=y, num_boost_round=1, quiet=True)
+    first = fb.train(params, x, label=y, weight=weight, num_boost_round=1, quiet=True)
+    repeat = fb.train(params, x, label=y, weight=weight, num_boost_round=1, quiet=True)
+    assert read_json(first, tmp_path / "first.json") == read_json(
+        repeat, tmp_path / "repeat.json"
+    )
+
+    total_weight = float(np.sum(weight, dtype=np.float64))
+    expected = -0.3 * (2.0 * total_weight) / (4.0 * total_weight + 1.0)
+    prediction = first.predict(x[:1], output_margin=True)[0]
+    assert abs(float(prediction) - expected) < 2e-5
+
+
+@pytest.mark.skipif(os.environ.get("FB_TEST_CUDA") != "1", reason="requires explicit CUDA test opt-in")
+@pytest.mark.parametrize("sampling_method", ["uniform", "gradient_based"])
+def test_cuda_fast_custom_objective_updated_margins_sampling_and_continuation(sampling_method):
+    x, y = data(64)
+    calls = []
+
+    def capture(margin, labels):
+        calls.append(margin.copy())
+        return squared_error(margin, labels)
+
+    params = {
+        **BASE,
+        "device": "cuda:0",
+        "gpu_math": "fast",
+        "sampling_method": sampling_method,
+        "subsample": 0.75,
+        "custom_objective": fb.CustomObjective("fast_sampled_square", capture),
+    }
+    prior = fb.train(params, x, label=y, num_boost_round=2, quiet=True)
+    assert len(calls) == 2
+    assert all(margin.shape == (len(y),) for margin in calls)
+    np.testing.assert_array_equal(calls[0], np.zeros(len(y), dtype=np.float32))
+    np.testing.assert_allclose(
+        calls[1],
+        prior.predict(x, output_margin=True, iteration_range=(0, 1)),
+        rtol=0,
+        atol=2e-5,
+    )
+
+    base_margin = prior.predict(x, output_margin=True)
+    continued = fb.train(
+        params,
+        x,
+        label=y,
+        num_boost_round=1,
+        init_model=prior,
+        quiet=True,
+    )
+    assert continued.num_trees == 3
+    assert len(calls) == 3
+    np.testing.assert_allclose(calls[2], base_margin, rtol=0, atol=2e-5)
 
 
 def test_callback_mutation_does_not_change_training_state():
