@@ -259,6 +259,67 @@ impl GpuBlockSession<'_> {
         Ok(true)
     }
 
+    /// The frontier is keyed by tree node ID and can span multiple depths.
+    pub(crate) fn begin_lossguide_split(&mut self, root: bool) -> Result<bool> {
+        if root {
+            return self.begin_split_level(0);
+        }
+        let slot = self.slot.as_ref().expect("histogram slot lease missing");
+        let Some(cache) = &slot.split_cache else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            cache.layout == slot.offsets_host && cache.next_ids.is_empty(),
+            "GPU lossguide split cache is out of sync"
+        );
+        Ok(true)
+    }
+
+    /// Preserve unselected leaves in the read arena. The write arena is
+    /// scratch for the latest batch, whose packets have already been read.
+    pub(crate) fn retain_lossguide_histograms(
+        &mut self,
+        parent: Option<usize>,
+        node_ids: &[usize],
+    ) -> Result<()> {
+        let slot = self.slot.as_mut().expect("histogram slot lease missing");
+        let stream = slot.stream.clone();
+        let cache = slot
+            .split_cache
+            .as_mut()
+            .context("GPU split cache unavailable")?;
+        if let Some(parent) = parent {
+            cache.previous_ids.retain(|&(node, _)| node != parent);
+        }
+        if cache.previous_ids.is_empty() {
+            std::mem::swap(&mut cache.previous, &mut cache.next);
+            std::mem::swap(&mut cache.previous_ids, &mut cache.next_ids);
+            for (index, _) in &mut cache.previous_ids {
+                *index = node_ids[*index];
+            }
+            return Ok(());
+        }
+        let width = self.n_hist * 2;
+        for (index, from) in cache.next_ids.drain(..) {
+            let to = if cache.previous_ids.len() == cache.capacity {
+                cache.previous_ids.remove(0).1
+            } else {
+                (0..cache.capacity)
+                    .find(|slot| !cache.previous_ids.iter().any(|&(_, used)| used == *slot))
+                    .expect("split cache has a free slot")
+            };
+            // The kernel strides in gradient pairs. The allocation is i64.
+            let src = from * cache.stride * 2;
+            let dst = to * cache.stride * 2;
+            stream.memcpy_dtod(
+                &cache.next.slice(src..src + width),
+                &mut cache.previous.slice_mut(dst..dst + width),
+            )?;
+            cache.previous_ids.push((node_ids[index], to));
+        }
+        Ok(())
+    }
+
     pub(crate) fn cached_parent_slot(&mut self, parent: usize) -> Option<usize> {
         let found = self
             .slot
@@ -338,7 +399,12 @@ impl GpuBlockSession<'_> {
         let mut pending = Vec::with_capacity(SPLIT_PACKET_WINDOW_BATCHES);
         let mut packet_nodes = 0;
         let mut results = Vec::new();
-        for chunk in groups.chunks((cap / 2).max(1)) {
+        let groups_per_batch = if self.ctx.has_symmetric_split() {
+            groups.len().max(1)
+        } else {
+            (cap / 2).max(1)
+        };
+        for chunk in groups.chunks(groups_per_batch) {
             let nodes: usize = chunk
                 .iter()
                 .map(|g| 1 + usize::from(g.large.is_some()))
@@ -463,6 +529,11 @@ impl GpuBlockSession<'_> {
                 .all(|x| x[1] - x[0] <= SPLIT_KERNEL_MAX_BINS),
             "GPU split: a feature above 255 bins needs the wide split kernels"
         );
+        let symmetric = self.ctx.has_symmetric_split();
+        anyhow::ensure!(
+            !symmetric || (!wide && node_enabled.is_none()),
+            "GPU symmetric split requires narrow histograms without node masks"
+        );
         let nodes = groups
             .iter()
             .map(|g| 1 + usize::from(g.large.is_some()))
@@ -493,9 +564,10 @@ impl GpuBlockSession<'_> {
             .context("resident split cache unavailable")?;
         let mut split_inputs = vec![0i64; nodes * 4];
         let mut bounds = Vec::with_capacity(nodes * 2);
-        let mut indices = Vec::with_capacity(nodes);
-        let mut working_slots = Vec::with_capacity(nodes);
-        let mut cached = Vec::with_capacity(nodes);
+        let mut indices = vec![0; nodes];
+        let mut working_slots = vec![0; nodes];
+        let mut cached = vec![false; nodes];
+        let mut appended = 0;
         let mut large_slot = groups.len();
         for (small_slot, g) in groups.iter().enumerate() {
             if let Some((_, parent, _, _)) = g.large {
@@ -516,16 +588,20 @@ impl GpuBlockSession<'_> {
                 } else {
                     u32::MAX
                 };
+                // Symmetric gains must accumulate in logical leaf order even
+                // when the smaller sibling's histogram was built first.
+                let position = if symmetric { index } else { appended };
                 write_split_input(
                     &mut split_inputs,
-                    indices.len(),
+                    position,
                     sum,
                     [work as u32, small_slot as u32, parent, destination],
                 );
                 bounds.extend_from_slice(&[node_bounds.lower, node_bounds.upper]);
-                indices.push(index);
-                working_slots.push(work);
-                cached.push(destination != u32::MAX);
+                indices[position] = index;
+                working_slots[position] = work;
+                cached[position] = destination != u32::MAX;
+                appended += 1;
             };
             append(g.small, small_slot, g.sum, g.bounds, u32::MAX);
             if let Some((index, parent, sum, large_bounds)) = g.large {
@@ -649,7 +725,7 @@ impl GpuBlockSession<'_> {
                 SPLIT_SCORE_LEGACY
             }
         };
-        if split_score_mode == SPLIT_SCORE_GIVEN_BOUNDED {
+        if !symmetric && split_score_mode == SPLIT_SCORE_GIVEN_BOUNDED {
             stream.memcpy_htod(&bounds, &mut cache.bounds.slice_mut(..bounds.len()))?;
             self.timing.split_metadata_h2d_calls += 1;
             self.timing.split_metadata_h2d_bytes += (bounds.len() * 4) as u64;
@@ -712,105 +788,174 @@ impl GpuBlockSession<'_> {
         // upload waits for their consumers through the original slot stream.
         let metadata_view = unsafe { metadata_words.transmute::<u32>(nodes * 4) }
             .context("packed split metadata view exceeds allocation")?;
-        let mut launch = stream.launch_builder(split_fn.context("GPU split kernel unavailable")?);
-        launch
-            .arg(&mut *hist_out)
-            .arg(&cache.previous)
-            .arg(&mut cache.next)
-            .arg(offsets)
-            .arg(&cache.feats)
-            .arg(&cache.enabled)
-            .arg(&sums_view)
-            .arg(&metadata_view)
-            .arg(&features)
-            .arg(&stride)
-            .arg(&cache_stride)
-            .arg(&ig)
-            .arg(&ih)
-            .arg(&p.lambda)
-            .arg(&p.gamma)
-            .arg(&p.min_child_weight)
-            .arg(&p.alpha)
-            .arg(&p.max_delta_step)
-            .arg(&cache.bounds)
-            .arg(&cache.monotone)
-            .arg(&split_score_mode)
-            .arg(&mut cache.candidates);
-        if node_enabled.is_some() {
-            launch.arg(&cache.node_enabled);
-        } else {
-            launch.arg(&no_node_mask);
-        }
-        let wide_set_words = cache.wide_set_words;
-        let wide_key_elems = cache.wide_key_elems;
-        if cache.cat_enabled && cache.wide {
+        if symmetric {
+            let (score_fn, reduce_fn) = self
+                .ctx
+                .split_symmetric_fns
+                .as_ref()
+                .context("GPU symmetric split kernels unavailable")?;
+            let node_count = nodes as u32;
+            let mut launch = stream.launch_builder(score_fn);
             launch
-                .arg(&cache.cat_info)
-                .arg(&cache.wide_layout)
-                .arg(&max_onehot)
-                .arg(&max_threshold)
-                .arg(&wide_set_words)
-                .arg(&wide_key_elems)
-                .arg(&mut cache.wide_keys)
-                .arg(&mut cache.wide_sets);
-        } else if cache.cat_enabled {
-            launch
-                .arg(&cache.cat_info)
-                .arg(&n_cat)
-                .arg(&max_onehot)
-                .arg(&max_threshold)
-                .arg(&mut cache.cat_sets);
-        }
-        // Bounds above cover all CTA loads/stores; previous/next/work allocations
-        // are disjoint and feature CTAs own disjoint histogram ranges.
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: (features, nodes as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }?;
-        let _submit_phase = crate::diagnostic::Phase::new(b"fb.host.packet_submit\0");
-        let packet_stride = cache.packet_stride;
-        let stride_arg = packet_stride as u32;
-        let mut packet_output = cache
-            .packets
-            .slice_mut(packet_offset * packet_stride..(packet_offset + nodes) * packet_stride);
-        let nodes_fn = match (cache.wide, cache.cat_enabled) {
-            (true, true) => wide_fns.and_then(|w| w.split_cat.as_ref()).map(|w| &w.1),
-            (_, true) => self.ctx.split_nodes_cat_fn.as_ref(),
-            (_, false) => self.ctx.split_nodes_fn.as_ref(),
-        };
-        let mut launch =
-            stream.launch_builder(nodes_fn.context("GPU split reduction unavailable")?);
-        launch.arg(&cache.candidates).arg(&features);
-        if cache.cat_enabled && cache.wide {
-            launch
-                .arg(&cache.wide_sets)
-                .arg(&cache.wide_layout)
-                .arg(&wide_set_words)
-                .arg(&mut packet_output)
-                .arg(&stride_arg);
-        } else if cache.cat_enabled {
-            launch
-                .arg(&cache.cat_sets)
-                .arg(&n_cat)
-                .arg(&mut packet_output)
-                .arg(&stride_arg);
-        } else {
-            launch
+                .arg(&mut *hist_out)
+                .arg(&cache.previous)
+                .arg(&mut cache.next)
+                .arg(&*offsets)
+                .arg(&cache.feats)
+                .arg(&cache.enabled)
+                .arg(&sums_view)
+                .arg(&metadata_view)
+                .arg(&node_count)
+                .arg(&stride)
+                .arg(&cache_stride)
                 .arg(&ig)
                 .arg(&ih)
                 .arg(&p.lambda)
+                .arg(&p.gamma)
+                .arg(&p.min_child_weight)
+                .arg(&p.alpha)
+                .arg(&p.max_delta_step)
+                .arg(&mut cache.candidates);
+            // Each CTA owns one feature across all leaves. The planner
+            // guarantees that the whole narrow numeric level fits in the batch.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (features, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
+
+            let mut packet_output = cache.packets.slice_mut(
+                packet_offset * SPLIT_PACKET_BYTES..(packet_offset + nodes) * SPLIT_PACKET_BYTES,
+            );
+            let mut launch = stream.launch_builder(reduce_fn);
+            launch
+                .arg(&cache.candidates)
+                .arg(&features)
+                .arg(&*hist_out)
+                .arg(&*offsets)
+                .arg(&sums_view)
+                .arg(&metadata_view)
+                .arg(&node_count)
+                .arg(&stride)
+                .arg(&ig)
+                .arg(&ih)
+                .arg(&p.lambda)
+                .arg(&p.gamma)
+                .arg(&p.min_child_weight)
+                .arg(&p.alpha)
+                .arg(&p.max_delta_step)
                 .arg(&mut packet_output);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
+        } else {
+            let mut launch =
+                stream.launch_builder(split_fn.context("GPU split kernel unavailable")?);
+            launch
+                .arg(&mut *hist_out)
+                .arg(&cache.previous)
+                .arg(&mut cache.next)
+                .arg(&*offsets)
+                .arg(&cache.feats)
+                .arg(&cache.enabled)
+                .arg(&sums_view)
+                .arg(&metadata_view)
+                .arg(&features)
+                .arg(&stride)
+                .arg(&cache_stride)
+                .arg(&ig)
+                .arg(&ih)
+                .arg(&p.lambda)
+                .arg(&p.gamma)
+                .arg(&p.min_child_weight)
+                .arg(&p.alpha)
+                .arg(&p.max_delta_step)
+                .arg(&cache.bounds)
+                .arg(&cache.monotone)
+                .arg(&split_score_mode)
+                .arg(&mut cache.candidates);
+            if node_enabled.is_some() {
+                launch.arg(&cache.node_enabled);
+            } else {
+                launch.arg(&no_node_mask);
+            }
+            let wide_set_words = cache.wide_set_words;
+            let wide_key_elems = cache.wide_key_elems;
+            if cache.cat_enabled && cache.wide {
+                launch
+                    .arg(&cache.cat_info)
+                    .arg(&cache.wide_layout)
+                    .arg(&max_onehot)
+                    .arg(&max_threshold)
+                    .arg(&wide_set_words)
+                    .arg(&wide_key_elems)
+                    .arg(&mut cache.wide_keys)
+                    .arg(&mut cache.wide_sets);
+            } else if cache.cat_enabled {
+                launch
+                    .arg(&cache.cat_info)
+                    .arg(&n_cat)
+                    .arg(&max_onehot)
+                    .arg(&max_threshold)
+                    .arg(&mut cache.cat_sets);
+            }
+            // Bounds above cover all CTA loads/stores; previous/next/work allocations
+            // are disjoint and feature CTAs own disjoint histogram ranges.
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (features, nodes as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
+            let _submit_phase = crate::diagnostic::Phase::new(b"fb.host.packet_submit\0");
+            let packet_stride = cache.packet_stride;
+            let stride_arg = packet_stride as u32;
+            let mut packet_output = cache
+                .packets
+                .slice_mut(packet_offset * packet_stride..(packet_offset + nodes) * packet_stride);
+            let nodes_fn = match (cache.wide, cache.cat_enabled) {
+                (true, true) => wide_fns.and_then(|w| w.split_cat.as_ref()).map(|w| &w.1),
+                (_, true) => self.ctx.split_nodes_cat_fn.as_ref(),
+                (_, false) => self.ctx.split_nodes_fn.as_ref(),
+            };
+            let mut launch =
+                stream.launch_builder(nodes_fn.context("GPU split reduction unavailable")?);
+            launch.arg(&cache.candidates).arg(&features);
+            if cache.cat_enabled && cache.wide {
+                launch
+                    .arg(&cache.wide_sets)
+                    .arg(&cache.wide_layout)
+                    .arg(&wide_set_words)
+                    .arg(&mut packet_output)
+                    .arg(&stride_arg);
+            } else if cache.cat_enabled {
+                launch
+                    .arg(&cache.cat_sets)
+                    .arg(&n_cat)
+                    .arg(&mut packet_output)
+                    .arg(&stride_arg);
+            } else {
+                launch
+                    .arg(&ig)
+                    .arg(&ih)
+                    .arg(&p.lambda)
+                    .arg(&mut packet_output);
+            }
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (nodes as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
         }
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: (nodes as u32, 1, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }?;
         self.timing.kernel_calls += 2;
         self.timing.split_kernel_calls += 2;
         self.timing.split_cat_evaluated += (nodes * n_cat as usize) as u64;

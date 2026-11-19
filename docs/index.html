@@ -97,16 +97,26 @@ prediction = model.predict("test.parquet")</code></pre>
 
     <section>
       <h2>Observed performance</h2>
-      <p>On the standardized HIGGS and Epsilon Parquet workloads reported in the README, FerrisBoost used 0.27–0.46× XGBoost setup time, 0.29–0.47× peak host RAM, and 0.43–0.72× combined RAM plus active VRAM on GPU. CPU training used 0.53–0.84× XGBoost CPU training time and GPU-fast training 0.37–0.73× XGBoost GPU training time. These results describe the tested workloads, not universal guarantees. These are historical measurements and do not report 0.0.9 performance.</p>
+      <p>On the standardized HIGGS and Epsilon Parquet workloads reported in the README, FerrisBoost used 0.27–0.46× XGBoost setup time, 0.29–0.47× peak host RAM, and 0.43–0.72× combined RAM plus active VRAM on GPU. CPU training used 0.53–0.84× XGBoost CPU training time and GPU-fast training 0.37–0.73× XGBoost GPU training time. These results describe the tested workloads, not universal guarantees. These historical measurements predate 0.1.1.</p>
     </section>
 
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
-      <h3>0.1.0 candidate</h3>
+      <h3>0.1.1</h3>
+      <ul>
+        <li>Added loss-guided and symmetric growth on CPU and single-GPU CUDA exact and fast. Python and scikit-learn use <code>grow_policy</code>. Rust uses explicit training entry points that accept a <code>GrowPolicy</code>. <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#tree-growth-and-feature-interactions">Tree growth parameters</a>.</li>
+        <li>Reduced CUDA split-search transfers for eligible resident blocks in loss-guided and symmetric growth.</li>
+        <li>Reused training margins for matching evaluation inputs on CPU and CUDA exact. Reduced temporary allocations for independent evaluation sets and eliminated unused terminal prediction transfers in CUDA exact.</li>
+        <li>Shared sorting for ungrouped binary AUC and AUCPR. Reduced NumPy allocation for multi-output Python evaluation metrics.</li>
+        <li>Reused parsed Parquet metadata across parallel row-group reads and reduced extra reads and copies during spill training. Quiet file-to-Parquet prediction skips the row-count scan used for progress reporting.</li>
+        <li>Removed temporary-file pre-sizing for single-worker model saves.</li>
+        <li>Preserved the Rust <code>TrainParams</code> fields and module import paths. Loading a scikit-learn pickle from 0.1.0 defaults to depthwise growth on the next fit.</li>
+      </ul>
+      <h3>0.1.0</h3>
       <ul>
         <li>Added cache budget and persistent cache reuse for lists, directories, and globs of Parquet training data.</li>
-        <li>Extended batch custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast. Rust applies row or query weights.</li>
+        <li>Extended batch custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast. Rust applies row or query weights. Evaluation supports built-in metrics and <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#custom-evaluation-metrics"><code>fb.CustomMetric</code></a> from 0.0.9.</li>
         <li>Added built-in and named Python prediction links for custom-objective models. Rebind named callbacks after loading or continuing a model.</li>
         <li>Reduced temporary work in Parquet quantization and single-worker model I/O.</li>
       </ul>

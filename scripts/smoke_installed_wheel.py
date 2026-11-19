@@ -39,12 +39,25 @@ def main() -> None:
         assert not str(Path(fb.__file__).resolve()).startswith(
             str(Path(args.forbid_import_prefix).resolve())
         ), fb.__file__
-    assert fb.__version__ == os.environ.get("FB_EXPECT_VERSION", "0.1.0")
+    assert fb.__version__ == os.environ.get("FB_EXPECT_VERSION", "0.1.1")
 
     rng = np.random.default_rng(7)
     x = rng.integers(0, 20, size=(120, 4)).astype(np.float32)
     y = ((x[:, 0] + x[:, 2]) > 18).astype(np.float32)
     params = {"objective": "binary:logistic", "max_depth": 3, "nthread": 1}
+    growth_x = np.arange(8, dtype=np.float32).reshape(-1, 1)
+    growth_y = np.array([0, 0, 1, 1, 10, 10, 14, 20], dtype=np.float32)
+    growth_params = {
+        "objective": "reg:squarederror",
+        "base_score": 0.0,
+        "lambda": 0.0,
+        "min_child_weight": 0.0,
+        "max_depth": 2,
+        "max_leaves": 3,
+        "nthread": 1,
+    }
+    growth_policies = ("lossguide", "symmetric")
+    growth_predictions: dict[str, np.ndarray] = {}
     passed: list[str] = []
     skipped: list[str] = []
 
@@ -132,6 +145,33 @@ def main() -> None:
         assert child.returncode == 0, child.stderr
         passed += ["save-load", "fresh-process-load"]
 
+        for policy, expected_leaves in zip(growth_policies, (3, 2)):
+            history = {}
+            grown = fb.train(
+                {**growth_params, "grow_policy": policy, "eval_metric": "rmse"},
+                growth_x,
+                label=growth_y,
+                evals=[
+                    (growth_x, growth_y, "train"),
+                    (growth_x.copy(), growth_y.copy(), "copy"),
+                ],
+                evals_result=history,
+                num_boost_round=2,
+                quiet=True,
+            )
+            assert len(history["train"]["rmse"]) == 2
+            assert history["train"]["rmse"] == history["copy"]["rmse"]
+            path = root / f"{policy}.json"
+            grown.save_model(str(path))
+            booster = json.loads(path.read_text(encoding="utf-8"))["learner"]["gradient_booster"]
+            first_tree = booster["model"]["trees"][0]
+            assert first_tree["left_children"].count(-1) == expected_leaves
+            prediction = grown.predict(growth_x)
+            loaded = fb.Model.load_model(str(path), quiet=True)
+            np.testing.assert_array_equal(loaded.predict(growth_x), prediction)
+            growth_predictions[policy] = prediction
+            passed.append(f"{policy}-cpu-eval-round-trip")
+
         quiet_code = (
             "import ferrisboost as f,numpy as n;"
             "x=n.ones((20,2),dtype=n.float32);y=n.zeros(20,dtype=n.float32);"
@@ -184,6 +224,26 @@ def main() -> None:
             assert fa.read_bytes() == fb_path.read_bytes()
             assert exact.predict(x).shape == fast_a.predict(x).shape
             passed += ["gpu-exact", "gpu-fast", "cuda-ordinal"]
+            for policy in growth_policies:
+                for math_mode in ("exact", "fast"):
+                    grown = fb.train(
+                        {
+                            **growth_params,
+                            "grow_policy": policy,
+                            "device": "cuda",
+                            "gpu_math": math_mode,
+                        },
+                        growth_x,
+                        label=growth_y,
+                        num_boost_round=2,
+                        quiet=True,
+                    )
+                    prediction = grown.predict(growth_x)
+                    assert prediction.shape == growth_predictions[policy].shape
+                    assert np.isfinite(prediction).all()
+                    if math_mode == "exact":
+                        np.testing.assert_array_equal(prediction, growth_predictions[policy])
+                    passed.append(f"{policy}-gpu-{math_mode}")
 
     print(json.dumps({
         "status": "PASS",

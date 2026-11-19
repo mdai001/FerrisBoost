@@ -275,6 +275,23 @@ def test_cross_val_score_gridsearch_and_pipeline():
     assert cross_val_score(small_reg(), Xr, yr, cv=3).mean() > 0.7
 
 
+def test_pickle_state_without_grow_policy_uses_depthwise_default():
+    from sklearn.base import clone
+
+    clf = FerrisBoostClassifier(n_estimators=2)
+    x = np.arange(16, dtype=np.float32).reshape(8, 2)
+    y = (x[:, 0] >= 8).astype(np.int64)
+    clf.fit(x, y)
+    old_state = clf.__getstate__()
+    del old_state["grow_policy"]
+
+    restored = FerrisBoostClassifier.__new__(FerrisBoostClassifier)
+    restored.__setstate__(old_state)
+    assert restored.get_params()["grow_policy"] is None
+    assert clone(restored).get_params()["grow_policy"] is None
+    np.testing.assert_array_equal(restored.predict_proba(x), clf.predict_proba(x))
+
+
 def test_gridsearch_parallel_pickles_estimators():
     X, y = make_classification(n_samples=300, n_features=6, random_state=0)
     grid = GridSearchCV(small_clf(), {"max_depth": [2, 3]}, cv=2, n_jobs=2).fit(X, y)

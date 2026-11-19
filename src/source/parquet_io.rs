@@ -22,6 +22,7 @@ struct State {
 struct Inner {
     length: u64,
     capacity: usize,
+    read_ahead_end: Option<u64>,
     state: Mutex<State>,
 }
 
@@ -34,10 +35,23 @@ impl CoalescedFile {
     }
 
     fn with_capacity(file: File, capacity: usize) -> io::Result<Self> {
+        Self::with_read_ahead(file, capacity, None)
+    }
+
+    pub(crate) fn for_row_group(file: File, end: Option<u64>) -> io::Result<Self> {
+        Self::with_read_ahead(file, READ_WINDOW_BYTES, end)
+    }
+
+    fn with_read_ahead(
+        file: File,
+        capacity: usize,
+        read_ahead_end: Option<u64>,
+    ) -> io::Result<Self> {
         let length = file.metadata()?.len();
         Ok(Self(Arc::new(Inner {
             length,
             capacity: capacity.max(1),
+            read_ahead_end,
             state: Mutex::new(State {
                 file,
                 start: 0,
@@ -75,8 +89,14 @@ impl Inner {
         if !offset.is_some_and(|n| n < state.valid) {
             state.valid = 0;
             state.start = position;
-            let length =
-                usize::try_from((self.length - position).min(self.capacity as u64)).unwrap();
+            // Row-group workers own separate windows. Stop speculative
+            // reads at the group's last chunk, while still allowing an
+            // explicit read at or beyond that boundary.
+            let end = self
+                .read_ahead_end
+                .filter(|&end| end > position)
+                .map_or(self.length, |end| end.min(self.length));
+            let length = ((end - position).min(self.capacity as u64)) as usize;
             if state.buffer.len() < length {
                 let additional = length - state.buffer.len();
                 state
@@ -170,6 +190,23 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn row_group_window_caps_backing_reads_without_changing_explicit_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "fb-coalesced-group-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let values: Vec<u8> = (0..64).collect();
+        std::fs::write(&path, &values).unwrap();
+        let source = CoalescedFile::for_row_group(File::open(&path).unwrap(), Some(20)).unwrap();
+        assert_eq!(source.get_bytes(8, 4).unwrap().as_ref(), &values[8..12]);
+        assert_eq!(source.test_backing_bytes(), 12);
+        assert_eq!(source.get_bytes(18, 6).unwrap().as_ref(), &values[18..24]);
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn independent_offsets_cross_windows_and_reject_out_of_range_bytes() {

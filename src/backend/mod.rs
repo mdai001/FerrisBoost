@@ -313,6 +313,12 @@ pub mod cuda {
         pub fn resolve_partitions(&self) -> Result<Vec<(GpuRowSpan, GpuRowSpan)>> {
             match self.0 {}
         }
+        pub(crate) fn commit_leaf_partition(
+            &self,
+            _span: GpuRowSpan,
+        ) -> Result<(GpuRowSpan, GpuRowSpan)> {
+            match self.0 {}
+        }
         pub fn download_rows(&self, _span: GpuRowSpan) -> Result<Vec<RowId>> {
             match self.0 {}
         }
@@ -325,6 +331,10 @@ pub mod cuda {
         pub fn download_prediction_delta(&self) -> Result<f32> {
             match self.0 {}
         }
+        pub(crate) fn wait_for_prediction_delta(&self) -> Result<()> {
+            unreachable!("prediction synchronization requires CUDA")
+        }
+
         pub fn with_prediction_delta(&self, _f: &mut dyn FnMut(&[f32])) -> Result<()> {
             match self.0 {}
         }

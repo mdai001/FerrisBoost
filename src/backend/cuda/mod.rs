@@ -24,7 +24,7 @@ pub use train_ctx::{
     GpuBlockSession, GpuHostMemoryBudget, GpuMemoryBudget, GpuPartitionSession, GpuRowSpan,
     GpuSegmentTiming, GpuTrainCtx, RankDeviceInputs,
 };
-pub(crate) use train_ctx::{GpuSplitGroup, GpuSplitResult};
+pub(crate) use train_ctx::{GpuSplitGroup, GpuSplitLevel, GpuSplitResult};
 
 const HISTOGRAM_PTX: &str = include_str!("histogram.ptx");
 

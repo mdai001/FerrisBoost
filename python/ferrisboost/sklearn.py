@@ -98,6 +98,7 @@ __all__ = ["FerrisBoostClassifier", "FerrisBoostRegressor", "FerrisBoostRanker"]
 _PARAM_MAP = {
     "max_depth": "max_depth",
     "max_leaves": "max_leaves",
+    "grow_policy": "grow_policy",
     "max_bin": "max_bin",
     "learning_rate": "eta",
     "n_jobs": "nthread",
@@ -199,6 +200,7 @@ class _FerrisBoostBase(BaseEstimator):
         n_estimators: int | None = None,
         max_depth: int | None = None,
         max_leaves: int | None = None,
+        grow_policy: str | None = None,
         max_bin: int | None = None,
         learning_rate: float | None = None,
         objective: str | None = None,
@@ -249,6 +251,7 @@ class _FerrisBoostBase(BaseEstimator):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.max_leaves = max_leaves
+        self.grow_policy = grow_policy
         self.max_bin = max_bin
         self.learning_rate = learning_rate
         self.objective = objective
@@ -664,6 +667,8 @@ class _FerrisBoostBase(BaseEstimator):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         state = dict(state)
+        # Estimators saved before 0.1.1 use the default depthwise policy.
+        state.setdefault("grow_policy", None)
         raw = state.pop("_booster_json", None)
         self.__dict__.update(state)
         if raw is not None:

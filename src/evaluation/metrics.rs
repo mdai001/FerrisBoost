@@ -14,6 +14,13 @@ pub trait Metric: Send + Sync {
 
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32;
 
+    /// Internal capability marker for sharing the ordinary binary AUC sort.
+    /// Default-false ensures custom metrics with a built-in name are not replaced.
+    #[doc(hidden)]
+    fn supports_shared_binary_auc_sort(&self) -> bool {
+        false
+    }
+
     /// 能否做加权评估。自定义 metric 默认不支持;训练入口在验证集带权重时
     /// 先检查这一项,不会把权重静默丢掉。
     fn supports_weights(&self) -> bool {
@@ -308,6 +315,10 @@ impl Metric for Auc {
         "auc"
     }
 
+    fn supports_shared_binary_auc_sort(&self) -> bool {
+        true
+    }
+
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
         self.eval_weighted(pred, label, None)
     }
@@ -348,35 +359,8 @@ impl Metric for Auc {
         if pred.is_empty() {
             return f32::NAN;
         }
-        let p: Vec<f32> = pred.iter().map(|&r| sigmoid_f32(r)).collect();
-        let mut idx: Vec<usize> = (0..p.len()).collect();
-        // 稳定排序,降序。NaN 概率不应出现(raw margin 有限)。
-        idx.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap_or(std::cmp::Ordering::Equal));
-        let wt = |i: usize| weight.map_or(1.0f32, |w| w[i]);
-        let trapezoid = |x0: f64, x1: f64, y0: f64, y1: f64| (x0 - x1).abs() * (y0 + y1) * 0.5;
-
-        let first = idx[0];
-        let (y, w) = (label[first], wt(first));
-        let mut fp = ((1.0 - y) * w) as f64;
-        let mut tp = (y * w) as f64;
-        let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
-        let mut area = 0.0f64;
-        for k in 1..idx.len() {
-            let (i, prev) = (idx[k], idx[k - 1]);
-            if p[i] != p[prev] {
-                area += trapezoid(fp_prev, fp, tp_prev, tp);
-                fp_prev = fp;
-                tp_prev = tp;
-            }
-            let (y, w) = (label[i], wt(i));
-            fp += ((1.0 - y) * w) as f64;
-            tp += (y * w) as f64;
-        }
-        area += trapezoid(fp_prev, fp, tp_prev, tp);
-        if fp <= 0.0 || tp <= 0.0 {
-            return f32::NAN;
-        }
-        (area / (fp * tp)).min(1.0) as f32
+        let prepared = BinaryAucPrepared::new(pred);
+        eval_auc_prepared(&prepared, label, weight)
     }
 
     fn lower_is_better(&self) -> bool {
@@ -412,6 +396,10 @@ pub(crate) fn delta_pr_auc(fp_prev: f64, fp: f64, tp_prev: f64, tp: f64, total_p
 impl Metric for AucPr {
     fn name(&self) -> &str {
         "aucpr"
+    }
+
+    fn supports_shared_binary_auc_sort(&self) -> bool {
+        true
     }
 
     fn eval(&self, pred: &[f32], label: &[f32]) -> f32 {
@@ -453,48 +441,153 @@ impl Metric for AucPr {
         if pred.is_empty() {
             return f32::NAN;
         }
-        let wt = |i: usize| weight.map_or(1.0f32, |w| w[i]);
         // total_pos / total_neg:f32 乘积再累加进 f64(与 XGBoost 一致)。
         let (mut total_pos, mut total_neg) = (0.0f64, 0.0f64);
         for (i, &y) in label.iter().enumerate() {
-            let w = wt(i);
+            let w = auc_weight(weight, i);
             total_pos += (w * y) as f64;
             total_neg += (w * (1.0f32 - y)) as f64;
         }
         if total_pos <= 0.0 || total_neg <= 0.0 {
             return f32::NAN;
         }
-        let p: Vec<f32> = pred.iter().map(|&r| sigmoid_f32(r)).collect();
-        let mut idx: Vec<usize> = (0..p.len()).collect();
-        idx.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap_or(std::cmp::Ordering::Equal));
-
-        let first = idx[0];
-        let (y, w) = (label[first], wt(first));
-        let mut fp = (1.0 - y as f64) * w as f64;
-        let mut tp = (y * w) as f64;
-        let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
-        let mut area = 0.0f64;
-        for k in 1..idx.len() {
-            let (i, prev) = (idx[k], idx[k - 1]);
-            if p[i] != p[prev] {
-                area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
-                fp_prev = fp;
-                tp_prev = tp;
-            }
-            let (y, w) = (label[i], wt(i));
-            fp += ((1.0f32 - y) * w) as f64;
-            tp += (y * w) as f64;
-        }
-        area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
-        if fp <= 0.0 || tp <= 0.0 {
-            area = 0.0;
-        }
-        area.min(1.0) as f32
+        let prepared = BinaryAucPrepared::new(pred);
+        eval_aucpr_prepared(&prepared, label, weight, total_pos, total_neg)
     }
 
     fn lower_is_better(&self) -> bool {
         false
     }
+}
+
+/// Shared sigmoid results and stable descending sort for ordinary binary AUC.
+struct BinaryAucPrepared {
+    probabilities: Vec<f32>,
+    order: Vec<usize>,
+}
+
+impl BinaryAucPrepared {
+    fn new(raw: &[f32]) -> Self {
+        let probabilities: Vec<f32> = raw.iter().map(|&r| sigmoid_f32(r)).collect();
+        let mut order: Vec<usize> = (0..probabilities.len()).collect();
+        // Stable sort, descending. Preserve the existing NaN comparator rule.
+        order.sort_by(|&a, &b| {
+            probabilities[b]
+                .partial_cmp(&probabilities[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Self {
+            probabilities,
+            order,
+        }
+    }
+}
+
+fn auc_weight(weight: Option<&[f32]>, row: usize) -> f32 {
+    weight.map_or(1.0f32, |w| w[row])
+}
+
+fn eval_auc_prepared(prepared: &BinaryAucPrepared, label: &[f32], weight: Option<&[f32]>) -> f32 {
+    let p = &prepared.probabilities;
+    let idx = &prepared.order;
+    if idx.is_empty() {
+        return f32::NAN;
+    }
+    let trapezoid = |x0: f64, x1: f64, y0: f64, y1: f64| (x0 - x1).abs() * (y0 + y1) * 0.5;
+    let first = idx[0];
+    let (y, w) = (label[first], auc_weight(weight, first));
+    let mut fp = ((1.0 - y) * w) as f64;
+    let mut tp = (y * w) as f64;
+    let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
+    let mut area = 0.0f64;
+    for k in 1..idx.len() {
+        let (i, prev) = (idx[k], idx[k - 1]);
+        if p[i] != p[prev] {
+            area += trapezoid(fp_prev, fp, tp_prev, tp);
+            fp_prev = fp;
+            tp_prev = tp;
+        }
+        let (y, w) = (label[i], auc_weight(weight, i));
+        fp += ((1.0 - y) * w) as f64;
+        tp += (y * w) as f64;
+    }
+    area += trapezoid(fp_prev, fp, tp_prev, tp);
+    if fp <= 0.0 || tp <= 0.0 {
+        return f32::NAN;
+    }
+    (area / (fp * tp)).min(1.0) as f32
+}
+
+fn eval_aucpr_prepared(
+    prepared: &BinaryAucPrepared,
+    label: &[f32],
+    weight: Option<&[f32]>,
+    total_pos: f64,
+    total_neg: f64,
+) -> f32 {
+    if total_pos <= 0.0 || total_neg <= 0.0 {
+        return f32::NAN;
+    }
+    let p = &prepared.probabilities;
+    let idx = &prepared.order;
+    // Non-empty input is guaranteed by the caller.
+    let first = idx[0];
+    let (y, w) = (label[first], auc_weight(weight, first));
+    let mut fp = (1.0 - y as f64) * w as f64;
+    let mut tp = (y * w) as f64;
+    let (mut fp_prev, mut tp_prev) = (0.0f64, 0.0f64);
+    let mut area = 0.0f64;
+    for k in 1..idx.len() {
+        let (i, prev) = (idx[k], idx[k - 1]);
+        if p[i] != p[prev] {
+            area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+            fp_prev = fp;
+            tp_prev = tp;
+        }
+        let (y, w) = (label[i], auc_weight(weight, i));
+        fp += ((1.0f32 - y) * w) as f64;
+        tp += (y * w) as f64;
+    }
+    area += delta_pr_auc(fp_prev, fp, tp_prev, tp, total_pos);
+    if fp <= 0.0 || tp <= 0.0 {
+        area = 0.0;
+    }
+    area.min(1.0) as f32
+}
+
+/// Evaluate both ordinary binary metrics with one sigmoid pass and stable sort.
+/// Grouped ranking metrics deliberately use their per-group implementation.
+pub(crate) fn eval_auc_aucpr_pair(
+    pred: &[f32],
+    label: &[f32],
+    weight: Option<&[f32]>,
+) -> (f32, f32) {
+    assert_eq!(
+        pred.len(),
+        label.len(),
+        "auc predictions and labels must have the same length"
+    );
+    if let Some(w) = weight {
+        assert_eq!(
+            pred.len(),
+            w.len(),
+            "auc predictions and weights must have the same length"
+        );
+    }
+    if pred.is_empty() {
+        return (f32::NAN, f32::NAN);
+    }
+    let (mut total_pos, mut total_neg) = (0.0f64, 0.0f64);
+    for (i, &y) in label.iter().enumerate() {
+        let w = auc_weight(weight, i);
+        total_pos += (w * y) as f64;
+        total_neg += (w * (1.0f32 - y)) as f64;
+    }
+    let prepared = BinaryAucPrepared::new(pred);
+    (
+        eval_auc_prepared(&prepared, label, weight),
+        eval_aucpr_prepared(&prepared, label, weight, total_pos, total_neg),
+    )
 }
 
 /// objective 决定的默认指标,和 XGBoost 一致。
@@ -549,8 +642,16 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
     } = obj
     {
         return match name {
-            "aft-nloglik" | "interval-regression-accuracy" => Ok(Box::new(crate::survival::AftMetric { distribution, scale, accuracy: name == "interval-regression-accuracy" })),
-            _ => Err(format!("survival:aft requires an interval metric: aft-nloglik or interval-regression-accuracy; got {name:?}")),
+            "aft-nloglik" | "interval-regression-accuracy" => {
+                Ok(Box::new(crate::survival::AftMetric {
+                    distribution,
+                    scale,
+                    accuracy: name == "interval-regression-accuracy",
+                }))
+            }
+            _ => Err(format!(
+                "survival:aft requires an interval metric: aft-nloglik or interval-regression-accuracy; got {name:?}"
+            )),
         };
     }
     if name == "cox-nloglik" {
@@ -570,13 +671,13 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
                 return Ok(Box::new(crate::rank::GroupAuc::new(
                     crate::rank::GroupAucKind::Roc,
                     false,
-                )))
+                )));
             }
             "aucpr" => {
                 return Ok(Box::new(crate::rank::GroupAuc::new(
                     crate::rank::GroupAucKind::Pr,
                     false,
-                )))
+                )));
             }
             _ => {}
         }
@@ -651,10 +752,19 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
         ("rmse", Objective::SquaredError) => Ok(Box::new(Rmse)),
         ("rmse", Objective::Logistic | Objective::LogisticRegression) => Ok(Box::new(ProbRmse)),
         ("rmse", _) => Ok(Box::new(Elementwise::new(Ew::Rmse, obj))),
-        ("logloss", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(LogLoss)),
-        ("error", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(ClassError)),
-        ("auc", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(Auc)),
-        ("aucpr", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => Ok(Box::new(AucPr)),
+        (
+            "logloss",
+            Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw,
+        ) => Ok(Box::new(LogLoss)),
+        ("error", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => {
+            Ok(Box::new(ClassError))
+        }
+        ("auc", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => {
+            Ok(Box::new(Auc))
+        }
+        ("aucpr", Objective::Logistic | Objective::LogisticRegression | Objective::LogisticRaw) => {
+            Ok(Box::new(AucPr))
+        }
         ("logloss" | "error" | "auc" | "aucpr", _) => Err(format!(
             "eval_metric {name:?} is a binary classification metric and requires objective=\"binary:logistic\" or \"reg:logistic\""
         )),
@@ -665,8 +775,7 @@ pub fn for_objective(name: &str, obj: Objective) -> Result<Box<dyn Metric>, Stri
 }
 
 /// 报错里列出的全部 metric 名字。
-pub const SUPPORTED_METRICS: &str =
-    "rmse / rmsle / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
+pub const SUPPORTED_METRICS: &str = "rmse / rmsle / mae / mape / mphe / logloss / error / error@t / auc / aucpr / \
 poisson-nloglik / gamma-nloglik / gamma-deviance / tweedie-nloglik@rho / quantile / mlogloss / merror";
 
 pub fn by_name(name: &str) -> Option<Box<dyn Metric>> {
@@ -1150,6 +1259,42 @@ mod tests {
             "a single class returns NaN"
         );
         assert!(!Auc.lower_is_better());
+    }
+
+    #[test]
+    fn shared_auc_sort_matches_standalone_metrics_exactly() {
+        let cases = [
+            (
+                vec![-4.0, 0.0, 0.0, 2.0, 2.0, 8.0],
+                vec![0.0, 1.0, 0.0, 0.3, 1.0, 1.0],
+                None,
+            ),
+            (
+                vec![
+                    f32::NEG_INFINITY,
+                    -2.0,
+                    0.0,
+                    0.0,
+                    3.0,
+                    f32::INFINITY,
+                    f32::NAN,
+                ],
+                vec![0.0, 1.0, 0.0, 1.0, 0.4, 1.0, 1.0],
+                Some(vec![1.0, 0.0, 2.0, 0.5, 3.0, 1.0, 1.0]),
+            ),
+            (vec![0.0, 1.0], vec![1.0, 1.0], Some(vec![0.0, 2.0])),
+            (vec![], vec![], None),
+        ];
+        let same = |a: f32, b: f32| a == b || (a.is_nan() && b.is_nan());
+        for (pred, label, weight) in cases {
+            let weight = weight.as_deref();
+            let (auc, aucpr) = eval_auc_aucpr_pair(&pred, &label, weight);
+            assert!(same(auc, Auc.eval_weighted(&pred, &label, weight)));
+            assert!(same(aucpr, AucPr.eval_weighted(&pred, &label, weight)));
+        }
+        assert!(Auc.supports_shared_binary_auc_sort());
+        assert!(AucPr.supports_shared_binary_auc_sort());
+        assert!(!Rmse.supports_shared_binary_auc_sort());
     }
 
     #[test]

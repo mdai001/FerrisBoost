@@ -50,6 +50,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_depth": 6,
     # 0 = 不额外限制每棵树的叶子数。
     "max_leaves": 0,
+    "grow_policy": "depthwise",
     "max_bin": 255,
     "eta": 0.3,
     "lambda": 1.0,
@@ -250,6 +251,10 @@ def _normalize_params(params: Mapping[str, Any], num_boost_round: int) -> dict[s
                 f'device must be "cpu", "cuda" or "cuda:N", got {d!r}'
             )
         out["device"] = d
+    if out["grow_policy"] not in ("depthwise", "lossguide", "symmetric"):
+        raise ValueError(
+            f"grow_policy must be depthwise, lossguide, or symmetric, got {out['grow_policy']!r}"
+        )
     # max_depth 的上限由 GPU 每层节点 buffer 决定(见 Rust 的
     # `types::MAX_DEPTH_LIMIT`)。CPU 自己能跑更深,但契约取两个后端的共同
     # 安全值 —— 否则 CPU 训出来的模型在 GPU 上复现不了。
@@ -1291,7 +1296,8 @@ def train(
             # predict) replaces the prior's intercept, as in XGBoost.
             start = _prior_margin(prior, specs, base_margin, p, header=header)
             eval_start = [
-                _prior_margin(prior, spec, base_margin, p, header=header)
+                start if len(specs) == 1 and specs[0] == spec
+                else _prior_margin(prior, spec, base_margin, p, header=header)
                 for spec, _ in eval_specs
             ]
         # 格式由 Rust 从解析出的文件判定 —— Python 不再按后缀猜,也不做
@@ -1381,8 +1387,10 @@ def train(
                 raise ValueError(
                     "evals elements must be (data, label, name) or (data, label, weight, name)"
                 )
-            et = _arrow_table(ed)
-            if et is not None:
+            et = None if ed is data else _arrow_table(ed)
+            if ed is data:
+                ed = x
+            elif et is not None:
                 # 训练集也有列名时按列名绑定;否则(numpy 训练集)只能按位置。
                 ed = _table_matrix(et, names, enable_cat, levels, f"evals[{name}]", scoring=True,
                                    categorical=eval_flags)[0]
@@ -1433,9 +1441,12 @@ def train(
         if prior is not None:
             # Starting predictions: the prior's margin on each data set (on top of a
             # supplied base_margin, which replaces the prior's intercept).
-            bm = _prior_margin(prior, x, bm, p)
+            starting_margin = bm
+            bm = _prior_margin(prior, x, starting_margin, p)
             eval_bms = [
-                _prior_margin(prior, spec[0], ebm, p) for spec, ebm in zip(eval_specs, eval_bms)
+                bm if spec[0] is x and ebm is starting_margin
+                else _prior_margin(prior, spec[0], ebm, p)
+                for spec, ebm in zip(eval_specs, eval_bms)
             ]
         model = _core.train_dense(x, y, p, eval_specs, early_stopping_rounds,
                                   verbose, cb_list, weight=w,

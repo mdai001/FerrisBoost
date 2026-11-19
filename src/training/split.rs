@@ -4,6 +4,10 @@ use crate::categorical::CatBits;
 use crate::hist::Histogram;
 use crate::types::{FeatId, GradPairFixed, GradQuantizer, TrainParams};
 
+#[path = "symmetric.rs"]
+mod symmetric;
+pub(crate) use symmetric::{best_level_split_in_block, LevelSplit};
+
 /// 挡住浮点噪声搞出来的「零增益」分裂(XGBoost 里叫 kRtEps)。
 ///
 /// 没有这个阈值,梯度全抵消的节点也会分出一堆增益是 1e-9 的裂口,

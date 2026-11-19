@@ -558,3 +558,113 @@ def test_custom_metric_runs_from_native_file_train_and_eval_paths(tmp_path, file
     assert continued.num_trees == model.num_trees + 1
     assert len(received) == 2
     assert len(continuation_result["valid"]["file_weighted_abs_sum"]) == 1
+
+
+@pytest.mark.parametrize("device, gpu_math", [
+    ("cpu", "exact"),
+    pytest.param("cuda:0", "exact", marks=pytest.mark.skipif(
+        os.environ.get("FB_TEST_CUDA") != "1", reason="requires explicit CUDA test opt-in")),
+])
+@pytest.mark.parametrize("objective, outputs", [
+    ("binary:logistic", 1),
+    ("multi:softprob", 3),
+])
+def test_training_monitor_matches_distinct_eval_with_same_starting_margin(
+    device, gpu_math, objective, outputs
+):
+    rng = np.random.default_rng(688)
+    x = rng.normal(size=(97, 5)).astype(np.float32)
+    x[::9, 1] = np.nan
+    y = (np.arange(len(x)) % max(2, outputs)).astype(np.float32)
+    start = rng.normal(size=(len(x), outputs)).astype(np.float32) * 0.1
+    seen = []
+
+    def score(pred, labels, weights, groups):
+        seen.append(pred)
+        return 0.0  # Two equal scores are enough to exercise early stopping.
+
+    options = params(
+        objective,
+        device=device,
+        gpu_math=gpu_math,
+        max_depth=3,
+        cols_per_block=2,
+        subsample=0.8,
+        eval_metric=fb.CustomMetric("capture", score),
+    )
+    if outputs > 1:
+        options["num_class"] = outputs
+    model = fb.train(
+        options, x, label=y, base_margin=start,
+        base_margin_eval_set=[start, start.copy(), np.zeros_like(start)],
+        evals=[(x, y, "self"), (x.copy(), y, "copy"), (x, y, "different_start")],
+        num_boost_round=10, early_stopping_rounds=1, quiet=True,
+    )
+    assert model.best_iteration == 0
+    assert len(seen) == 6
+    for i in (0, 3):
+        np.testing.assert_array_equal(seen[i], seen[i + 1])
+        assert not np.array_equal(seen[i], seen[i + 2])
+        assert seen[i].flags.writeable and seen[i].flags.c_contiguous
+        untouched = seen[i + 1].copy()
+        seen[i].fill(999)
+        np.testing.assert_array_equal(seen[i + 1], untouched)
+
+
+@pytest.mark.parametrize("kind", ["csv", "parquet", "multi_parquet"])
+def test_file_training_monitor_matches_an_independent_file_copy(tmp_path, kind):
+    import shutil
+
+    if kind != "csv":
+        pa = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+    x, y = data(32)
+    weights = np.linspace(0.5, 2, len(y), dtype=np.float32)
+    suffix = ".csv" if kind == "csv" else ".parquet"
+    train_dir = tmp_path / "train"
+    copy_dir = tmp_path / "copy"
+    train_dir.mkdir()
+    copy_dir.mkdir()
+    pieces = [slice(0, 16), slice(16, 32)] if kind == "multi_parquet" else [slice(None)]
+    for i, sl in enumerate(pieces):
+        path = train_dir / f"part-{i}{suffix}"
+        if kind == "csv":
+            with path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["feature", "target", "weight"])
+                writer.writerows(zip(x[sl, 0], y[sl], weights[sl]))
+        else:
+            pq.write_table(pa.table({
+                "feature": x[sl, 0], "target": y[sl], "weight": weights[sl],
+            }), path, row_group_size=8)
+        shutil.copyfile(path, copy_dir / path.name)
+
+    options = params(eval_metric=["auc", "aucpr"])
+    if kind != "csv":
+        options["cache_budget_bytes"] = 0
+    result = {}
+    fb.train(
+        options, train_dir, label="target", weight="weight",
+        evals=[(train_dir, "self"), (copy_dir, "copy")],
+        num_boost_round=3, evals_result=result, quiet=True,
+    )
+    assert result["self"] == result["copy"]
+
+
+def test_auc_sort_sharing_keeps_a_custom_metric_named_auc():
+    x, y = data(32)
+    seen = []
+
+    def named_auc(pred, label, weight, groups):
+        value = 0.25
+        seen.append(value)
+        return value
+
+    result = {}
+    fb.train(
+        params(eval_metric=["auc", fb.CustomMetric("auc", named_auc), "aucpr"]),
+        x, label=y, evals=[(x, y, "self")], evals_result=result,
+        num_boost_round=3, quiet=True,
+    )
+    assert seen == [0.25] * 3
+    assert result["self"]["auc"][1::2] == seen

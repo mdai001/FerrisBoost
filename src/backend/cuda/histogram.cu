@@ -4431,3 +4431,153 @@ extern "C" __global__ void gradient_importance_apply(
         } else { pairs[2*i]=0.0f; pairs[2*i+1]=0.0f; }
     }
 }
+
+// One shared split must be valid at every leaf of a symmetric level. The
+// per-leaf gains round to f32 before their ordered f64 sum, as on the host.
+__device__ float symmetric_gain(SplitPair l, SplitPair r, float parent,
+    double ig, double ih, float lambda, float gamma, float mcw, float alpha, float mds) {
+    double hl = split_value(l.hess, ih), hr = split_value(r.hess, ih);
+    if (!(hl > 0.0 && hr > 0.0 && hl >= mcw && hr >= mcw)) return __int_as_float(0x7fc00000);
+    double gl = split_value(l.grad, ig), gr = split_value(r.grad, ig);
+    constexpr float limit = 3.402823466e+38F;
+    float wl = mono_apply(mono_weight(gl, hl, lambda, alpha, mds), -limit, limit);
+    float wr = mono_apply(mono_weight(gr, hr, lambda, alpha, mds), -limit, limit);
+    float gain = __fadd_rn(mono_gain_given_weight(gl, hl, wl, lambda, alpha),
+                           mono_gain_given_weight(gr, hr, wr, lambda, alpha));
+    return __double2float_rn(__dsub_rn((double)__fsub_rn(gain, parent), (double)gamma));
+}
+
+struct SymmetricWinner { double score; uint32_t index; };
+
+__device__ bool symmetric_better(SymmetricWinner a, SymmetricWinner b) {
+    return a.score > b.score || (a.score == b.score && a.index < b.index);
+}
+
+// Only the two consumers below call this, with one 256-thread block each.
+__device__ SymmetricWinner symmetric_reduce(SymmetricWinner local, SymmetricWinner* shared) {
+    const uint32_t t = threadIdx.x;
+    shared[t] = local;
+    __syncthreads();
+    for (uint32_t step = SPLIT_CTA_THREADS / 2; step; step >>= 1) {
+        if (t < step && symmetric_better(shared[t + step], shared[t]))
+            shared[t] = shared[t + step];
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+extern "C" __global__ void split_symmetric_features(
+    SplitPair* hist, const SplitPair* previous, SplitPair* next,
+    const uint32_t* offsets, const uint32_t* feats, const uint32_t* enabled,
+    const SplitPair* sums, const uint32_t* metadata,
+    uint32_t nodes, uint32_t stride, uint32_t cache_stride,
+    double ig, double ih, float lambda, float gamma, float mcw, float alpha, float mds,
+    SplitPacket* output) {
+    const uint32_t f = blockIdx.x, t = threadIdx.x;
+    const uint32_t start = offsets[f], count = offsets[f + 1] - start;
+    constexpr float limit = 3.402823466e+38F;
+    __shared__ SplitPair prefix[SPLIT_CTA_THREADS], warps[8];
+    __shared__ SymmetricWinner winners[SPLIT_CTA_THREADS];
+    __shared__ float parent_gain;
+    double forward = 0.0, reverse = 0.0;
+    bool missing = false;
+    for (uint32_t n = 0; n < nodes; ++n) {
+        const uint32_t* m = metadata + 4 * n;
+        SplitPair v{};
+        if (t < count) {
+            size_t at = start + t;
+            if (m[2] != 0xffffffffu) {
+                v = split_sub(previous[(size_t)m[2] * cache_stride + at],
+                              hist[(size_t)m[1] * stride + at]);
+                hist[(size_t)m[0] * stride + at] = v;
+            } else {
+                v = hist[(size_t)m[0] * stride + at];
+            }
+            if (m[3] != 0xffffffffu) next[(size_t)m[3] * cache_stride + at] = v;
+        }
+        if (!enabled[f] || !count) continue;
+
+        if (!t) parent_gain = mono_node_gain(sums[n], ig, ih, lambda, alpha, mds, -limit, limit);
+        prefix[t] = split_block_scan(v, warps);
+        __syncthreads();
+        const SplitPair sum = sums[n], observed = prefix[count - 1];
+        const bool has_missing = observed.grad != sum.grad || observed.hess != sum.hess;
+        missing |= has_missing;
+        if (t <= count) {
+            const SplitPair left = t ? prefix[t - 1] : SplitPair{};
+            const SplitPair right = split_sub(observed, left);
+            float gain = __int_as_float(0x7fc00000);
+            const bool score_forward = t && isfinite(forward);
+            if (score_forward) {
+                gain = symmetric_gain(left, split_sub(sum, left), parent_gain,
+                                      ig, ih, lambda, gamma, mcw, alpha, mds);
+                forward = __dadd_rn(forward, (double)gain);
+            }
+            if (t < count && isfinite(reverse)) {
+                if (has_missing || !score_forward)
+                    gain = symmetric_gain(split_sub(sum, right), right, parent_gain,
+                                          ig, ih, lambda, gamma, mcw, alpha, mds);
+                reverse = __dadd_rn(reverse, (double)gain);
+            }
+        }
+        __syncthreads();
+    }
+
+    const double minimum = __dmul_rn((double)1.e-6f, (double)nodes);
+    SymmetricWinner local{minimum, 0xffffffffu};
+    if (enabled[f] && t && t <= count && isfinite(forward) && forward > minimum)
+        local = {forward, t - 1};
+    if (enabled[f] && missing && t < count && isfinite(reverse) && reverse > local.score)
+        local = {reverse, 2 * count - 1 - t};
+    SymmetricWinner best = symmetric_reduce(local, winners);
+    if (!t) {
+        SplitPacket packet{};
+        if (best.index != 0xffffffffu) {
+            const bool missing_left = best.index >= count;
+            packet.feat = feats[f];
+            packet.bin = missing_left ? 2 * count - 1 - best.index : best.index + 1;
+            packet.flags = 1u | (missing_left ? 2u : 0u);
+            packet.left.grad = __double_as_longlong(best.score);
+        }
+        output[f] = packet;
+    }
+}
+
+extern "C" __global__ void split_symmetric_nodes(
+    const SplitPacket* features, uint32_t n_features, const SplitPair* hist,
+    const uint32_t* offsets, const SplitPair* sums, const uint32_t* metadata,
+    uint32_t nodes, uint32_t stride, double ig, double ih,
+    float lambda, float gamma, float mcw, float alpha, float mds, SplitPacket* output) {
+    const uint32_t t = threadIdx.x;
+    constexpr float limit = 3.402823466e+38F;
+    __shared__ SymmetricWinner winners[SPLIT_CTA_THREADS];
+    // The host supplies ascending feature IDs within each physical block.
+    SymmetricWinner local{0.0, 0xffffffffu};
+    for (uint32_t f = t; f < n_features; f += blockDim.x) {
+        const auto p = features[f];
+        const SymmetricWinner candidate{__longlong_as_double(p.left.grad), f};
+        if (p.flags && symmetric_better(candidate, local)) local = candidate;
+    }
+    const uint32_t feature = symmetric_reduce(local, winners).index;
+    if (t >= nodes) return;
+    if (feature == 0xffffffffu) {
+        output[t] = SplitPacket{};
+        return;
+    }
+    SplitPacket p = features[feature];
+    const uint32_t start = offsets[feature], boundary = start + p.bin;
+    const SplitPair* bins = hist + (size_t)metadata[4 * t] * stride;
+    SplitPair part{};
+    if (p.flags & 2u) {
+        for (uint32_t i = boundary; i < offsets[feature + 1]; ++i) part = split_add(part, bins[i]);
+        p.left = split_sub(sums[t], part);
+        p.right = part;
+    } else {
+        for (uint32_t i = start; i < boundary; ++i) part = split_add(part, bins[i]);
+        p.left = part;
+        p.right = split_sub(sums[t], part);
+    }
+    float parent = mono_node_gain(sums[t], ig, ih, lambda, alpha, mds, -limit, limit);
+    p.gain = symmetric_gain(p.left, p.right, parent, ig, ih, lambda, gamma, mcw, alpha, mds);
+    output[t] = p;
+}

@@ -4,7 +4,8 @@
 //! keeps the arrays valid if the callback stores them after it returns.
 
 use anyhow::{anyhow, bail, Result};
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::ndarray::Array2;
+use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -122,13 +123,12 @@ impl PythonMetric {
         // accompany non-ranking objectives, whose weights remain per row.
 
         Python::attach(|py| {
-            let prediction = PyArray1::from_vec(py, pred.to_vec());
-            let prediction: Bound<'_, PyAny> = if self.noutputs == 1 {
-                prediction.into_any()
+            let prediction = if self.noutputs == 1 {
+                PyArray1::from_vec(py, pred.to_vec()).into_any()
             } else {
-                prediction
-                    .reshape([label.len(), self.noutputs])
-                    .map_err(|e| anyhow::Error::new(PyErr::from(e)))?
+                Array2::from_shape_vec((label.len(), self.noutputs), pred.to_vec())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                    .into_pyarray(py)
                     .into_any()
             };
             let labels = PyArray1::from_vec(py, label.to_vec()).into_any();

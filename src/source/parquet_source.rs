@@ -28,7 +28,7 @@ use crate::bins::{BinCode, BinData, BinSlice, BinWidth};
 use crate::columns::{quantize_value, BinCuts, ColumnBlock};
 use crate::source::arrow_source::ArrowSource;
 use crate::source::Targets;
-use crate::train::BlockSource;
+use crate::train::{BlockSource, BlockSourceExt};
 use crate::types::FeatId;
 
 pub(crate) const PARQUET_READ_WINDOW_BYTES: usize = crate::source::parquet_io::READ_WINDOW_BYTES;
@@ -98,6 +98,15 @@ fn batch_reader(
     let file =
         File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
     let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    batch_reader_with_metadata(file, metadata, columns, batch_size)
+}
+
+fn batch_reader_with_metadata(
+    file: File,
+    metadata: ArrowReaderMetadata,
+    columns: &[usize],
+    batch_size: usize,
+) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
     if coalesced_projection(&metadata, columns) {
         let input = crate::source::parquet_io::CoalescedFile::new(file)?;
         if metadata.metadata().num_row_groups() > 1 {
@@ -162,40 +171,6 @@ fn coalesced_row_group_reader(
             }
         }
     })))
-}
-
-fn batch_reader_row_group(
-    path: &Path,
-    columns: &[usize],
-    batch_size: usize,
-    row_group: usize,
-) -> anyhow::Result<impl Iterator<Item = anyhow::Result<RecordBatch>>> {
-    let reader = projected_reader(path, columns, batch_size, Some(row_group))?;
-    Ok(reader.map(|r| r.map_err(anyhow::Error::from)))
-}
-
-fn projected_reader(
-    path: &Path,
-    columns: &[usize],
-    batch_size: usize,
-    row_group: Option<usize>,
-) -> anyhow::Result<ProjectedReader> {
-    let file =
-        File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
-    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
-    // Sparse projections (especially labels and streaming feature tiles) must
-    // not read unrelated columns just to fill a large lookahead window.
-    if coalesced_projection(&metadata, columns) {
-        build_projected_reader(
-            crate::source::parquet_io::CoalescedFile::new(file)?,
-            metadata,
-            columns,
-            batch_size,
-            row_group,
-        )
-    } else {
-        build_projected_reader(file, metadata, columns, batch_size, row_group)
-    }
 }
 
 fn coalesced_projection(metadata: &ArrowReaderMetadata, columns: &[usize]) -> bool {
@@ -302,48 +277,73 @@ fn parallel_row_groups(
     nthread: usize,
 ) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
     if nthread <= 1 {
-        return Ok(Box::new(batch_reader(&path, &columns, batch_size)?));
+        return batch_reader(&path, &columns, batch_size);
     }
-    let n_groups = {
-        let file = File::open(&path)?;
-        ParquetRecordBatchReaderBuilder::try_new(file)?
-            .metadata()
-            .num_row_groups()
-    };
+    let file = File::open(&path)?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    let n_groups = metadata.metadata().num_row_groups();
     if n_groups <= 1 {
-        return Ok(Box::new(batch_reader(&path, &columns, batch_size)?));
+        return batch_reader_with_metadata(file, metadata, &columns, batch_size);
     }
-    let path = std::sync::Arc::new(path);
-    let columns = std::sync::Arc::new(columns);
+    // Share the parsed footer and projection decision across row groups.
+    // Each group still opens its own file handle for an independent cursor.
+    let coalesced = coalesced_projection(&metadata, &columns);
     Ok(Box::new(
         crate::source::parallel_reader::ordered_parallel_batches(
             n_groups,
             nthread,
             move |row_group| {
-                Ok(Box::new(batch_reader_row_group(
-                    &path, &columns, batch_size, row_group,
-                )?))
+                let file = File::open(&path)
+                    .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+                let reader = if coalesced {
+                    let end = row_group_data_end(metadata.metadata().row_group(row_group));
+                    build_projected_reader(
+                        crate::source::parquet_io::CoalescedFile::for_row_group(file, end)?,
+                        metadata.clone(),
+                        &columns,
+                        batch_size,
+                        Some(row_group),
+                    )?
+                } else {
+                    build_projected_reader(
+                        file,
+                        metadata.clone(),
+                        &columns,
+                        batch_size,
+                        Some(row_group),
+                    )?
+                };
+                Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
             },
         ),
     ))
+}
+
+fn row_group_data_end(group: &parquet::file::metadata::RowGroupMetaData) -> Option<u64> {
+    group.columns().iter().try_fold(0, |end, column| {
+        let offset = column
+            .dictionary_page_offset()
+            .unwrap_or_else(|| column.data_page_offset());
+        let offset = u64::try_from(offset).ok()?;
+        let len = u64::try_from(column.compressed_size()).ok()?;
+        Some(end.max(offset.checked_add(len)?))
+    })
 }
 
 /// 列名 -> 下标。
 fn column_index(path: &Path, name: &str) -> anyhow::Result<usize> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    builder
-        .schema()
+    schema_column_index(builder.schema(), name)
+}
+
+fn schema_column_index(schema: &arrow::datatypes::Schema, name: &str) -> anyhow::Result<usize> {
+    schema
         .fields()
         .iter()
         .position(|f| f.name() == name)
         .ok_or_else(|| {
-            let have: Vec<&str> = builder
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
+            let have: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             crate::input_err!("file has no column {name:?}; available columns: {have:?}")
         })
 }
@@ -416,7 +416,11 @@ pub fn feature_names_of<'a>(
 pub fn peek_n_rows(path: impl AsRef<Path>) -> anyhow::Result<u64> {
     let file = File::open(path.as_ref())?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let n = builder.metadata().file_metadata().num_rows();
+    parquet_row_count(builder.metadata())
+}
+
+fn parquet_row_count(metadata: &parquet::file::metadata::ParquetMetaData) -> anyhow::Result<u64> {
+    let n = metadata.file_metadata().num_rows();
     anyhow::ensure!(n >= 0, "negative row count in the parquet footer: {n}");
     Ok(n as u64)
 }
@@ -447,13 +451,19 @@ fn feature_columns<'a>(
     let targets = targets.into();
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let schema = builder.schema();
+    features_in_schema(builder.schema(), targets)
+}
+
+fn features_in_schema(
+    schema: &arrow::datatypes::Schema,
+    targets: Targets<'_>,
+) -> anyhow::Result<(Vec<usize>, Vec<String>)> {
     if let Some(w) = targets.weight {
         // 权重列找不到要报错,不能静默当成「没给权重」。
-        column_index(path, w)?;
+        schema_column_index(schema, w)?;
     }
     if let Some(q) = targets.qid {
-        column_index(path, q)?;
+        schema_column_index(schema, q)?;
     }
     let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     targets.select_features(&columns)
@@ -490,14 +500,22 @@ fn resolve_categorical_flags(
         .collect())
 }
 
+fn named_column_batches(
+    path: &Path,
+    name: &str,
+) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
+    let file = File::open(path)?;
+    let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+    let column = schema_column_index(metadata.schema(), name)?;
+    batch_reader_with_metadata(file, metadata, &[column], BATCH_SIZE)
+}
+
 /// 读一整列 f32(单文件 parquet 的权重列用)。不量化、不留其它列。
 #[cfg_attr(not(feature = "python"), allow(dead_code))] // Called from the Python ingest path.
 pub(crate) fn read_f32_column(path: impl AsRef<Path>, name: &str) -> anyhow::Result<Vec<f32>> {
-    let path = path.as_ref();
-    let col = column_index(path, name)?;
     let mut out = Vec::new();
-    for batch in batch_reader(path, &[col], BATCH_SIZE)? {
-        out.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
+    for batch in named_column_batches(path.as_ref(), name)? {
+        crate::source::arrow_source::for_each_column_f32(&batch?, 0, |v| out.push(v))?;
     }
     Ok(out)
 }
@@ -508,8 +526,7 @@ pub(crate) fn read_f32_column(path: impl AsRef<Path>, name: &str) -> anyhow::Res
 pub(crate) fn read_u64_columns(paths: &[PathBuf], name: &str) -> anyhow::Result<Vec<u64>> {
     let mut out = Vec::new();
     for path in paths {
-        let col = column_index(path, name)?;
-        for batch in batch_reader(path, &[col], BATCH_SIZE)? {
+        for batch in named_column_batches(path, name)? {
             out.extend(crate::source::arrow_source::column_as_u64(
                 &batch?, 0, name,
             )?);
@@ -679,55 +696,17 @@ pub(crate) fn open_many_observed<'a>(
     nthread: usize,
     mut observe: impl FnMut(&'static str, usize, usize),
 ) -> anyhow::Result<Dataset> {
-    anyhow::ensure!(!paths.is_empty(), "no input files");
     let targets = targets.into();
-    let label = targets.label;
     let metadata_profile = crate::source::openprof::start("multi metadata");
-    let (first_cols, feature_names) = feature_columns(&paths[0], targets)?;
-    let label_col_first = column_index(&paths[0], label)?;
-    let mut weight_proj: Vec<usize> = Vec::new();
-    if let Some(w) = targets.weight {
-        weight_proj.push(column_index(&paths[0], w)?);
-    }
-
-    // 每个文件各自解投影:列名相同、物理顺序不同也能一起训。
-    let mut feat_proj: Vec<Vec<usize>> = vec![first_cols];
-    let mut label_proj: Vec<usize> = vec![label_col_first];
-    for p in &paths[1..] {
-        let (cols, names) = feature_columns(p, targets)?;
-        crate::ensure_input!(
-            names.len() == feature_names.len(),
-            "schemas differ across files: {} has {} feature columns, {} has {}",
-            paths[0].display(),
-            feature_names.len(),
-            p.display(),
-            names.len()
-        );
-        // 按**名字**取该文件里的下标,排成规范顺序。
-        let mut mapped = Vec::with_capacity(feature_names.len());
-        for want in &feature_names {
-            let at = names.iter().position(|n| n == want).ok_or_else(|| {
-                crate::input_err!(
-                    "schemas differ across files: {} has no feature column {want:?}",
-                    p.display()
-                )
-            })?;
-            mapped.push(cols[at]);
-        }
-        feat_proj.push(mapped);
-        label_proj.push(column_index(p, label)?);
-        if let Some(w) = targets.weight {
-            weight_proj.push(column_index(p, w)?);
-        }
-    }
-
+    let ManyFileLayout {
+        features: feat_proj,
+        feature_names,
+        labels: label_proj,
+        weights: weight_proj,
+        max_batches: batches_per_task,
+        ..
+    } = inspect_many_files(paths, targets)?;
     let reader_tasks = paths.len();
-    let mut batches_per_task = 0usize;
-    for path in paths {
-        let rows = usize::try_from(peek_n_rows(path)?)
-            .map_err(|_| anyhow::anyhow!("Parquet rows exceed usize"))?;
-        batches_per_task = batches_per_task.max(rows.div_ceil(BATCH_SIZE));
-    }
     // A single-file dataset reader remains inline; the single-file training
     // route uses ParquetBlockSource and row-group-parallel cut construction.
     let cuts_plan = crate::source::parquet_pipeline_threads(
@@ -805,34 +784,15 @@ pub(crate) fn open_many_observed<'a>(
         )?,
     };
 
-    let _label_profile = crate::source::openprof::start("multi labels");
-    let mut labels = Vec::new();
-    for batch in dataset_reader(
-        paths.to_vec(),
-        label_proj.iter().map(|c| vec![*c]).collect(),
-        BATCH_SIZE,
-        nthread,
-    ) {
-        let batch = batch?;
-        labels.extend(crate::source::arrow_source::column_as_f32(&batch, 0)?);
-    }
-    let weights = match targets.weight {
-        None => None,
-        Some(w) => {
-            let _p = crate::source::openprof::start("multi weights");
-            let mut values = Vec::new();
-            for batch in dataset_reader(
-                paths.to_vec(),
-                weight_proj.iter().map(|c| vec![*c]).collect(),
-                BATCH_SIZE,
-                nthread,
-            ) {
-                values.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
-            }
-            Some((values, w))
-        }
-    };
-    Dataset::assemble(source, labels, feature_names, label, weights)
+    let _target_profile = crate::source::openprof::start("multi labels and weights");
+    let (labels, weights) = read_many_targets(paths, &label_proj, &weight_proj, nthread)?;
+    Dataset::assemble(
+        source,
+        labels,
+        feature_names,
+        targets.label,
+        weights.zip(targets.weight),
+    )
 }
 
 fn dataset_reader(
@@ -874,53 +834,15 @@ pub(crate) fn open_many_with_cache_observed<'a>(
     nthread: usize,
     mut observe: impl FnMut(&'static str, usize, usize),
 ) -> anyhow::Result<(ParquetBlockSource, Vec<f32>, Option<Vec<f32>>, Vec<String>)> {
-    anyhow::ensure!(!paths.is_empty(), "no input files");
     let targets = targets.into();
-    let (first_cols, feature_names) = feature_columns(&paths[0], targets)?;
-    let mut file_cols = vec![first_cols];
-    let mut label_cols = vec![column_index(&paths[0], targets.label)?];
-    let mut weight_cols = targets
-        .weight
-        .map(|w| column_index(&paths[0], w).map(|c| vec![c]))
-        .transpose()?
-        .unwrap_or_default();
-    for path in &paths[1..] {
-        let (cols, names) = feature_columns(path, targets)?;
-        crate::ensure_input!(
-            names.len() == feature_names.len(),
-            "schemas differ across files: {} has {} feature columns, {} has {}",
-            paths[0].display(),
-            feature_names.len(),
-            path.display(),
-            names.len()
-        );
-        let mut mapped = Vec::with_capacity(feature_names.len());
-        for name in &feature_names {
-            let at = names.iter().position(|n| n == name).ok_or_else(|| {
-                crate::input_err!(
-                    "schemas differ across files: {} has no feature column {name:?}",
-                    path.display()
-                )
-            })?;
-            mapped.push(cols[at]);
-        }
-        file_cols.push(mapped);
-        label_cols.push(column_index(path, targets.label)?);
-        if let Some(weight) = targets.weight {
-            weight_cols.push(column_index(path, weight)?);
-        }
-    }
-
-    let mut n_rows = 0usize;
-    let mut max_batches = 0usize;
-    for path in paths {
-        let rows = usize::try_from(peek_n_rows(path)?)
-            .map_err(|_| anyhow::anyhow!("Parquet rows exceed usize"))?;
-        n_rows = n_rows
-            .checked_add(rows)
-            .ok_or_else(|| anyhow::anyhow!("row count overflows usize"))?;
-        max_batches = max_batches.max(rows.div_ceil(BATCH_SIZE));
-    }
+    let ManyFileLayout {
+        features: file_cols,
+        feature_names,
+        labels: label_cols,
+        weights: weight_cols,
+        n_rows,
+        max_batches,
+    } = inspect_many_files(paths, targets)?;
     let cuts_plan = crate::source::parquet_pipeline_threads(
         nthread,
         paths.len(),
@@ -1043,41 +965,114 @@ pub(crate) fn open_many_with_cache_observed<'a>(
     Ok((source, labels, weights, feature_names))
 }
 
+struct ManyFileLayout {
+    features: Vec<Vec<usize>>,
+    feature_names: Vec<String>,
+    labels: Vec<usize>,
+    weights: Vec<usize>,
+    n_rows: usize,
+    max_batches: usize,
+}
+
+fn inspect_many_files(paths: &[PathBuf], targets: Targets<'_>) -> anyhow::Result<ManyFileLayout> {
+    anyhow::ensure!(!paths.is_empty(), "no input files");
+    let mut layout = ManyFileLayout {
+        features: Vec::with_capacity(paths.len()),
+        feature_names: Vec::new(),
+        labels: Vec::with_capacity(paths.len()),
+        weights: Vec::new(),
+        n_rows: 0,
+        max_batches: 0,
+    };
+    for path in paths {
+        let metadata = ArrowReaderMetadata::load(&File::open(path)?, ArrowReaderOptions::new())?;
+        let schema = metadata.schema();
+        let (columns, names) = features_in_schema(schema, targets)?;
+        if layout.features.is_empty() {
+            layout.features.push(columns);
+            layout.feature_names = names;
+        } else {
+            crate::ensure_input!(
+                names.len() == layout.feature_names.len(),
+                "schemas differ across files: {} has {} feature columns, {} has {}",
+                paths[0].display(),
+                layout.feature_names.len(),
+                path.display(),
+                names.len()
+            );
+            let by_name: std::collections::HashMap<_, _> = names.iter().zip(columns).collect();
+            let mapped = layout
+                .feature_names
+                .iter()
+                .map(|name| {
+                    by_name.get(name).copied().ok_or_else(|| {
+                        crate::input_err!(
+                            "schemas differ across files: {} has no feature column {name:?}",
+                            path.display()
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            layout.features.push(mapped);
+        }
+        layout
+            .labels
+            .push(schema_column_index(schema, targets.label)?);
+        if let Some(weight) = targets.weight {
+            layout.weights.push(schema_column_index(schema, weight)?);
+        }
+        let rows = usize::try_from(parquet_row_count(metadata.metadata())?)
+            .map_err(|_| anyhow::anyhow!("Parquet rows exceed usize"))?;
+        layout.n_rows = layout
+            .n_rows
+            .checked_add(rows)
+            .ok_or_else(|| anyhow::anyhow!("row count overflows usize"))?;
+        layout.max_batches = layout.max_batches.max(rows.div_ceil(BATCH_SIZE));
+    }
+    Ok(layout)
+}
+
+fn read_many_targets(
+    paths: &[PathBuf],
+    label_cols: &[usize],
+    weight_cols: &[usize],
+    nthread: usize,
+) -> anyhow::Result<(Vec<f32>, Option<Vec<f32>>)> {
+    let projections = label_cols
+        .iter()
+        .enumerate()
+        .map(|(i, &label)| match weight_cols.get(i) {
+            Some(&weight) => vec![label, weight],
+            None => vec![label],
+        })
+        .collect();
+    let mut labels = Vec::new();
+    let mut weights = (!weight_cols.is_empty()).then(Vec::new);
+    for batch in dataset_reader(paths.to_vec(), projections, BATCH_SIZE, nthread) {
+        let batch = batch?;
+        crate::source::arrow_source::for_each_column_f32(&batch, 0, |v| labels.push(v))?;
+        if let Some(weights) = &mut weights {
+            crate::source::arrow_source::for_each_column_f32(&batch, 1, |v| weights.push(v))?;
+        }
+    }
+    Ok((labels, weights))
+}
+
 fn read_many_labels_weights(
     paths: &[PathBuf],
     label_cols: &[usize],
     weight_cols: &[usize],
     targets: Targets<'_>,
 ) -> anyhow::Result<(Vec<f32>, Option<Vec<f32>>)> {
-    let mut labels = Vec::new();
-    for batch in dataset_reader(
-        paths.to_vec(),
-        label_cols.iter().map(|&c| vec![c]).collect(),
-        BATCH_SIZE,
-        1,
-    ) {
-        labels.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
-    }
+    let (labels, weights) = read_many_targets(paths, label_cols, weight_cols, 1)?;
     crate::ensure_input!(
         !labels.iter().any(|v| v.is_nan()),
         "label column {:?} has missing values",
         targets.label
     );
-    let weights = if let Some(name) = targets.weight {
-        let mut values = Vec::new();
-        for batch in dataset_reader(
-            paths.to_vec(),
-            weight_cols.iter().map(|&c| vec![c]).collect(),
-            BATCH_SIZE,
-            1,
-        ) {
-            values.extend(crate::source::arrow_source::column_as_f32(&batch?, 0)?);
-        }
-        crate::source::check_weight_column(&values, name)?;
-        Some(values)
-    } else {
-        None
-    };
+    if let Some((weights, name)) = weights.as_ref().zip(targets.weight) {
+        crate::source::check_weight_column(weights, name)?;
+    }
     Ok((labels, weights))
 }
 
@@ -1714,9 +1709,9 @@ impl ParquetBlockSource {
         let mut staging = CacheStage(Some(write_dir.clone()));
         let write_block = |i| -> anyhow::Result<String> {
             let block = self.quantize_block(i)?;
-            let bytes = block.data.to_le_bytes();
-            File::create(write_dir.join(format!("block-{i}.bin")))?.write_all(&bytes)?;
-            Ok(block_hash(&bytes))
+            let bytes = block.data.as_le_bytes();
+            File::create(write_dir.join(format!("block-{i}.bin")))?.write_all(bytes)?;
+            Ok(block_hash(bytes))
         };
         let block_hashes = {
             let _p = crate::source::openprof::start("quantize+write");
@@ -2374,75 +2369,17 @@ impl BlockSource for ParquetBlockSource {
         if cols.is_empty() || cols.len() == feat_ids.len() {
             return self.with_block(i, f);
         }
-        match &self.cache {
-            QuantizedCache::Disk { dir, verified, .. } => {
-                let already_verified = verified
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("cache block {i} has no checksum state"))?
-                    .load(Ordering::Acquire);
-                if !already_verified {
-                    // 第一次碰这个块:整块读 + 校验(付一次全量代价,
-                    // 换掉"静默跳过校验")。
-                    //
-                    // ⚠️ 但**交回去的仍然只能是调用方要的那几列** ——
-                    // 调用方已经按压实算好了 offsets,交回整块会直接对不上。
-                    // 早一版就是在这里 `return self.with_block(i, f)`,
-                    // 被一致性断言抓了个正着。
-                    let mut whole = None;
-                    self.with_block(i, &mut |b| {
-                        whole = Some((b.data.clone(), b.feat_ids.clone()));
-                    })?;
-                    let (whole_data, whole_feats) =
-                        whole.expect("with_block must call f exactly once");
-                    let n_rows = self.n_rows;
-                    for &l in cols {
-                        anyhow::ensure!(
-                            l < whole_feats.len(),
-                            "column block {i} has no local feature {l}"
-                        );
-                    }
-                    let data = match &whole_data {
-                        BinData::U8(d) => BinData::U8(gather_columns(d, cols, n_rows)),
-                        BinData::U16(d) => BinData::U16(gather_columns(d, cols, n_rows)),
-                    };
-                    let block = ColumnBlock {
-                        feat_ids: cols.iter().map(|&l| whole_feats[l]).collect(),
-                        data,
-                        n_rows: self.n_rows,
-                    };
-                    f(&block);
-                    return Ok(());
-                }
-                use std::io::{Read, Seek, SeekFrom};
-                let width = self.cuts.block_width(feat_ids);
-                let col_bytes = self.n_rows * width.bytes();
-                let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
-                // Read straight into the block's typed cells (no byte-to-cell copy).
-                let mut data = BinData::missing(width, cols.len() * self.n_rows);
-                let bytes = data.as_le_bytes_mut();
-                for (slot, &l) in cols.iter().enumerate() {
-                    anyhow::ensure!(
-                        l < feat_ids.len(),
-                        "column block {i} has no local feature {l}"
-                    );
-                    file.seek(SeekFrom::Start((l * col_bytes) as u64))?;
-                    file.read_exact(&mut bytes[slot * col_bytes..(slot + 1) * col_bytes])?;
-                }
-                self.cache_reads.fetch_add(1, Ordering::Relaxed);
-                self.source_bytes
-                    .fetch_add(data.byte_len() as u64, Ordering::Relaxed);
-                let block = ColumnBlock {
-                    feat_ids: cols.iter().map(|&l| feat_ids[l]).collect(),
-                    data,
-                    n_rows: self.n_rows,
-                };
-                f(&block);
-                Ok(())
-            }
-            // 内存 cache 本来就没有「读取」这件事,整块借出去是零拷贝,
-            // 再挑列反而多一次复制。
-            QuantizedCache::Memory(_) => self.with_block(i, f),
+        if matches!(self.cache, QuantizedCache::Memory(_)) {
+            // A resident block can be borrowed directly.
+            return self.with_block(i, f);
         }
+        let data = self.read_disk_columns(i, cols)?;
+        f(&ColumnBlock {
+            feat_ids: cols.iter().map(|&l| feat_ids[l]).collect(),
+            data,
+            n_rows: self.n_rows,
+        });
+        Ok(())
     }
 
     /// 只有落盘(spill)的 cache 能真的少读:块文件是列主序,
@@ -2563,13 +2500,10 @@ impl BlockSource for ParquetBlockSource {
         // 所以直接复用 `with_block_cols` 的部分读路径(连同它的 checksum
         // 首触规则和字节计数)。不支持部分读的 source 会走默认整块回退,
         // 行为和以前一致。
-        let mut result = None;
-        self.with_block_cols(block_id, &[local], &mut |block| {
-            // 部分读时块里只有这一列;整块回退时仍要按 local 取。
-            let col = if block.n_feats() == 1 { 0 } else { local };
-            result = Some(block.column(col).to_owned());
-        })?;
-        Ok(result.expect("with_block_cols must call f exactly once"))
+        if self.supports_column_selection() && self.groups[block_id].len() > 1 {
+            return self.read_disk_columns(block_id, &[local]);
+        }
+        self.with_block_ret(block_id, |block| block.column(local).to_owned())
     }
 
     /// 内存 cache 直接借出列,零拷贝;落盘 cache 返回 `None`,调用方走
@@ -2594,6 +2528,46 @@ impl BlockSource for ParquetBlockSource {
 }
 
 impl ParquetBlockSource {
+    fn read_disk_columns(&self, i: usize, cols: &[usize]) -> anyhow::Result<BinData> {
+        use std::io::{Seek, SeekFrom};
+
+        let QuantizedCache::Disk { dir, verified, .. } = &self.cache else {
+            unreachable!("disk column reads require a spill cache");
+        };
+        let feat_ids = &self.groups[i];
+        for &local in cols {
+            anyhow::ensure!(
+                local < feat_ids.len(),
+                "column block {i} has no local feature {local}"
+            );
+        }
+        let checked = verified
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("cache block {i} has no checksum state"))?
+            .load(Ordering::Acquire);
+        if !checked {
+            // Verify the full payload on first touch and gather directly
+            // from that buffer while with_block still owns it.
+            return self.with_block_ret(i, |block| match &block.data {
+                BinData::U8(data) => BinData::U8(gather_columns(data, cols, self.n_rows)),
+                BinData::U16(data) => BinData::U16(gather_columns(data, cols, self.n_rows)),
+            });
+        }
+
+        let width = self.cuts.block_width(feat_ids);
+        let col_bytes = self.n_rows * width.bytes();
+        let mut file = File::open(dir.join(format!("block-{i}.bin")))?;
+        let mut data = BinData::missing(width, cols.len() * self.n_rows);
+        for (slot, &local) in cols.iter().enumerate() {
+            file.seek(SeekFrom::Start((local * col_bytes) as u64))?;
+            file.read_exact(&mut data.as_le_bytes_mut()[slot * col_bytes..(slot + 1) * col_bytes])?;
+        }
+        self.cache_reads.fetch_add(1, Ordering::Relaxed);
+        self.source_bytes
+            .fetch_add(data.byte_len() as u64, Ordering::Relaxed);
+        Ok(data)
+    }
+
     /// 读若干列并量化,列主序写进 `out`。
     ///
     /// `block()` 和 `feature_column()` **共用这一份量化代码**。分成两份
@@ -3312,7 +3286,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let cached = projected_reader(&path, &features, 17, None).unwrap();
+        let cached = batch_reader(&path, &features, 17).unwrap();
         let a: Vec<_> = ordinary.map(Result::unwrap).collect();
         let b: Vec<_> = cached.map(Result::unwrap).collect();
         assert_eq!(a, b);
@@ -3589,6 +3563,21 @@ mod tests {
         .unwrap();
         assert_eq!(disk.cache_kind(), "disk");
         assert_eq!(disk.parquet_load_count(), disk.n_blocks());
+        let first_block = memory.block_features(0).unwrap();
+        let selected = first_block[1];
+        let expected = memory.feature_column(selected).unwrap();
+        assert_eq!(disk.feature_column(selected).unwrap(), expected);
+        let full_bytes = (expected.byte_len() * first_block.len()) as u64;
+        assert_eq!(disk.source_bytes_read(), Some(full_bytes));
+        disk.with_block_cols(0, &[1], &mut |block| {
+            assert_eq!(block.feat_ids, [selected]);
+            assert_eq!(block.data, expected);
+        })
+        .unwrap();
+        assert_eq!(
+            disk.source_bytes_read(),
+            Some(full_bytes + expected.byte_len() as u64)
+        );
         for b in 0..memory.n_blocks() {
             memory
                 .with_block(b, &mut |a| {
@@ -3733,8 +3722,10 @@ mod tests {
 
         let (reused, _) =
             ParquetBlockSource::open_with_cache(&path, "target", 16, 2, opts()).unwrap();
+        // The corruption is in the second column. Selecting only the first
+        // must still verify the entire block and suppress the callback.
         let err = reused
-            .with_block(0, &mut |_| {})
+            .with_block_cols(0, &[0], &mut |_| panic!("invalid block was exposed"))
             .expect_err("same-length payload corruption must be caught by the checksum");
         assert!(
             err.to_string().contains("payload checksum mismatch"),

@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn category_set_capacity_matches_the_kernel_and_the_host_bitset() {
-        let kernel = include_str!("backend/cuda/histogram.cu");
+        let kernel = include_str!("../backend/cuda/histogram.cu");
         let defined = kernel
             .lines()
             .find_map(|l| l.strip_prefix("#define CAT_SET_WORDS "))
@@ -1551,7 +1551,7 @@ mod resolve_tests {
         );
         assert_eq!(FAST_QUANTILE_SCRATCH_BYTES, (256 * 2 + 1) * 8);
         // 归约形状常量必须和 kernel 里的 #define 一致。
-        let cu = include_str!("backend/cuda/histogram.cu");
+        let cu = include_str!("../backend/cuda/histogram.cu");
         assert!(
             cu.contains(&format!(
                 "#define QUANTILE_REDUCE_BLOCKS {QUANTILE_REDUCE_BLOCKS}u"
@@ -1640,7 +1640,7 @@ mod resolve_tests {
             base.fixed_bytes + fast_rank_bytes(rows, &shape)
         );
         // the CUDA constants the formula relies on
-        let cu = include_str!("backend/cuda/histogram.cu");
+        let cu = include_str!("../backend/cuda/histogram.cu");
         assert!(cu.contains("rank_sort_groups") && cu.contains("rank_pairs"));
         assert!(
             cu.contains(&format!("#define RANK_BIAS_REPLICAS {RANK_BIAS_REPLICAS}u")),

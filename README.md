@@ -18,7 +18,7 @@ In large-scale GBDT workflows, GPU acceleration is frequently bottlenecked not b
 
 - **Eliminating Host-Memory Bottlenecks & Slow Setup**: In XGBoost, GPU training often incurs high host memory and multi-pass materialization when constructing a `DMatrix`, `QuantileDMatrix`, or data iterator. FerrisBoost streams and quantizes directly from Parquet or CSV in Rust, making setup **2–4× faster** while cutting peak host RAM by **2–3×** (`0.29–0.47× XGBoost`).
 - **Memory-bounded multi-file Parquet training**: Lists, directories, and globs of Parquet files can use `cache_budget_bytes` to bound the in-memory quantized feature-block cache; the cache moves to local disk when its payload exceeds the budget. Set the budget to zero to force disk use. `cache_path` persists and reuses the quantized training cache across processes. This budget covers feature blocks, not total process RSS or GPU residency. Multi-file Parquet without these options continues to use the ordinary in-memory quantized route.
-- **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the rest from the quantized cache every level (hybrid), down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans.
+- **Streaming Training Beyond GPU Memory**: A small GPU can train data larger than its memory. The memory planner keeps as many column blocks resident on the GPU as the budget allows and streams the remaining blocks during split search, down to pure streaming when VRAM is tight. The plan is fixed for the whole run, with no manual chunking, external-memory iterators or batch tuning, and models are identical across plans.
 - **Physically Selective Column Sampling**: On the column-major GPU path, `colsample_bytree` builds compact selected-feature histograms over unchanged resident blocks. Unselected features are omitted from histogram initialization, accumulation, subtraction, and device-to-host output without rematerializing resident data for each tree.
 - **Optimized for Wide Data (High Feature Counts)**: Datasets with hundreds or thousands of features (wide tables) severely strain GPU histogram construction and setup time. FerrisBoost's **column-blocked histogram engine** tiles features into cache-conscious blocks, ensuring bounded GPU-memory planning, strong cache locality, and sustained throughput on high-dimensional datasets.
 - **Single-GPU training**: Training targets one selected GPU per job (`device="cuda"` or `device="cuda:N"`). Multi-GPU support is future 1.0 work.
@@ -42,11 +42,11 @@ The following ratios compare FerrisBoost with the corresponding XGBoost backend 
 
 On these workloads, FerrisBoost used approximately **0.27–0.46×** XGBoost setup time, **0.29–0.47×** peak host RAM, and **0.43–0.72×** combined RAM plus active VRAM on GPU. CPU training used **0.53–0.84×** XGBoost CPU training time and GPU-fast training **0.37–0.73×** XGBoost GPU training time. Accuracy ratios remained within **0.9987–0.9998×** of XGBoost.
 
-These ratios describe the tested workloads and hardware, not universal performance guarantees. They are historical measurements and do not report 0.0.9 performance. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Training uses row and column subsampling of 0.6. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
+These ratios describe the tested workloads and hardware, not universal performance guarantees. These historical measurements predate 0.1.1. Setup includes input processing, quantization, planner initialization, and initial GPU preparation. Combined memory is an observed secondary footprint indicator, not a hard memory-budget guarantee. Training uses row and column subsampling of 0.6. Metric scoring is excluded from training time. GPU memory remains adaptive: full residency is used when possible, with hybrid or streaming execution under tighter budgets.
 
 ## Install
 
-FerrisBoost is available on [PyPI](https://pypi.org/project/ferrisboost/):
+Install the portable wheel from [PyPI](https://pypi.org/project/ferrisboost/). Wheels support Python 3.9 or later on x86-64 Linux (glibc 2.34 or later) and Windows.
 
 ```bash
 pip install ferrisboost
@@ -114,7 +114,8 @@ model = fb.train(
     num_boost_round=200,
 )
 
-# Predict returns a 1-D NumPy float32 array (multiclass models return a 2-D array):
+# Predict returns a NumPy float32 array. Probabilities and margins for
+# multiclass models and multi-quantile predictions have one column per output.
 prediction = model.predict("test.parquet", predict_threads=0)
 model.save_model("model.json")
 ```
@@ -139,6 +140,7 @@ model = fb.train(
 - **Adaptive VRAM**: Automatically selects a stable full-residency, hybrid-residency, or streaming plan based on dataset shape and the available VRAM budget.
 - **`colsample_bytree`**: Selects a deterministic feature subset per tree. Column-major GPU execution uses that subset as the logical histogram execution/output width while preserving the physical resident-block layout and model compatibility.
 - **`gpu_math`**: `"exact"` (default) guarantees byte-by-byte exact CPU reproducibility; `"fast"` is deterministic but does not guarantee byte-identical CPU/GPU models.
+- **`grow_policy`**: `depthwise` is the default. `lossguide` splits the highest-gain eligible leaf, and `symmetric` applies one shared split per level. [Tree growth parameters](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#tree-growth-and-feature-interactions).
 - **`nthread`**: `0` selects available physical CPU parallelism.
 - **Prediction CPU threads**: `model.predict(..., predict_threads=0)` uses process-aware automatic CPU parallelism independently of training `nthread`; a positive value overrides it.
 - **GPU prediction**: `model.predict(..., use_gpu=True)` opts into single-GPU inference, including categorical models and `base_margin`. The compact tree model is uploaded lazily and cached for reuse; small or transfer-heavy batches automatically remain on CPU.
@@ -248,6 +250,9 @@ File-to-file CPU scoring is also available through `Model.predict_to_parquet()`;
 
 Supported objectives include `binary:logistic`, `reg:squarederror`, `count:poisson`, `reg:gamma`, `reg:tweedie`, `reg:pseudohubererror`, `reg:quantileerror`, `multi:softprob`, `multi:softmax`, `rank:ndcg`, `rank:pairwise`, and `rank:map`, plus `reg:logistic`, `binary:logitraw`, `binary:hinge`, `reg:squaredlogerror`, `reg:absoluteerror`, `reg:expectileerror`, `survival:cox`, and `survival:aft`. Survival objectives use CPU and CUDA exact; CUDA fast is unsupported. See the Python API How-To for objective details and compatibility. Supported `eval_metric` values include `rmse`, `mae`, `mape`, `mphe`, `rmsle`, `expectile`, `logloss`, `error`, `error@t`, `auc`, `aucpr`, `poisson-nloglik`, `gamma-nloglik`, `gamma-deviance`, `tweedie-nloglik@rho`, `quantile`, `cox-nloglik`, `aft-nloglik`, `interval-regression-accuracy`, `mlogloss`, `merror`, and ranking `ndcg`, `map`, and `pre` (with `@k`).
 
+`fb.CustomMetric` adds batched Python evaluation metrics to `eval_metric`, including with custom objectives and scikit-learn estimators. Callbacks receive raw margins, labels, optional weights, and query offsets for ranking. They run on the host during CPU and CUDA training.
+See [Custom evaluation metrics](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#custom-evaluation-metrics) for weighting and early stopping.
+
 ### Known limitations
 
 * **GPU inference:** prediction currently targets GPU 0 only and uses a bounded single-stream staging path. Multi-stream H2D/kernel overlap remains future optimization work.
@@ -263,18 +268,28 @@ Project homepage: [mdai001.github.io/FerrisBoost](https://mdai001.github.io/Ferr
 
 Source code: [github.com/mdai001/FerrisBoost](https://github.com/mdai001/FerrisBoost).
 
-See the [Python API How-To](documents/howto.md) for installation details,
+See the [Python API How-To](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md) for installation details,
 Parquet/CSV input formats, validation, early stopping, model persistence,
 logging, and the complete parameter reference.
 
 ## Changelog
 
-See the [Python API How-To](documents/howto.md) for details.
+See the [Python API How-To](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md) for details.
 
-### 0.1.0 candidate
+### 0.1.1
+
+- Added loss-guided and symmetric growth on CPU and single-GPU CUDA exact and fast. Python and scikit-learn use `grow_policy`. Rust uses explicit training entry points that accept a `GrowPolicy`. [Tree growth parameters](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#tree-growth-and-feature-interactions).
+- Reduced CUDA split-search transfers for eligible resident blocks in loss-guided and symmetric growth.
+- Reused training margins for matching evaluation inputs on CPU and CUDA exact. Reduced temporary allocations for independent evaluation sets and eliminated unused terminal prediction transfers in CUDA exact.
+- Shared sorting for ungrouped binary AUC and AUCPR. Reduced NumPy allocation for multi-output Python evaluation metrics.
+- Reused parsed Parquet metadata across parallel row-group reads and reduced extra reads and copies during spill training. Quiet file-to-Parquet prediction skips the row-count scan used for progress reporting.
+- Removed temporary-file pre-sizing for single-worker model saves.
+- Preserved the Rust `TrainParams` fields and module import paths. Loading a scikit-learn pickle from 0.1.0 defaults to depthwise growth on the next fit.
+
+### 0.1.0
 
 - Added cache budgets and persistent cache reuse for lists, directories, and globs of Parquet training files. A zero budget forces quantized feature blocks to disk. Validation shares the training cuts and uses its own temporary cache or in-memory blocks.
-- Extended Python custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast, with one batch callback per boosting round. Rust validates derivatives, applies row or query weights, and builds the trees.
+- Extended Python custom objectives to scalar regression, multiclass classification, and ranking on CPU and single-GPU CUDA exact and fast, with one batch callback per boosting round. Rust validates derivatives, applies row or query weights, and builds the trees. These objectives can be evaluated with built-in metrics or [`fb.CustomMetric`](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#custom-evaluation-metrics), introduced in 0.0.9.
 - Added prediction links for custom-objective models. The model stores built-in links or the name of a shape-preserving Python callback. Rebind named callbacks after loading or continuing the model. Raw-margin predictions and SHAP values are unchanged.
 - Reduced temporary work in Parquet quantization and single-worker model I/O.
 

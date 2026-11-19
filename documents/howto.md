@@ -5,7 +5,7 @@ PyArrow, Parquet, and CSV training inputs. Its parameter names and JSON model
 format are designed to be familiar to XGBoost users, but FerrisBoost does not
 use a `DMatrix` object.
 
-This guide documents the FerrisBoost 0.1.0 candidate Python API. Sections marked
+This guide documents the FerrisBoost 0.1.1 Python API. Sections marked
 **0.0.9** describe behavior introduced in that historical release. Select one
 GPU with
 `device="cuda"` or `device="cuda:N"`; multi-GPU support is future 1.0 work.
@@ -84,11 +84,10 @@ WHEEL_PATH=$(MATURIN=.venv/bin/maturin FB_PY=.venv/bin/python \
 uv pip install "$WHEEL_PATH"
 ```
 
-If a release bundle provides both `generic/` and `x86-64-v3/`, install the
-generic wheel unless the target CPU is known to implement the x86-64-v3 ISA
-level. The optimized build is not a runtime-dispatched universal wheel. The two
-files have the same Python compatibility tag and are therefore distributed in
-separate directories.
+The portable distribution is `ferrisboost`. Install `ferrisboost-v3` in a
+separate environment for CPUs with x86-64-v3 support. Both distributions
+provide the `ferrisboost` import and model format. Wheels support Python 3.9 or
+later on x86-64 Linux (glibc 2.34 or later) and Windows.
 
 Check the installed package:
 
@@ -474,7 +473,14 @@ trained value is stored in the model and used again at prediction time.
 
 For in-memory data, each validation entry is a
 `(features, labels, name)` tuple, or `(features, labels, weights, name)` for a
-weighted validation set (see [Sample weights](#sample-weights)):
+weighted validation set (see [Sample weights](#sample-weights)).
+
+To monitor training data, include the same input in `evals`. FerrisBoost can
+reuse its quantized data when an array evaluation shares the training matrix,
+or when file inputs resolve to the same ordered paths. CPU and CUDA exact also
+reuse training margins when the starting margins match. Independent evaluation
+sets update their cached margins with each new tree. CUDA fast reuses the
+quantized source when eligible and maintains separate evaluation margins.
 
 ```python
 X_train, X_valid = X[:8_000], X[8_000:]
@@ -590,8 +596,9 @@ best_prediction = model.predict(
 
 ## Custom evaluation metrics
 
-Available in 0.0.9. Wrap a batch function in `fb.CustomMetric`
-and pass it through `eval_metric`, alone or in a list with built-in metric names:
+Introduced in 0.0.9. Wrap a batch function in `fb.CustomMetric` and pass it
+through `eval_metric`, alone or in a list with built-in metric names. It works
+with built-in and [custom objectives](#custom-objectives) on CPU and CUDA.
 
 ```python
 def raw_rmse(predictions, labels, sample_weight, group_ptr):
@@ -1008,12 +1015,55 @@ uninterrupted run.
 
 ## Tree growth and feature interactions
 
-Available in 0.0.9. `max_leaves` limits the total leaves in
-each tree, including branches that stopped growing earlier. The default `0`
-adds no leaf limit; `1` produces a root-only tree. Trees retain depthwise growth,
-with stable node order when a level has more candidates than remaining leaf
-slots. `max_depth` remains an independent limit; its value `0` still means a
-root-only tree. Loss-guided growth is not implemented.
+`max_leaves` limits the total leaves per tree, including branches that stop
+growing early. Its default, `0`, adds no leaf limit. A value of `1` produces a
+root-only tree. `max_depth` is an independent limit, and `max_depth=0` also
+produces a root-only tree.
+
+`grow_policy="depthwise"` is the default. It grows one level at a time and
+spends the remaining leaf budget in node order. Set
+`grow_policy="lossguide"` (added in 0.1.1) to split the eligible leaf with the
+highest gain across the tree. Equal gains go to the lower node ID.
+Depthwise and loss-guided growth use the same split scoring and constraints.
+Loss-guided growth supports CPU and single-GPU CUDA exact and fast, including
+streamed Parquet. On CUDA, columns follow the selected residency plan and
+rows stay on the device. Each split updates its children before the next
+leaf is selected, so streamed columns may be read more often than during
+depthwise growth.
+
+```python
+model = fb.train(
+    {"objective": "binary:logistic", "grow_policy": "lossguide",
+     "max_leaves": 16, "max_depth": 8},
+    X_train, label=y_train, num_boost_round=100,
+)
+```
+
+`grow_policy="symmetric"` (added in 0.1.1) applies the same split feature,
+numeric threshold or category set, and missing-value direction to every
+node at a level. Each candidate must satisfy the split constraints at every
+leaf. FerrisBoost picks the candidate with the largest sum of leaf gains
+and adds the level only if the total exceeds the sum of the per-leaf gain
+floors, which account for `gamma` and numerical noise.
+Node-level column sampling leaves only features sampled by every node eligible.
+For categorical partition splits, candidate sets are generated from one category
+ordering based on pooled statistics for the level.
+
+Symmetric growth doubles the leaf count at each new level. It stops before a
+level would exceed `max_leaves`, so `max_leaves=31` allows at most 16 leaves.
+It supports CPU and single-GPU CUDA exact and fast, including streamed file
+inputs. All growth policies use the same XGBoost-compatible JSON tree format
+and predictors.
+
+The same `grow_policy` values are available on sklearn estimators. In Rust, pass
+`GrowPolicy::LossGuide` or `GrowPolicy::Symmetric` to
+`train::train_weighted_with_grow_policy` or
+`train::train_gpu_weighted_with_grow_policy`. Use `None` for unweighted
+training. Import the enum as `ferrisboost::types::GrowPolicy`. Symmetric
+growth requires one communication rank (`Comm::size() == 1`) and can use
+multiple local CPU threads. The existing Rust training entry points default to
+depthwise growth. Use the same growth parameters when
+continuing training to reproduce an uninterrupted run.
 
 `interaction_constraints` restricts which features may appear together along
 a root-to-leaf path:
@@ -1033,9 +1083,8 @@ with themselves. Reusing a feature is allowed. An empty outer list or `None`
 disables constraints; empty inner groups and invalid feature references raise
 an error. Duplicate entries are normalized in Rust.
 
-Both controls apply to numerical and categorical splits and combine with
-column sampling and monotone constraints. Constraints narrow split candidates;
-they do not automatically eliminate histogram reads needed by other nodes.
+Leaf limits and interaction constraints apply to numerical and categorical
+splits and combine with column sampling and monotone constraints.
 
 ## Monotone constraints
 
@@ -1341,13 +1390,12 @@ both directions. A loaded XGBoost
 model may use category ids above 65533; prediction follows its sets, with
 unknown or invalid values going left.
 
-On GPU, categorical features work with `gpu_math="exact"` (byte-identical to
-CPU) and `"fast"`. The resident GPU split cache enumerates categorical features
-on the device (one-hot and sorted partition, with the same tie-breaking and
-missing-value direction as the CPU), so histogram building, split search, row
-partitioning, and gradients all stay on the device. Cache overflow and pure
-streaming (`resident_blocks=0`) fall back to the exact host enumeration over
-downloaded histograms.
+Both CUDA math modes support categorical features. For depthwise and
+loss-guided growth, eligible resident blocks can use device split search for
+one-hot and sorted-partition candidates. Streamed blocks and symmetric
+categorical splits are scored on the host from GPU histograms. Built-in
+objective gradients run on the host in exact mode and on the device in fast
+mode.
 
 ## Learning to rank
 
@@ -1580,17 +1628,17 @@ a FerrisBoost multiclass model, and FerrisBoost loads one trained by XGBoost.
 
 ## scikit-learn estimators
 
-`FerrisBoostClassifier` and `FerrisBoostRegressor` follow the `XGBClassifier` /
-`XGBRegressor` interface without taking the XGBoost names (so both libraries can
-be imported together):
+FerrisBoost provides scikit-learn estimators for classification, regression
+and ranking. Each follows the corresponding XGBoost estimator interface.
 
 | XGBoost | FerrisBoost |
 |---|---|
 | `xgboost.XGBClassifier` | `ferrisboost.FerrisBoostClassifier` |
 | `xgboost.XGBRegressor` | `ferrisboost.FerrisBoostRegressor` |
+| `xgboost.XGBRanker` | `ferrisboost.FerrisBoostRanker` |
 
-scikit-learn is optional: `import ferrisboost` never imports it, and the two
-names are loaded on first access.
+scikit-learn is optional. FerrisBoost imports it when an estimator is first
+accessed.
 
 ```python
 from ferrisboost.sklearn import FerrisBoostClassifier
@@ -1613,7 +1661,12 @@ clf.save_model("clf.json")                # XGBoost-compatible JSON
   `subsample`, `colsample_by*`, `reg_alpha`, `reg_lambda`, `n_jobs`,
   `random_state`, `eval_metric`, `early_stopping_rounds`, ...) plus FerrisBoost's
   `device`, `gpu_math`, `cols_per_block`, `quantile_alpha`,
-  `tweedie_variance_power`, `huber_slope`, and `importance_type`. `None` means "use FerrisBoost's default".
+  `tweedie_variance_power`, `huber_slope`, and `importance_type`. `None` means
+  use FerrisBoost's default.
+- Set `grow_policy="depthwise"`, `"lossguide"`, or `"symmetric"` on the
+  estimator. `None` uses depthwise growth. Estimators restored from a 0.1.0
+  pickle use this default on their next fit. Their fitted model and predictions
+  are preserved.
 - `missing` (default `NaN`) is a constructor parameter as in XGBoost. It is
   applied to the training data, every `eval_set`, and to `predict`,
   `predict_proba`, and `apply`, so a fitted estimator always uses the value it
@@ -1778,7 +1831,7 @@ individual column blocks efficiently, so it is fully quantized in memory.
 ## Control the Parquet quantized cache
 
 Cache settings belong in the parameter dictionary.
-In the 0.1.0 candidate, the cache options also support multi-file Parquet
+Starting in 0.1.0, the cache options also support multi-file Parquet
 training supplied as a list, directory, or glob.
 
 `cache_budget_bytes` limits how much quantized feature-block data may remain
@@ -1944,8 +1997,9 @@ memory budget, without manual chunk or batch tuning:
   objectives compute derivatives, quantization scales and prediction updates
   on the device. Runs are deterministic but need not match CPU bit for bit.
   `reg:absoluteerror` and `reg:quantileerror` reduce their residual scale on
-  the device. Fast mode requires `device_quantize=True`; custom objectives
-  and survival objectives currently require CPU or CUDA exact.
+  the device. Fast mode requires `device_quantize=True`. [Custom objectives](#custom-objectives)
+  compute derivatives on the host in both CUDA modes. Survival objectives
+  support CPU and CUDA exact.
 - **Ranking on the GPU**: with `gpu_math="exact"` the group gradients are
   computed on the host and the model is byte-identical to the CPU model. With
   `gpu_math="fast"` the whole LambdaMART step runs on the device: a stable
@@ -1967,34 +2021,40 @@ memory budget, without manual chunk or batch tuning:
   `quantile_alpha` values keep one prediction column per quantile.
   `reg:quantileerror` adds a small fixed scratch buffer that does not depend
   on the row count (it is reused by every quantile in turn). The memory planner accounts for all of these.
-- **`colsample_bylevel` / `colsample_bynode`**: supported with `device="cuda"` and byte-identical to the CPU under `gpu_math="exact"`. The per-level and per-node feature sets are drawn on the host exactly as on the CPU and applied by the device split cache.
-- **Categorical features**: supported with both `gpu_math` modes. Split search
-  for them runs in the device split cache (see
-  [Categorical features](#categorical-features)).
+- **Column sampling**: Both CUDA math modes support per-level and per-node
+  sampling. The feature sets are drawn on the host. Eligible depthwise and
+  loss-guided splits can use the resident device cache. Symmetric split search
+  runs on the host when per-level or per-node sampling is enabled.
+- **Categorical features**: Both CUDA math modes support them. Eligible
+  resident depthwise and loss-guided splits can use the device cache. Symmetric
+  categorical split search runs on the host. See
+  [Categorical features](#categorical-features).
 - **`device_quantize`**: `True` (default) performs fixed-point gradient and
   Hessian quantization on the GPU. Feature binning and feature bins remain on
   the host/source side.
 - **Bounded split cache**: A bounded resident histogram/split cache is enabled
-  by default and included in the GPU memory plan. Cache overflow and pure
-  streaming use the exact host fallback. This is managed internally and is not
+  by default and included in the GPU memory plan. Streamed blocks and ineligible searches use the host scorer. This is managed internally and is not
   a public Python parameter.
 - **`hist_streams`**: Defaults to automatic (`None`); the GPU planner resolves the stream count from the execution path, block width, and VRAM budget. The current column-major path uses one stream by default; set `1` or `2` to override it.
 - **`device` selection**: Training currently targets one selected GPU (`device="cuda"` or `device="cuda:N"`). Multi-GPU support is future 1.0 work and is not implemented.
-- **`max_depth`**: Depth-wise tree growth on GPU is constrained to `0..=14` by partition buffer limits.
+- **`max_depth`**: The GPU partition buffer limits tree depth to `0..=14`.
+
+Set `FB_PROFILE=1` for CUDA allocation diagnostics. The estimated peak describes
+planned training allocations. Reported device use is sampled after allocation.
 
 ### What runs where
 
 | Step | Where it runs |
 |---|---|
-| Histograms and row partition | GPU for both math modes; objective gradients run on the host in exact mode and on the device in fast mode |
-| Split search | GPU (resident cache) by default, including categorical features and `colsample_bylevel` / `colsample_bynode`; on the host from downloaded histograms for cache overflow and pure streaming |
+| Histograms and row partition | GPU for both math modes; built-in objective gradients run on the host in exact mode and on the device in fast mode. Custom objective callbacks run on the host |
+| Split search | GPU for eligible resident blocks. The symmetric device search requires numeric 8-bit bins and a maximum permitted frontier that fits in one node batch. Symmetric search with monotone constraints, interaction constraints, or per-level or per-node column sampling runs on the host. Streamed blocks use host search |
 | Feature binning and file ingest | Host |
 | Prediction (`use_gpu=True`) | GPU 0 when worthwhile, including categorical models and `base_margin`; CPU for small batches and `predict_to_parquet` |
 | Explanations (`use_gpu=True`) | `pred_contribs` (exact and `approx_contribs`), `pred_interactions` and `pred_leaf` run on GPU 0 for every call, categorical splits and `base_margin` included, with values bit-identical to the CPU path. With `use_gpu=False` they run on the CPU |
 
 What raises an error instead of falling back: `device="cuda"` on a build without
 CUDA, `max_depth` above 14 (on CPU too), `gpu_math="fast"` together with
-`device_quantize=False`, custom objectives or survival objectives.
+`device_quantize=False` or a survival objective.
 
 ## Prediction
 
@@ -2052,6 +2112,9 @@ A model is bound to file columns by name when it has feature names, including an
 Readers keep deterministic file/row order and bounded batches. In auto CPU mode, ingest and scoring share one process-visible CPU budget so `ingest_threads` and `predict_threads` do not each consume the full machine. If both are explicitly set above that budget, FerrisBoost preserves the overrides and emits an oversubscription warning. GPU file prediction keeps input in the Rust batch path and does not first materialize a full NumPy matrix.
 
 `predict_to_parquet()` accepts the same file, file-list, directory, and glob inputs as file-based `predict()`; it does not accept a NumPy input. This first implementation uses CPU scoring and writes one non-null `float32` column to a single `.parquet` or `.pq` file with Snappy compression. It returns the number of rows written. For multiclass models and for models with several `quantile_alpha` values it writes one column per class or quantile instead (see [Multiclass prediction](#multiclass-prediction)), streamed in the same bounded batches. The target must not already exist, and an incomplete output created by the call is removed if schema validation, reading, scoring, encoding, or finalization fails.
+
+Set `quiet=True` when training or loading the model to suppress routine
+`predict_to_parquet` logging and skip its Parquet row-count scan for progress.
 
 The direct-output path keeps a bounded two-batch channel between scoring and one ordered Parquet writer thread. The writer can overlap encoding/output with the next input batch while preserving file order and row order. Auto mode shares one process-visible CPU budget across ingest, scoring, and the writer; explicit ingest or prediction thread counts are preserved and produce an oversubscription warning when their total plus the writer exceeds that budget.
 
@@ -2205,8 +2268,9 @@ prediction = restored.predict(X.astype(np.float32))
 
 Model save/load converts independent trees in parallel with fixed-index ordering,
 keeps single-document JSON serialization/parsing sequential, and uses bounded
-positional file I/O. `model_io_threads=0` selects system-adaptive workers and is
-independent of file ingest and training threads. Small models automatically use
+positional file I/O. Save writes and syncs a temporary file in the destination
+directory before replacing the model file. `model_io_threads=0` selects
+system-adaptive workers independently of file ingest and training threads. Small models automatically use
 one conversion worker; override per operation when needed:
 
 ```python
@@ -2222,7 +2286,7 @@ conversion independently bounds the same request by tree work. Auto uses CPUs
 actually available to the process (including affinity/cgroup limits),
 independent work, and a conservative transient-memory bound. A positive value
 overrides CPU auto-selection but remains bounded by available work and memory.
-Pass `quiet=True` to suppress routine messages.
+Pass `quiet=True` to suppress routine model I/O messages.
 
 XGBoost can load a model written by FerrisBoost:
 
@@ -2268,7 +2332,7 @@ empty `evals_result()`.
 | `aft_loss_distribution` | `"normal"` | AFT noise distribution: `"normal"`, `"logistic"`, or `"extreme"` |
 | `aft_loss_distribution_scale` | `1.0` | Positive finite AFT distribution scale |
 | `custom_objective` | `None` | An `fb.CustomObjective` descriptor for scalar regression, multiclass, or ranking. See [Custom objectives](#custom-objectives) |
-| `max_depth` | `6` | Depth-wise tree growth (`0..=14`) |
+| `max_depth` | `6` | Maximum tree depth (`0..=14`). Zero makes each tree root-only |
 | `max_bin` | `255` | Must be between 1 and 65535. Features with more than 255 bins use 2 bytes per value instead of 1 (CPU and GPU) |
 | `eta` | `0.3` | Alias: `learning_rate` |
 | `lambda` | `1.0` | Alias: `reg_lambda` |
@@ -2294,13 +2358,14 @@ empty `evals_result()`.
 | `hist_nodes_per_batch` | automatic | GPU only: number of nodes merged into one histogram launch (`1..=32`, `1` disables merging; the GPU default is 16) |
 | `ingest_threads` | `0` (auto) | Process-visible CPUs, independent work, and memory bound file ingest; independent of `nthread` |
 | `model_io_threads` | `0` (auto) | Work/memory-bound ordered tree conversion and model-file I/O; JSON parse/dump remains serial |
-| `max_leaves` | `0` | 0.0.9: total leaf cap per depthwise tree; zero adds no cap |
+| `grow_policy` | `depthwise` | `depthwise` grows in node order by level, `lossguide` splits the highest-gain eligible leaf, and `symmetric` uses one shared split per level. See [Tree growth and feature interactions](#tree-growth-and-feature-interactions) |
+| `max_leaves` | `0` | Total leaves per tree. Zero adds no cap and one makes each tree root-only. `symmetric` adds only whole levels |
 | `interaction_constraints` | `None` | 0.0.9: allowed feature groups by index or name |
 | `seed` | `0` | Alias: `random_state` |
 | `base_score` | estimated | Starting prediction in the objective's output space (a probability for `binary:logistic` and `reg:logistic`, a raw margin for `binary:logitraw` and `binary:hinge`, a positive mean for log-link objectives, a per-class margin for multiclass). If unset, it is estimated from the training labels as XGBoost 2.0+ does; see [Starting prediction](#starting-prediction-base_score) |
 | `cache_budget_bytes` | automatic | Quantized Parquet feature-block cache budget; supports lists, directories, and globs; zero forces spill. Does not bound total RSS or GPU memory (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
 | `cache_path` | `None` | Persistent quantized training cache directory for single or multi-file Parquet; validation reuses cuts without using this directory (see [Control the Parquet quantized cache](#control-the-parquet-quantized-cache)) |
-| `eval_metric` | objective default | One name or a list; see the metric table under [Validation and early stopping](#validation-and-early-stopping). Early stopping watches the last one |
+| `eval_metric` | objective default | A built-in metric name, an [`fb.CustomMetric`](#custom-evaluation-metrics) descriptor, or a list of both. Early stopping watches the last metric on the last validation set |
 | `monotone_constraints` | `None` | `1` / `-1` / `0` per feature: tuple, list, `"(1,-1,0)"` string, or `{feature_name: dir}` dict |
 | `missing` | `NaN` | Feature value treated exactly like `NaN` (XGBoost's `DMatrix` `missing`), in training, validation, and prediction. Finite `float32` or `NaN`; `inf` and `float32` max are rejected. Not stored in the model: pass the same `missing` to `predict`. See [Missing values](#missing-values-and-the-missing-sentinel) |
 | `enable_categorical` | `False` | Detect pandas `category` and PyArrow dictionary columns as categorical features; see [Categorical features](#categorical-features) |
@@ -2325,7 +2390,8 @@ Arguments of `fb.train(params, data, label=None, num_boost_round=10, evals=(), e
 - `init_model` (alias `xgb_model`): a model, a model JSON path or an `xgboost.Booster` to continue; see [Continue training](#continue-training-init_model).
 - `qid`, `group`, `eval_qid`, `eval_group`: query groups for the ranking objectives; see [Learning to rank](#learning-to-rank).
 
-Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction) (categorical input: [How categorical input is coded](#how-categorical-input-is-coded)), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
+Keyword options of `Model.predict(data, output_margin=False, n_trees=None, header=True, *, predict_threads=0, use_gpu=False, iteration_range=None, pred_contribs=False, approx_contribs=False, pred_interactions=False, pred_leaf=False, missing=nan, base_margin=None, strict_shape=False)` are described under [Prediction](#prediction) (categorical input: [How categorical input is coded](#how-categorical-input-is-coded)), [Feature importance, SHAP values, and leaf indices](#feature-importance-shap-values-and-leaf-indices), and [The `missing` sentinel in prediction](#the-missing-sentinel-in-prediction). `Model.predict_to_parquet` takes `output_margin`, `n_trees`, `header`, `predict_threads`, `prediction_column`, `iteration_range`, `missing`, and `base_margin` (a column name or a list of
+column names for multi-output models). `Model.save_model(path, quiet=None, model_io_threads=None)` and `Model.load_model(path, quiet=False, model_io_threads=0, ingest_threads=0)` take the thread and logging options described under [Save, load, and exchange models with XGBoost](#save-load-and-exchange-models-with-xgboost).
 
 ## Common errors
 

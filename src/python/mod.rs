@@ -22,7 +22,7 @@ use crate::columns::BinningStrategy;
 use crate::comm::Local;
 use crate::source::parquet_source::{ParquetBlockSource, QuantizedCacheOptions};
 use crate::source::{csv_source, parquet_source, DenseSource};
-use crate::train::{train_weighted, BlockSource, EvalSet, TrainConfig};
+use crate::train::{train_weighted_with_grow_policy, BlockSource, EvalSet, TrainConfig};
 
 mod explain;
 mod feature_weights;
@@ -377,7 +377,14 @@ fn gpu_plan_model(
         ),
         _ => model,
     };
+    let symmetric = cfg.grow_policy == crate::types::GrowPolicy::Symmetric;
     if !cfg.params.gpu_split_cache
+        || (symmetric
+            && (!cfg.params.symmetric_split_cache_eligible()
+                || cfg.params.resident_blocks == Some(0)
+                || shape.is_some_and(|(shape, _)| shape.has_wide())
+                || cfg.categorical.iter().any(|&cat| cat)
+                || !cfg.interaction_constraints.is_empty()))
         || matches!(
             std::env::var("FB_HIST_BUCKET_PROFILE").as_deref(),
             Ok("1") | Ok("true")
@@ -388,8 +395,16 @@ fn gpu_plan_model(
     // Planning can precede schema/name resolution; price the unresolved request too.
     let node_masks =
         cfg.params.needs_node_feature_masks() || !cfg.interaction_constraints.is_empty();
+    if symmetric {
+        return match shape {
+            None => model.with_resident_split_cache(max_bin, cap),
+            Some((shape, cols)) => {
+                model.with_resident_split_cache_for_shape(shape, cols, cap, false, false)
+            }
+        };
+    }
     match shape {
-        // Categorical set outputs are reserved unconditionally:
+        // Categorical set outputs are reserved for ordinary cached splits:
         // Arrow dictionary columns make a file input categorical
         // without a declaration (tiny: ~0.5 KB / column / slot).
         None => {
@@ -615,24 +630,24 @@ impl IngestReporter {
     ) -> Self {
         use std::sync::atomic::Ordering;
         let started = std::time::Instant::now();
-        let read0 = process_read_chars();
         let files = paths.len();
-        let bytes_total = paths
-            .iter()
-            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
-            .sum::<u64>();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if quiet {
             return Self {
                 quiet,
                 started,
-                read0,
+                read0: None,
                 files,
                 workers,
                 stop,
                 handle: None,
             };
         }
+        let read0 = process_read_chars();
+        let bytes_total = paths
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|m| m.len()))
+            .sum::<u64>();
         let requested = if requested == 0 {
             "auto".to_string()
         } else {
@@ -922,13 +937,13 @@ fn parallel_model_write(
     let workers = resolved_model_io_workers(bytes.len(), requested);
     let reporter = ModelIoReporter::start(quiet, "SAVE", path, bytes.len(), requested, workers);
     crate::model_io::atomic_write(std::path::Path::new(path), |file| {
-        file.set_len(bytes.len() as u64)?;
         let progress = reporter.counter();
         if workers == 1 {
             write_all_at(file, bytes, 0)?;
             progress.store(bytes.len() as u64, Ordering::Relaxed);
             return Ok(());
         }
+        file.set_len(bytes.len() as u64)?;
         let chunk_size = bytes.len().max(1).div_ceil(workers);
         std::thread::scope(|scope| -> anyhow::Result<()> {
             let mut handles = Vec::new();
@@ -1445,17 +1460,18 @@ fn predict_files_to_parquet(
             .map(|c| format!("{prediction_column}_{c}"))
             .collect()
     };
-    let rows_total = if resolved.format == crate::source::input::InputFormat::Parquet {
-        resolved
-            .paths
-            .iter()
-            .try_fold(0u64, |total, path| {
-                crate::source::parquet_source::peek_n_rows(path).map(|rows| total + rows)
-            })
-            .ok()
-    } else {
-        None
-    };
+    let rows_total =
+        if !model.quiet && resolved.format == crate::source::input::InputFormat::Parquet {
+            resolved
+                .paths
+                .iter()
+                .try_fold(0u64, |total, path| {
+                    crate::source::parquet_source::peek_n_rows(path).map(|rows| total + rows)
+                })
+                .ok()
+        } else {
+            None
+        };
     let initially_resolved_ingest = resolved_ingest_workers(
         model.ingest_threads,
         resolved.format.label(),
@@ -3241,6 +3257,7 @@ enum MetricSpec {
 
 struct Parsed {
     params: TrainParams,
+    grow_policy: crate::types::GrowPolicy,
     /// 用户**显式**传进来的 `cols_per_block`;`None` 表示交给启发式。
     /// 和 `params.cols_per_block`(生效值)分开存,这样日志能同时报
     /// requested / effective,自动选择选错时看得出来是谁定的。
@@ -3663,6 +3680,16 @@ fn parse_params(d: &Bound<'_, PyDict>) -> PyResult<Parsed> {
         .validate_params()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let mut parsed = Parsed {
+        grow_policy: d
+            .get_item("grow_policy")?
+            .map(|value| {
+                value
+                    .extract::<String>()?
+                    .parse()
+                    .map_err(PyValueError::new_err)
+            })
+            .transpose()?
+            .unwrap_or_default(),
         params: TrainParams {
             n_rounds: get!("num_boost_round"),
             max_depth: get!("max_depth"),
@@ -3929,7 +3956,10 @@ fn finish(
     model_io_threads: usize,
     ingest_threads: usize,
 ) -> PyModel {
-    let history = handle.lock().map(|h| h.clone()).unwrap_or_default();
+    let history = handle
+        .lock()
+        .map(|mut h| std::mem::take(&mut *h))
+        .unwrap_or_default();
     let mut model = model;
     // 名单和模式**一起设**,它们不可能各自为政:有名字就是命名模式,
     // 没名字就是位置模式。分两处赋值早晚会漂移成"有名字但标着位置"。
@@ -4274,7 +4304,8 @@ fn train_dense(
     // The `missing` sentinel becomes NaN before any check or binning (borrowed
     // when no value matches; otherwise one corrected copy, never the caller's
     // array). Categorical codes are subject to it too, as in XGBoost.
-    let x_values = crate::source::missing_as_nan(x.as_slice()?, cfg.missing);
+    let train_values = x.as_slice()?;
+    let x_values = crate::source::missing_as_nan(train_values, cfg.missing);
     reject_inf(&x_values, n_features, "training data")?;
     check_categorical_codes(&x_values, n_rows, n_features, &cfg.categorical)?;
     let categories = parse_categories(params.get_item("_categories")?, n_features)?;
@@ -4317,7 +4348,7 @@ fn train_dense(
     #[allow(clippy::type_complexity)]
     let mut eval_data: Vec<(
         String,
-        DenseSource,
+        Option<DenseSource>,
         Vec<f32>,
         Option<Vec<f32>>,
         Option<Vec<u32>>,
@@ -4351,15 +4382,20 @@ fn train_dense(
                     eshape[1]
                 )));
             }
-            let ex_values = crate::source::missing_as_nan(ex.as_slice()?, cfg.missing);
-            reject_inf(&ex_values, n_features, &format!("validation set {name}"))?;
-            let src = DenseSource::new(
-                &ex_values,
-                eshape[0],
-                n_features,
-                BinningStrategy::Provided(train_src.cuts()),
-                cfg.params.cols_per_block,
-            );
+            let eval_values = ex.as_slice()?;
+            let src = if std::ptr::eq(train_values, eval_values) {
+                None
+            } else {
+                let ex_values = crate::source::missing_as_nan(eval_values, cfg.missing);
+                reject_inf(&ex_values, n_features, &format!("validation set {name}"))?;
+                Some(DenseSource::new(
+                    &ex_values,
+                    eshape[0],
+                    n_features,
+                    BinningStrategy::Provided(train_src.cuts()),
+                    cfg.params.cols_per_block,
+                ))
+            };
             let ew = ew.map(|w| w.as_slice().map(<[f32]>::to_vec)).transpose()?;
             let egp = crate::rank::group_ptr_from_inputs(
                 eq.as_ref().map(|q| q.as_slice()).transpose()?,
@@ -4426,7 +4462,9 @@ fn train_dense(
     }
     if let Some(list) = eval_base_margins {
         for (i, item) in list.iter().enumerate() {
-            let rows = eval_data.get(i).map_or(0, |e| e.1.n_rows());
+            let rows = eval_data
+                .get(i)
+                .map_or(0, |e| e.1.as_ref().map_or(n_rows, BlockSource::n_rows));
             train_cfg.eval_base_margins.push(if item.is_none() {
                 None
             } else {
@@ -4468,11 +4506,12 @@ fn train_dense(
         );
     }
 
+    let train_source: &dyn BlockSource = &train_src;
     let evals_ref: Vec<EvalSet> = eval_data
         .iter()
         .map(|(name, src, labels, w, gp)| EvalSet {
             name: name.clone(),
-            source: src,
+            source: src.as_ref().map_or(train_source, |source| source),
             labels,
             weights: w.as_deref(),
             group_ptr: gp.as_deref(),
@@ -4485,26 +4524,28 @@ fn train_dense(
     let model = py
         .detach(|| match device {
             #[cfg(feature = "cuda")]
-            Some(ord) => crate::train::train_gpu_weighted(
+            Some(ord) => crate::train::train_gpu_weighted_with_grow_policy(
                 ord,
-                &train_src,
+                train_source,
                 &labels,
                 weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
                 &Local,
+                cfg.grow_policy,
             ),
             #[cfg(not(feature = "cuda"))]
             Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
-            None => train_weighted(
-                &train_src,
+            None => train_weighted_with_grow_policy(
+                train_source,
                 &labels,
                 weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
                 &Local,
+                cfg.grow_policy,
             ),
         })
         .map_err(to_py_err)?;
@@ -4952,6 +4993,97 @@ fn train_file(
         feature_names: Vec<String>,
     }
 
+    struct FileEval {
+        name: String,
+        input: crate::source::input::ResolvedInput,
+        data: Option<(FileDataset, Option<Vec<u32>>)>,
+    }
+
+    impl FileEval {
+        fn bind<'a>(&'a self, train: &EvalSet<'a>) -> EvalSet<'a> {
+            match &self.data {
+                Some((data, groups)) => EvalSet {
+                    name: self.name.clone(),
+                    source: data.source.as_ref(),
+                    labels: &data.labels,
+                    weights: data.weights.as_deref(),
+                    group_ptr: groups.as_deref(),
+                },
+                None => EvalSet {
+                    name: self.name.clone(),
+                    ..*train
+                },
+            }
+        }
+    }
+
+    let resolve_eval = |path: &str| -> PyResult<crate::source::input::ResolvedInput> {
+        let input = crate::source::input::resolve(&[path.to_owned()]).map_err(to_py_err)?;
+        if input.format != resolved.format {
+            let message = format!(
+                "validation set format ({}) differs from the training set ({})",
+                input.format.label(),
+                fmt,
+            );
+            return Err(if fmt == "parquet" && paths.len() == 1 {
+                PyValueError::new_err(message)
+            } else {
+                PyRuntimeError::new_err(message)
+            });
+        }
+        Ok(input)
+    };
+
+    let prepare_evals = |cfg: &mut TrainConfig,
+                         evals: &[FileEval],
+                         train_rows: usize|
+     -> PyResult<()> {
+        for (i, eval) in evals.iter().enumerate() {
+            let name = &eval.name;
+            let rows = eval
+                .data
+                .as_ref()
+                .map_or(train_rows, |(d, _)| d.labels.len());
+            let upper = match (&eval.data, label_upper_owned.as_deref()) {
+                (None, _) => cfg.label_upper_bound.clone(),
+                (Some(_), Some(column)) => {
+                    let values = margin::read_bound_column(&eval.input, column, header)
+                        .map_err(|e| PyValueError::new_err(format!("eval set {name:?}:{e:#}")))?;
+                    if values.len() != rows {
+                        return Err(PyValueError::new_err(format!(
+                            "eval set {name:?} label_upper_bound has {} rows, the data has {rows} rows",
+                            values.len(),
+                        )));
+                    }
+                    Some(values)
+                }
+                (Some(_), None) => None,
+            };
+            cfg.eval_upper_bounds.push(upper);
+            let supplied = margin::list_item(eval_start_margins, i)?;
+            let same_start = match (start_margin.filter(|v| !v.is_none()), supplied.as_ref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.is(b),
+                _ => false,
+            };
+            let initial = if eval.data.is_none() && same_start {
+                cfg.base_margin.clone()
+            } else {
+                margin::dataset_margin(
+                    supplied.as_ref(),
+                    &eval.input,
+                    &margin_names,
+                    header,
+                    rows,
+                    k_out,
+                    &format!("eval set {name:?}"),
+                )?
+            };
+            cfg.eval_base_margins.push(initial);
+        }
+        Ok(())
+    };
+
     let max_bin = cfg.params.max_bin;
     let ingest_quiet = cfg.quiet;
     let cache_budget_bytes = cfg.cache_budget_bytes;
@@ -5029,36 +5161,6 @@ fn train_file(
             feature_names: opened.feature_names,
         })
     };
-    // 验证集同样接受多文件规格。
-    // ⚠️ 验证集**按列名**绑定到训练集的特征(无表头 CSV 只能按位置):
-    // 按位置读的话,列顺序不同的验证文件会被静默错配,早停跟着选错轮数。
-    let open_spec = |spec: &str,
-                     train_features: &[String],
-                     cuts: Option<crate::columns::BinCuts>,
-                     cols_per_block: usize|
-     -> anyhow::Result<FileDataset> {
-        let r = crate::source::input::resolve(&[spec.to_string()])?;
-        anyhow::ensure!(
-            r.format == resolved.format,
-            "validation set format ({}) differs from the training set ({})",
-            r.format.label(),
-            resolved.format.label()
-        );
-        let eval_targets = if header || fmt == "parquet" {
-            targets.with_features(train_features)
-        } else {
-            targets
-        };
-        open_paths(
-            &r.paths,
-            eval_targets,
-            cuts,
-            None,
-            csv_source::BlockWidth::Fixed(cols_per_block),
-            None,
-        )
-    };
-
     let device = cfg.device;
 
     // Keep the existing single-file Parquet source and persistent cache format.
@@ -5143,64 +5245,58 @@ fn train_file(
         train_cfg.group_ptr = train_group_ptr;
         ingest_reporter.complete(src.n_rows());
         let mut eval_data = Vec::new();
-        let mut eval_paths: Vec<String> = Vec::new();
         if let Some(list) = evals {
             for item in list.iter() {
-                let (p, name): (String, String) = item.extract()?;
-                eval_paths.push(p.clone());
-                // Validation reuses training cuts and the budget, with its own
-                // temporary cache. Single-file inputs retain their existing path.
-                let spec =
-                    crate::source::input::resolve(std::slice::from_ref(&p)).map_err(to_py_err)?;
-                if spec.format != resolved.format {
-                    return Err(PyValueError::new_err(format!(
-                        "validation set format ({}) differs from the training set ({})",
-                        spec.format.label(),
-                        fmt
-                    )));
-                }
-                let (mut d, ids) = if spec.paths.len() == 1 {
-                    let path = &spec.paths[0];
-                    let (source, labels) = ParquetBlockSource::with_cuts_and_cache_and_nthread(
-                        path,
-                        targets.with_features(&names),
-                        src.cuts().clone(),
-                        cfg.params.cols_per_block,
-                        QuantizedCacheOptions {
-                            budget_bytes: cache_budget_bytes,
-                            path: None,
-                        },
-                        ingest_threads,
-                    )
-                    .map_err(to_py_err)?;
-                    (
-                        FileDataset {
-                            source: Box::new(source),
-                            labels,
-                            weights: read_weights(path)?,
-                            feature_names: names.clone(),
-                        },
-                        read_qid(path)?,
-                    )
+                let (path, name): (String, String) = item.extract()?;
+                let input = resolve_eval(&path)?;
+                let data = if input.paths == paths {
+                    None
                 } else {
-                    let data = open_paths(
-                        &spec.paths,
-                        targets.with_features(&names),
-                        Some(src.cuts().clone()),
-                        None,
-                        csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
-                        None,
-                    )
-                    .map_err(to_py_err)?;
-                    let ids = targets
-                        .qid
-                        .map(|q| parquet_source::read_u64_columns(&spec.paths, q))
-                        .transpose()
+                    let (mut d, ids) = if input.paths.len() == 1 {
+                        let path = &input.paths[0];
+                        let (source, labels) = ParquetBlockSource::with_cuts_and_cache_and_nthread(
+                            path,
+                            targets.with_features(&names),
+                            src.cuts().clone(),
+                            cfg.params.cols_per_block,
+                            QuantizedCacheOptions {
+                                budget_bytes: cache_budget_bytes,
+                                path: None,
+                            },
+                            ingest_threads,
+                        )
                         .map_err(to_py_err)?;
-                    (data, ids)
+                        (
+                            FileDataset {
+                                source: Box::new(source),
+                                labels,
+                                weights: read_weights(path)?,
+                                feature_names: names.clone(),
+                            },
+                            read_qid(path)?,
+                        )
+                    } else {
+                        let data = open_paths(
+                            &input.paths,
+                            targets.with_features(&names),
+                            Some(src.cuts().clone()),
+                            None,
+                            csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+                            None,
+                        )
+                        .map_err(to_py_err)?;
+                        let ids = targets
+                            .qid
+                            .map(|q| parquet_source::read_u64_columns(&input.paths, q))
+                            .transpose()
+                            .map_err(to_py_err)?;
+                        (data, ids)
+                    };
+                    let (weights, groups) = group_inputs(ids, d.weights.take())?;
+                    d.weights = weights;
+                    Some((d, groups))
                 };
-                let (ew, egp) = group_inputs(ids, d.weights.take())?;
-                eval_data.push((name, d, ew, egp));
+                eval_data.push(FileEval { name, input, data });
             }
         }
         if let Some(upper_name) = label_upper_owned.as_deref() {
@@ -5215,27 +5311,6 @@ fn train_file(
             }
             train_cfg.label_upper_bound = Some(upper);
         }
-        for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
-            let labels = &d.labels;
-            if let Some(upper_name) = label_upper_owned.as_deref() {
-                let eval_resolved =
-                    crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
-                        .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-                let upper = margin::read_bound_column(&eval_resolved, upper_name, header)
-                    .map_err(|e| PyValueError::new_err(format!("eval set {name:?}:{e:#}")))?;
-                if upper.len() != labels.len() {
-                    return Err(PyValueError::new_err(format!(
-                        "eval set {name:?} label_upper_bound has {} rows, the data has {} rows",
-                        upper.len(),
-                        labels.len()
-                    )));
-                }
-                train_cfg.eval_upper_bounds.push(Some(upper));
-            } else {
-                train_cfg.eval_upper_bounds.push(None);
-            }
-        }
-        // Starting margins (see `margin::dataset_margin`): train, then each eval.
         train_cfg.base_margin = margin::dataset_margin(
             start_margin,
             &resolved,
@@ -5245,29 +5320,15 @@ fn train_file(
             k_out,
             "training set",
         )?;
-        for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
-            let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
-                .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-            train_cfg.eval_base_margins.push(margin::dataset_margin(
-                margin::list_item(eval_start_margins, i)?.as_ref(),
-                &eval_resolved,
-                &margin_names,
-                header,
-                d.labels.len(),
-                k_out,
-                &format!("eval set {name:?}"),
-            )?);
-        }
-        let evals_ref: Vec<EvalSet> = eval_data
-            .iter()
-            .map(|(name, d, w, gp)| EvalSet {
-                name: name.clone(),
-                source: d.source.as_ref(),
-                labels: &d.labels,
-                weights: w.as_deref(),
-                group_ptr: gp.as_deref(),
-            })
-            .collect();
+        prepare_evals(&mut train_cfg, &eval_data, src.n_rows())?;
+        let training = EvalSet {
+            name: String::new(),
+            source: &src,
+            labels: &labels,
+            weights: weights.as_deref(),
+            group_ptr: train_cfg.group_ptr.as_deref(),
+        };
+        let evals_ref: Vec<_> = eval_data.iter().map(|eval| eval.bind(&training)).collect();
         if !cfg.quiet {
             eprintln!(
                 "SETUP input=parquet files=1 rows={} features={n_features} weights={} seconds={:.3}",
@@ -5280,26 +5341,28 @@ fn train_file(
         let model = py
             .detach(|| match device {
                 #[cfg(feature = "cuda")]
-                Some(ord) => crate::train::train_gpu_weighted(
+                Some(ord) => crate::train::train_gpu_weighted_with_grow_policy(
                     ord,
-                    &src,
+                    training.source,
                     &labels,
                     weights.as_deref(),
                     &evals_ref,
                     &train_cfg,
                     &mut cbs,
                     &Local,
+                    cfg.grow_policy,
                 ),
                 #[cfg(not(feature = "cuda"))]
                 Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
-                None => train_weighted(
-                    &src,
+                None => train_weighted_with_grow_policy(
+                    training.source,
                     &labels,
                     weights.as_deref(),
                     &evals_ref,
                     &train_cfg,
                     &mut cbs,
                     &Local,
+                    cfg.grow_policy,
                 ),
             })
             .map_err(to_py_err)?;
@@ -5454,23 +5517,33 @@ fn train_file(
         );
     }
     let mut eval_data = Vec::new();
-    let mut eval_paths: Vec<String> = Vec::new();
     if let Some(list) = evals {
         for item in list.iter() {
-            let (p, name): (String, String) = item.extract()?;
-            let d = open_spec(
-                &p,
-                &ds.feature_names,
-                Some(ds.source.cuts().clone()),
-                cfg.params.cols_per_block,
-            )
-            .map_err(to_py_err)?;
-            eval_paths.push(p.clone());
-            let eval_paths = crate::source::input::resolve(&[p.clone()])
-                .map_err(|e| PyValueError::new_err(format!("{e}")))?
-                .paths;
-            let (ew, egp) = group_inputs(read_qid_paths(&eval_paths)?, d.weights.as_deref())?;
-            eval_data.push((name, d, ew, egp));
+            let (path, name): (String, String) = item.extract()?;
+            let input = resolve_eval(&path)?;
+            let data = if input.paths == paths {
+                None
+            } else {
+                let eval_targets = if header || fmt == "parquet" {
+                    targets.with_features(&ds.feature_names)
+                } else {
+                    targets
+                };
+                let mut d = open_paths(
+                    &input.paths,
+                    eval_targets,
+                    Some(ds.source.cuts().clone()),
+                    None,
+                    csv_source::BlockWidth::Fixed(cfg.params.cols_per_block),
+                    None,
+                )
+                .map_err(to_py_err)?;
+                let (weights, groups) =
+                    group_inputs(read_qid_paths(&input.paths)?, d.weights.as_deref())?;
+                d.weights = weights;
+                Some((d, groups))
+            };
+            eval_data.push(FileEval { name, input, data });
         }
     }
     train_cfg.base_margin = margin::dataset_margin(
@@ -5482,43 +5555,15 @@ fn train_file(
         k_out,
         "training set",
     )?;
-    for (i, (name, d, _, _)) in eval_data.iter().enumerate() {
-        let eval_resolved = crate::source::input::resolve(std::slice::from_ref(&eval_paths[i]))
-            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-        if let Some(upper_name) = label_upper_owned.as_deref() {
-            let upper = margin::read_bound_column(&eval_resolved, upper_name, header)
-                .map_err(|e| PyValueError::new_err(format!("eval set {name:?}:{e:#}")))?;
-            if upper.len() != d.labels.len() {
-                return Err(PyValueError::new_err(format!(
-                    "eval set {name:?} label_upper_bound has {} rows, the data has {} rows",
-                    upper.len(),
-                    d.labels.len()
-                )));
-            }
-            train_cfg.eval_upper_bounds.push(Some(upper));
-        } else {
-            train_cfg.eval_upper_bounds.push(None);
-        }
-        train_cfg.eval_base_margins.push(margin::dataset_margin(
-            margin::list_item(eval_start_margins, i)?.as_ref(),
-            &eval_resolved,
-            &margin_names,
-            header,
-            d.labels.len(),
-            k_out,
-            &format!("eval set {name:?}"),
-        )?);
-    }
-    let evals_ref: Vec<EvalSet> = eval_data
-        .iter()
-        .map(|(name, d, w, gp)| EvalSet {
-            name: name.clone(),
-            source: d.source.as_ref(),
-            labels: &d.labels,
-            weights: w.as_deref(),
-            group_ptr: gp.as_deref(),
-        })
-        .collect();
+    prepare_evals(&mut train_cfg, &eval_data, ds.source.n_rows())?;
+    let training = EvalSet {
+        name: String::new(),
+        source: ds.source.as_ref(),
+        labels: &ds.labels,
+        weights: ds_weights.as_deref(),
+        group_ptr: train_cfg.group_ptr.as_deref(),
+    };
+    let evals_ref: Vec<_> = eval_data.iter().map(|eval| eval.bind(&training)).collect();
 
     if !cfg.quiet {
         eprintln!(
@@ -5534,26 +5579,28 @@ fn train_file(
     let model = py
         .detach(|| match device {
             #[cfg(feature = "cuda")]
-            Some(ord) => crate::train::train_gpu_weighted(
+            Some(ord) => crate::train::train_gpu_weighted_with_grow_policy(
                 ord,
-                ds.source.as_ref(),
+                training.source,
                 &ds.labels,
                 ds_weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
                 &Local,
+                cfg.grow_policy,
             ),
             #[cfg(not(feature = "cuda"))]
             Some(_) => Err(anyhow::anyhow!("this build has no CUDA support")),
-            None => train_weighted(
-                ds.source.as_ref(),
+            None => train_weighted_with_grow_policy(
+                training.source,
                 &ds.labels,
                 ds_weights.as_deref(),
                 &evals_ref,
                 &train_cfg,
                 &mut cbs,
                 &Local,
+                cfg.grow_policy,
             ),
         })
         .map_err(to_py_err)?;

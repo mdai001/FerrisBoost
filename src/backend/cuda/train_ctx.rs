@@ -437,7 +437,7 @@ mod rank_ctx;
 pub use rank_ctx::RankDeviceInputs;
 #[path = "split_ctx.rs"]
 mod split_ctx;
-pub(crate) use split_ctx::{GpuSplitGroup, GpuSplitResult};
+pub(crate) use split_ctx::{GpuSplitGroup, GpuSplitLevel, GpuSplitResult};
 
 struct GpuHistBuffers {
     split_cache: Option<split_ctx::ResidentSplitBuffers>,
@@ -582,6 +582,7 @@ enum FastInit<'a> {
 pub struct GpuTrainCtx {
     split_features_fn: Option<CudaFunction>,
     split_nodes_fn: Option<CudaFunction>,
+    split_symmetric_fns: Option<(CudaFunction, CudaFunction)>,
     /// Categorical variants of the two split kernels (present only when the
     /// resident split cache is on and the data has categorical features).
     split_features_cat_fn: Option<CudaFunction>,
@@ -1665,6 +1666,7 @@ impl GpuTrainCtx {
         let ctx = Self {
             split_features_fn,
             split_nodes_fn,
+            split_symmetric_fns: None,
             split_features_cat_fn,
             split_nodes_cat_fn,
             apply_grad_fn,
@@ -1897,6 +1899,22 @@ impl GpuTrainCtx {
         self.resident_block_count
     }
 
+    pub(crate) fn with_symmetric_split(mut self) -> Result<Self> {
+        if self.resident_block_count > 0 && self.split_nodes_fn.is_some() {
+            self.split_symmetric_fns = Some((
+                self.state
+                    .module
+                    .load_function("split_symmetric_features")?,
+                self.state.module.load_function("split_symmetric_nodes")?,
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn has_symmetric_split(&self) -> bool {
+        self.split_symmetric_fns.is_some()
+    }
+
     /// Compact selected-feature histograms are available only on the normal
     /// batched column-major path. Bucket profiling keeps the legacy kernels.
     pub fn supports_compact_column_histogram(&self) -> bool {
@@ -2050,6 +2068,49 @@ impl GpuTrainCtx {
         Ok(())
     }
 
+    /// Keep the current row arena and replace only the split leaf's span.
+    /// The partition scratch contains one leaf's stable left/right ordering.
+    pub(crate) fn commit_leaf_partition(
+        &self,
+        span: GpuRowSpan,
+    ) -> Result<(GpuRowSpan, GpuRowSpan)> {
+        let parts = self.resolve_partitions()?;
+        let &[(left, right)] = parts.as_slice() else {
+            bail!("lossguide requires exactly one pending partition");
+        };
+        ensure!(
+            left.len + right.len == span.len && span.offset.saturating_add(span.len) <= self.n_rows,
+            "lossguide partition does not match its input row span"
+        );
+        let mut buf = self.lock()?;
+        let GpuBuffers {
+            rows,
+            part_right_out,
+            ..
+        } = &mut *buf;
+        if span.offset == 0 && span.len == self.n_rows && left.offset == 0 {
+            std::mem::swap(rows, part_right_out);
+        } else if span.len != 0 {
+            let output = part_right_out.slice(left.offset..left.offset + span.len);
+            let mut current = rows.slice_mut(span.offset..span.offset + span.len);
+            self.stream
+                .memcpy_dtod(&output, &mut current)
+                .context("commit leaf rows D2D")?;
+        }
+        buf.next_rows_cursor = 0;
+        buf.part_pending.clear();
+        Ok((
+            GpuRowSpan {
+                offset: span.offset,
+                len: left.len,
+            },
+            GpuRowSpan {
+                offset: span.offset + left.len,
+                len: right.len,
+            },
+        ))
+    }
+
     /// Diagnostic/correctness hook; the training loop itself never downloads
     /// row ids. Useful for asserting stable partition order against the CPU.
     pub fn download_rows(&self, span: GpuRowSpan) -> Result<Vec<RowId>> {
@@ -2172,6 +2233,13 @@ impl GpuTrainCtx {
         } else {
             0.0
         })
+    }
+
+    /// Wait for terminal leaf writes when no host consumer needs the delta.
+    pub(crate) fn wait_for_prediction_delta(&self) -> Result<()> {
+        self.stream
+            .synchronize()
+            .context("wait for terminal leaf prediction")
     }
 
     /// 借出刚取回的 delta。调用方在同一次遍历里施加它并算出梯度。

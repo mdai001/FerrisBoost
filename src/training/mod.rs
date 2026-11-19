@@ -621,8 +621,7 @@ use crate::metrics::Metric;
 use crate::split::{self, SplitCandidate};
 use crate::tree::{self, Model, Tree};
 use crate::types::{
-    FeatId, GradPair, GradPairFixed, GradQuantizer, Objective, PredictionAuthority, RowId,
-    TrainParams,
+    FeatId, GradPair, GradPairFixed, GradQuantizer, GrowPolicy, Objective, RowId, TrainParams,
 };
 
 pub struct TrainConfig {
@@ -917,7 +916,7 @@ pub fn train(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
 ) -> anyhow::Result<Model> {
-    train_with_backend(source, labels, None, evals, cfg, callbacks, comm, None)
+    train_weighted(source, labels, None, evals, cfg, callbacks, comm)
 }
 
 /// `train` 加每行样本权重(XGBoost 的 DMatrix `weight`)。
@@ -933,7 +932,41 @@ pub fn train_weighted(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
 ) -> anyhow::Result<Model> {
-    train_with_backend(source, labels, weights, evals, cfg, callbacks, comm, None)
+    train_weighted_with_grow_policy(
+        source,
+        labels,
+        weights,
+        evals,
+        cfg,
+        callbacks,
+        comm,
+        GrowPolicy::Depthwise,
+    )
+}
+
+/// Train on CPU with an explicit tree growth policy.
+#[allow(clippy::too_many_arguments)]
+pub fn train_weighted_with_grow_policy(
+    source: &dyn BlockSource,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    evals: &[EvalSet],
+    cfg: &TrainConfig,
+    callbacks: &mut [Box<dyn Callback>],
+    comm: &dyn Comm,
+    grow_policy: GrowPolicy,
+) -> anyhow::Result<Model> {
+    train_with_backend(
+        source,
+        labels,
+        weights,
+        evals,
+        cfg,
+        callbacks,
+        comm,
+        None,
+        grow_policy,
+    )
 }
 
 /// 完整多轮/多层 GPU 训练入口。量化列块仍按 `BlockSource::with_block`
@@ -949,7 +982,8 @@ pub fn train_gpu(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
 ) -> anyhow::Result<Model> {
-    train_with_backend(
+    train_gpu_weighted(
+        device_ordinal,
         source,
         labels,
         None,
@@ -957,7 +991,6 @@ pub fn train_gpu(
         cfg,
         callbacks,
         comm,
-        Some(device_ordinal),
     )
 }
 
@@ -974,6 +1007,33 @@ pub fn train_gpu_weighted(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
 ) -> anyhow::Result<Model> {
+    train_gpu_weighted_with_grow_policy(
+        device_ordinal,
+        source,
+        labels,
+        weights,
+        evals,
+        cfg,
+        callbacks,
+        comm,
+        GrowPolicy::Depthwise,
+    )
+}
+
+/// Train on a selected CUDA device with an explicit tree growth policy.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn train_gpu_weighted_with_grow_policy(
+    device_ordinal: usize,
+    source: &dyn BlockSource,
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    evals: &[EvalSet],
+    cfg: &TrainConfig,
+    callbacks: &mut [Box<dyn Callback>],
+    comm: &dyn Comm,
+    grow_policy: GrowPolicy,
+) -> anyhow::Result<Model> {
     train_with_backend(
         source,
         labels,
@@ -983,6 +1043,7 @@ pub fn train_gpu_weighted(
         callbacks,
         comm,
         Some(device_ordinal),
+        grow_policy,
     )
 }
 
@@ -1244,7 +1305,12 @@ fn train_with_backend(
     callbacks: &mut [Box<dyn Callback>],
     comm: &dyn Comm,
     gpu_device: Option<usize>,
+    grow_policy: GrowPolicy,
 ) -> anyhow::Result<Model> {
+    crate::ensure_input!(
+        grow_policy != GrowPolicy::Symmetric || comm.size() == 1,
+        "grow_policy=symmetric requires a single training worker"
+    );
     cfg.validate_custom_objective()?;
     cfg.validate_sampling_method()?;
     let feature_weights =
@@ -1639,22 +1705,6 @@ fn train_with_backend(
         best_score: cfg.prior_model.as_ref().and_then(|m| m.best_score),
     };
 
-    // 每个验证集缓存一份 raw margin,每轮只把**新加的那棵树**累上去。
-    //
-    // 原来是每轮拿整个模型重算一遍,那是 O(轮数²):100 轮的任务后半程
-    // 光评估就比建树还贵,而 early stopping 的全部意义就是快速迭代。
-    // CLAUDE.md 说这个优化要等数值对齐之后再做 —— 现在对齐了,而且有
-    // tests/bit_exact_vs_xgboost.rs 兜底,可以动了。
-    // `base_margin`(含续训的既有预测)给了就从它起步,否则从截距起步。
-    let mut eval_preds: Vec<Vec<f32>> = evals
-        .iter()
-        .enumerate()
-        .map(|(i, e)| match cfg.eval_margin(i) {
-            Some(m) if num_class == 1 => m.to_vec(),
-            _ => vec![base_margin(cfg.objective, base_score); e.source.n_rows()],
-        })
-        .collect();
-
     // GPU 资源按**最坏情况**在训练开始分配一次:gpair、row index、
     // 装列块的 buffer、直方图和 partition 的临时区。训练过程中不再有任何
     // device 分配 / 释放 —— cudaMalloc/cudaFree 是同步的,夹在 kernel 前后
@@ -1668,6 +1718,15 @@ fn train_with_backend(
             // 16-bit blocks run on the device too (column-major, byte-sized
             // slots); the context allocates for the real block shape.
             let shape = gpu_block_shape(source)?;
+            let symmetric = grow_policy == GrowPolicy::Symmetric;
+            #[cfg(feature = "cuda")]
+            let symmetric_cache = symmetric
+                && cfg.params.symmetric_split_cache_eligible()
+                && cfg.params.resident_blocks != Some(0)
+                && !shape.has_wide()
+                && !cuts.has_categorical();
+            #[cfg(not(feature = "cuda"))]
+            let symmetric_cache = false;
             let ctx = crate::backend::cuda::GpuTrainCtx::new_with_shape(
                 device,
                 n,
@@ -1685,8 +1744,8 @@ fn train_with_backend(
                     // Categorical features are enumerated by the device split
                     // cache too (one-hot and sorted-partition kernels); the
                     // flag adds their set outputs to the cache allocation.
-                    gpu_split_cache: cfg.params.gpu_split_cache,
-                    has_categorical: source.cuts().has_categorical(),
+                    gpu_split_cache: cfg.params.gpu_split_cache && (!symmetric || symmetric_cache),
+                    has_categorical: cuts.has_categorical(),
                     node_feature_masks: cfg.params.needs_node_feature_masks(),
                     gpu_math: cfg.params.gpu_math,
                     gradient_sampling_rate: (cfg.params.gpu_math == crate::types::GpuMath::Fast
@@ -1715,6 +1774,12 @@ fn train_with_backend(
                 },
                 prof::enabled(),
             )?;
+            #[cfg(feature = "cuda")]
+            let ctx = if symmetric_cache {
+                ctx.with_symmetric_split()?
+            } else {
+                ctx
+            };
             // The histogram kernels tile a block by whole features. A 16-bit
             // feature wider than one shared-memory tile is accumulated in
             // global memory; an 8-bit feature always fits a tile unless the
@@ -1810,6 +1875,7 @@ fn train_with_backend(
                 cfg,
                 comm,
                 gpu: gpu.as_ref(),
+                grow_policy,
                 pool: &pool,
                 interactions: interactions.as_ref(),
                 feature_weights,
@@ -1819,7 +1885,10 @@ fn train_with_backend(
         );
     }
 
-    // 融合路径把「施加 delta」推迟到下一轮开头,所以要记着是否欠一次。
+    let mut eval_preds = EvalPredictions::new(source, evals, cfg, &[margin], !fast_math);
+    let shares_training = eval_preds.shares_training();
+    // The exact-mode delta is downloaded when the next gradient pass needs
+    // it, or immediately when this round monitors the training margins.
     let mut pending_delta = false;
     // host 量化的定点梯度缓冲,跨轮复用(见 `quantize_host`)。
     let mut fixed_buf: Vec<GradPairFixed> = Vec::new();
@@ -1856,10 +1925,14 @@ fn train_with_backend(
         // 融合之后一遍就够:施加 delta,**就地**用更新后的值算梯度。
         // 每行只依赖同下标的输入,没有任何重结合,所以**逐位相同**。
         //
-        // `predictions` 在两点之间没有任何读者(eval 走 `eval_preds`,
-        // 回调和 metric 也只看 eval),所以把施加推迟到这里是安全的;
-        // 训练结束时若还欠一次施加,循环外会补上,不留下过期状态。
+        // Training margins without a monitor are next read here.
         let fuse = pending_delta;
+        if fuse && !fast_math {
+            download_training_delta(
+                gpu.as_ref().expect("pending delta requires CUDA"),
+                &predictions,
+            )?;
+        }
         let round_seed = round_seeds.as_mut().map_or(0, |r| r.draw());
         // fast 模式下 host 侧完全不产生 gpair:prediction apply、objective
         // gradient 和量化在 device 上一次做完。
@@ -2186,6 +2259,7 @@ fn train_with_backend(
                 cfg,
                 comm,
                 gpu.as_ref(),
+                grow_policy,
                 sampled.as_deref(),
                 interactions.as_ref(),
                 crate::colsample::NestedSampler::new(
@@ -2198,20 +2272,20 @@ fn train_with_backend(
             )
         })?;
         fixed_buf = fixed;
-        // GPU 路径的叶子增量留在 device buffer 里没有施加,记一笔债;
-        // CPU 路径是按行 scatter 进 `predictions` 的,没有可推迟的 delta。
-        if gpu.is_some() {
-            pending_delta = true;
+        if let Some(ctx) = gpu.as_ref() {
+            if shares_training {
+                apply_training_delta(ctx, &mut predictions, &pool)?;
+            } else {
+                pending_delta = true;
+            }
         }
         {
             let _t = prof::Timer::new(&prof::EVAL);
-            for (ev, pred) in evals.iter().zip(eval_preds.iter_mut()) {
-                update_predictions(pred, &tree, ev.source)?;
-            }
+            eval_preds.update(evals, 0, &tree)?;
         }
         model.trees.push(tree);
 
-        let m = evaluate(&eval_preds, evals, round, cfg)?;
+        let m = evaluate(&eval_preds, &predictions, evals, round, cfg)?;
         // 任一 callback 返回 false 就停 —— early stopping 走这条路。
         // Every callback must run even after an earlier callback requests stopping.
         #[allow(clippy::unnecessary_fold)]
@@ -2236,28 +2310,11 @@ fn train_with_backend(
         }
     }
 
-    // 融合路径把最后一棵树的 delta 推迟了,而训练结束时没人再读 `predictions`。
-    // 但把它留成过期状态是个陷阱:以后有人加一个「训练后读预测」的功能就会
-    // 静默拿到少一棵树的值。整次训练补一遍 O(行数),代价可以忽略。
-    // fast 模式下 `predictions` 的所有权在 device,host 那份本来就不参与
-    // 训练,补一次 D2H 只会把一份没人读的数组写成「差一棵树」的状态,
-    // 白付一次 O(行数) 传输。
     if pending_delta && !fast_math {
-        if let Some(ctx) = gpu.as_ref() {
-            let mut delta_applied = Ok(());
-            pool.install(|| {
-                delta_applied = ctx.with_prediction_delta(&mut |delta| {
-                    predictions
-                        .par_iter_mut()
-                        .zip(delta.par_iter())
-                        .for_each(|(p, d)| *p += *d);
-                });
-            });
-            delta_applied?;
-        }
-        pending_delta = false;
+        gpu.as_ref()
+            .expect("pending delta requires CUDA")
+            .wait_for_prediction_delta()?;
     }
-    let _ = pending_delta;
 
     if prof::enabled() {
         let completed_rounds = model.trees.len().max(1);
@@ -2498,6 +2555,7 @@ struct MulticlassRun<'a> {
     cfg: &'a TrainConfig,
     comm: &'a dyn Comm,
     gpu: Option<&'a crate::backend::cuda::GpuTrainCtx>,
+    grow_policy: GrowPolicy,
     pool: &'a rayon::ThreadPool,
     interactions: Option<&'a crate::interaction::InteractionConstraints>,
     feature_weights: Option<&'a [f32]>,
@@ -2530,6 +2588,7 @@ fn train_multiclass_rounds(
         cfg,
         comm,
         gpu,
+        grow_policy,
         pool,
         interactions,
         feature_weights,
@@ -2554,17 +2613,11 @@ fn train_multiclass_rounds(
     } else {
         margins.iter().map(|&m| vec![m; n]).collect()
     };
-    let mut eval_class_preds: Vec<Vec<Vec<f32>>> = evals
-        .iter()
-        .enumerate()
-        .map(|(i, e)| match cfg.eval_margin(i) {
-            Some(m) => split_classes(m, e.source.n_rows()),
-            None => margins
-                .iter()
-                .map(|&m| vec![m; e.source.n_rows()])
-                .collect(),
-        })
-        .collect();
+    let mut eval_preds = EvalPredictions::new(source, evals, cfg, &margins, !fast_math);
+    let shares_training = eval_preds.shares_training();
+    // Only a training monitor needs a row-major view of the training margins.
+    let mut monitor = Vec::new();
+    let mut pending_last_output = false;
     let mut grads: Vec<Vec<GradPair>> = vec![Vec::new(); k_count];
     let mut custom_margins = Vec::new();
     let mut custom_pairs = Vec::new();
@@ -2581,6 +2634,14 @@ fn train_multiclass_rounds(
 
     for round in 0..cfg.params.n_rounds {
         let round_started = std::time::Instant::now();
+        if pending_last_output {
+            apply_training_delta(
+                gpu.expect("pending delta requires CUDA"),
+                &mut class_preds[k_count - 1],
+                pool,
+            )?;
+            pending_last_output = false;
+        }
         if let Some(custom) = cfg.custom_objective.as_ref() {
             let _t = prof::Timer::new(&prof::GRAD);
             if let Some(ctx) = gpu.filter(|_| fast_math) {
@@ -2725,6 +2786,7 @@ fn train_multiclass_rounds(
                     cfg,
                     comm,
                     gpu,
+                    grow_policy,
                     sampled.as_deref(),
                     interactions,
                     crate::colsample::NestedSampler::new(
@@ -2745,36 +2807,31 @@ fn train_multiclass_rounds(
             } else if fast_math {
                 gpu.expect("fast_math implies a GPU context")
                     .fast_multiclass_apply_delta(class)?;
-            }
-            // GPU 路径的叶子增量还在 device 回传的 buffer 里:立即施加到这一类。
-            else if let Some(ctx) = gpu {
-                let preds = &mut class_preds[class];
-                let mut applied = Ok(());
-                pool.install(|| {
-                    applied = ctx.with_prediction_delta(&mut |delta| {
-                        preds
-                            .par_iter_mut()
-                            .zip(delta.par_iter())
-                            .for_each(|(p, d)| *p += *d);
-                    });
-                });
-                applied?;
+            } else if let Some(ctx) = gpu {
+                if !shares_training && class == k_count - 1 {
+                    // The last output's delta survives until the next round.
+                    pending_last_output = true;
+                } else if shares_training || round + 1 < cfg.params.n_rounds {
+                    // The next class tree will overwrite this output's delta.
+                    apply_training_delta(ctx, &mut class_preds[class], pool)?;
+                }
             }
             {
                 let _t = prof::Timer::new(&prof::EVAL);
-                for (ev, preds) in evals.iter().zip(eval_class_preds.iter_mut()) {
-                    update_predictions(&mut preds[class], &tree, ev.source)?;
-                }
+                eval_preds.update(evals, class, &tree)?;
             }
             model.trees.push(tree);
         }
 
-        // 指标要按行排的 n × K margin。
-        let interleaved: Vec<Vec<f32>> = eval_class_preds
-            .iter()
-            .map(|per_class| interleave_classes(per_class))
-            .collect();
-        let m = evaluate(&interleaved, evals, round, cfg)?;
+        if shares_training {
+            monitor.resize(n * k_count, 0.0);
+            for (class, column) in class_preds.iter().enumerate() {
+                for (row, &value) in column.iter().enumerate() {
+                    monitor[row * k_count + class] = value;
+                }
+            }
+        }
+        let m = evaluate(&eval_preds, &monitor, evals, round, cfg)?;
         #[allow(clippy::unnecessary_fold)]
         let keep_going = callbacks
             .iter_mut()
@@ -2789,6 +2846,10 @@ fn train_multiclass_rounds(
         if !keep_going {
             break;
         }
+    }
+    if pending_last_output {
+        gpu.expect("pending delta requires CUDA")
+            .wait_for_prediction_delta()?;
     }
     for cb in callbacks.iter_mut() {
         cb.after_training();
@@ -2828,17 +2889,85 @@ fn quantile_multi_gradients(
         });
 }
 
-/// K 份按类排的预测 → 按行排的 `n × K`。
-fn interleave_classes(per_class: &[Vec<f32>]) -> Vec<f32> {
-    let k = per_class.len();
-    let n = per_class.first().map_or(0, Vec::len);
-    let mut out = vec![0.0f32; n * k];
-    for (c, col) in per_class.iter().enumerate() {
-        for (i, &v) in col.iter().enumerate() {
-            out[i * k + c] = v;
-        }
+enum EvalPrediction {
+    Training,
+    Independent {
+        margins: Vec<f32>,
+        layout: Option<EvalPredictionLayout>,
+    },
+}
+
+struct EvalPredictions {
+    outputs: usize,
+    slots: Vec<EvalPrediction>,
+}
+
+impl EvalPredictions {
+    fn new(
+        source: &dyn BlockSource,
+        evals: &[EvalSet],
+        cfg: &TrainConfig,
+        intercepts: &[f32],
+        host_predictions: bool,
+    ) -> Self {
+        let outputs = intercepts.len();
+        let slots = evals
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| {
+                let initial = cfg.eval_margin(i);
+                if host_predictions && std::ptr::eq(source, ev.source) {
+                    let same_margin = match (cfg.base_margin.as_deref(), initial) {
+                        (None, None) => true,
+                        (Some(train), Some(eval)) => {
+                            train.len() == eval.len()
+                                && train
+                                    .iter()
+                                    .zip(eval)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                        }
+                        _ => false,
+                    };
+                    if same_margin {
+                        return EvalPrediction::Training;
+                    }
+                }
+                let rows = ev.source.n_rows();
+                let margins = match initial {
+                    Some(values) if outputs == 1 => values.to_vec(),
+                    Some(values) => (0..rows)
+                        .flat_map(|row| (0..outputs).map(move |output| values[output * rows + row]))
+                        .collect(),
+                    None => intercepts
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(rows * outputs)
+                        .collect(),
+                };
+                EvalPrediction::Independent {
+                    margins,
+                    layout: None,
+                }
+            })
+            .collect();
+        Self { outputs, slots }
     }
-    out
+
+    fn shares_training(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot, EvalPrediction::Training))
+    }
+
+    fn update(&mut self, evals: &[EvalSet], output: usize, tree: &Tree) -> anyhow::Result<()> {
+        for (slot, set) in self.slots.iter_mut().zip(evals) {
+            if let EvalPrediction::Independent { margins, layout } = slot {
+                apply_prediction_column(margins, output, self.outputs, tree, set.source, layout)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 在每个验证集上算每个指标。
@@ -2847,23 +2976,45 @@ fn interleave_classes(per_class: &[Vec<f32>]) -> Vec<f32> {
 /// 顺序是「eval 外层、metric 内层」,所以 `RoundMetrics::last()` 拿到的
 /// 是**最后一个 eval 的最后一个 metric**,也是 early stopping 的默认指标。
 fn evaluate(
-    eval_preds: &[Vec<f32>],
+    eval_preds: &EvalPredictions,
+    train_pred: &[f32],
     evals: &[EvalSet],
     round: usize,
     cfg: &TrainConfig,
 ) -> anyhow::Result<RoundMetrics> {
     let mut entries = Vec::new();
-    for (i, (ev, pred)) in evals.iter().zip(eval_preds).enumerate() {
+    if evals.is_empty() {
+        return Ok(RoundMetrics { round, entries });
+    }
+    let has_area = |name| {
+        cfg.eval_metrics
+            .iter()
+            .any(|m| m.name() == name && m.supports_shared_binary_auc_sort())
+    };
+    let shared_auc = has_area("auc") && has_area("aucpr");
+    for (i, (ev, slot)) in evals.iter().zip(&eval_preds.slots).enumerate() {
+        let pred = match slot {
+            EvalPrediction::Training => train_pred,
+            EvalPrediction::Independent { margins, .. } => margins,
+        };
+        let mut areas = None;
+        let upper = cfg.eval_upper_bounds.get(i).and_then(Option::as_deref);
         for m in &cfg.eval_metrics {
-            entries.push((
-                ev.name.clone(),
-                m.name().to_string(),
-                if let Some(upper) = cfg.eval_upper_bounds.get(i).and_then(Option::as_deref) {
-                    m.try_eval_interval(pred, ev.labels, upper, ev.weights)?
+            let value = if let Some(upper) = upper {
+                m.try_eval_interval(pred, ev.labels, upper, ev.weights)?
+            } else if shared_auc && ev.group_ptr.is_none() && m.supports_shared_binary_auc_sort() {
+                let (auc, aucpr) = *areas.get_or_insert_with(|| {
+                    crate::metrics::eval_auc_aucpr_pair(pred, ev.labels, ev.weights)
+                });
+                if m.name() == "auc" {
+                    auc
                 } else {
-                    m.try_eval_grouped(pred, ev.labels, ev.weights, ev.group_ptr)?
-                },
-            ));
+                    aucpr
+                }
+            } else {
+                m.try_eval_grouped(pred, ev.labels, ev.weights, ev.group_ptr)?
+            };
+            entries.push((ev.name.clone(), m.name().to_string(), value));
         }
     }
     Ok(RoundMetrics { round, entries })
@@ -2882,24 +3033,75 @@ fn predict_on(model: &Model, source: &dyn BlockSource) -> anyhow::Result<Vec<f32
     Ok(pred)
 }
 
-/// 每行走到的叶子值(已含 learning_rate)。
-///
-/// `predict_on` 和 `update_predictions` 共用这一份下降逻辑。**两处
-/// 必须完全一致** —— 各写一遍的话,训练时累加的 pred 和验证时算的
-/// pred 会悄悄地不是同一个东西,而且只在缺失值或边界 bin 上差一点。
-///
-/// 手里只有量化后的 bin,所以先把每个节点的浮点阈值换回 bin 右边界
-/// (`tree::split_bin`),再按 bin 比。
-///
-/// **逐层推进,一次只驻留一个列块。** 原来是先把所有块拿到手再逐行
-/// 走树 —— 那样按需加载就白做了,预测这一步会把整个数据集拉回内存。
-/// 现在每加载一个块,就把"当前节点的分裂特征正好在这个块里"的行尽量
-/// 往下推;一个块能连着推几层就推几层。最多扫 max_depth 遍块即可全部
-/// 落到叶子(最坏情况每遍每行只前进一层)。
-fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
-    let cuts = source.cuts();
-    let n_rows = source.n_rows();
+/// Stable source-side lookup tables shared by every tree evaluated on a dataset.
+/// This is metadata only; block payloads are still loaded lazily as rows need them.
+struct EvalPredictionLayout {
+    n_rows: usize,
+    n_features: usize,
+    block_features: Vec<Vec<FeatId>>,
+    block_of: Vec<usize>,
+    local_of: Vec<usize>,
+}
 
+impl EvalPredictionLayout {
+    fn new(source: &dyn BlockSource) -> anyhow::Result<Self> {
+        let n_features = source.n_features();
+        let mut block_of = vec![usize::MAX; n_features];
+        let mut local_of = vec![usize::MAX; n_features];
+        let mut block_features = Vec::with_capacity(source.n_blocks());
+        for b in 0..source.n_blocks() {
+            let feats = source.block_features(b)?;
+            for (local, &feat) in feats.iter().enumerate() {
+                let f = feat as usize;
+                anyhow::ensure!(
+                    f < n_features,
+                    "prediction: column block {b} has out-of-range feature {feat}"
+                );
+                block_of[f] = b;
+                local_of[f] = local;
+            }
+            block_features.push(feats);
+        }
+        Ok(Self {
+            n_rows: source.n_rows(),
+            n_features,
+            block_features,
+            block_of,
+            local_of,
+        })
+    }
+
+    fn validate_source(&self, source: &dyn BlockSource) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            source.n_rows() == self.n_rows
+                && source.n_features() == self.n_features
+                && source.n_blocks() == self.block_features.len(),
+            "prediction: source shape changed after its evaluation layout was built"
+        );
+        Ok(())
+    }
+}
+
+/// Leaves are routed one block at a time. The compact node-index vector is
+/// retained so source errors cannot partially update a caller's predictions.
+fn routed_leaf_nodes(
+    t: &Tree,
+    source: &dyn BlockSource,
+    layout: &EvalPredictionLayout,
+) -> anyhow::Result<Vec<u32>> {
+    layout.validate_source(source)?;
+    let cuts = source.cuts();
+    let n_rows = layout.n_rows;
+    for node in t.nodes.iter().filter(|node| !node.is_leaf) {
+        anyhow::ensure!(
+            layout
+                .block_of
+                .get(node.feat as usize)
+                .is_some_and(|&b| b != usize::MAX),
+            "prediction: feature {} has no column block",
+            node.feat,
+        );
+    }
     let thresholds: Vec<u32> = t
         .nodes
         .iter()
@@ -2911,15 +3113,13 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
             }
         })
         .collect();
-    // Categorical nodes compare the bin (= category code) against a set.
     let node_cats: Vec<Option<crate::categorical::CatBits>> = t
         .nodes
         .iter()
         .map(|n| {
             n.cats.as_ref().map(|words| {
-                // Only trained codes (`< n_bins`) can be a bin of this feature;
-                // a larger member (from a continued model) must never match
-                // the width's unseen-category bin.
+                // Only trained codes can match a bin; continued-model codes
+                // outside this feature's cuts must stay unseen.
                 let n_bins = cuts.n_bins(n.feat);
                 let mut bits = crate::categorical::CatBits::for_bins(n_bins);
                 for cat in crate::categorical::categories_from_words(words) {
@@ -2932,23 +3132,11 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         })
         .collect();
 
-    // 特征 → 它在哪个块。分桶要用。
-    let mut block_of = vec![usize::MAX; source.n_features()];
-    let mut block_feats = Vec::with_capacity(source.n_blocks());
-    for b in 0..source.n_blocks() {
-        let feats = source.block_features(b)?;
-        for &f in &feats {
-            block_of[f as usize] = b;
-        }
-        block_feats.push(feats);
+    let mut at = vec![0u32; n_rows];
+    if n_rows == 0 || t.nodes[0].is_leaf {
+        return Ok(at);
     }
 
-    // 每行当前停在哪个节点
-    let mut at = vec![0u32; n_rows];
-    let mut done = t.nodes[0].is_leaf;
-
-    // 遍数的上界是**树的深度**:一遍之内每行都会走到它需要的那个块,
-    // 所以至少往下一层。
     fn depth_of(t: &Tree, node: usize) -> usize {
         let n = &t.nodes[node];
         if n.is_leaf {
@@ -2958,31 +3146,26 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
         }
     }
     let max_passes = depth_of(t, 0);
-    let mut bucket: Vec<Vec<RowId>> = vec![Vec::new(); source.n_blocks()];
+    let mut bucket: Vec<Vec<RowId>> = vec![Vec::new(); layout.block_features.len()];
+    let mut active_rows = n_rows;
 
     for _pass in 0..=max_passes {
-        if done {
+        if active_rows == 0 {
             break;
         }
-        // 先分桶:每行按「它当前需要哪个块」归位,一次 O(行数)。
-        //
-        // 原来是「每个块都把所有行扫一遍」,复杂度 O(深度 × 块数 × 行数)
-        // —— 14 个块时 8.8 亿次行访问,其中绝大多数是「这个块里没有我
-        // 要的特征」然后立刻退出。分桶之后每行每趟只被碰一次,
-        // **块数这个维度就没了**,和只有一个块时一样。
-        for b in bucket.iter_mut() {
+        for b in &mut bucket {
             b.clear();
         }
         for (row, &node) in at.iter().enumerate() {
             let n = &t.nodes[node as usize];
             if !n.is_leaf {
-                bucket[block_of[n.feat as usize]].push(row as RowId);
+                bucket[layout.block_of[n.feat as usize]].push(row as RowId);
             }
         }
 
-        for b in 0..source.n_blocks() {
+        for b in 0..layout.block_features.len() {
             if bucket[b].is_empty() {
-                continue; // 没有行等这个块,就根本不加载它
+                continue;
             }
             source.with_block_ret(b, |block| -> anyhow::Result<()> {
                 anyhow::ensure!(
@@ -2999,26 +3182,18 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                     "prediction: column block {b} bin width does not match the cuts"
                 );
                 anyhow::ensure!(
-                    block.feat_ids == block_feats[b],
+                    block.feat_ids == layout.block_features[b],
                     "prediction: column block {b} features do not match the block_features metadata"
                 );
-                let mut local_of = vec![usize::MAX; source.n_features()];
-                for (local, &f) in block.feat_ids.iter().enumerate() {
-                    local_of[f as usize] = local;
-                }
                 for &row in &bucket[b] {
                     let node = &mut at[row as usize];
-                    // 父子的分裂特征常常在同一块,能连着推几层就推几层
+                    // Keep routing in this resident block as long as possible.
                     loop {
                         let n = &t.nodes[*node as usize];
-                        if n.is_leaf {
+                        if n.is_leaf || layout.block_of[n.feat as usize] != b {
                             break;
                         }
-                        let local = local_of[n.feat as usize];
-                        if local == usize::MAX {
-                            break;
-                        }
-                        let col = block.column(local);
+                        let col = block.column(layout.local_of[n.feat as usize]);
                         let bin = col.get(row as usize);
                         let go_left = if bin == col.width().missing() {
                             n.default_left
@@ -3033,18 +3208,31 @@ fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
                             n.right as u32
                         };
                     }
+                    if t.nodes[*node as usize].is_leaf {
+                        active_rows -= 1;
+                    }
                 }
                 Ok(())
             })??;
         }
-        done = at.iter().all(|&n| t.nodes[n as usize].is_leaf);
     }
     anyhow::ensure!(
-        done,
+        active_rows == 0,
         "some rows did not reach a leaf; the tree structure is invalid"
     );
+    Ok(at)
+}
 
-    Ok(at.iter().map(|&n| t.nodes[n as usize].leaf_value).collect())
+#[cfg(test)]
+fn leaf_values(t: &Tree, source: &dyn BlockSource) -> anyhow::Result<Vec<f32>> {
+    let layout = EvalPredictionLayout::new(source)?;
+    if t.nodes[0].is_leaf {
+        return Ok(vec![t.nodes[0].leaf_value; layout.n_rows]);
+    }
+    Ok(routed_leaf_nodes(t, source, &layout)?
+        .into_iter()
+        .map(|node| t.nodes[node as usize].leaf_value)
+        .collect())
 }
 
 /// 本层里的一个活跃节点。
@@ -3061,6 +3249,7 @@ struct LevelNode {
     bounds: split::NodeBounds,
 }
 
+#[derive(Clone, Copy)]
 enum NodeRows {
     /// 本层宿主行缓冲里的一段(见 [`HostSpan`])。
     Host(HostSpan),
@@ -3108,6 +3297,63 @@ type PreSplit = Vec<crate::backend::cuda::GpuSplitResult>;
 #[cfg(not(feature = "cuda"))]
 type PreSplit = std::convert::Infallible;
 
+mod lossguide;
+
+struct BlockPlan {
+    /// source / cache / resident 缓存里的原始块号。
+    physical: usize,
+    /// 本块里**被采样中**的全局特征 id(升序)。
+    sampled_global: Vec<FeatId>,
+    /// 上面那些特征在**原始块**里的局部下标 —— partition 查 resident
+    /// 列时用的是这个,和压实与否无关。
+    orig_local: Vec<usize>,
+    /// 这个块**实际会交回来**的特征列表:压实时是采样子集,
+    /// 否则是整块。offsets 和那条一致性断言都按它来。
+    ///
+    /// ⚠️ 曾经把它和 `sampled_global` 合成一个字段,结果不支持部分读的
+    /// source 交回整块、而 offsets 按子集算,直接对不上 —— 断言抓到了。
+    handed_feats: Vec<FeatId>,
+    /// 直方图的逻辑特征。column-major GPU 可只含采样列,即使
+    /// resident `handed_feats` 仍保持完整物理块。
+    hist_feats: Vec<FeatId>,
+    /// 与 `hist_feats` 一一对应的紧凑 histogram offsets。
+    hist_offsets: Vec<u32>,
+    /// 是否物化成压实块(只读选中列)。resident 块恒为 false。
+    compact: bool,
+}
+
+enum BlockSplits {
+    Independent(Vec<Option<SplitCandidate>>),
+    Symmetric(Option<split::LevelSplit>),
+}
+
+fn validate_planned_block(
+    source: &dyn BlockSource,
+    plan: &BlockPlan,
+    block: &ColumnBlock,
+) -> anyhow::Result<()> {
+    let phys = plan.physical;
+    anyhow::ensure!(
+        block.n_rows == source.n_rows(),
+        "column block {phys} has {} rows, but the source declares {}",
+        block.n_rows,
+        source.n_rows()
+    );
+    anyhow::ensure!(
+        block.feat_ids == plan.handed_feats,
+        "column block {phys} returned features that do not match the plan"
+    );
+    anyhow::ensure!(
+        block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
+        "column block {phys} data length does not match rows × features"
+    );
+    anyhow::ensure!(
+        block.width() == source.cuts().block_width(&block.feat_ids),
+        "column block {phys} bin width does not match the cuts"
+    );
+    Ok(())
+}
+
 fn build_tree(
     source: &dyn BlockSource,
     gpair: &[GradPairFixed],
@@ -3122,6 +3368,7 @@ fn build_tree(
     cfg: &TrainConfig,
     comm: &dyn Comm,
     gpu: Option<&crate::backend::cuda::GpuTrainCtx>,
+    grow_policy: GrowPolicy,
     // 本棵树的采样特征集(全局 id,升序)。`None` = 全选。
     sampled: Option<&[FeatId]>,
     interactions: Option<&crate::interaction::InteractionConstraints>,
@@ -3144,28 +3391,6 @@ fn build_tree(
     // ⚠️ 上一版用「过滤后的位置」去推物理块号,结果 resident slot 认错块
     // (轻则退回整列上传,重则读到别的块的数据)。所以这里把三套下标
     // **显式带在一起**,不再靠位置推导。
-    struct BlockPlan {
-        /// source / cache / resident 缓存里的原始块号。
-        physical: usize,
-        /// 本块里**被采样中**的全局特征 id(升序)。
-        sampled_global: Vec<FeatId>,
-        /// 上面那些特征在**原始块**里的局部下标 —— partition 查 resident
-        /// 列时用的是这个,和压实与否无关。
-        orig_local: Vec<usize>,
-        /// 这个块**实际会交回来**的特征列表:压实时是采样子集,
-        /// 否则是整块。offsets 和那条一致性断言都按它来。
-        ///
-        /// ⚠️ 曾经把它和 `sampled_global` 合成一个字段,结果不支持部分读的
-        /// source 交回整块、而 offsets 按子集算,直接对不上 —— 断言抓到了。
-        handed_feats: Vec<FeatId>,
-        /// 直方图的逻辑特征。column-major GPU 可只含采样列,即使
-        /// resident `handed_feats` 仍保持完整物理块。
-        hist_feats: Vec<FeatId>,
-        /// 与 `hist_feats` 一一对应的紧凑 histogram offsets。
-        hist_offsets: Vec<u32>,
-        /// 是否物化成压实块(只读选中列)。resident 块恒为 false。
-        compact: bool,
-    }
     // 只把"每块有哪些特征"这张表留着(几百个 u32),块本身按需加载。
     let all_block_feats: Vec<Vec<FeatId>> = (0..n_blocks_total)
         .map(|i| source.block_features(i))
@@ -3302,10 +3527,50 @@ fn build_tree(
         (None, _) => Vec::new(),
     };
 
+    if grow_policy == GrowPolicy::LossGuide {
+        lossguide::grow(
+            source,
+            &plans,
+            gpair,
+            q,
+            p,
+            comm,
+            gpu,
+            sampled,
+            interactions,
+            nested,
+            &tree_features,
+            &mut t,
+            level.pop().expect("root"),
+            &mut rows_cur,
+            predictions,
+            drop_zero_rows,
+            &mut split_info,
+        )?;
+        if drop_zero_rows {
+            apply_dropped_rows(
+                &t,
+                &split_info,
+                source,
+                gpair,
+                host_nonzero.as_ref(),
+                predictions,
+            )?;
+        }
+        return Ok(t);
+    }
+
+    let symmetric = grow_policy == GrowPolicy::Symmetric;
+    #[cfg(feature = "cuda")]
+    let cached_split =
+        !symmetric || gpu.is_some_and(crate::backend::cuda::GpuTrainCtx::has_symmetric_split);
     // Count all leaves, including terminal nodes no longer in the active level.
     let mut leaf_count = 1u32;
     for depth in 0..p.max_depth {
-        if level.is_empty() || (p.max_leaves != 0 && leaf_count >= p.max_leaves) {
+        if level.is_empty()
+            || (p.max_leaves != 0
+                && (leaf_count >= p.max_leaves || (symmetric && leaf_count * 2 > p.max_leaves)))
+        {
             break;
         }
         // ---- 本层每个节点的 split 枚举特征集 ----
@@ -3366,6 +3631,13 @@ fn build_tree(
                 (None, None) => sampled,
             }
         };
+        let symmetric_nodes = symmetric.then(|| {
+            level
+                .iter()
+                .map(|node| (node.sum, node.bounds))
+                .collect::<Vec<_>>()
+        });
+
         // ★ 外层列块、内层节点。反过来写(外层节点、内层列块)每个
         // 节点都要重新过一遍所有列块,传输量从 O(数据) 变成
         // O(节点数 × 数据) —— 整个方案就没意义了。改这里要特别小心。
@@ -3438,7 +3710,8 @@ fn build_tree(
         let mut pre_split: Vec<Option<PreSplit>> = (0..n_blocks).map(|_| None).collect();
         #[cfg(feature = "cuda")]
         let two_phase = gpu.is_some_and(|ctx| {
-            n_blocks > 1
+            cached_split
+                && n_blocks > 1
                 && plans
                     .iter()
                     .all(|pl| !pl.compact && pl.physical < ctx.resident_block_count())
@@ -3503,7 +3776,7 @@ fn build_tree(
             usize,
             (Option<Vec<Histogram>>, Option<PreSplit>),
         )|
-         -> anyhow::Result<(Vec<Histogram>, Vec<Option<SplitCandidate>>)> {
+         -> anyhow::Result<(Vec<Histogram>, BlockSplits)> {
             #[cfg(feature = "cuda")]
             let mut pre = pre;
             #[cfg(not(feature = "cuda"))]
@@ -3522,24 +3795,7 @@ fn build_tree(
                            resident: Option<crate::backend::cuda::GpuBlockSession<'_>>|
              -> anyhow::Result<_> {
                 if let Some(block) = block {
-                    anyhow::ensure!(
-                        block.n_rows == source.n_rows(),
-                        "column block {phys} has {} rows, but the source declares {}",
-                        block.n_rows,
-                        source.n_rows()
-                    );
-                    anyhow::ensure!(
-                        block.feat_ids == plan.handed_feats,
-                        "column block {phys} returned features that do not match the plan"
-                    );
-                    anyhow::ensure!(
-                        block.data.len() == block.n_rows.saturating_mul(block.n_feats()),
-                        "column block {b} data length does not match rows × features"
-                    );
-                    anyhow::ensure!(
-                        block.width() == source.cuts().block_width(&block.feat_ids),
-                        "column block {phys} bin width does not match the cuts"
-                    );
+                    validate_planned_block(source, plan, block)?;
                 }
                 let width = *plan.hist_offsets.last().unwrap() as usize;
                 // 要相减的槽位先放个空壳,缓冲在下面 subtract 那一趟才分配。
@@ -3601,7 +3857,7 @@ fn build_tree(
                                 per_node[i].bins = bins;
                             }
                         }
-                    } else if session.begin_split_level(depth)? {
+                    } else if cached_split && session.begin_split_level(depth)? {
                         let groups = gpu_split_groups(&mut session);
                         for (i, candidate, histogram) in session.split_cached_batch(
                             &groups,
@@ -3743,6 +3999,39 @@ fn build_tree(
                 }
 
                 let _t = prof::Timer::new(&prof::ENUM);
+                if let Some(nodes) = &symmetric_nodes {
+                    #[cfg(feature = "cuda")]
+                    if gpu_done.iter().all(|&done| done) {
+                        let candidates: Vec<_> = gpu_candidates.into_iter().flatten().collect();
+                        let selected = if candidates.is_empty() {
+                            None
+                        } else {
+                            anyhow::ensure!(
+                                candidates.len() == level.len(),
+                                "incomplete symmetric GPU split packets"
+                            );
+                            let score = candidates.iter().map(|split| f64::from(split.gain)).sum();
+                            Some(split::LevelSplit { score, candidates })
+                        };
+                        return Ok((per_node, BlockSplits::Symmetric(selected)));
+                    }
+                    let selected = split::best_level_split_in_block(
+                        &per_node,
+                        &plan.hist_feats,
+                        &plan.hist_offsets,
+                        nodes,
+                        q,
+                        p,
+                        |feat| {
+                            level.iter().enumerate().all(|(i, _)| {
+                                enum_features(i)
+                                    .is_none_or(|features| features.binary_search(&feat).is_ok())
+                            })
+                        },
+                        cuts.has_categorical().then(|| cuts.categorical_flags()),
+                    );
+                    return Ok((per_node, BlockSplits::Symmetric(selected)));
+                }
                 let cands: Vec<Option<SplitCandidate>> = level
                     .iter()
                     .enumerate()
@@ -3763,7 +4052,7 @@ fn build_tree(
                         )
                     })
                     .collect();
-                Ok((per_node, cands))
+                Ok((per_node, BlockSplits::Independent(cands)))
             };
             // Check the dedicated resident slot before asking the source to
             // materialize bins. Its payload passed source/shape validation
@@ -3796,12 +4085,11 @@ fn build_tree(
         };
         // Paired histogram and split results retain per-block ownership.
         #[allow(clippy::type_complexity)]
-        let per_block: anyhow::Result<Vec<(Vec<Histogram>, Vec<Option<SplitCandidate>>)>> =
-            if two_phase {
-                items.into_iter().map(&block_fn).collect()
-            } else {
-                items.into_par_iter().map(&block_fn).collect()
-            };
+        let per_block: anyhow::Result<Vec<(Vec<Histogram>, BlockSplits)>> = if two_phase {
+            items.into_iter().map(&block_fn).collect()
+        } else {
+            items.into_par_iter().map(&block_fn).collect()
+        };
         let per_block = per_block?;
         drop(hist_phase);
         drop(_phase);
@@ -3814,25 +4102,42 @@ fn build_tree(
         // tests/bit_exact_vs_xgboost.rs 盯着这条。
         let split_reduce_phase = crate::diagnostic::Phase::new(b"fb.host.split_reduce\0");
         let mut best: Vec<Option<SplitCandidate>> = vec![None; level.len()];
+        let mut best_level: Option<split::LevelSplit> = None;
         let mut hists: Vec<Vec<Histogram>> = Vec::with_capacity(n_blocks);
         for (per_node, cands) in per_block {
-            for (i, cand) in cands.into_iter().enumerate() {
-                best[i] = split::reduce_best(&[best[i].take(), cand]);
+            match cands {
+                BlockSplits::Independent(candidates) => {
+                    for (i, cand) in candidates.into_iter().enumerate() {
+                        best[i] = split::reduce_best(&[best[i].take(), cand]);
+                    }
+                }
+                BlockSplits::Symmetric(Some(candidate)) => {
+                    if best_level
+                        .as_ref()
+                        .is_none_or(|prior| candidate.beats(prior))
+                    {
+                        best_level = Some(candidate);
+                    }
+                }
+                BlockSplits::Symmetric(None) => {}
             }
             hists.push(per_node);
         }
 
-        // 多机/多卡时各方只看得到自己那几列,全局最优要在这里汇总。
-        // 单机 Local 是恒等,但训练逻辑里不能直接挑本地最优 ——
-        // 那样换个 Comm 就不对了。
-        let mut chosen: Vec<Option<SplitCandidate>> = best
-            .into_iter()
-            .map(|c| comm.allreduce_best_split(c))
-            .collect();
+        let mut chosen: Vec<Option<SplitCandidate>> = if symmetric {
+            best_level.map_or(best, |winner| {
+                winner.candidates.into_iter().map(Some).collect()
+            })
+        } else {
+            // Each worker may hold a different subset of columns.
+            best.into_iter()
+                .map(|c| comm.allreduce_best_split(c))
+                .collect()
+        };
         // Reserve the remaining leaf budget in stable depthwise node order.
         // Clear rejected candidates before partition submission, so terminal
         // rows retain their existing span and receive the normal leaf update.
-        if p.max_leaves != 0 {
+        if !symmetric && p.max_leaves != 0 {
             let mut remaining = p.max_leaves.saturating_sub(leaf_count);
             for candidate in &mut chosen {
                 if candidate.is_some() {
@@ -3989,11 +4294,11 @@ fn build_tree(
         if gpu.is_none() {
             // CPU:整层一起分(见 `partition_level_host`)。节点按层内顺序,
             // 也就是按行缓冲里的位置升序。
-            let nodes: Vec<(HostSpan, SplitCandidate)> = level
+            let nodes: Vec<(HostSpan, &SplitCandidate)> = level
                 .iter()
                 .zip(&chosen)
                 .filter_map(|(ln, c)| match (&ln.rows, c) {
-                    (NodeRows::Host(span), Some(c)) => Some((*span, c.clone())),
+                    (NodeRows::Host(span), Some(c)) => Some((*span, c)),
                     _ => None,
                 })
                 .collect();
@@ -4242,32 +4547,6 @@ fn build_tree(
             // Keep row-buffer release in the same profiled phase as before.
             drop(level);
         }
-        // `gpu_math = "fast"` 下 delta 由 device 上的 gradient kernel 直接
-        // 消费,host 永远不需要看它 —— 这一次 4 B/行 的 D2H 整个消失。
-        // 漏掉这个判断的话 fast 模式仍然每棵树付一次 40 MB D2H
-        // (实测 16.5 ms/轮),收益被吃掉一半还多。
-        // exact:host 是权威副本,delta 要交回去施加。
-        // fast:device 是权威副本,delta 由 device 的 gradient kernel 直接
-        // 消费,这一次 4 B/行 的 D2H 整个不存在。
-        if let Some(ctx) = gpu.filter(|c| c.prediction_authority() == PredictionAuthority::Host) {
-            // 只取回 delta;施加推迟到下一轮开头,和求梯度合并成一次遍历
-            // (见 train_with_backend 里那一段)。
-            let d2h_ms = ctx.download_prediction_delta()?;
-            if prof::enabled() {
-                prof::GPU_PRED_D2H.fetch_add(
-                    (d2h_ms as f64 * 1e6) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                prof::GPU_PRED_D2H_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                prof::GPU_PRED_D2H_BYTES.fetch_add(
-                    std::mem::size_of_val(predictions) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                // One f32 delta per training row is downloaded once per tree.
-                // Applying it to `predictions` is intentionally kept on CPU
-                // for now and remains visible in UPDATE_PRED / round wall.
-            }
-        }
     }
 
     if drop_zero_rows {
@@ -4282,6 +4561,42 @@ fn build_tree(
     }
 
     Ok(t)
+}
+
+fn download_training_delta(
+    ctx: &crate::backend::cuda::GpuTrainCtx,
+    predictions: &[f32],
+) -> anyhow::Result<()> {
+    let d2h_ms = ctx.download_prediction_delta()?;
+    if prof::enabled() {
+        prof::GPU_PRED_D2H.fetch_add(
+            (d2h_ms as f64 * 1e6) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        prof::GPU_PRED_D2H_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        prof::GPU_PRED_D2H_BYTES.fetch_add(
+            std::mem::size_of_val(predictions) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+fn apply_training_delta(
+    ctx: &crate::backend::cuda::GpuTrainCtx,
+    predictions: &mut [f32],
+    pool: &rayon::ThreadPool,
+) -> anyhow::Result<()> {
+    download_training_delta(ctx, predictions)?;
+    let _t = prof::Timer::new(&prof::UPDATE_PRED);
+    pool.install(|| {
+        ctx.with_prediction_delta(&mut |delta| {
+            predictions
+                .par_iter_mut()
+                .zip(delta.par_iter())
+                .for_each(|(p, d)| *p += *d);
+        })
+    })
 }
 
 /// The bin geometry GPU training allocates for: block widths in features and
@@ -4901,7 +5216,7 @@ enum PartCols<'a> {
 }
 
 impl<'a> PartCols<'a> {
-    fn for_nodes(source: &'a dyn BlockSource, nodes: &[(HostSpan, SplitCandidate)]) -> Self {
+    fn for_nodes(source: &'a dyn BlockSource, nodes: &[(HostSpan, &SplitCandidate)]) -> Self {
         match nodes
             .iter()
             .map(|(_, c)| source.resident_feature_column(c.feat))
@@ -4916,7 +5231,7 @@ impl<'a> PartCols<'a> {
 fn partition_level_host(
     rows: &[RowId],
     next: &mut [RowId],
-    nodes: &[(HostSpan, SplitCandidate)],
+    nodes: &[(HostSpan, &SplitCandidate)],
     cols: PartCols<'_>,
     comm: &dyn Comm,
 ) -> anyhow::Result<Vec<(HostSpan, HostSpan)>> {
@@ -5340,8 +5655,56 @@ fn update_predictions(
     tree: &Tree,
     source: &dyn BlockSource,
 ) -> anyhow::Result<()> {
-    for (p, v) in pred.iter_mut().zip(leaf_values(tree, source)?) {
-        *p += v;
+    if tree.nodes[0].is_leaf {
+        for p in pred.iter_mut().take(source.n_rows()) {
+            *p += tree.nodes[0].leaf_value;
+        }
+        return Ok(());
+    }
+    let layout = EvalPredictionLayout::new(source)?;
+    let leaves = routed_leaf_nodes(tree, source, &layout)?;
+    for (p, node) in pred.iter_mut().zip(leaves) {
+        *p += tree.nodes[node as usize].leaf_value;
+    }
+    Ok(())
+}
+
+/// Apply one output's tree increment to row-major predictions. The tree still
+/// routes each row once; `output` selects the interleaved output column.
+fn apply_prediction_column(
+    pred: &mut [f32],
+    output: usize,
+    outputs: usize,
+    tree: &Tree,
+    source: &dyn BlockSource,
+    layout: &mut Option<EvalPredictionLayout>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(outputs > 0, "prediction output count must be nonzero");
+    anyhow::ensure!(output < outputs, "prediction output index is out of range");
+    let expected = source
+        .n_rows()
+        .checked_mul(outputs)
+        .ok_or_else(|| anyhow::anyhow!("prediction size overflow"))?;
+    anyhow::ensure!(
+        pred.len() == expected,
+        "prediction length {} does not match rows × outputs {expected}",
+        pred.len()
+    );
+
+    if tree.nodes[0].is_leaf {
+        let value = tree.nodes[0].leaf_value;
+        for row in pred.chunks_exact_mut(outputs) {
+            row[output] += value;
+        }
+        return Ok(());
+    }
+    let layout = match layout {
+        Some(layout) => layout,
+        slot => slot.insert(EvalPredictionLayout::new(source)?),
+    };
+    let leaves = routed_leaf_nodes(tree, source, layout)?;
+    for (row, node) in leaves.into_iter().enumerate() {
+        pred[row * outputs + output] += tree.nodes[node as usize].leaf_value;
     }
     Ok(())
 }
@@ -5961,10 +6324,11 @@ mod tests {
                 missing_left,
                 cats: None,
             };
-            let nodes: Vec<(HostSpan, SplitCandidate)> = spans
+            let candidates: Vec<SplitCandidate> = [3, 1, 4].map(cand).into_iter().collect();
+            let nodes: Vec<(HostSpan, &SplitCandidate)> = spans
                 .iter()
-                .zip([3, 1, 4])
-                .map(|(s, b)| (*s, cand(b)))
+                .zip(&candidates)
+                .map(|(s, c)| (*s, c))
                 .collect();
             let run = |nthread| {
                 let mut next = vec![RowId::MAX; n];

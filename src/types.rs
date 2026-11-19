@@ -48,6 +48,33 @@ impl std::str::FromStr for SamplingMethod {
     }
 }
 
+/// Strategy for choosing which leaves to split and how to split them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrowPolicy {
+    /// Grow one level at a time, spending the leaf budget in node order.
+    #[default]
+    Depthwise,
+    /// Split the eligible leaf with the highest gain across the tree.
+    LossGuide,
+    /// Apply the same split to every leaf at a given level.
+    Symmetric,
+}
+
+impl std::str::FromStr for GrowPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "depthwise" => Ok(Self::Depthwise),
+            "lossguide" => Ok(Self::LossGuide),
+            "symmetric" => Ok(Self::Symmetric),
+            _ => Err(format!(
+                "grow_policy must be depthwise, lossguide, or symmetric, got {value:?}"
+            )),
+        }
+    }
+}
+
 /// GPU 目标函数数学模式。见 [`TrainParams::gpu_math`]。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GpuMath {
@@ -406,7 +433,7 @@ pub type FeatId = u32;
 pub struct TrainParams {
     pub n_rounds: usize,
     pub max_depth: u32,
-    /// Maximum leaves per tree under depthwise growth; 0 adds no leaf limit.
+    /// Maximum leaves per tree; 0 adds no leaf limit.
     /// A value of 1 produces a root-only tree. The depth limit still applies.
     pub max_leaves: u32,
     pub max_bin: u32,
@@ -562,6 +589,30 @@ pub struct TrainParams {
 }
 
 impl TrainParams {
+    /// A cached symmetric search needs the whole frontier at once, with no
+    /// categorical, monotone or per-leaf feature restrictions.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn symmetric_split_cache_eligible(&self) -> bool {
+        let mut depth = self.max_depth;
+        if self.max_leaves != 0 {
+            depth = depth.min(self.max_leaves.ilog2());
+        }
+        let cap = self.hist_nodes_per_batch.unwrap_or_else(|| {
+            std::env::var("FB_HIST_NODES_PER_BATCH")
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(16)
+        });
+        self.max_bin <= 255
+            && !self.has_monotone()
+            && !self.needs_node_feature_masks()
+            && cap >= 2
+            && depth > 0
+            && 1usize
+                .checked_shl(depth - 1)
+                .is_some_and(|nodes| nodes <= cap)
+    }
+
     /// Shared predicate for GPU mask allocation and planner accounting.
     pub fn needs_node_feature_masks(&self) -> bool {
         self.colsample_bylevel < 1.0
