@@ -79,12 +79,12 @@ custom platform tag. Do not install both distributions into the same environment
 
 ### Install from source
 
-FerrisBoost requires Python 3.9+ and a Rust toolchain when installing from source:
+FerrisBoost requires Python 3.9+ and Rust 1.88 or newer when installing from source:
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip maturin
+python -m pip install --upgrade pip "maturin>=1.16,<2"
 
 # CPU-only build:
 maturin develop --release
@@ -275,6 +275,11 @@ logging, and the complete parameter reference.
 ## Changelog
 
 See the [Python API How-To](https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md) for details.
+
+### 0.1.1.post1
+
+- Updated Arrow/Parquet to 60.2.0, PyO3 to 0.30.1, Rust NumPy bindings to 0.30.0, and cudarc to 0.19.10. Python and Rust APIs remain unchanged.
+- Source builds require Rust 1.88 or newer and maturin 1.16 or newer.
 
 ### 0.1.1
 

@@ -55,13 +55,13 @@ uv pip install ferrisboost
 
 ### Install from the source tree
 
-FerrisBoost requires Python 3.9 or newer and a Rust toolchain. For development,
+FerrisBoost requires Python 3.9 or newer and Rust 1.88 or newer. For development,
 create a UV-managed virtual environment and install Maturin into it:
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
-uv pip install "maturin>=1.7,<2"
+uv pip install "maturin>=1.16,<2"
 
 # CPU-only build:
 uv run --no-sync maturin develop --release

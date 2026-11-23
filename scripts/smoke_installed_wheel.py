@@ -39,7 +39,7 @@ def main() -> None:
         assert not str(Path(fb.__file__).resolve()).startswith(
             str(Path(args.forbid_import_prefix).resolve())
         ), fb.__file__
-    assert fb.__version__ == os.environ.get("FB_EXPECT_VERSION", "0.1.1")
+    assert fb.__version__ == os.environ.get("FB_EXPECT_VERSION", "0.1.1-post1")
 
     rng = np.random.default_rng(7)
     x = rng.integers(0, 20, size=(120, 4)).astype(np.float32)

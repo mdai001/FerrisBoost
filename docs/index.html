@@ -103,6 +103,11 @@ prediction = model.predict("test.parquet")</code></pre>
     <section>
       <h2>Changelog</h2>
       <p>See the <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md">Python API How-To</a> for details.</p>
+      <h3>0.1.1.post1</h3>
+      <ul>
+        <li>Updated Arrow/Parquet to 60.2.0, PyO3 to 0.30.1, Rust NumPy bindings to 0.30.0, and cudarc to 0.19.10. Python and Rust APIs remain unchanged.</li>
+        <li>Source builds require Rust 1.88 or newer and maturin 1.16 or newer.</li>
+      </ul>
       <h3>0.1.1</h3>
       <ul>
         <li>Added loss-guided and symmetric growth on CPU and single-GPU CUDA exact and fast. Python and scikit-learn use <code>grow_policy</code>. Rust uses explicit training entry points that accept a <code>GrowPolicy</code>. <a href="https://github.com/mdai001/FerrisBoost/blob/develop/documents/howto.md#tree-growth-and-feature-interactions">Tree growth parameters</a>.</li>

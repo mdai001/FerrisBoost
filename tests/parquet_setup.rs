@@ -97,7 +97,7 @@ impl Fixture {
         .unwrap();
         let path = self.0.join(name);
         let props = WriterProperties::builder()
-            .set_max_row_group_size(group_rows)
+            .set_max_row_group_row_count(Some(group_rows))
             .build();
         let mut writer =
             ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))
@@ -146,7 +146,7 @@ impl Fixture {
         let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
         let path = self.0.join(name);
         let props = WriterProperties::builder()
-            .set_max_row_group_size(group_rows)
+            .set_max_row_group_row_count(Some(group_rows))
             .build();
         let mut writer =
             ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))

@@ -1319,7 +1319,7 @@ fn prediction_parquet_writer(
     ));
     let properties = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
-        .set_max_row_group_size(PREDICTION_PARQUET_ROW_GROUP_ROWS)
+        .set_max_row_group_row_count(Some(PREDICTION_PARQUET_ROW_GROUP_ROWS))
         .build();
     let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
         .context("failed to create the prediction Parquet writer")?;

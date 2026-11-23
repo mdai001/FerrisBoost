@@ -2911,7 +2911,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{name}.parquet"));
         let properties = WriterProperties::builder()
-            .set_max_row_group_size(max_rows)
+            .set_max_row_group_row_count(Some(max_rows))
             .build();
         let mut writer =
             ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
