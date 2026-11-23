@@ -109,11 +109,7 @@ fn batch_reader_with_metadata(
 ) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
     if coalesced_projection(&metadata, columns) {
         let input = crate::source::parquet_io::CoalescedFile::new(file)?;
-        if metadata.metadata().num_row_groups() > 1 {
-            return coalesced_row_group_reader(input, metadata, columns, batch_size);
-        }
-        let reader = build_projected_reader(input, metadata, columns, batch_size, None)?;
-        Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
+        coalesced_row_group_reader(input, metadata, columns, batch_size)
     } else {
         let reader = build_projected_reader(file, metadata, columns, batch_size, None)?;
         Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
@@ -134,13 +130,8 @@ fn coalesced_row_group_reader(
     let n_groups = metadata.metadata().num_row_groups();
     anyhow::ensure!(n_groups > 0, "Parquet file has no row groups");
     let columns = columns.to_vec();
-    let mut current = build_projected_reader(
-        input.clone(),
-        metadata.clone(),
-        &columns,
-        batch_size,
-        Some(0),
-    )?;
+    let mut current =
+        bounded_coalesced_group(input.clone(), metadata.clone(), &columns, batch_size, 0)?;
     let mut next_group = 1;
     let mut failed = false;
     Ok(Box::new(std::iter::from_fn(move || loop {
@@ -149,17 +140,17 @@ fn coalesced_row_group_reader(
         }
         if let Some(batch) = current.next() {
             failed = batch.is_err();
-            return Some(batch.map_err(anyhow::Error::from));
+            return Some(batch);
         }
         if next_group == n_groups {
             return None;
         }
-        match build_projected_reader(
+        match bounded_coalesced_group(
             input.clone(),
             metadata.clone(),
             &columns,
             batch_size,
-            Some(next_group),
+            next_group,
         ) {
             Ok(reader) => {
                 current = reader;
@@ -295,28 +286,164 @@ fn parallel_row_groups(
             move |row_group| {
                 let file = File::open(&path)
                     .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
-                let reader = if coalesced {
+                if coalesced {
                     let end = row_group_data_end(metadata.metadata().row_group(row_group));
-                    build_projected_reader(
+                    return bounded_coalesced_group(
                         crate::source::parquet_io::CoalescedFile::for_row_group(file, end)?,
                         metadata.clone(),
                         &columns,
                         batch_size,
-                        Some(row_group),
-                    )?
-                } else {
-                    build_projected_reader(
-                        file,
-                        metadata.clone(),
-                        &columns,
-                        batch_size,
-                        Some(row_group),
-                    )?
-                };
+                        row_group,
+                    );
+                }
+                let reader = build_projected_reader(
+                    file,
+                    metadata.clone(),
+                    &columns,
+                    batch_size,
+                    Some(row_group),
+                )?;
                 Ok(Box::new(reader.map(|r| r.map_err(anyhow::Error::from))))
             },
         ),
     ))
+}
+
+// Bound decoder state independently of the full projection width. The existing
+// coalesced eligibility check limits each row group to two standard batches.
+const COALESCED_DECODE_COLUMNS: usize = 256;
+
+fn coalesced_fixed_width_projection(metadata: &ArrowReaderMetadata, columns: &[usize]) -> bool {
+    use arrow::datatypes::DataType;
+    columns.iter().all(|&column| {
+        metadata.schema().fields().get(column).is_some_and(|field| {
+            matches!(
+                field.data_type(),
+                DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Float16
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Timestamp(_, _)
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Duration(_)
+                    | DataType::Interval(_)
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _)
+            )
+        })
+    })
+}
+
+fn bounded_coalesced_group(
+    input: crate::source::parquet_io::CoalescedFile,
+    metadata: ArrowReaderMetadata,
+    columns: &[usize],
+    batch_size: usize,
+    row_group: usize,
+) -> anyhow::Result<crate::source::parallel_reader::BatchIter> {
+    let rows = metadata.metadata().row_group(row_group).num_rows();
+    if columns.len() <= COALESCED_DECODE_COLUMNS
+        || !(0..=(2 * BATCH_SIZE) as i64).contains(&rows)
+        || !coalesced_fixed_width_projection(&metadata, columns)
+    {
+        let reader = build_projected_reader(input, metadata, columns, batch_size, Some(row_group))?;
+        return Ok(Box::new(
+            reader.map(|batch| batch.map_err(anyhow::Error::from)),
+        ));
+    }
+    let columns = columns.to_vec();
+    // Defer page reads until iteration, matching the ordinary reader. Errors are
+    // yielded once; a partially assembled row group is never exposed.
+    Ok(Box::new(
+        std::iter::once_with(move || {
+            decode_coalesced_group(input, metadata, &columns, batch_size, row_group)
+        })
+        .flat_map(|result| match result {
+            Ok(batches) => batches.into_iter().map(Ok).collect::<Vec<_>>(),
+            Err(error) => vec![Err(error)],
+        }),
+    ))
+}
+
+/// Arrow keeps dictionaries and page decoders for every projected column alive
+/// until its reader is dropped. Decode bounded column sets and drop each reader
+/// before opening the next set. Reassemble the original row batches by sharing
+/// their arrays, without copying values or changing row/feature order. This only
+/// materializes one short row group of fixed-width values. Variable-width and
+/// dictionary arrays retain the ordinary streaming path rather than staging
+/// potentially large payloads across multiple batches.
+fn decode_coalesced_group(
+    input: crate::source::parquet_io::CoalescedFile,
+    metadata: ArrowReaderMetadata,
+    columns: &[usize],
+    batch_size: usize,
+    row_group: usize,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let (physical, order) = crate::source::input::projection_and_order(columns);
+    let mut arrays: Vec<Vec<arrow::array::ArrayRef>> = Vec::new();
+    let mut rows = Vec::new();
+    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::new();
+    for (part, chunk) in physical.chunks(COALESCED_DECODE_COLUMNS).enumerate() {
+        let reader = build_projected_reader(
+            input.clone(),
+            metadata.clone(),
+            chunk,
+            batch_size,
+            Some(row_group),
+        )?;
+        let mut count = 0;
+        for batch in reader {
+            let batch = batch?;
+            if part == 0 {
+                rows.push(batch.num_rows());
+                arrays.push(Vec::with_capacity(physical.len()));
+            }
+            anyhow::ensure!(
+                rows.get(count) == Some(&batch.num_rows()),
+                "Parquet column decoder row batches differ"
+            );
+            if count == 0 {
+                fields.extend(batch.schema().fields().iter().cloned());
+            }
+            arrays[count].extend(batch.columns().iter().cloned());
+            count += 1;
+        }
+        anyhow::ensure!(
+            count == rows.len(),
+            "Parquet column decoder batch count differs"
+        );
+    }
+    anyhow::ensure!(
+        rows.iter().sum::<usize>() == metadata.metadata().row_group(row_group).num_rows() as usize,
+        "Parquet column decoder row count differs from row-group metadata"
+    );
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        metadata.schema().metadata().clone(),
+    ));
+    let identity = order.iter().enumerate().all(|(i, &o)| i == o) && order.len() == physical.len();
+    arrays
+        .into_iter()
+        .map(|arrays| {
+            let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+            Ok(if identity {
+                batch
+            } else {
+                crate::source::input::reorder(&batch, &order)
+            })
+        })
+        .collect()
 }
 
 fn row_group_data_end(group: &parquet::file::metadata::RowGroupMetaData) -> Option<u64> {
@@ -2674,8 +2801,10 @@ impl ParquetBlockSource {
 mod tests {
     use super::*;
     use crate::source::DenseSource;
-    use arrow::array::{Array, Float32Array, Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{
+        Array, DictionaryArray, Float32Array, Float64Array, Int64Array, Int8Array, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
@@ -2954,6 +3083,395 @@ mod tests {
                 .collect::<Vec<_>>(),
             "{context}: cut value bits"
         );
+    }
+
+    fn write_wide_f32_range(
+        name: &str,
+        n_rows: usize,
+        n_cols: usize,
+        dictionary_column: Option<usize>,
+    ) -> PathBuf {
+        // Keep the bounded wide fixture fixed-width, while allowing one
+        // dictionary column for the ordinary-reader fallback test.
+        let mut fields: Vec<_> = (0..n_cols)
+            .map(|i| {
+                let data_type = if Some(i) == dictionary_column {
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+                } else {
+                    DataType::Float32
+                };
+                Field::new(format!("f{i}"), data_type, true)
+            })
+            .collect();
+        fields.push(Field::new("target", DataType::Float32, false));
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<std::sync::Arc<dyn arrow::array::Array>> = (0..n_cols)
+            .map(|column| {
+                if Some(column) == dictionary_column {
+                    let keys = (0..n_rows)
+                        .map(|row| (row % 11 != 0).then_some((row % 3) as i8))
+                        .collect::<Vec<_>>();
+                    return Arc::new(
+                        DictionaryArray::<Int8Type>::try_new(
+                            Int8Array::from(keys),
+                            Arc::new(StringArray::from(vec!["red", "green", "blue"])),
+                        )
+                        .unwrap(),
+                    ) as std::sync::Arc<dyn arrow::array::Array>;
+                }
+                let values = (0..n_rows)
+                    .map(|row| match (row * 31 + column * 17) % 19 {
+                        0 => None,
+                        1 => Some(-0.0),
+                        2 => Some(0.0),
+                        value => Some((value as f32 - 9.0) / 4.0),
+                    })
+                    .collect::<Vec<_>>();
+                Arc::new(Float32Array::from(values)) as std::sync::Arc<dyn arrow::array::Array>
+            })
+            .chain(std::iter::once(Arc::new(Float32Array::from(
+                (0..n_rows).map(|row| (row % 2) as f32).collect::<Vec<_>>(),
+            ))
+                as std::sync::Arc<dyn arrow::array::Array>))
+            .collect();
+        let dir = std::env::temp_dir().join(format!("fb_parquet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.parquet"));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, arrays).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    fn assert_f32_batches_bitwise_equal(actual: &[RecordBatch], expected: &[RecordBatch]) {
+        assert_eq!(actual.len(), expected.len(), "batch count");
+        for (batch_index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.schema().as_ref(),
+                expected.schema().as_ref(),
+                "batch {batch_index} schema"
+            );
+            assert_eq!(
+                actual.num_rows(),
+                expected.num_rows(),
+                "batch {batch_index} row count"
+            );
+            assert_eq!(actual.num_columns(), expected.num_columns());
+            for column in 0..actual.num_columns() {
+                if let (Some(actual_values), Some(expected_values)) = (
+                    actual
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<Float32Array>(),
+                    expected
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<Float32Array>(),
+                ) {
+                    assert_eq!(actual_values.len(), expected_values.len());
+                    for row in 0..actual_values.len() {
+                        let actual_bits = (!actual_values.is_null(row))
+                            .then(|| actual_values.value(row).to_bits());
+                        let expected_bits = (!expected_values.is_null(row))
+                            .then(|| expected_values.value(row).to_bits());
+                        assert_eq!(
+                            actual_bits, expected_bits,
+                            "batch {batch_index}, column {column}, row {row}"
+                        );
+                    }
+                } else {
+                    let actual_dictionary = actual
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<Int8Type>>()
+                        .unwrap();
+                    let expected_dictionary = expected
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<Int8Type>>()
+                        .unwrap();
+                    assert_eq!(actual_dictionary.keys(), expected_dictionary.keys());
+                    let actual_values = actual_dictionary
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    let expected_values = expected_dictionary
+                        .values()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert_eq!(actual_values, expected_values);
+                }
+            }
+        }
+    }
+
+    fn assert_quantized_sources_bitwise_equal(
+        left: &ParquetBlockSource,
+        right: &ParquetBlockSource,
+        context: &str,
+    ) {
+        assert_eq!(left.n_rows(), right.n_rows(), "{context}: row count");
+        assert_eq!(
+            left.n_features(),
+            right.n_features(),
+            "{context}: feature count"
+        );
+        assert_eq!(left.n_blocks(), right.n_blocks(), "{context}: block count");
+        assert_cuts_bitwise_equal(left.cuts(), right.cuts(), context);
+        for block in 0..left.n_blocks() {
+            left.with_block(block, &mut |left_block| {
+                right
+                    .with_block(block, &mut |right_block| {
+                        assert_eq!(left_block.feat_ids, right_block.feat_ids);
+                        assert_eq!(left_block.n_rows, right_block.n_rows);
+                        assert_eq!(
+                            left_block.data, right_block.data,
+                            "{context}: block {block}"
+                        );
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn wide_coalesced_groups_match_ordinary_f32_batches_in_requested_order() {
+        // Widths 257 and 513 force 256+1 and 256+256+1 decoder chunks.
+        // The latter also spans several short row groups and a short final group.
+        for (n_cols, row_group_size, batch_size) in [(257usize, None, 13usize), (513, Some(16), 7)]
+        {
+            let initial =
+                write_wide_f32_range(&format!("coalesced_f32_{n_cols}_source"), 50, n_cols, None);
+            let path = if let Some(row_group_size) = row_group_size {
+                let path = rewrite_with_row_group_size(
+                    &initial,
+                    &format!("coalesced_f32_{n_cols}_groups"),
+                    row_group_size,
+                );
+                std::fs::remove_file(initial).unwrap();
+                path
+            } else {
+                initial
+            };
+            let metadata =
+                ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                    .unwrap();
+            let row_groups = metadata.metadata().row_groups();
+            assert_eq!(
+                row_groups
+                    .iter()
+                    .map(|group| group.num_rows())
+                    .collect::<Vec<_>>(),
+                if n_cols == 257 {
+                    vec![50]
+                } else {
+                    vec![16, 16, 16, 2]
+                }
+            );
+
+            let features: Vec<_> = (0..n_cols).collect();
+            let mut reversed = features.clone();
+            reversed.reverse();
+            let rotated = (37..n_cols).chain(0..37).collect::<Vec<_>>();
+            for columns in [features, reversed, rotated] {
+                assert!(coalesced_projection(&metadata, &columns));
+                assert!(coalesced_fixed_width_projection(&metadata, &columns));
+
+                // The expected arrays come from independent ordinary File
+                // readers, each explicitly scoped to one row group.
+                let mut expected = Vec::new();
+                let mut expected_group_rows = Vec::new();
+                for row_group in 0..row_groups.len() {
+                    let ordinary = build_projected_reader(
+                        File::open(&path).unwrap(),
+                        metadata.clone(),
+                        &columns,
+                        batch_size,
+                        Some(row_group),
+                    )
+                    .unwrap();
+                    let batches = ordinary.map(Result::unwrap).collect::<Vec<_>>();
+                    expected_group_rows.push(
+                        batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .collect::<Vec<_>>(),
+                    );
+                    expected.extend(batches);
+                }
+
+                let input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+                    File::open(&path).unwrap(),
+                    4096,
+                )
+                .unwrap();
+                let probe = input.clone();
+                let mut reader =
+                    coalesced_row_group_reader(input, metadata.clone(), &columns, batch_size)
+                        .unwrap();
+                assert_eq!(probe.test_backing_bytes(), 0, "construction must be lazy");
+                let actual = reader.by_ref().map(Result::unwrap).collect::<Vec<_>>();
+                drop(reader);
+                let backing_bytes = probe.test_backing_bytes();
+                drop(probe);
+                assert!(backing_bytes > 0, "iteration should read the file");
+                assert_f32_batches_bitwise_equal(&actual, &expected);
+
+                let ordinary_group_rows = row_groups
+                    .iter()
+                    .map(|group| {
+                        let rows = group.num_rows() as usize;
+                        (0..rows)
+                            .step_by(batch_size)
+                            .map(|start| (rows - start).min(batch_size))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ordinary_group_rows, expected_group_rows);
+                let actual_batch_rows =
+                    actual.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
+                assert_eq!(
+                    actual_batch_rows,
+                    expected_group_rows
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    actual_batch_rows.len(),
+                    expected_group_rows
+                        .iter()
+                        .map(|rows| rows.len())
+                        .sum::<usize>()
+                );
+                assert!(
+                    actual_batch_rows.iter().any(|&rows| rows < batch_size),
+                    "fixture must include a partial batch tail"
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn wide_coalesced_group_is_lazy_and_truncation_yields_one_error_without_batches() {
+        let path = write_wide_f32_range("coalesced_f32_truncated", 50, 257, None);
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let group = metadata.metadata().row_group(0);
+        // Preserve the first 256-column decode, then truncate the one-column
+        // tail chunk so assembly fails after earlier chunks have succeeded.
+        let failing_chunk_page = group.columns()[256]
+            .dictionary_page_offset()
+            .unwrap_or_else(|| group.columns()[256].data_page_offset());
+        let input = crate::source::parquet_io::CoalescedFile::test_with_capacity(
+            File::open(&path).unwrap(),
+            4096,
+        )
+        .unwrap();
+        let probe = input.clone();
+        let columns: Vec<_> = (0..257).collect();
+        let mut reader = bounded_coalesced_group(input, metadata, &columns, 13, 0).unwrap();
+        assert_eq!(probe.test_backing_bytes(), 0, "construction must be lazy");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(failing_chunk_page as u64)
+            .unwrap();
+        let first = reader.next().expect("truncated group must yield an error");
+        assert!(first.is_err(), "no partially decoded group may be yielded");
+        assert!(reader.next().is_none(), "decode error must be yielded once");
+        assert!(
+            reader.next().is_none(),
+            "reader must stay fused after its error"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wide_dictionary_projection_uses_ordinary_reader_batches() {
+        let path = write_wide_f32_range("coalesced_dictionary_fallback", 50, 257, Some(256));
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let columns = (0..257).rev().collect::<Vec<_>>();
+        assert!(coalesced_projection(&metadata, &columns));
+        assert!(
+            !coalesced_fixed_width_projection(&metadata, &columns),
+            "dictionary/Utf8 columns must use the original reader"
+        );
+
+        let expected = build_projected_reader(
+            File::open(&path).unwrap(),
+            metadata.clone(),
+            &columns,
+            11,
+            None,
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+        let actual = batch_reader_with_metadata(File::open(&path).unwrap(), metadata, &columns, 11)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(actual.len() > 1, "fixture must exercise multiple batches");
+        assert!(actual.last().unwrap().num_rows() < 11, "partial tail batch");
+        assert_f32_batches_bitwise_equal(&actual, &expected);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wide_coalesced_routing_is_bitwise_invariant_across_thread_counts() {
+        let initial = write_wide_f32_range("coalesced_f32_threads_source", 50, 513, None);
+        let path = rewrite_with_row_group_size(&initial, "coalesced_f32_threads_groups", 16);
+        std::fs::remove_file(initial).unwrap();
+        let mut one_cut_readers = None;
+        let (one, labels_one) = ParquetBlockSource::open_with_cache_observed(
+            &path,
+            "target",
+            255,
+            300,
+            QuantizedCacheOptions::default(),
+            1,
+            |phase, readers, _| {
+                if phase == "cuts" {
+                    one_cut_readers = Some(readers);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(one_cut_readers, Some(1));
+
+        let mut parallel_cut_readers = None;
+        let (parallel, labels_parallel) = ParquetBlockSource::open_with_cache_observed(
+            &path,
+            "target",
+            255,
+            300,
+            QuantizedCacheOptions::default(),
+            4,
+            |phase, readers, _| {
+                if phase == "cuts" {
+                    parallel_cut_readers = Some(readers);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(parallel_cut_readers, Some(2));
+        assert_eq!(labels_one, labels_parallel, "nthread=4");
+        assert_quantized_sources_bitwise_equal(&one, &parallel, "nthread 1 vs 4");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

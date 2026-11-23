@@ -279,6 +279,7 @@ See the [Python API How-To](https://github.com/mdai001/FerrisBoost/blob/develop/
 ### 0.1.1.post1
 
 - Updated Arrow/Parquet to 60.2.0, PyO3 to 0.30.1, Rust NumPy bindings to 0.30.0, and cudarc to 0.19.10. Python and Rust APIs remain unchanged.
+- Bounded temporary decoder state for dense, wide Parquet inputs with fixed-width columns while preserving row and feature order.
 - Source builds require Rust 1.88 or newer and maturin 1.16 or newer.
 
 ### 0.1.1

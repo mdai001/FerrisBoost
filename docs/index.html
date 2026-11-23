@@ -106,6 +106,7 @@ prediction = model.predict("test.parquet")</code></pre>
       <h3>0.1.1.post1</h3>
       <ul>
         <li>Updated Arrow/Parquet to 60.2.0, PyO3 to 0.30.1, Rust NumPy bindings to 0.30.0, and cudarc to 0.19.10. Python and Rust APIs remain unchanged.</li>
+        <li>Bounded temporary decoder state for dense, wide Parquet inputs with fixed-width columns while preserving row and feature order.</li>
         <li>Source builds require Rust 1.88 or newer and maturin 1.16 or newer.</li>
       </ul>
       <h3>0.1.1</h3>

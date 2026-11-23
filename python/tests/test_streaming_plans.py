@@ -12,14 +12,14 @@ not the arithmetic). Every GPU run confirms the executed plan from the runtime
 `GPU_PATH` echo, never from the requested configuration.
 
 Budget-driven planning (no resident-block override) and a forced host-cache spill
-are covered too. Larger datasets (automatic block width and observed device
-memory against the planner estimate) run with FB_SLOW_TESTS=1.
+are covered too. Larger datasets (automatic block width and this process's CUDA
+default-pool requested allocations against the planner estimate) run with
+FB_SLOW_TESTS=1. These measurements exclude device-wide usage, driver-internal
+pools, and allocations owned by other processes.
 """
 import os
 import re
-import subprocess
-import threading
-import time
+from cuda_pool_probe import _PeakPoolAllocation, _used_pool_mb
 
 import numpy as np
 import pytest
@@ -762,38 +762,6 @@ def test_fast_ranking_plans_the_real_query_groups_for_every_input(tmp_path, capf
 
 # ---------------------------------------------------------------- slow (FB_SLOW_TESTS=1)
 
-def _used_mb():
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10).stdout
-        return int(out.strip().splitlines()[0])
-    except Exception:  # noqa: BLE001
-        return None
-
-
-class _PeakVram:
-    def __init__(self):
-        self.peak = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self):
-        while not self._stop.is_set():
-            used = _used_mb()
-            if used is not None:
-                self.peak = max(self.peak, used)
-            time.sleep(0.05)
-
-    def __enter__(self):
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self._stop.set()
-        self._thread.join()
-
-
 @pytest.fixture(scope="module")
 def large_parquet(tmp_path_factory):
     """3M x 23 rows (two categorical) for automatic column-major planning."""
@@ -819,7 +787,8 @@ def test_large_auto_plans_match_and_stay_within_the_planner_estimate(
         large_parquet, tmp_path, capfd, math):
     """Fully automatic planning (width, streams, residency) on a dataset large enough
     for the budget to force hybrid and pure streaming. Exact matches the CPU model,
-    fast is plan-invariant, and the observed device memory never exceeds the estimate."""
+    fast is plan-invariant, and this process's default-pool requested allocation
+    high-water never exceeds the estimate."""
     path, ftypes = large_parquet
     p = {"objective": "binary:logistic", "max_depth": 6, "nthread": 4, "seed": 1,
          "subsample": 0.8, "colsample_bytree": 0.8, "colsample_bynode": 0.8}
@@ -827,21 +796,20 @@ def test_large_auto_plans_match_and_stay_within_the_planner_estimate(
     ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu") if math == "exact" else None
     fb.train({"device": "cuda", "max_depth": 1}, np.zeros((64, 2), np.float32),
              np.zeros(64, np.float32), num_boost_round=1, quiet=True)
-    base = _used_mb()
+    base = _used_pool_mb()
     seen = {}
     labels = set()
     for budget in (None, 760, 710, 690):
         gpu = {"gpu_math": math, **({"gpu_memory_budget": budget * MB} if budget else {})}
         try:
-            with _PeakVram() as peak:
+            with _PeakPoolAllocation() as peak:
                 model, info = _gpu(capfd, p, path, kw, **gpu)
         except (ValueError, RuntimeError) as e:
             assert "does not fit" in str(e) and budget is not None
             continue
         labels.add(info["residency"])
         est = float(re.search(r"estimated_peak:\s+([\d.]+) MB", info["log"]).group(1))
-        if base is not None:
-            assert peak.peak - base <= est + 1, (budget, peak.peak - base, est)
+        assert peak.peak - base <= est + 1, (budget, peak.peak - base, est)
         out = _bytes(model, tmp_path, "gpu")
         if ref is not None:
             assert out == ref, f"budget {budget}: {info['residency']} differs from the CPU model"
@@ -875,7 +843,8 @@ def test_large_forced_column_major_plans_match_cpu(
 def test_large_wide_bin_plans_stay_within_the_planner_estimate(tmp_path, capfd, math):
     """1M rows with max_bin=1024 numeric features and a 20,000-category feature:
     automatic and budget-forced plans train the CPU model (exact) or one model
-    (fast), and the observed device memory never exceeds the re-planned estimate
+    (fast), and this process's default-pool requested allocation high-water never
+    exceeds the re-planned estimate
     (priced from the opened 16-bit blocks)."""
     n, f = 1_000_000, 12
     rng = np.random.default_rng(5)
@@ -896,12 +865,12 @@ def test_large_wide_bin_plans_stay_within_the_planner_estimate(tmp_path, capfd, 
     ref = _bytes(fb.train(p, path, quiet=True, **kw), tmp_path, "cpu") if math == "exact" else None
     fb.train({"device": "cuda", "max_depth": 1}, np.zeros((64, 2), np.float32),
              np.zeros(64, np.float32), num_boost_round=1, quiet=True)
-    base = _used_mb()
+    base = _used_pool_mb()
     seen, labels = {}, set()
     for budget in (None, 700, 650, 620, 600):
         gpu = {"gpu_math": math, **({"gpu_memory_budget": budget * MB} if budget else {})}
         try:
-            with _PeakVram() as peak:
+            with _PeakPoolAllocation() as peak:
                 model, info = _wide_plan(capfd, p, path, kw, **gpu)
         except (ValueError, RuntimeError) as e:
             assert "does not fit" in str(e) and budget is not None
@@ -910,8 +879,7 @@ def test_large_wide_bin_plans_stay_within_the_planner_estimate(tmp_path, capfd, 
         # the last plan report is the one priced from the opened blocks
         est = float(re.findall(r"estimated_peak:\s+([\d.]+) MB", info["log"])[-1])
         assert "priced from the opened blocks" in info["log"]
-        if base is not None:
-            assert peak.peak - base <= est + 1, (budget, peak.peak - base, est)
+        assert peak.peak - base <= est + 1, (budget, peak.peak - base, est)
         out = _bytes(model, tmp_path, "gpu")
         if ref is not None:
             assert out == ref, f"budget {budget}: {info['residency']} differs from the CPU model"
@@ -939,7 +907,8 @@ def large_rank_parquet(tmp_path_factory):
 @pytest.mark.parametrize("case", list(RANK_CASES))
 def test_large_fast_ranking_estimate_covers_observed_memory_and_tight_budgets_train(
         large_rank_parquet, tmp_path, capfd, case):
-    """On 3M rows the fast ranking estimate stays above the observed device memory
+    """On 3M rows the fast ranking estimate stays above this process's default-pool
+    requested allocation high-water
     without the old one-group-per-row overcharge, and a budget between the real need
     and that overcharge now trains: fast stays plan-invariant, exact matches the CPU."""
     path, n_groups = large_rank_parquet[case == "map"]
@@ -948,15 +917,14 @@ def test_large_fast_ranking_estimate_covers_observed_memory_and_tight_budgets_tr
     kw = {"label": "label", "qid": "qid", "num_boost_round": 3}
     fb.train({"device": "cuda", "max_depth": 1}, np.zeros((64, 2), np.float32),
              np.zeros(64, np.float32), num_boost_round=1, quiet=True)
-    base = _used_mb()
-    with _PeakVram() as peak:
+    base = _used_pool_mb()
+    with _PeakPoolAllocation() as peak:
         ref, info = _gpu(capfd, p, path, kw, gpu_math="fast")
     est = _plan_mb(info["log"], "estimated_peak")
-    if base is not None:
-        assert peak.peak - base <= est + 1, (peak.peak - base, est)
-        # the old charge added (n - n_groups) x 28 bytes on top of this estimate
-        assert est - (peak.peak - base) < (n - n_groups) * RANK_GROUP_BYTES / MB, (
-            peak.peak - base, est)
+    assert peak.peak - base <= est + 1, (peak.peak - base, est)
+    # the old charge added (n - n_groups) x 28 bytes on top of this estimate
+    assert est - (peak.peak - base) < (n - n_groups) * RANK_GROUP_BYTES / MB, (
+        peak.peak - base, est)
     ref = _bytes(ref, tmp_path, "fast_ref")
     # The minimum plan at this width: pure streaming with one histogram stream.
     _, info = _gpu(capfd, p, path, kw, gpu_math="fast", resident_blocks=0, hist_streams=1)
